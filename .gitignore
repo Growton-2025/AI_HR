@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+myenv/
+*.DS_Store
+*.egg-info/
+.env
+celeryconfig.py
+company_profile.py
+to.txt
