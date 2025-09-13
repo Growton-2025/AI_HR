@@ -1,0 +1,10 @@
+streamlit
+langchain-openai
+langchain
+python-dotenv
+psycopg2-binary
+pgvector
+redis
+tiktoken
+openai
+
