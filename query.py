@@ -43,8 +43,8 @@ except redis.ConnectionError as e:
 # --- LLM and Embeddings Initialization ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
 streaming_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, streaming=True)
-specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1) # Use a powerful model for validation
-generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2) # Powerful model for one-time taxonomy generation
+specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1) 
+generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2) 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -192,11 +192,7 @@ def load_all_profiles_from_db():
         if candidate_id not in roles_by_candidate:
             roles_by_candidate[candidate_id] = []
         
-        # Manually construct the 'company_details' dictionary to maintain compatibility
-        # with downstream functions (e.g., check_industry_presence, check_customer_segments).
         company_details = {
-            # The new schema provides 'company_details_product_service'. We map this to both 'industry'
-            # and 'product_service' keys to ensure the industry check function works as expected.
             "industry": role[5] or "",
             "product_service": role[5] or "",
             # The 'company_details_customer_segment' is a TEXT[] array, which is handled correctly.
@@ -562,11 +558,23 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
                 "source_text": f"Profile confirms experience in at least one required geography. Found: {', '.join(found_values)}."
             })
         return is_met
-
 async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Performs strict, deterministic filtering in Python with the new flexible logic."""
+    """Performs strict, deterministic filtering in Python with the new flexible logic and sorts by specified criterion duration."""
     logger.info("Applying detailed filters with reasoning...")
     matching_candidates = []
+
+    # Determine the primary criterion for sorting (e.g., required_segments for SMB experience)
+    sort_criterion = None
+    if criteria.get("required_segments"):
+        sort_criterion = "required_segments"
+    elif criteria.get("required_functions"):
+        sort_criterion = "required_functions"
+    elif criteria.get("required_industries"):
+        sort_criterion = "required_industries"
+    elif criteria.get("required_geographies"):
+        sort_criterion = "required_geographies"
+    else:
+        sort_criterion = "required_functions"  # Default to functions if none specified
 
     for profile in profiles:
         profile['evidence_log'] = []
@@ -596,7 +604,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         if all_criteria_met and not check_geography_experience(profile, criteria):
             all_criteria_met = False
 
-        # 4. Check for dynamic year requirements
+        # 4. Check for dynamic year requirements and calculate durations for sorting
         if all_criteria_met:
             for key, calc_func in [
                 ("required_functions", calculate_functional_experience_duration),
@@ -619,6 +627,15 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                     if duration < min_y:
                         all_criteria_met = False
                         break 
+                elif crit_obj and isinstance(crit_obj, dict):
+                    # Calculate duration even if no min_years, for sorting purposes
+                    duration, roles = calc_func(profile, crit_obj)
+                    profile['calculated_experience'][key] = {
+                        "duration": duration, 
+                        "roles": roles, 
+                        "label": ", ".join(crit_obj.get("values",[])),
+                        "required": 0.0
+                    }
 
         if all_criteria_met:
             # If specific experience was calculated, use it for the breakdown. Otherwise, fall back to default functional breakdown.
@@ -632,7 +649,18 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
 
             matching_candidates.append(profile)
 
-    logger.info(f"Found {len(matching_candidates)} candidates after strict filtering.")
+    # Sort candidates by the duration of the primary criterion (e.g., SMB experience)
+    if matching_candidates and sort_criterion:
+        matching_candidates.sort(
+            key=lambda x: x['calculated_experience'].get(sort_criterion, {}).get('duration', 0.0),
+            reverse=True
+        )
+
+    # Limit to top_n candidates
+    top_n = criteria.get("top_n", 1)
+    matching_candidates = matching_candidates[:top_n]
+
+    logger.info(f"Found {len(matching_candidates)} candidates after strict filtering and sorting by {sort_criterion} duration.")
     return matching_candidates
 
 async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any]) -> AsyncIterator[str]:
@@ -693,9 +721,9 @@ async def process_query_main(query: str, session_id: str) -> AsyncIterator[str]:
     
     # 1. Extract Criteria using LLM with detailed definitions
     criteria_extraction_prompt = PromptTemplate(
-        input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys"],
-        template="""
-You are an expert assistant. Extract structured filtering criteria from a user's query. Your primary goal is to correctly categorize user intent into functions, segments, industries, etc.
+    input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys"],
+    template="""
+You are an expert assistant. Extract structured filtering criteria from a user's query. Your primary goal is to correctly categorize user intent into functions, segments, industries, etc., and identify if the user requests a specific number of top candidates (e.g., 'top 10', 'one profile').
 
 **DEFINITIONS & CANONICAL KEYS:**
 - `required_functions`: Describes a sales role. **Map user input to one of these keys:** {sales_taxonomy_keys}
@@ -703,6 +731,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
 - `required_industries`: Companies or industries worked in.
 - `required_geographies`: Regions of sales experience.
 - `required_locations`: Candidate's physical base.
+- `top_n`: Integer indicating how many top candidates to return (e.g., 1 for 'one profile', 10 for 'top 10'). Default to 1 if not specified.
 
 **JSON STRUCTURE RULES:**
 - For each criterion, use an object with "operator" ("AND"/"OR") and "values" (a list of the mapped canonical keys or strings).
@@ -710,15 +739,19 @@ You are an expert assistant. Extract structured filtering criteria from a user's
 - **CRITICAL RULE:** If years of experience are mentioned directly with a function, industry, or segment (e.g., "10 years in inside sales"), you **MUST** capture this as `min_years` inside that specific criterion's object. Only use the top-level `min_total_experience` if the years are mentioned generally (e.g., "candidate with 10 years of experience").
 - `min_total_experience` and `min_people_managed` are top-level keys.
 - `required_locations` is a simple list of strings.
+- For queries like "top N" or "one profile," include a `top_n` integer field at the top level. If not specified, set `top_n` to 1.
+- For queries requesting the "maximum experience" in a criterion (e.g., "maximum experience in SMB space"), set `top_n` to 1 and prioritize sorting by that criterion's duration.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
 | User Query                                                  | Correct JSON Output                                                                                                                                                 |
 |-------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| "more than 10 years in inside sales"                        | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}` (Years correctly attached to the function)                          |
-| "10 years of SMB sales and managed 30 people"               | `{{"min_people_managed": 30, "required_segments": {{"operator": "OR", "values": ["smb"], "min_years": 10.0}}}}` (Correctly identified 'smb' as a segment)         |
+| "more than 10 years in inside sales"                        | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`                                                                 |
+| "10 years of SMB sales and managed 30 people"               | `{{"min_people_managed": 30, "required_segments": {{"operator": "OR", "values": ["smb"], "min_years": 10.0}}}}`                                                     |
 | "experience hunting in the enterprise space"                | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"]}}, "required_segments": {{"operator": "OR", "values": ["enterprise"]}}}}`                         |
-| "experience in HCL AND Tech Mahindra"                       | `{{"required_industries": {{"operator": "AND", "values": ["HCL", "Tech Mahindra"]}}}}` (Correctly identified the AND operator)                                      |
-| "at least 15 years of team management experience"           | `{{"min_total_experience": 15.0, "min_people_managed": 1}}`                                                                                                          |
+| "experience in HCL AND Tech Mahindra"                       | `{{"required_industries": {{"operator": "AND", "values": ["HCL", "Tech Mahindra"]}}}}`                                                                              |
+| "at least 15 years of team management experience"           | `{{"min_total_experience": 15.0, "min_people_managed": 1}}`                                                                                                         |
+| "top 10 profiles with SMB experience"                       | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                                                                     |
+| "one profile who have maximum experience in SMB space"       | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 1}}`                                                                                      |
 
 **Available criteria keys:**
 - `min_total_experience` (float)
@@ -728,12 +761,13 @@ You are an expert assistant. Extract structured filtering criteria from a user's
 - `required_industries` (object)
 - `required_functions` (object)
 - `required_segments` (object)
-        
+- `top_n` (integer, default 1)
+
 **User Query:** {query}
         
 **JSON Criteria:**
         """
-    )
+)
     try:
         yield "Extracting criteria... "
         criteria_response = await llm.ainvoke(criteria_extraction_prompt.format(
