@@ -23,36 +23,85 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 def parse_date(date_str):
-    """Parse date strings from JSON, handling various formats."""
+    """
+    Parse date strings from JSON, handling various formats and stripping time components.
+    This fix addresses the 'Invalid date format: YYYY-MM-DD 00:00:00' warnings.
+    """
     if not date_str or date_str.strip() == "" or date_str.lower() in ["present", "current"]:
         return None  # Treat 'Present' and 'current' as NULL
+
+    # NEW FIX: Strip the time component (like 00:00:00) if a space is present,
+    # because PostgreSQL DATE type only needs YYYY-MM-DD.
+    if ' ' in date_str:
+        date_str = date_str.split(' ')[0]
+        
     try:
-        # Handle YYYY-MM-DD HH:MM:SS
-        if ' ' in date_str:
-            return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").date()
-        # Handle YYYY-MM-DD
-        elif len(date_str.split('-')) == 3:
+        # Handle YYYY-MM-DD (This now handles the stripped format from above)
+        if len(date_str.split('-')) == 3:
             return datetime.strptime(date_str, "%Y-%m-%d").date()
         # Handle YYYY-MM
         elif len(date_str.split('-')) == 2:
+            # Append day '01' to create a valid date object
             return datetime.strptime(date_str + "-01", "%Y-%m-%d").date()
         # Handle YYYY
         elif len(date_str) == 4 and date_str.isdigit():
+            # Append month/day '01-01' to create a valid date object
             return datetime.strptime(date_str + "-01-01", "%Y-%m-%d").date()
         else:
-            logging.warning(f"Invalid date format: {date_str}")
+            logging.warning(f"Invalid date format (unknown format): {date_str}")
             return None
     except ValueError:
-        logging.warning(f"Invalid date format: {date_str}")
+        # Catch unexpected errors during parsing of the simplified date_str
+        logging.warning(f"Invalid date format (Value Error): {date_str}")
         return None
 
-def create_schema(cur):
-    """Create the normalized database schema."""
-    logging.info("Creating database schema...")
+
+def drop_all_tables(cur, conn):
+    """
+    Drops all user-defined tables in the public schema using CASCADE.
+    This ensures a clean start and removes any tables from previous, incomplete runs.
+    """
+    logging.info("Attempting to drop all existing tables in the 'public' schema...")
+
+    # Query for all tables in the 'public' schema
+    cur.execute("""
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tableowner != 'postgres';
+    """)
+    tables = [row[0] for row in cur.fetchall()]
+    
+    if not tables:
+        logging.info("No user tables found to drop.")
+        return
+
+    # Generate DROP TABLE statements with CASCADE to handle foreign key dependencies
+    drop_statements = [f"DROP TABLE IF EXISTS {table} CASCADE;" for table in tables]
+    
+    try:
+        for statement in drop_statements:
+            cur.execute(statement)
+        conn.commit()
+        logging.info(f"Successfully dropped {len(tables)} tables with CASCADE.")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Error dropping tables: {e}")
+        # We raise the error here to stop the script if the database connection/permissions are fundamentally broken
+        raise
+
+def create_schema(cur, conn):
+    """
+    Create the normalized database schema. 
+    NOTE: The order is crucial to satisfy Foreign Key dependencies. 
+    'candidates' and 'companies' must be created before 'roles' and other referencing tables.
+    Each statement is executed and committed individually for maximum robustness.
+    """
+    # This logging line confirms you are running the new logic!
+    logging.info("Starting robust schema creation (17 tables expected)...") 
     schema_statements = [
-        """
-        CREATE EXTENSION IF NOT EXISTS vector;
-        """,
+        
+        # ----------------------------------------------------
+        # 1. BASE TABLE: candidates (Most tables depend on this)
+        # ----------------------------------------------------
+        ("candidates", 
         """
         CREATE TABLE IF NOT EXISTS candidates (
             id SERIAL PRIMARY KEY,
@@ -86,25 +135,46 @@ def create_schema(cur):
             raw_fields JSONB,
             embedding VECTOR(1536)
         );
-        """,
+        """),
+        
+        # ----------------------------------------------------
+        # 2. BASE TABLE: companies (roles table depends on this)
+        # ----------------------------------------------------
+        ("companies",
+        """
+        CREATE TABLE IF NOT EXISTS companies (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) UNIQUE NOT NULL, 
+            funding_stage VARCHAR(255),
+            revenue TEXT,
+            business_model VARCHAR(255),
+            product_service TEXT,
+            customer_segment TEXT[],
+            customer_presence TEXT[],
+            culture_type VARCHAR(255),
+            headquarters VARCHAR(255)
+        );
+        """),
+
+        # ----------------------------------------------------
+        # 3. LINKING TABLE: roles (Requires candidates and companies to exist)
+        # ----------------------------------------------------
+        ("roles",
         """
         CREATE TABLE IF NOT EXISTS roles (
             id SERIAL PRIMARY KEY,
             candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
-            company VARCHAR(255),
+            company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE, 
             title VARCHAR(255),
             details TEXT,
-            duration_years NUMERIC,
-            company_details_product_service TEXT,
-            company_details_customer_segment TEXT[],
-            company_details_customer_presence TEXT[],
-            company_details_funding_stage VARCHAR(255),  -- Increased to 255 to handle longer values
-            company_details_revenue TEXT,
-            company_details_culture_type VARCHAR(255),  -- Increased to 255
-            company_details_headquarters VARCHAR(255),
-            company_details_business_model VARCHAR(255)  -- Increased to 255
+            duration_years NUMERIC
         );
-        """,
+        """),
+        
+        # ----------------------------------------------------
+        # 4-17. Other tables (Mostly referencing candidates)
+        # ----------------------------------------------------
+        ("education",
         """
         CREATE TABLE IF NOT EXISTS education (
             id SERIAL PRIMARY KEY,
@@ -115,7 +185,8 @@ def create_schema(cur):
             end_date DATE,
             details TEXT
         );
-        """,
+        """),
+        ("company_years",
         """
         CREATE TABLE IF NOT EXISTS company_years (
             id SERIAL PRIMARY KEY,
@@ -123,7 +194,8 @@ def create_schema(cur):
             company VARCHAR(255),
             years NUMERIC
         );
-        """,
+        """),
+        ("experience_gaps",
         """
         CREATE TABLE IF NOT EXISTS experience_gaps (
             id SERIAL PRIMARY KEY,
@@ -133,7 +205,8 @@ def create_schema(cur):
             duration_months INTEGER,
             reason VARCHAR(100)
         );
-        """,
+        """),
+        ("education_gaps",
         """
         CREATE TABLE IF NOT EXISTS education_gaps (
             id SERIAL PRIMARY KEY,
@@ -143,7 +216,8 @@ def create_schema(cur):
             duration_months INTEGER,
             reason VARCHAR(100)
         );
-        """,
+        """),
+        ("industry_gaps",
         """
         CREATE TABLE IF NOT EXISTS industry_gaps (
             id SERIAL PRIMARY KEY,
@@ -153,7 +227,8 @@ def create_schema(cur):
             duration_months INTEGER,
             reason VARCHAR(100)
         );
-        """,
+        """),
+        ("functional_experiences",
         """
         CREATE TABLE IF NOT EXISTS functional_experiences (
             id SERIAL PRIMARY KEY,
@@ -161,7 +236,8 @@ def create_schema(cur):
             score INTEGER,
             rationale TEXT
         );
-        """,
+        """),
+        ("functional_experience_roles",
         """
         CREATE TABLE IF NOT EXISTS functional_experience_roles (
             id SERIAL PRIMARY KEY,
@@ -171,7 +247,8 @@ def create_schema(cur):
             reason TEXT,
             duration_years NUMERIC
         );
-        """,
+        """),
+        ("industry_experiences",
         """
         CREATE TABLE IF NOT EXISTS industry_experiences (
             id SERIAL PRIMARY KEY,
@@ -179,7 +256,8 @@ def create_schema(cur):
             score INTEGER,
             rationale TEXT
         );
-        """,
+        """),
+        ("industry_experience_roles",
         """
         CREATE TABLE IF NOT EXISTS industry_experience_roles (
             id SERIAL PRIMARY KEY,
@@ -189,7 +267,8 @@ def create_schema(cur):
             reason TEXT,
             duration_years NUMERIC
         );
-        """,
+        """),
+        ("segment_experiences",
         """
         CREATE TABLE IF NOT EXISTS segment_experiences (
             id SERIAL PRIMARY KEY,
@@ -197,7 +276,8 @@ def create_schema(cur):
             score INTEGER,
             rationale TEXT
         );
-        """,
+        """),
+        ("segment_experience_roles",
         """
         CREATE TABLE IF NOT EXISTS segment_experience_roles (
             id SERIAL PRIMARY KEY,
@@ -207,7 +287,8 @@ def create_schema(cur):
             reason TEXT,
             duration_years NUMERIC
         );
-        """,
+        """),
+        ("geography_experiences",
         """
         CREATE TABLE IF NOT EXISTS geography_experiences (
             id SERIAL PRIMARY KEY,
@@ -215,14 +296,16 @@ def create_schema(cur):
             score INTEGER,
             rationale TEXT
         );
-        """,
+        """),
+        ("geography_experience_regions",
         """
         CREATE TABLE IF NOT EXISTS geography_experience_regions (
             id SERIAL PRIMARY KEY,
             geography_experience_id INTEGER REFERENCES geography_experiences(id) ON DELETE CASCADE,
             region VARCHAR(100)
         );
-        """,
+        """),
+        ("titles_held",
         """
         CREATE TABLE IF NOT EXISTS titles_held (
             id SERIAL PRIMARY KEY,
@@ -232,15 +315,28 @@ def create_schema(cur):
             start_date DATE,
             end_date DATE
         );
-        """
+        """)
     ]
-    try:
-        for statement in schema_statements:
+    
+    successful_creations = 0
+    total_statements = len(schema_statements)
+
+    for i, (table_name, statement) in enumerate(schema_statements):
+        try:
+            logging.info(f"Executing statement {i+1}/{total_statements}: CREATE TABLE {table_name}...")
             cur.execute(statement)
-        logging.info("Schema created successfully.")
-    except Exception as e:
-        logging.error(f"Error creating schema: {e}")
-        raise
+            conn.commit() # Commit after each statement
+            successful_creations += 1
+            logging.info(f"SUCCESS: Table '{table_name}' created/checked.")
+        except psycopg2.Error as e:
+            conn.rollback() # Rollback the failed transaction only
+            logging.error(f"FAILURE on statement {i+1}/{total_statements}: Table '{table_name}' failed to create.")
+            logging.error(f"Database Error: {e.pgcode} - {e.pgerror}")
+            logging.error(f"Failing Query: {statement.strip()}")
+            # DO NOT raise here, let it continue attempting the remaining tables
+
+    logging.info(f"Schema creation finished. {successful_creations} out of {total_statements} tables were successfully created/checked.")
+
 
 def ingest_data():
     logging.info("Starting JSON data ingestion...")
@@ -250,15 +346,33 @@ def ingest_data():
     try:
         conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
         cur = conn.cursor()
-        register_vector(conn)
         logging.info("Successfully connected to the database.")
     except Exception as e:
         logging.error(f"Failed to connect to database: {e}")
         raise
+        
+    # --- 1. DROP ALL EXISTING TABLES FOR A CLEAN START ---
+    drop_all_tables(cur, conn)
 
-    # Create schema
-    create_schema(cur)
-    conn.commit()
+    # --- 2. ENSURE PGVECTOR EXTENSION IS ENABLED ---
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        conn.commit()
+        logging.info("pgvector extension enabled.")
+    except Exception as e:
+        logging.error(f"Error enabling pgvector extension. Please ensure you have installed pgvector on your PostgreSQL server: {e}")
+        conn.rollback()
+        raise
+
+    # Register vector type handler for psycopg2
+    try:
+        register_vector(conn)
+    except Exception as e:
+        logging.error(f"Failed to register pgvector type: {e}")
+        raise
+
+    # --- 3. CREATE SCHEMA WITH CORRECTED TABLE ORDER (All 17 tables) ---
+    create_schema(cur, conn) # Pass conn to allow for per-statement commits
 
     # Load JSON data
     try:
@@ -270,6 +384,14 @@ def ingest_data():
         cur.close()
         conn.close()
         raise
+        
+    # Helper function to correctly format array fields (handle strings -> list conversion)
+    def format_array_field(data):
+        if isinstance(data, list):
+            return data
+        if isinstance(data, str) and data:
+            return [s.strip() for s in data.split(',') if s.strip()]
+        return []
 
     for i, profile in enumerate(profiles_data):
         try:
@@ -337,6 +459,73 @@ def ingest_data():
                 RETURNING id;
             """, candidate_params)
             candidate_id = cur.fetchone()[0]
+
+            # Insert into roles with normalized company data
+            roles = profile.get('roles', [])
+            if roles:
+                roles_to_insert = []
+                for r in roles:
+                    company_name = r.get('company')
+                    # Skip role if company name is missing, as it's required for upsert
+                    if not company_name:
+                        logging.warning(f"Skipping role for candidate {candidate_id} due to missing company name.")
+                        continue
+                        
+                    company_details = r.get('company_details', {})
+                    
+                    # --- 1. Prepare & Upsert Company Data ---
+                    
+                    customer_segment = format_array_field(company_details.get('customer_segment'))
+                    customer_presence = format_array_field(company_details.get('customer_presence'))
+
+                    # Truncate strings for VARCHAR fields
+                    funding_stage = company_details.get('funding_stage', '')[:255]
+                    culture_type = company_details.get('culture_type', '')[:255]
+                    business_model = company_details.get('business_model', '')[:255]
+                    headquarters = company_details.get('headquarters', '')[:255]
+
+                    # Upsert into companies table to get company_id
+                    cur.execute("""
+                        INSERT INTO companies (
+                            name, funding_stage, revenue, business_model, product_service, 
+                            customer_segment, customer_presence, culture_type, headquarters
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (name) DO UPDATE SET
+                            funding_stage = EXCLUDED.funding_stage, 
+                            revenue = EXCLUDED.revenue,
+                            business_model = EXCLUDED.business_model,
+                            product_service = EXCLUDED.product_service,
+                            customer_segment = EXCLUDED.customer_segment,
+                            customer_presence = EXCLUDED.customer_presence,
+                            culture_type = EXCLUDED.culture_type,
+                            headquarters = EXCLUDED.headquarters
+                        RETURNING id;
+                    """, (
+                        company_name, company_details.get('funding_stage'), company_details.get('revenue'), 
+                        company_details.get('business_model'), company_details.get('product_service'), 
+                        customer_segment, customer_presence, 
+                        company_details.get('culture_type'), company_details.get('headquarters')
+                    ))
+                    company_id = cur.fetchone()[0]
+
+                    # --- 2. Prepare Role Data (Now just storing company_id) ---
+                    roles_to_insert.append(
+                        (
+                            candidate_id, 
+                            company_id, # Use company_id instead of company_name
+                            r.get('title'), 
+                            r.get('details'), 
+                            r.get('duration_years')
+                        )
+                    )
+                
+                # --- 3. Insert Role Data ---
+                if roles_to_insert:
+                    execute_values(cur, """
+                        INSERT INTO roles (
+                            candidate_id, company_id, title, details, duration_years
+                        ) VALUES %s
+                    """, roles_to_insert)
 
             # Insert into company_years
             company_years_data = profile.get('company_years', {})
@@ -475,51 +664,6 @@ def ingest_data():
                         INSERT INTO geography_experience_regions (geography_experience_id, region)
                         VALUES %s
                     """, regions_to_insert)
-
-            # Insert into roles with flattened company_details, handling arrays and truncation
-            roles = profile.get('roles', [])
-            if roles:
-                roles_to_insert = []
-                for r in roles:
-                    company_details = r.get('company_details', {})
-                    customer_segment = company_details.get('customer_segment', [])
-                    if isinstance(customer_segment, str):
-                        customer_segment = [customer_segment.strip()]
-
-                    customer_presence = company_details.get('customer_presence', [])
-                    if isinstance(customer_presence, str):
-                        # Split if contains commas or spaces
-                        presence_list = [p.strip() for p in customer_presence.split(',') if p.strip()]
-                        if not presence_list:
-                            presence_list = [customer_presence]
-                        customer_presence = presence_list
-
-                    funding_stage = company_details.get('funding_stage', '')[:255]
-                    culture_type = company_details.get('culture_type', '')[:255]
-                    business_model = company_details.get('business_model', '')[:255]
-
-                    roles_to_insert.append(
-                        (
-                            candidate_id, r.get('company'), r.get('title'), r.get('details'), r.get('duration_years'),
-                            company_details.get('product_service'),
-                            customer_segment,
-                            customer_presence,
-                            funding_stage,
-                            company_details.get('revenue'),
-                            culture_type,
-                            company_details.get('headquarters'),
-                            business_model
-                        )
-                    )
-                execute_values(cur, """
-                    INSERT INTO roles (
-                        candidate_id, company, title, details, duration_years,
-                        company_details_product_service, company_details_customer_segment,
-                        company_details_customer_presence, company_details_funding_stage,
-                        company_details_revenue, company_details_culture_type,
-                        company_details_headquarters, company_details_business_model
-                    ) VALUES %s
-                """, roles_to_insert)
 
             # Insert into education with parsed dates
             education_history = profile.get('education', [])

@@ -43,8 +43,8 @@ except redis.ConnectionError as e:
 # --- LLM and Embeddings Initialization ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
 streaming_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, streaming=True)
-specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1) 
-generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2) 
+specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -61,7 +61,7 @@ def safe_json_loads(json_str: str, default_val: Any = None) -> Any:
             cleaned_str = cleaned_str[7:].rstrip("```").strip()
         elif cleaned_str.startswith("`"):
             cleaned_str = cleaned_str.strip("`").strip()
-        
+
         if not cleaned_str:
             return default_val
         return json.loads(cleaned_str)
@@ -76,7 +76,7 @@ def generate_dynamic_taxonomy(seed_taxonomy: dict, category: str) -> dict:
     The result is cached to avoid repeated LLM calls.
     """
     logger.info(f"Generating dynamic taxonomy for category: {category}... (This will be cached)")
-    
+
     prompt_template = PromptTemplate(
         input_variables=["seed_taxonomy_json", "category"],
         template="""
@@ -102,11 +102,11 @@ def generate_dynamic_taxonomy(seed_taxonomy: dict, category: str) -> dict:
         )
         response = generation_llm.invoke(formatted_prompt)
         expanded_taxonomy = safe_json_loads(response.content, default_val=seed_taxonomy)
-        
+
         if expanded_taxonomy == seed_taxonomy:
             logger.warning(f"LLM failed to generate an expanded taxonomy for {category}. Falling back to the static seed.")
             return seed_taxonomy
-            
+
         logger.info(f"Successfully generated and cached dynamic taxonomy for {category}.")
         return expanded_taxonomy
     except Exception as e:
@@ -128,6 +128,18 @@ STATIC_SEGMENT_SYNONYMS = {
     "smb": ["smb", "small business", "small and medium business", "sme"]
 }
 
+STATIC_COMPANY_DETAILS_TAXONOMY = {
+    "bootstrapped": ["bootstrapped", "self-funded"],
+    "seed": ["seed", "seed stage", "pre-seed"],
+    "series-a": ["series a", "series-a"],
+    "series-b": ["series b", "series-b"],
+    "public": ["public", "publicly traded", "ipo"],
+    "b2b": ["b2b", "business-to-business"],
+    "b2c": ["b2c", "business-to-consumer"],
+    "saas": ["saas", "software as a service"]
+}
+
+
 # --- ✨ DYNAMIC TAXONOMY INITIALIZATION ✨ ---
 SALES_TAXONOMY = generate_dynamic_taxonomy(
     seed_taxonomy=STATIC_SALES_TAXONOMY,
@@ -139,9 +151,16 @@ SEGMENT_SYNONYMS = generate_dynamic_taxonomy(
     category="Customer Segments"
 )
 
+COMPANY_DETAILS_TAXONOMY = generate_dynamic_taxonomy(
+    seed_taxonomy=STATIC_COMPANY_DETAILS_TAXONOMY,
+    category="Company Attributes (Funding, Business Model)"
+)
+
+
 # Log the results to see what the LLM created
 logger.info(f"Loaded Sales Taxonomy with {sum(len(v) for v in SALES_TAXONOMY.values())} total terms.")
 logger.info(f"Loaded Segment Taxonomy with {sum(len(v) for v in SEGMENT_SYNONYMS.values())} total terms.")
+logger.info(f"Loaded Company Details Taxonomy with {sum(len(v) for v in COMPANY_DETAILS_TAXONOMY.values())} total terms.")
 
 
 # --- Database Connection Pool ---
@@ -168,43 +187,58 @@ def load_all_profiles_from_db():
     logger.info("Loading all profiles from the database into cache...")
     conn = get_db_connection()
     cur = conn.cursor()
-    
+
     # Fetch all candidates using the core fields needed for the app
     cur.execute("SELECT id, name, linkedin, location, headline, about, total_experience_years, max_people_managed FROM candidates")
     candidates_raw = cur.fetchall()
-    
-    # Fetch all roles and map them by candidate_id, selecting from the new schema columns
+
+    # Fetch all roles and join with companies table to get company details
     cur.execute("""
-        SELECT 
-            candidate_id, 
-            company, 
-            title, 
-            details, 
-            duration_years, 
-            company_details_product_service, 
-            company_details_customer_segment 
-        FROM roles
+        SELECT
+            r.candidate_id,
+            c.name as company_name,
+            r.title,
+            r.details,
+            r.duration_years,
+            c.funding_stage,
+            c.revenue,
+            c.business_model,
+            c.product_service,
+            c.customer_segment,
+            c.customer_presence,
+            c.culture_type,
+            c.headquarters
+        FROM roles r
+        JOIN companies c ON r.company_id = c.id
     """)
     roles_raw = cur.fetchall()
     roles_by_candidate = {}
     for role in roles_raw:
+        # Map by index based on the new SELECT statement
         candidate_id = role[0]
         if candidate_id not in roles_by_candidate:
             roles_by_candidate[candidate_id] = []
-        
+
+        # Construct the company_details dictionary with all the fetched fields
         company_details = {
-            "industry": role[5] or "",
-            "product_service": role[5] or "",
-            # The 'company_details_customer_segment' is a TEXT[] array, which is handled correctly.
-            "customer_segment": role[6] if role[6] is not None else []
+            "funding_stage": role[5],
+            "revenue": role[6],
+            "business_model": role[7],
+            "product_service": role[8],
+            "customer_segment": role[9] if role[9] is not None else [],
+            "customer_presence": role[10] if role[10] is not None else [],
+            "culture_type": role[11],
+            "headquarters": role[12],
+            # Adding 'industry' for compatibility with downstream functions, mapping it from product_service.
+            "industry": role[8] or ""
         }
 
         roles_by_candidate[candidate_id].append({
-            "company": role[1],
+            "company": role[1], # company_name
             "title": role[2],
             "details": role[3],
             "duration_years": float(role[4]) if role[4] is not None else 0.0,
-            "company_details": company_details  # Use the constructed dictionary
+            "company_details": company_details
         })
 
     # Combine candidates and their roles
@@ -222,7 +256,7 @@ def load_all_profiles_from_db():
             "max_people_managed": cand[7] or 0,
             "roles": roles_by_candidate.get(candidate_id, [])
         })
-        
+
     cur.close()
     conn.close()
     logger.info(f"Successfully loaded and cached {len(profiles)} profiles.")
@@ -231,7 +265,7 @@ def load_all_profiles_from_db():
 # Load data into a global variable for the app session
 PROFILES_BY_ID = {p['id']: p for p in load_all_profiles_from_db()}
 
-# --- Core Logic (No changes needed here as data structure is preserved) ---
+# --- Core Logic ---
 
 def normalize_query_with_llm(query: str) -> str:
     """Uses LLM to normalize common synonyms in the query."""
@@ -273,7 +307,7 @@ def calculate_industry_experience_duration(profile: Dict[str, Any], criteria_obj
     contributing_roles = []
     if not criteria_obj or not isinstance(criteria_obj, dict):
         return 0.0, []
-    
+
     req_values = [v.lower() for v in criteria_obj.get("values", [])]
     if not req_values:
         return 0.0, []
@@ -301,7 +335,7 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
     contributing_roles = []
     if not criteria_obj or not isinstance(criteria_obj, dict):
         return 0.0, []
-    
+
     req_values = [v.lower() for v in criteria_obj.get("values", [])]
     if not req_values:
         return 0.0, []
@@ -315,7 +349,7 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
         company_segments = role.get("company_details", {}).get("customer_segment", [])
         company_segments_lower = ' '.join([cs.lower() for cs in company_segments])
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()} {company_segments_lower}"
-        
+
         for original_value, synonyms in all_search_terms.items():
             if any(s in role_text for s in synonyms):
                 duration = role.get('duration_years', 0.0) or 0.0
@@ -334,7 +368,7 @@ def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_ob
     contributing_roles = []
     if not criteria_obj or not isinstance(criteria_obj, dict):
         return 0.0, []
-    
+
     req_values = [v.lower() for v in criteria_obj.get("values", [])]
     if not req_values:
         return 0.0, []
@@ -342,6 +376,34 @@ def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_ob
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         if any(v in role_text for v in req_values):
+            duration = role.get('duration_years', 0.0) or 0.0
+            total_duration += duration
+            contributing_roles.append({
+                'company': role.get('company', ''),
+                'title': role.get('title', ''),
+                'duration_years': duration
+            })
+    return total_duration, contributing_roles
+
+def calculate_company_details_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
+    """Calculates the total duration for roles that meet the company detail criteria."""
+    total_duration = 0.0
+    contributing_roles = []
+    if not criteria_obj or not isinstance(criteria_obj, dict):
+        return 0.0, []
+
+    req_values = [v.lower() for v in criteria_obj.get("values", [])]
+    if not req_values:
+        return 0.0, []
+
+    for role in profile.get('roles', []):
+        company_details = role.get('company_details', {})
+        details_text = (
+            f"{(company_details.get('funding_stage') or '').lower()} "
+            f"{(company_details.get('business_model') or '').lower()} "
+            f"{(company_details.get('product_service') or '').lower()}"
+        )
+        if any(v in details_text for v in req_values):
             duration = role.get('duration_years', 0.0) or 0.0
             total_duration += duration
             contributing_roles.append({
@@ -383,7 +445,7 @@ def check_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -
             if v in role_text:
                 found_values.add(v)
                 break
-    
+
     if op == "AND":
         is_met = found_values == set(values)
         if is_met:
@@ -425,7 +487,7 @@ def check_functional_presence(profile: Dict[str, Any], criteria: Dict[str, Any])
             if v in role_text:
                 found_values.add(v)
                 break
-    
+
     if op == "AND":
         is_met = found_values == set(values)
         if is_met:
@@ -459,7 +521,7 @@ def check_customer_segments(profile: Dict[str, Any], criteria: Dict[str, Any]) -
 
     if not values:
         return True
-    
+
     # Expand synonyms for all values
     all_search_terms = {}
     for v in values:
@@ -472,53 +534,71 @@ def check_customer_segments(profile: Dict[str, Any], criteria: Dict[str, Any]) -
             company_segments = role.get("company_details", {}).get("customer_segment", [])
             company_segments_lower = ' '.join([cs.lower() for cs in company_segments])
             role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()} {company_segments_lower}"
-            
+
             if any(s in role_text for s in synonyms):
                 found_values.add(original_value)
                 found_synonym = True
                 break
         if found_synonym:
-            continue
-    
+            profile['evidence_log'].append({
+                "criterion": "segment_presence (OR)",
+                "source_text": f"Profile confirms experience in at least one required segment. Found: {', '.join(found_values)}."
+            })
+
     if op == "AND":
         is_met = found_values == set(values)
         if is_met:
             profile['evidence_log'].append({
-                "criterion": "segment_experience (AND)",
+                "criterion": "segment_presence (AND)",
                 "source_text": f"Profile confirms experience in all required segments: {', '.join(values)}."
+            })
+        return is_met
+    else: # OR
+        is_met = bool(found_values)
+        return is_met
+
+def check_location_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """Checks if the candidate's location matches the required locations, supporting AND/OR logic."""
+    criteria_obj = criteria.get("required_locations")
+    if not criteria_obj:
+        return True
+
+    op = "OR"
+    values = []
+    if isinstance(criteria_obj, dict):
+        op = criteria_obj.get("operator", "OR").upper()
+        values = [v.lower() for v in criteria_obj.get("values", [])]
+    elif isinstance(criteria_obj, list):
+        values = [v.lower() for v in criteria_obj]
+
+    if not values:
+        return True
+
+    profile_location = (profile.get('location') or '').lower()
+    found_values = set()
+    for v in values:
+        if v in profile_location:
+            found_values.add(v)
+
+    if op == "AND":
+        is_met = found_values == set(values)
+        if is_met:
+            profile['evidence_log'].append({
+                "criterion": "location_presence (AND)",
+                "source_text": f"Profile location confirms all required locations: {', '.join(values)}."
             })
         return is_met
     else: # OR
         is_met = bool(found_values)
         if is_met:
             profile['evidence_log'].append({
-                "criterion": "segment_experience (OR)",
-                "source_text": f"Profile confirms experience in at least one required segment. Found: {', '.join(found_values)}."
+                "criterion": "location_presence (OR)",
+                "source_text": f"Profile location confirms at least one required location. Found: {', '.join(found_values)}."
             })
         return is_met
 
-def check_location_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    """Checks if the candidate is in one of the required locations."""
-    req_locations = [loc.lower() for loc in criteria.get("required_locations", [])]
-    if not req_locations:
-        return True
-
-    candidate_location = (profile.get('location') or "").lower()
-    if not candidate_location:
-        return False
-
-    if any(loc in candidate_location for loc in req_locations):
-        profile['evidence_log'].append({
-            "criterion": "location_presence",
-            "source_text": f"Candidate is located in '{profile.get('location')}', which matches the search criteria."
-        })
-        return True
-    
-    logger.debug(f"{profile.get('name')} filtered out: location '{profile.get('location')}' not in {req_locations}")
-    return False
-
 def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    """Checks if the candidate has sales experience in a required geography, supporting AND/OR logic."""
+    """Checks if the candidate has experience in the required geographies, supporting AND/OR logic."""
     criteria_obj = criteria.get("required_geographies")
     if not criteria_obj:
         return True
@@ -541,12 +621,12 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
             if v in role_text:
                 found_values.add(v)
                 break
-    
+
     if op == "AND":
         is_met = found_values == set(values)
         if is_met:
             profile['evidence_log'].append({
-                "criterion": "geography_experience (AND)",
+                "criterion": "geography_presence (AND)",
                 "source_text": f"Profile confirms experience in all required geographies: {', '.join(values)}."
             })
         return is_met
@@ -554,10 +634,62 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
         is_met = bool(found_values)
         if is_met:
             profile['evidence_log'].append({
-                "criterion": "geography_experience (OR)",
+                "criterion": "geography_presence (OR)",
                 "source_text": f"Profile confirms experience in at least one required geography. Found: {', '.join(found_values)}."
             })
         return is_met
+
+def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """Checks if the candidate has ever worked in a company matching the company detail criteria."""
+    criteria_obj = criteria.get("required_company_details")
+    if not criteria_obj:
+        return True
+
+    op = "OR"
+    values = []
+    if isinstance(criteria_obj, dict):
+        op = criteria_obj.get("operator", "OR").upper()
+        values = [v.lower() for v in criteria_obj.get("values", [])]
+    elif isinstance(criteria_obj, list):
+        values = [v.lower() for v in criteria_obj]
+
+    if not values:
+        return True
+
+    found_values = set()
+    for v in values:
+        for role in profile.get('roles', []):
+            company_details = role.get('company_details', {})
+            # Combine multiple company fields into one text block for searching
+            details_text = (
+                f"{(company_details.get('funding_stage') or '').lower()} "
+                f"{(company_details.get('business_model') or '').lower()} "
+                f"{(company_details.get('product_service') or '').lower()}"
+            )
+            if v in details_text:
+                found_values.add(v)
+                break
+
+    if op == "AND":
+        is_met = found_values == set(values)
+        if is_met:
+            profile['evidence_log'].append({
+                "criterion": "company_details_presence (AND)",
+                "source_text": f"Profile confirms experience in companies with all required attributes: {', '.join(values)}."
+            })
+        return is_met
+    else: # OR
+        is_met = bool(found_values)
+        if is_met:
+            profile['evidence_log'].append({
+                "criterion": "company_details_presence (OR)",
+                "source_text": f"Profile confirms experience in a company with at least one required attribute. Found: {', '.join(found_values)}."
+            })
+        return is_met
+
+
+# --- Strict Filtering Function ---
+
 async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Performs strict, deterministic filtering in Python with the new flexible logic and sorts by specified criterion duration."""
     logger.info("Applying detailed filters with reasoning...")
@@ -573,6 +705,8 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         sort_criterion = "required_industries"
     elif criteria.get("required_geographies"):
         sort_criterion = "required_geographies"
+    elif criteria.get("required_company_details"):
+        sort_criterion = "required_company_details"
     else:
         sort_criterion = "required_functions"  # Default to functions if none specified
 
@@ -591,7 +725,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         min_managed = criteria.get("min_people_managed")
         if min_managed and (profile.get("max_people_managed") or 0) < min_managed:
             all_criteria_met = False
-            
+
         # 3. Check for presence in required fields (AND/OR logic)
         if all_criteria_met and not check_functional_presence(profile, criteria):
             all_criteria_met = False
@@ -603,6 +737,8 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             all_criteria_met = False
         if all_criteria_met and not check_geography_experience(profile, criteria):
             all_criteria_met = False
+        if all_criteria_met and not check_company_details(profile, criteria):
+            all_criteria_met = False
 
         # 4. Check for dynamic year requirements and calculate durations for sorting
         if all_criteria_met:
@@ -610,29 +746,30 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                 ("required_functions", calculate_functional_experience_duration),
                 ("required_industries", calculate_industry_experience_duration),
                 ("required_segments", calculate_segment_experience_duration),
-                ("required_geographies", calculate_geography_experience_duration)
+                ("required_geographies", calculate_geography_experience_duration),
+                ("required_company_details", calculate_company_details_experience_duration)
             ]:
                 crit_obj = criteria.get(key)
                 if crit_obj and isinstance(crit_obj, dict) and crit_obj.get("min_years"):
                     min_y = crit_obj["min_years"]
                     duration, roles = calc_func(profile, crit_obj)
-                    
+
                     profile['calculated_experience'][key] = {
-                        "duration": duration, 
-                        "roles": roles, 
+                        "duration": duration,
+                        "roles": roles,
                         "label": ", ".join(crit_obj.get("values",[])),
                         "required": min_y
                     }
 
                     if duration < min_y:
                         all_criteria_met = False
-                        break 
+                        break
                 elif crit_obj and isinstance(crit_obj, dict):
                     # Calculate duration even if no min_years, for sorting purposes
                     duration, roles = calc_func(profile, crit_obj)
                     profile['calculated_experience'][key] = {
-                        "duration": duration, 
-                        "roles": roles, 
+                        "duration": duration,
+                        "roles": roles,
                         "label": ", ".join(crit_obj.get("values",[])),
                         "required": 0.0
                     }
@@ -644,8 +781,8 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                 first_calc_key = next(iter(profile['calculated_experience']))
                 profile['contributing_roles_details'] = {'roles': profile['calculated_experience'][first_calc_key]['roles']}
             else:
-                 _, roles_list = calculate_functional_experience_duration(profile, criteria.get("required_functions", {}))
-                 profile['contributing_roles_details'] = {'roles': roles_list}
+                _, roles_list = calculate_functional_experience_duration(profile, criteria.get("required_functions", {}))
+                profile['contributing_roles_details'] = {'roles': roles_list}
 
             matching_candidates.append(profile)
 
@@ -656,16 +793,20 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             reverse=True
         )
 
-    # Limit to top_n candidates
-    top_n = criteria.get("top_n", 1)
-    matching_candidates = matching_candidates[:top_n]
+    # Limit to top_n candidates, or return all if top_n is 0 or not specified
+    top_n = criteria.get("top_n")
+    if top_n is None or top_n == 0:
+        logger.info(f"No top_n specified or top_n is 0, returning all {len(matching_candidates)} candidates.")
+    else:
+        matching_candidates = matching_candidates[:top_n]
+        logger.info(f"Found {len(matching_candidates)} candidates after strict filtering and sorting by {sort_criterion} duration, limited to top {top_n}.")
 
-    logger.info(f"Found {len(matching_candidates)} candidates after strict filtering and sorting by {sort_criterion} duration.")
     return matching_candidates
 
 async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any]) -> AsyncIterator[str]:
     """
     Generates the final response with detailed, evidence-based reasoning.
+    This function now processes one profile at a time to avoid context length errors.
     """
     if not matching_profiles:
         yield "No candidates were found that strictly match all criteria with explicit evidence in their profiles."
@@ -674,18 +815,20 @@ async def generate_response_with_evidence(query: str, matching_profiles: List[di
     yield f"Found {len(matching_profiles)} matching candidates. Here are the details:\n\n"
 
     final_answer_prompt_template = PromptTemplate(
-        input_variables=["query", "criteria_json", "matching_profiles_json"],
+        input_variables=["query", "criteria_json", "matching_profile_json"],
         template="""
-You are an expert recruitment analyst. Your task is to generate a concise, evidence-based summary for each matching candidate based on the user's query and the specific criteria they were filtered by.
+You are an expert recruitment analyst. Your task is to generate a concise, evidence-based summary for the single candidate provided, based on the user's query and the filtering criteria.
 
 **Original User Query:** {query}
 **Filtering Criteria Used (JSON):** {criteria_json}
-**Matching Candidates (JSON):** {matching_profiles_json}
+**Matching Candidate (JSON):** {matching_profile_json}
 
 **CRITICAL INSTRUCTIONS FOR DYNAMIC REASONING:**
 
-1.  **Address Each Criterion:** For each candidate, you **MUST** create a "**Reasoning**" section. This section **MUST** contain a separate bullet point for **EACH KEY** present in the `Filtering Criteria Used` JSON.
-2.  **Be Specific and Cite Evidence:**
+1. **Candidate Header:** Start the response with the candidate's basic information. Use a large Markdown header (e.g., # Name) for the candidate's name to make it prominent. Then, list the following details in bullet points: LinkedIn, Location, Headline, Total Experience Years, Max People Managed.
+
+2.  **Address Each Criterion:** For the candidate, you **MUST** create a "**Reasoning**" section. This section **MUST** contain a separate bullet point for **EACH KEY** present in the `Filtering Criteria Used` JSON.
+3.  **Be Specific and Cite Evidence:**
     - For `min_total_experience`: State how the candidate meets the requirement by mentioning their total experience.
     - For `min_people_managed`: State how the candidate meets the management requirement by mentioning their max team size.
     - For `required_locations`: Cite their location as evidence.
@@ -693,65 +836,74 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
         - First, cite the evidence from the `evidence_log` that they have presence in the required field.
         - **If a specific `min_years` was required for that criterion**, you **MUST** also cite the calculated duration from the `calculated_experience` field in the candidate's JSON.
         - **Example for Specific Duration:** "Meets Industry Experience: Has worked in FinTech (evidence: role at Stripe). Satisfies the 10-year minimum with 12.5 years of calculated FinTech experience."
-3.  **Transparent Experience Calculation:**
+4.  **Transparent Experience Calculation:**
     - If the candidate's JSON data includes a `contributing_roles_details` section with a `roles` list, you **MUST** display it as "Experience Breakdown".
-
+5. Do not mention any conclusion section or add any concluding remarks. [MANDATORY]
 ---
-**Your Turn. Generate the response now based on the provided query, criteria, and profiles.**
+**Your Turn. Generate the response for the single candidate provided.**
 """
-    )
+    )    
     
     for i, profile in enumerate(matching_profiles):
         profile['display_number'] = i + 1
+        
+        # Format the prompt for each individual profile
+        final_prompt_formatted = final_answer_prompt_template.format(
+            query=query,
+            criteria_json=json.dumps(criteria, indent=2),
+            matching_profile_json=json.dumps(profile, indent=2) # Only one profile
+        )
 
-    final_prompt_formatted = final_answer_prompt_template.format(
-        query=query,
-        criteria_json=json.dumps(criteria, indent=2),
-        matching_profiles_json=json.dumps(matching_profiles, indent=2)
-    )
+        # Stream the response for this single profile
+        async for chunk in streaming_llm.astream(final_prompt_formatted):
+            yield chunk.content
+        yield "\n---\n\n" # Add a separator between candidates
 
-    async for chunk in streaming_llm.astream(final_prompt_formatted):
-        yield chunk.content
 
 async def process_query_main(query: str, session_id: str) -> AsyncIterator[str]:
     """
     Main processing pipeline for a user query.
     """
     normalized_query = normalize_query_with_llm(query)
-    
+
     # 1. Extract Criteria using LLM with detailed definitions
     criteria_extraction_prompt = PromptTemplate(
-    input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys"],
+    input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys"],
     template="""
-You are an expert assistant. Extract structured filtering criteria from a user's query. Your primary goal is to correctly categorize user intent into functions, segments, industries, etc., and identify if the user requests a specific number of top candidates (e.g., 'top 10', 'one profile').
+You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and determine if the user requests a specific number of candidates (e.g., 'top 10', 'one profile') or all candidates.
 
 **DEFINITIONS & CANONICAL KEYS:**
-- `required_functions`: Describes a sales role. **Map user input to one of these keys:** {sales_taxonomy_keys}
-- `required_segments`: Describes a customer type. **Map user input to one of these keys:** {segment_taxonomy_keys}
+- `required_functions`: Sales roles. **Map user input to one of these keys:** {sales_taxonomy_keys}
+- `required_segments`: Customer types. **Map user input to one of these keys:** {segment_taxonomy_keys}
+- `required_company_details`: Company attributes like funding stage or business model. **Map to keys:** {company_details_taxonomy_keys}
 - `required_industries`: Companies or industries worked in.
+- `competitors_of`: A list of companies for which to find competitors.
 - `required_geographies`: Regions of sales experience.
 - `required_locations`: Candidate's physical base.
-- `top_n`: Integer indicating how many top candidates to return (e.g., 1 for 'one profile', 10 for 'top 10'). Default to 1 if not specified.
+- `top_n`: Integer for the number of candidates to return (e.g., 1 for 'one profile', 10 for 'top 10'). If the query includes "all" (e.g., "all candidates"), set `top_n` to 0. **If no top count is specified (e.g., "candidates with SMB experience"), do NOT include `top_n` in the JSON.**
 
 **JSON STRUCTURE RULES:**
-- For each criterion, use an object with "operator" ("AND"/"OR") and "values" (a list of the mapped canonical keys or strings).
-- If the query specifies years for a criterion, add a "min_years" (float) key to that criterion's object.
-- **CRITICAL RULE:** If years of experience are mentioned directly with a function, industry, or segment (e.g., "10 years in inside sales"), you **MUST** capture this as `min_years` inside that specific criterion's object. Only use the top-level `min_total_experience` if the years are mentioned generally (e.g., "candidate with 10 years of experience").
-- `min_total_experience` and `min_people_managed` are top-level keys.
-- `required_locations` is a simple list of strings.
-- For queries like "top N" or "one profile," include a `top_n` integer field at the top level. If not specified, set `top_n` to 1.
-- For queries requesting the "maximum experience" in a criterion (e.g., "maximum experience in SMB space"), set `top_n` to 1 and prioritize sorting by that criterion's duration.
+- For each criterion, use an object with "operator" ("AND"/"OR") and "values" (list of mapped canonical keys or strings).
+- If years of experience are mentioned with a criterion (e.g., "10 years in inside sales"), include a "min_years" (float) key in that criterion's object.
+- Use `min_total_experience` (float) only for general experience (e.g., "candidate with 10 years of experience").
+- `min_people_managed` (integer) is a top-level key.
+- `required_locations` is a list of strings.
+- `competitors_of` is a list of strings.
+- Include `top_n` only for explicit requests like "top N", "one profile", or "all". For "all",
+- Set `top_n: 0`. For queries without a top count (e.g., "candidates with sales development exp"), **omit `top_n` entirely**.   [MANDATORY]
+- For "maximum experience" queries (e.g., "maximum experience in SMB space"), set `top_n: 1` and prioritize sorting by that criterion's duration.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
 | User Query                                                  | Correct JSON Output                                                                                                                                                 |
 |-------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "more than 10 years in inside sales"                        | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`                                                                 |
 | "10 years of SMB sales and managed 30 people"               | `{{"min_people_managed": 30, "required_segments": {{"operator": "OR", "values": ["smb"], "min_years": 10.0}}}}`                                                     |
-| "experience hunting in the enterprise space"                | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"]}}, "required_segments": {{"operator": "OR", "values": ["enterprise"]}}}}`                         |
+| "candidates who have worked at competitors of Oracle"       | `{{"competitors_of": ["Oracle"]}}`                                                                                                                                   |
+| "candidates from series-a startups"                         | `{{"required_company_details": {{"operator": "OR", "values": ["series-a"]}}}}`                                                                                      |
 | "experience in HCL AND Tech Mahindra"                       | `{{"required_industries": {{"operator": "AND", "values": ["HCL", "Tech Mahindra"]}}}}`                                                                              |
-| "at least 15 years of team management experience"           | `{{"min_total_experience": 15.0, "min_people_managed": 1}}`                                                                                                         |
 | "top 10 profiles with SMB experience"                       | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                                                                     |
-| "one profile who have maximum experience in SMB space"       | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 1}}`                                                                                      |
+| "all candidates with sales development exp"                 | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"]}}, "top_n": 0}}`                                                                        |
+
 
 **Available criteria keys:**
 - `min_total_experience` (float)
@@ -761,38 +913,110 @@ You are an expert assistant. Extract structured filtering criteria from a user's
 - `required_industries` (object)
 - `required_functions` (object)
 - `required_segments` (object)
-- `top_n` (integer, default 1)
+- `required_company_details` (object)
+- `competitors_of` (list of strings)
+- `top_n` (integer, set to 0 for "all" queries, omit if no top count specified)
+
+**CRITICAL INSTRUCTION**: Do NOT include `top_n` unless the query explicitly mentions "top", "one", "maximum", or "all". For all other queries, omit `top_n` to return all matching candidates.
 
 **User Query:** {query}
-        
+
 **JSON Criteria:**
-        """
+"""
 )
     try:
         yield "Extracting criteria... "
         criteria_response = await llm.ainvoke(criteria_extraction_prompt.format(
             query=normalized_query,
             sales_taxonomy_keys=json.dumps(list(SALES_TAXONOMY.keys())),
-            segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys()))
+            segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys())),
+            company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys()))
         ))
         criteria = safe_json_loads(criteria_response.content, {})
         if not criteria:
             raise ValueError("Failed to parse criteria.")
+
+        # Log the raw LLM response for debugging
+        logger.info(f"Raw LLM criteria response: {criteria_response.content}")
+
+        # Post-extraction override: Remove top_n for blunt queries, set to 0 for "all"
+        normalized_query_lower = normalized_query.lower()
+        if "all" in normalized_query_lower:
+            criteria["top_n"] = 0
+            logger.info("Detected 'all' in query; setting top_n to 0 to return all matches.")
+        elif not any(word in normalized_query_lower for word in ["top", "one", "maximum"]):
+            if "top_n" in criteria:
+                logger.info(f"Blunt query detected; removing top_n (was {criteria['top_n']}) to return all matches.")
+                del criteria["top_n"]
+        else:
+            logger.info(f"Keeping top_n as {criteria.get('top_n')} for explicit top count query.")
+
     except (json.JSONDecodeError, Exception) as e:
         logger.error(f"Error parsing criteria: {e}")
         yield "I had trouble understanding the criteria in your query. Could you please rephrase it?"
         return
 
-    # 2. Expand Keywords using LLM for better search recall
+    # --- NEW: Competitor Identification Step ---
+    original_competitor_query_company = None
+    if "competitors_of" in criteria and criteria["competitors_of"]:
+        company_to_find_competitors_for = criteria["competitors_of"][0]
+        original_competitor_query_company = company_to_find_competitors_for
+        yield f"Identifying competitors for **{company_to_find_competitors_for}**... "
+
+        competitor_prompt = PromptTemplate(
+            input_variables=["company_name"],
+            template="""
+            You are an expert business analyst. Based on the company name '{company_name}', generate a JSON list of its top 5-7 direct competitors.
+
+            Example Input: Salesforce
+            Example Output: ["Oracle", "SAP", "Microsoft Dynamics", "Zoho", "HubSpot"]
+
+            Your Turn.
+            Company Name: {company_name}
+            JSON List of Competitors:
+            """
+        )
+        try:
+            competitor_response = await llm.ainvoke(competitor_prompt.format(company_name=company_to_find_competitors_for))
+            competitors = safe_json_loads(competitor_response.content, [])
+            if competitors:
+                yield f"Found competitors: `{', '.join(competitors)}`. Now searching for candidates with this experience.\n"
+                # Add competitors to the 'required_industries' filter
+                if "required_industries" not in criteria:
+                    criteria["required_industries"] = {"operator": "OR", "values": []}
+                # Ensure values is a list
+                if "values" not in criteria["required_industries"]:
+                     criteria["required_industries"]["values"] = []
+
+                # Combine and remove duplicates
+                existing_industries = set(criteria["required_industries"]["values"])
+                competitor_set = set(competitors)
+                criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
+
+                # Clean up the original trigger
+                del criteria["competitors_of"]
+            else:
+                yield f"Could not identify competitors for {company_to_find_competitors_for}. Proceeding with other criteria.\n"
+
+        except Exception as e:
+            logger.error(f"Error finding competitors: {e}")
+            yield "There was an issue finding competitors. Please try again.\n"
+    # --- END OF NEW STEP ---
+
+   
     keyword_expansion_prompt = PromptTemplate(
-        input_variables=["keywords", "category"],
-        template="""
-        Generate a JSON list of 5-7 semantically similar keywords or synonyms for candidate profile searches based on the initial keywords.
-        The category is '{category}'.
-        Initial Keywords: {keywords}
-        JSON List:
-        """
-    )
+    input_variables=["keywords", "category"],
+    template="""
+    You are an expert business analyst. Your task is to generate a JSON list of 5-7 semantically similar keywords or synonyms for the initial keywords provided.
+    The category is '{category}'.
+    
+    **CRITICAL RULE: You MUST NOT include any of the original 'Initial Keywords' in your final JSON list output.** Your goal is to find *alternatives* or *competitors*, not to repeat the input.
+
+    Initial Keywords: {keywords}
+    
+    JSON List of Alternatives/Synonyms (excluding initial keywords):
+    """
+)
     location_expansion_prompt = PromptTemplate(
         input_variables=["locations"],
         template="""
@@ -802,7 +1026,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
         If the input is ["Malaysia"], the output should be a JSON list like: ["Malaysia", "Kuala Lumpur", "Penang", "Johor Bahru", "Selangor"].
 
         Initial Locations: {locations}
-        
+
         JSON List:
         """
     )
@@ -822,7 +1046,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                 industry_keywords.extend(expanded_industries)
                 if isinstance(criteria["required_industries"], dict):
                     criteria["required_industries"]["values"] = list(set(industry_keywords))
-        
+
         # Expand functions with a fallback for unknown terms
         if criteria.get("required_functions"):
             function_keywords = get_values_from_criteria(criteria["required_functions"])
@@ -835,7 +1059,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                         expanded_functions.extend(SALES_TAXONOMY.get(func, [func]))
                     else:
                         unknown_functions.append(func)
-                
+
                 if unknown_functions:
                     logger.info(f"Found unknown function terms, expanding them on the fly: {unknown_functions}")
                     unknown_functions_response = await llm.ainvoke(keyword_expansion_prompt.format(
@@ -849,7 +1073,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                 if isinstance(criteria["required_functions"], dict):
                     all_funcs = list(set(expanded_functions))
                     criteria["required_functions"]["values"] = all_funcs
-        
+
         # Expand segments with a fallback for unknown terms
         if criteria.get("required_segments"):
             segment_keywords = get_values_from_criteria(criteria["required_segments"])
@@ -862,7 +1086,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                         expanded_segments.extend(SEGMENT_SYNONYMS.get(seg, [seg]))
                     else:
                         unknown_segments.append(seg)
-                
+
                 if unknown_segments:
                     logger.info(f"Found unknown segment terms, expanding them on the fly: {unknown_segments}")
                     unknown_segments_response = await llm.ainvoke(keyword_expansion_prompt.format(
@@ -877,6 +1101,33 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                     all_segs = list(set(expanded_segments))
                     criteria["required_segments"]["values"] = all_segs
 
+        # Expand company details with a fallback for unknown terms
+        if criteria.get("required_company_details"):
+            company_keywords = get_values_from_criteria(criteria["required_company_details"])
+            if company_keywords:
+                expanded_details = []
+                unknown_details = []
+
+                for detail in company_keywords:
+                    if detail in COMPANY_DETAILS_TAXONOMY:
+                        expanded_details.extend(COMPANY_DETAILS_TAXONOMY.get(detail, [detail]))
+                    else:
+                        unknown_details.append(detail)
+                
+                if unknown_details:
+                    logger.info(f"Found unknown company detail terms, expanding them on the fly: {unknown_details}")
+                    unknown_details_response = await llm.ainvoke(keyword_expansion_prompt.format(
+                        keywords=unknown_details,
+                        category="Company Attributes (e.g., funding, business model)"
+                    ))
+                    expanded_unknown = safe_json_loads(unknown_details_response.content, [])
+                    expanded_details.extend(unknown_details)
+                    expanded_details.extend(expanded_unknown)
+
+                if isinstance(criteria["required_company_details"], dict):
+                    all_details = list(set(expanded_details))
+                    criteria["required_company_details"]["values"] = all_details
+
         # Expand locations
         if criteria.get("required_locations"):
             locations_to_expand = criteria["required_locations"]
@@ -884,21 +1135,32 @@ You are an expert assistant. Extract structured filtering criteria from a user's
                 location_response = await llm.ainvoke(location_expansion_prompt.format(locations=json.dumps(locations_to_expand)))
                 expanded_locations = safe_json_loads(location_response.content, [])
                 criteria["required_locations"] = list(set(locations_to_expand + expanded_locations))
-        
+
         # Centralized cleanup logic for all expandable fields
-        for key in ["required_industries", "required_functions", "required_geographies", "required_segments"]:
+        for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details"]:
             if key in criteria and isinstance(criteria[key], dict) and "values" in criteria[key]:
                 original_values = criteria[key]["values"]
                 # Clean the "keywords" literal and any empty strings
                 cleaned_values = [v for v in original_values if v and v.lower() != 'keywords']
                 criteria[key]["values"] = cleaned_values
+        
+        # --- FIX: EXCLUDE ORIGINAL COMPANY FROM COMPETITOR SEARCH ---
+        if original_competitor_query_company and "required_industries" in criteria:
+            logger.info(f"Excluding '{original_competitor_query_company}' from competitor search results.")
+            # Filter out the original company from the final list (case-insensitive)
+            final_industries = [
+                industry for industry in criteria["required_industries"]["values"]
+                if industry.lower() != original_competitor_query_company.lower()
+            ]
+            criteria["required_industries"]["values"] = final_industries
+        # --- END OF FIX ---
 
-        logger.info(f"Full Criteria after expansion: {json.dumps(criteria)}")
+        logger.info(f"Full Criteria after expansion and filtering: {json.dumps(criteria)}")
         yield f"Full Criteria: `{json.dumps(criteria)}`\n"
 
     except Exception as e:
         logger.error(f"Error expanding keywords: {e}")
-        
+
     # 3. Initial Semantic Search against PostgreSQL
     yield "Performing initial semantic search... "
     def get_values_from_criteria_for_search(crit_val):
@@ -907,16 +1169,17 @@ You are an expert assistant. Extract structured filtering criteria from a user's
         return []
 
     search_query_text = " ".join(
-        get_values_from_criteria_for_search(criteria.get("required_industries")) + 
-        get_values_from_criteria_for_search(criteria.get("required_functions")) + 
+        get_values_from_criteria_for_search(criteria.get("required_industries")) +
+        get_values_from_criteria_for_search(criteria.get("required_functions")) +
         get_values_from_criteria_for_search(criteria.get("required_segments")) +
-        get_values_from_criteria_for_search(criteria.get("required_geographies"))
+        get_values_from_criteria_for_search(criteria.get("required_geographies")) +
+        get_values_from_criteria_for_search(criteria.get("required_company_details"))
     )
-    
+
     # A query is only too broad if it has no semantic keywords AND no hard filters at all.
     hard_filters_present = (
-        criteria.get("required_locations") or 
-        criteria.get("min_people_managed") is not None or 
+        criteria.get("required_locations") or
+        criteria.get("min_people_managed") is not None or
         criteria.get("min_total_experience") is not None
     )
     if not search_query_text and not hard_filters_present:
@@ -926,7 +1189,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
     # If there's semantic text, perform the search. Otherwise, we'll just filter the whole dataset.
     if search_query_text:
         query_embedding = embeddings.embed_query(search_query_text)
-        
+
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -936,7 +1199,7 @@ You are an expert assistant. Extract structured filtering criteria from a user's
         initial_candidate_ids = [row[0] for row in cur.fetchall()]
         cur.close()
         conn.close()
-        
+
         if not initial_candidate_ids:
             yield "No potential matches found in the initial search."
             return
@@ -950,13 +1213,28 @@ You are an expert assistant. Extract structured filtering criteria from a user's
 
     # 4. Strict Python Filtering
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
-    
+
     # 5. Generate Final Response
     async for token in generate_response_with_evidence(query, final_candidates, criteria):
         yield token
 # --- Streamlit UI ---
 st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
-
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] {
+        width: 280px !important;  /* Adjust this value as needed for your preferred width */
+        min-width: 250px !important;
+        max-width: 300px !important;
+    }
+    section[data-testid="stSidebar"] > div {  /* Targets the inner content wrapper for better control */
+        height: 100%;
+        overflow-y: auto;  /* Adds scrolling if content overflows, preventing expansion */
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 st.markdown(
     """
     <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 30px;">
@@ -995,4 +1273,3 @@ if prompt := st.chat_input(""):
         st.markdown(prompt)
     with st.chat_message("assistant"):
         st.write_stream(process_query_main(prompt, st.session_state.session_id))
-
