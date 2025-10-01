@@ -139,6 +139,13 @@ STATIC_COMPANY_DETAILS_TAXONOMY = {
     "saas": ["saas", "software as a service"]
 }
 
+# --- NEW: Culture Taxonomy ---
+STATIC_CULTURE_TAXONOMY = {
+    "startup": ["startup", "fast-paced", "agile environment", "high-growth", "early-stage"],
+    "corporate": ["corporate", "mnc", "multinational", "large enterprise", "structured environment", "established company"],
+    "remote": ["remote-first", "fully remote", "distributed team"]
+}
+
 
 # --- ✨ DYNAMIC TAXONOMY INITIALIZATION ✨ ---
 SALES_TAXONOMY = generate_dynamic_taxonomy(
@@ -156,11 +163,18 @@ COMPANY_DETAILS_TAXONOMY = generate_dynamic_taxonomy(
     category="Company Attributes (Funding, Business Model)"
 )
 
+# --- NEW: Initialize Culture Taxonomy ---
+CULTURE_TAXONOMY = generate_dynamic_taxonomy(
+    seed_taxonomy=STATIC_CULTURE_TAXONOMY,
+    category="Company Culture Types"
+)
+
 
 # Log the results to see what the LLM created
 logger.info(f"Loaded Sales Taxonomy with {sum(len(v) for v in SALES_TAXONOMY.values())} total terms.")
 logger.info(f"Loaded Segment Taxonomy with {sum(len(v) for v in SEGMENT_SYNONYMS.values())} total terms.")
 logger.info(f"Loaded Company Details Taxonomy with {sum(len(v) for v in COMPANY_DETAILS_TAXONOMY.values())} total terms.")
+logger.info(f"Loaded Culture Taxonomy with {sum(len(v) for v in CULTURE_TAXONOMY.values())} total terms.")
 
 
 # --- Database Connection Pool ---
@@ -713,6 +727,48 @@ def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> 
             })
         return is_met
 
+def check_company_culture_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """Checks if the candidate has ever worked in a company matching the culture type criteria."""
+    criteria_obj = criteria.get("required_culture_type")
+    if not criteria_obj:
+        return True
+
+    op = "OR"
+    values = []
+    if isinstance(criteria_obj, dict):
+        op = criteria_obj.get("operator", "OR").upper()
+        values = [v.lower() for v in criteria_obj.get("values", [])]
+    elif isinstance(criteria_obj, list):
+        values = [v.lower() for v in criteria_obj]
+
+    if not values:
+        return True
+
+    found_values = set()
+    for v in values:
+        for role in profile.get('roles', []):
+            culture_type = (role.get('company_details', {}).get('culture_type') or '').lower()
+            if v in culture_type:
+                found_values.add(v)
+                break
+
+    if op == "AND":
+        is_met = found_values == set(values)
+        if is_met:
+            profile['evidence_log'].append({
+                "criterion": "culture_type_presence (AND)",
+                "source_text": f"Profile confirms experience in companies with all required culture types: {', '.join(values)}."
+            })
+        return is_met
+    else: # OR
+        is_met = bool(found_values)
+        if is_met:
+            profile['evidence_log'].append({
+                "criterion": "culture_type_presence (OR)",
+                "source_text": f"Profile confirms experience in a company with at least one required culture type. Found: {', '.join(found_values)}."
+            })
+        return is_met
+
 
 # --- Strict Filtering Function ---
 
@@ -733,6 +789,8 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         sort_criterion = "required_geographies"
     elif criteria.get("required_company_details"):
         sort_criterion = "required_company_details"
+    elif criteria.get("required_culture_type"):
+        sort_criterion = "required_culture_type"
     else:
         sort_criterion = "required_functions"  # Default to functions if none specified
 
@@ -753,7 +811,6 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             all_criteria_met = False
 
         # 3. Check for presence in required fields (AND/OR logic)
-        # --- MODIFIED: Added check_company_presence ---
         if all_criteria_met and not check_company_presence(profile, criteria):
             all_criteria_met = False
         if all_criteria_met and not check_functional_presence(profile, criteria):
@@ -767,6 +824,9 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         if all_criteria_met and not check_geography_experience(profile, criteria):
             all_criteria_met = False
         if all_criteria_met and not check_company_details(profile, criteria):
+            all_criteria_met = False
+        # --- NEW: Added culture check ---
+        if all_criteria_met and not check_company_culture_presence(profile, criteria):
             all_criteria_met = False
 
         # 4. Check for dynamic year requirements and calculate durations for sorting
@@ -903,9 +963,8 @@ async def process_query_main(query: str, session_id: str) -> AsyncIterator[str]:
     normalized_query = normalize_query_with_llm(query)
 
     # 1. Extract Criteria using LLM with detailed definitions
-    # --- MODIFIED: Updated the prompt template ---
     criteria_extraction_prompt = PromptTemplate(
-        input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys"],
+        input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys", "culture_taxonomy_keys"],
         template="""
 You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc.
 
@@ -914,6 +973,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `required_functions`: Sales roles. **Map user input to one of these keys:** {sales_taxonomy_keys}
 - `required_segments`: Customer types. **Map user input to one of these keys:** {segment_taxonomy_keys}
 - `required_company_details`: Company attributes like funding stage or business model. **Map to keys:** {company_details_taxonomy_keys}
+- `required_culture_type`: Company environment. **Map to keys:** {culture_taxonomy_keys}
 - `required_industries`: Broad industries (e.g., "SaaS", "Fintech"). Do NOT put specific company names here.
 - `competitors_of`: A list of companies for which to find competitors.
 - `required_geographies`: Regions of sales experience.
@@ -931,6 +991,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 |-----------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | "experience in HCL AND Tech Mahindra"         | `{{"required_companies": ["HCL", "Tech Mahindra"]}}`                                                              |
 | "candidates from the SaaS industry"           | `{{"required_industries": {{"operator": "OR", "values": ["SaaS"]}}}}`                                             |
+| "candidates with startup culture experience"  | `{{"required_culture_type": {{"operator": "OR", "values": ["startup"]}}}}`                                        |
 | "more than 10 years in inside sales"          | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`               |
 | "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                        |
 | "top 10 profiles with SMB experience"         | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                   |
@@ -945,6 +1006,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `required_functions` (object)
 - `required_segments` (object)
 - `required_company_details` (object)
+- `required_culture_type` (object)
 - `competitors_of` (list of strings)
 - `top_n` (integer)
 
@@ -961,7 +1023,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
             query=normalized_query,
             sales_taxonomy_keys=json.dumps(list(SALES_TAXONOMY.keys())),
             segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys())),
-            company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys()))
+            company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys())),
+            culture_taxonomy_keys=json.dumps(list(CULTURE_TAXONOMY.keys()))
         ))
         criteria = safe_json_loads(criteria_response.content, {})
         if not criteria:
@@ -1063,7 +1126,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
     )
     try:
         yield "Expanding keywords... "
-        # --- MODIFIED: Separate companies before expansion ---
         company_keywords = criteria.pop("required_companies", [])
 
         def get_values_from_criteria(crit_val):
@@ -1071,7 +1133,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
             if isinstance(crit_val, list): return crit_val
             return []
 
-        # Expand industries (companies are no longer in `criteria` so they won't be expanded)
+        # Expand industries
         if criteria.get("required_industries"):
             industry_keywords = get_values_from_criteria(criteria["required_industries"])
             if industry_keywords:
@@ -1162,6 +1224,33 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     all_details = list(set(expanded_details))
                     criteria["required_company_details"]["values"] = all_details
 
+        # --- NEW: Expand culture types ---
+        if criteria.get("required_culture_type"):
+            culture_keywords = get_values_from_criteria(criteria["required_culture_type"])
+            if culture_keywords:
+                expanded_cultures = []
+                unknown_cultures = []
+                for culture in culture_keywords:
+                    if culture in CULTURE_TAXONOMY:
+                        expanded_cultures.extend(CULTURE_TAXONOMY.get(culture, [culture]))
+                    else:
+                        unknown_cultures.append(culture)
+                
+                if unknown_cultures:
+                    logger.info(f"Found unknown culture terms, expanding them on the fly: {unknown_cultures}")
+                    unknown_cultures_response = await llm.ainvoke(keyword_expansion_prompt.format(
+                        keywords=unknown_cultures,
+                        category="Company Culture (e.g., startup, corporate)"
+                    ))
+                    expanded_unknown = safe_json_loads(unknown_cultures_response.content, [])
+                    expanded_cultures.extend(unknown_cultures)
+                    expanded_cultures.extend(expanded_unknown)
+
+                if isinstance(criteria["required_culture_type"], dict):
+                    all_cultures = list(set(expanded_cultures))
+                    criteria["required_culture_type"]["values"] = all_cultures
+
+
         # Expand locations
         if criteria.get("required_locations"):
             locations_to_expand = criteria["required_locations"]
@@ -1171,7 +1260,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 criteria["required_locations"] = list(set(locations_to_expand + expanded_locations))
 
         # Centralized cleanup logic for all expandable fields
-        for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details"]:
+        for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details", "required_culture_type"]:
             if key in criteria and isinstance(criteria[key], dict) and "values" in criteria[key]:
                 original_values = criteria[key]["values"]
                 # Clean the "keywords" literal and any empty strings
@@ -1189,7 +1278,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
             criteria["required_industries"]["values"] = final_industries
         # --- END OF FIX ---
         
-        # --- MODIFIED: Put companies back for logging and filtering ---
         if company_keywords:
             criteria["required_companies"] = company_keywords
 
@@ -1206,14 +1294,14 @@ You are an expert assistant tasked with extracting structured filtering criteria
         if isinstance(crit_val, list): return crit_val
         return []
 
-    # --- MODIFIED: Add company_keywords to the search text ---
     search_query_text = " ".join(
-        company_keywords + # Add the non-expanded company names here
+        company_keywords + 
         get_values_from_criteria_for_search(criteria.get("required_industries")) +
         get_values_from_criteria_for_search(criteria.get("required_functions")) +
         get_values_from_criteria_for_search(criteria.get("required_segments")) +
         get_values_from_criteria_for_search(criteria.get("required_geographies")) +
-        get_values_from_criteria_for_search(criteria.get("required_company_details"))
+        get_values_from_criteria_for_search(criteria.get("required_company_details")) +
+        get_values_from_criteria_for_search(criteria.get("required_culture_type")) # --- NEW: Added culture to search ---
     )
 
     # A query is only too broad if it has no semantic keywords AND no hard filters at all.
@@ -1221,7 +1309,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
         criteria.get("required_locations") or
         criteria.get("min_people_managed") is not None or
         criteria.get("min_total_experience") is not None or
-        criteria.get("required_companies") # A company is a hard filter
+        criteria.get("required_companies")
     )
     if not search_query_text and not hard_filters_present:
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
@@ -1315,3 +1403,4 @@ if prompt := st.chat_input(""):
         st.markdown(prompt)
     with st.chat_message("assistant"):
         st.write_stream(process_query_main(prompt, st.session_state.session_id))
+
