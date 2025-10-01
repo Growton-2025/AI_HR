@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # --- Database Configuration ---
-DB_NAME = "candidate_search"
+DB_NAME = "growton_ai"
 DB_USER = "postgres"
 DB_PASSWORD = "postgres"
 DB_HOST = "localhost"
@@ -416,6 +416,32 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
 
 # --- Presence Check Functions ---
 
+def check_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """Checks if the candidate has ever worked in a specifically named company."""
+    # This key is a simple list, not a dict with operator/values
+    required_companies = criteria.get("required_companies")
+    if not required_companies or not isinstance(required_companies, list):
+        return True # No requirement, so it passes
+
+    # Case-insensitive matching
+    required_companies_lower = [c.lower() for c in required_companies]
+    found_companies = set()
+
+    for company_name in required_companies_lower:
+        for role in profile.get('roles', []):
+            if company_name in (role.get('company') or '').lower():
+                found_companies.add(company_name)
+                break # Move to the next required company
+
+    # For companies, we assume AND logic. The user wants experience in ALL specified companies.
+    is_met = found_companies == set(required_companies_lower)
+    if is_met:
+        profile['evidence_log'].append({
+            "criterion": "company_presence (AND)",
+            "source_text": f"Profile confirms experience in all required companies: {', '.join(required_companies)}."
+        })
+    return is_met
+
 def check_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     """Checks if the candidate has ever worked in a company matching the industry criteria, supporting AND/OR logic."""
     criteria_obj = criteria.get("required_industries")
@@ -451,7 +477,7 @@ def check_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -
         if is_met:
             profile['evidence_log'].append({
                 "criterion": "industry_presence (AND)",
-                "source_text": f"Profile confirms experience in all required companies/industries: {', '.join(values)}."
+                "source_text": f"Profile confirms experience in all required industries: {', '.join(values)}."
             })
         return is_met
     else: # OR
@@ -459,7 +485,7 @@ def check_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -
         if is_met:
             profile['evidence_log'].append({
                 "criterion": "industry_presence (OR)",
-                "source_text": f"Profile confirms experience in at least one required company/industry. Found: {', '.join(found_values)}."
+                "source_text": f"Profile confirms experience in at least one required industry. Found: {', '.join(found_values)}."
             })
         return is_met
 
@@ -727,6 +753,9 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             all_criteria_met = False
 
         # 3. Check for presence in required fields (AND/OR logic)
+        # --- MODIFIED: Added check_company_presence ---
+        if all_criteria_met and not check_company_presence(profile, criteria):
+            all_criteria_met = False
         if all_criteria_met and not check_functional_presence(profile, criteria):
             all_criteria_met = False
         if all_criteria_met and not check_industry_presence(profile, criteria):
@@ -874,63 +903,58 @@ async def process_query_main(query: str, session_id: str) -> AsyncIterator[str]:
     normalized_query = normalize_query_with_llm(query)
 
     # 1. Extract Criteria using LLM with detailed definitions
+    # --- MODIFIED: Updated the prompt template ---
     criteria_extraction_prompt = PromptTemplate(
-    input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys"],
-    template="""
-You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and determine if the user requests a specific number of candidates (e.g., 'top 10', 'one profile') or all candidates.
+        input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys"],
+        template="""
+You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc.
 
 **DEFINITIONS & CANONICAL KEYS:**
+- `required_companies`: A list of specific company names. Use this when the user asks for experience *at* a company (e.g., "worked at Google", "from Microsoft").
 - `required_functions`: Sales roles. **Map user input to one of these keys:** {sales_taxonomy_keys}
 - `required_segments`: Customer types. **Map user input to one of these keys:** {segment_taxonomy_keys}
 - `required_company_details`: Company attributes like funding stage or business model. **Map to keys:** {company_details_taxonomy_keys}
-- `required_industries`: Companies or industries worked in.
+- `required_industries`: Broad industries (e.g., "SaaS", "Fintech"). Do NOT put specific company names here.
 - `competitors_of`: A list of companies for which to find competitors.
 - `required_geographies`: Regions of sales experience.
 - `required_locations`: Candidate's physical base.
-- `top_n`: Integer for the number of candidates to return (e.g., 1 for 'one profile', 10 for 'top 10'). If the query includes "all" (e.g., "all candidates"), set `top_n` to 0. **If no top count is specified (e.g., "candidates with SMB experience"), do NOT include `top_n` in the JSON.**
+- `top_n`: Integer for the number of candidates to return.
 
 **JSON STRUCTURE RULES:**
 - For each criterion, use an object with "operator" ("AND"/"OR") and "values" (list of mapped canonical keys or strings).
+- `required_companies` should be a simple list of strings.
 - If years of experience are mentioned with a criterion (e.g., "10 years in inside sales"), include a "min_years" (float) key in that criterion's object.
-- Use `min_total_experience` (float) only for general experience (e.g., "candidate with 10 years of experience").
-- `min_people_managed` (integer) is a top-level key.
-- `required_locations` is a list of strings.
-- `competitors_of` is a list of strings.
-- Include `top_n` only for explicit requests like "top N", "one profile", or "all". For "all",
-- Set `top_n: 0`. For queries without a top count (e.g., "candidates with sales development exp"), **omit `top_n` entirely**.   [MANDATORY]
-- For "maximum experience" queries (e.g., "maximum experience in SMB space"), set `top_n: 1` and prioritize sorting by that criterion's duration.
+- Use `min_total_experience` (float) only for general experience.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
-| User Query                                                  | Correct JSON Output                                                                                                                                                 |
-|-------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| "more than 10 years in inside sales"                        | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`                                                                 |
-| "10 years of SMB sales and managed 30 people"               | `{{"min_people_managed": 30, "required_segments": {{"operator": "OR", "values": ["smb"], "min_years": 10.0}}}}`                                                     |
-| "candidates who have worked at competitors of Oracle"       | `{{"competitors_of": ["Oracle"]}}`                                                                                                                                   |
-| "candidates from series-a startups"                         | `{{"required_company_details": {{"operator": "OR", "values": ["series-a"]}}}}`                                                                                      |
-| "experience in HCL AND Tech Mahindra"                       | `{{"required_industries": {{"operator": "AND", "values": ["HCL", "Tech Mahindra"]}}}}`                                                                              |
-| "top 10 profiles with SMB experience"                       | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                                                                     |
-| "all candidates with sales development exp"                 | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"]}}, "top_n": 0}}`                                                                        |
-
+| User Query                                    | Correct JSON Output                                                                                               |
+|-----------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| "experience in HCL AND Tech Mahindra"         | `{{"required_companies": ["HCL", "Tech Mahindra"]}}`                                                              |
+| "candidates from the SaaS industry"           | `{{"required_industries": {{"operator": "OR", "values": ["SaaS"]}}}}`                                             |
+| "more than 10 years in inside sales"          | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`               |
+| "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                        |
+| "top 10 profiles with SMB experience"         | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                   |
 
 **Available criteria keys:**
 - `min_total_experience` (float)
 - `min_people_managed` (integer)
 - `required_locations` (list of strings)
 - `required_geographies` (object)
+- `required_companies` (list of strings)
 - `required_industries` (object)
 - `required_functions` (object)
 - `required_segments` (object)
 - `required_company_details` (object)
 - `competitors_of` (list of strings)
-- `top_n` (integer, set to 0 for "all" queries, omit if no top count specified)
+- `top_n` (integer)
 
-**CRITICAL INSTRUCTION**: Do NOT include `top_n` unless the query explicitly mentions "top", "one", "maximum", or "all". For all other queries, omit `top_n` to return all matching candidates.
+**CRITICAL INSTRUCTION**: Use `required_companies` for specific company names and `required_industries` for general categories.
 
 **User Query:** {query}
 
 **JSON Criteria:**
 """
-)
+    )
     try:
         yield "Extracting criteria... "
         criteria_response = await llm.ainvoke(criteria_extraction_prompt.format(
@@ -1039,12 +1063,15 @@ You are an expert assistant tasked with extracting structured filtering criteria
     )
     try:
         yield "Expanding keywords... "
+        # --- MODIFIED: Separate companies before expansion ---
+        company_keywords = criteria.pop("required_companies", [])
+
         def get_values_from_criteria(crit_val):
             if isinstance(crit_val, dict): return crit_val.get("values", [])
             if isinstance(crit_val, list): return crit_val
             return []
 
-        # Expand industries
+        # Expand industries (companies are no longer in `criteria` so they won't be expanded)
         if criteria.get("required_industries"):
             industry_keywords = get_values_from_criteria(criteria["required_industries"])
             if industry_keywords:
@@ -1110,12 +1137,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
         # Expand company details with a fallback for unknown terms
         if criteria.get("required_company_details"):
-            company_keywords = get_values_from_criteria(criteria["required_company_details"])
-            if company_keywords:
+            cd_keywords = get_values_from_criteria(criteria["required_company_details"])
+            if cd_keywords:
                 expanded_details = []
                 unknown_details = []
 
-                for detail in company_keywords:
+                for detail in cd_keywords:
                     if detail in COMPANY_DETAILS_TAXONOMY:
                         expanded_details.extend(COMPANY_DETAILS_TAXONOMY.get(detail, [detail]))
                     else:
@@ -1161,6 +1188,10 @@ You are an expert assistant tasked with extracting structured filtering criteria
             ]
             criteria["required_industries"]["values"] = final_industries
         # --- END OF FIX ---
+        
+        # --- MODIFIED: Put companies back for logging and filtering ---
+        if company_keywords:
+            criteria["required_companies"] = company_keywords
 
         logger.info(f"Full Criteria after expansion and filtering: {json.dumps(criteria)}")
         yield f"Full Criteria: `{json.dumps(criteria)}`\n"
@@ -1175,7 +1206,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
         if isinstance(crit_val, list): return crit_val
         return []
 
+    # --- MODIFIED: Add company_keywords to the search text ---
     search_query_text = " ".join(
+        company_keywords + # Add the non-expanded company names here
         get_values_from_criteria_for_search(criteria.get("required_industries")) +
         get_values_from_criteria_for_search(criteria.get("required_functions")) +
         get_values_from_criteria_for_search(criteria.get("required_segments")) +
@@ -1187,7 +1220,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
     hard_filters_present = (
         criteria.get("required_locations") or
         criteria.get("min_people_managed") is not None or
-        criteria.get("min_total_experience") is not None
+        criteria.get("min_total_experience") is not None or
+        criteria.get("required_companies") # A company is a hard filter
     )
     if not search_query_text and not hard_filters_present:
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
@@ -1214,7 +1248,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
         initial_candidate_pool = [PROFILES_BY_ID[id] for id in initial_candidate_ids if id in PROFILES_BY_ID]
         yield f"Found {len(initial_candidate_pool)} potential matches. "
     else:
-        # If the search is only by location, the initial pool is all candidates.
+        # If the search is only by hard filters, the initial pool is all candidates.
         initial_candidate_pool = list(PROFILES_BY_ID.values())
 
 
@@ -1224,6 +1258,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
     # 5. Generate Final Response
     async for token in generate_response_with_evidence(query, final_candidates, criteria):
         yield token
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
 st.markdown(
@@ -1280,4 +1315,3 @@ if prompt := st.chat_input(""):
         st.markdown(prompt)
     with st.chat_message("assistant"):
         st.write_stream(process_query_main(prompt, st.session_state.session_id))
-

@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- CONFIGURE YOUR DETAILS HERE ---
 load_dotenv()
-DB_NAME = "candidate_search"
+DB_NAME = "growton_ai"
 DB_USER = "postgres"
 DB_PASSWORD = "postgres"
 DB_HOST = "localhost"
