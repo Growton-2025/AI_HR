@@ -825,20 +825,27 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
 
 **CRITICAL INSTRUCTIONS FOR DYNAMIC REASONING:**
 
-1. **Candidate Header:** Start the response with the candidate's basic information. Use a large Markdown header (e.g., # Name) for the candidate's name to make it prominent. Then, list the following details in bullet points: LinkedIn, Location, Headline, Total Experience Years, Max People Managed.
+1.  **Candidate Header:** Start with the candidate's name as a large Markdown header (e.g., # Name). Then, list their LinkedIn, Location, Headline, Total Experience Years, and Max People Managed.
 
-2.  **Address Each Criterion:** For the candidate, you **MUST** create a "**Reasoning**" section. This section **MUST** contain a separate bullet point for **EACH KEY** present in the `Filtering Criteria Used` JSON.
-3.  **Be Specific and Cite Evidence:**
-    - For `min_total_experience`: State how the candidate meets the requirement by mentioning their total experience.
-    - For `min_people_managed`: State how the candidate meets the management requirement by mentioning their max team size.
-    - For `required_locations`: Cite their location as evidence.
-    - For other criteria (`required_functions`, `required_industries`, etc.):
-        - First, cite the evidence from the `evidence_log` that they have presence in the required field.
-        - **If a specific `min_years` was required for that criterion**, you **MUST** also cite the calculated duration from the `calculated_experience` field in the candidate's JSON.
-        - **Example for Specific Duration:** "Meets Industry Experience: Has worked in FinTech (evidence: role at Stripe). Satisfies the 10-year minimum with 12.5 years of calculated FinTech experience."
-4.  **Transparent Experience Calculation:**
-    - If the candidate's JSON data includes a `contributing_roles_details` section with a `roles` list, you **MUST** display it as "Experience Breakdown".
-5. Do not mention any conclusion section or add any concluding remarks. [MANDATORY]
+2.  **Create a "Reasoning" Section:**
+    - You **MUST** create a bullet point for **ONLY the keys present** in the `Filtering Criteria Used` JSON.
+    - **Do NOT** mention criteria like `min_total_experience` or `min_people_managed` if they are not in the `Filtering Criteria Used` JSON.
+
+3.  **Generate Specific, Evidence-Based Reasoning:**
+    - For each criterion (e.g., `required_segments`), look inside the candidate's `calculated_experience` object.
+    - Find the matching key (e.g., `calculated_experience.required_segments`).
+    - Use the `duration` and `roles` from that object to construct a detailed reason.
+    - **Example Sentence Structure:** "The candidate meets the **SMB Experience** requirement with **[Duration] years** of experience, gained primarily from their roles at **[Company A]** and **[Company B]**."
+    - This creates a direct link between the requirement, the experience duration, and the companies where it was gained.
+
+4.  **Create a Correct "Experience Breakdown" Section:**
+    - Look for the `contributing_roles_details.roles` list in the candidate's JSON.
+    - If it exists, you **MUST** format it as a bulleted list under the heading "Relevant Experience".
+    - **Use this exact format for each role:** `* **{{company}}**: {{title}} ({{duration_years}} years)`
+    - This section should only list the specific roles that contributed to meeting the primary search criterion.
+
+5. **No Conclusion:** Do not add any concluding remarks.
+
 ---
 **Your Turn. Generate the response for the single candidate provided.**
 """
@@ -1273,3 +1280,4 @@ if prompt := st.chat_input(""):
         st.markdown(prompt)
     with st.chat_message("assistant"):
         st.write_stream(process_query_main(prompt, st.session_state.session_id))
+

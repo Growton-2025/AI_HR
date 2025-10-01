@@ -7,4 +7,3 @@ pgvector
 redis
 tiktoken
 openai
-
