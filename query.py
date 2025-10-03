@@ -192,6 +192,26 @@ def get_db_connection():
 
 # --- Caching Data from Database ---
 @st.cache_data(ttl=3600) # Cache for 1 hour
+def load_all_company_names_from_db():
+    """Loads all unique company names from the database."""
+    logger.info("Loading all unique company names from the database into cache...")
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT name FROM companies ORDER BY name")
+            company_names = [row[0] for row in cur.fetchall()]
+            logger.info(f"Successfully loaded and cached {len(company_names)} unique company names.")
+            return company_names
+    except psycopg2.Error as e:
+        logger.error(f"Failed to load company names from DB: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+@st.cache_data(ttl=3600) # Cache for 1 hour
 def load_all_profiles_from_db():
     """
     Loads all candidate profiles and their roles from the database based on the new schema.
@@ -278,6 +298,7 @@ def load_all_profiles_from_db():
 
 # Load data into a global variable for the app session
 PROFILES_BY_ID = {p['id']: p for p in load_all_profiles_from_db()}
+ALL_COMPANY_NAMES = load_all_company_names_from_db()
 
 # --- Core Logic ---
 
@@ -1050,52 +1071,79 @@ You are an expert assistant tasked with extracting structured filtering criteria
         yield "I had trouble understanding the criteria in your query. Could you please rephrase it?"
         return
 
-    # --- NEW: Competitor Identification Step ---
-    original_competitor_query_company = None
-    if "competitors_of" in criteria and criteria["competitors_of"]:
+    # --- NEW: Competitor Identification using dedicated LLM node ---
+    if "competitors_of" in criteria and criteria.get("competitors_of"):
         company_to_find_competitors_for = criteria["competitors_of"][0]
-        original_competitor_query_company = company_to_find_competitors_for
-        yield f"Identifying competitors for **{company_to_find_competitors_for}**... "
+        
+        # Determine the dynamic task for the LLM based on the user's query
+        competitor_task = "identify all direct competitors for the given company"
+        if "top" in normalized_query.lower() and criteria.get("top_n"):
+             competitor_task = f"identify the top {criteria['top_n']} direct competitors for the given company"
 
-        competitor_prompt = PromptTemplate(
-            input_variables=["company_name"],
-            template="""
-            You are an expert business analyst. Based on the company name '{company_name}', generate a JSON list of its top 5-7 direct competitors.
+        yield f"Identifying competitors for **{company_to_find_competitors_for}** using the company database as context... "
 
-            Example Input: Salesforce
-            Example Output: ["Oracle", "SAP", "Microsoft Dynamics", "Zoho", "HubSpot"]
-
-            Your Turn.
-            Company Name: {company_name}
-            JSON List of Competitors:
-            """
-        )
+        competitors_found = False
         try:
-            competitor_response = await llm.ainvoke(competitor_prompt.format(company_name=company_to_find_competitors_for))
-            competitors = safe_json_loads(competitor_response.content, [])
+            # This is the new dedicated "LLM node" for competitor analysis with a dynamic task
+            competitor_identification_prompt = PromptTemplate(
+                input_variables=["company_name", "company_list_json", "competitor_task"],
+                template="""
+                You are an expert business analyst. Your task is to {competitor_task}.
+                You MUST ONLY select competitors from the provided JSON list of companies available in our database.
+
+                **Target Company:**
+                {company_name}
+
+                **List of all available companies in the database:**
+                {company_list_json}
+
+                Analyze the list and return a JSON list of names that are direct competitors of the target company. If you cannot find any direct competitors in the list, return an empty list.
+
+                **JSON List of Competitors (must be names from the list above):**
+                """
+            )
+
+            formatted_prompt = competitor_identification_prompt.format(
+                company_name=company_to_find_competitors_for,
+                company_list_json=json.dumps(ALL_COMPANY_NAMES),
+                competitor_task=competitor_task
+            )
+            
+            response = await llm.ainvoke(formatted_prompt)
+            competitors = safe_json_loads(response.content, [])
+
             if competitors:
-                yield f"Found competitors: `{', '.join(competitors)}`. Now searching for candidates with this experience.\n"
-                # Add competitors to the 'required_industries' filter
+                yield f"Found potential competitors in DB via LLM analysis: `{', '.join(competitors)}`. Now searching for candidates...\n"
+                
+                # Funnel competitors into 'required_industries' to leverage existing OR logic
                 if "required_industries" not in criteria:
                     criteria["required_industries"] = {"operator": "OR", "values": []}
-                # Ensure values is a list
-                if "values" not in criteria["required_industries"]:
-                     criteria["required_industries"]["values"] = []
-
-                # Combine and remove duplicates
-                existing_industries = set(criteria["required_industries"]["values"])
+                
+                existing_industries = set(criteria["required_industries"].get("values", []))
                 competitor_set = set(competitors)
+                # Ensure the original company is not included in the competitor search
+                competitor_set.discard(company_to_find_competitors_for)
                 criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
-
-                # Clean up the original trigger
-                del criteria["competitors_of"]
+                
+                competitors_found = True
             else:
-                yield f"Could not identify competitors for {company_to_find_competitors_for}. Proceeding with other criteria.\n"
+                yield f"The LLM could not identify any direct competitors for '{company_to_find_competitors_for}' from within the database list. "
 
         except Exception as e:
-            logger.error(f"Error finding competitors: {e}")
-            yield "There was an issue finding competitors. Please try again.\n"
-    # --- END OF NEW STEP ---
+            logger.error(f"LLM error while finding competitors: {e}")
+            yield "There was an issue analyzing competitors with the LLM. "
+
+        # Fallback logic: if LLM fails, use the original company name as an industry search term
+        if not competitors_found:
+            yield "Falling back to use the original company name as a search keyword.\n"
+            if "required_industries" not in criteria:
+                criteria["required_industries"] = {"operator": "OR", "values": []}
+            if company_to_find_competitors_for not in criteria["required_industries"]["values"]:
+                 criteria["required_industries"]["values"].append(company_to_find_competitors_for)
+
+        # Always remove the trigger key
+        del criteria["competitors_of"]
+    # --- END OF STEP ---
 
    
     keyword_expansion_prompt = PromptTemplate(
@@ -1267,17 +1315,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 cleaned_values = [v for v in original_values if v and v.lower() != 'keywords']
                 criteria[key]["values"] = cleaned_values
         
-        # --- FIX: EXCLUDE ORIGINAL COMPANY FROM COMPETITOR SEARCH ---
-        if original_competitor_query_company and "required_industries" in criteria:
-            logger.info(f"Excluding '{original_competitor_query_company}' from competitor search results.")
-            # Filter out the original company from the final list (case-insensitive)
-            final_industries = [
-                industry for industry in criteria["required_industries"]["values"]
-                if industry.lower() != original_competitor_query_company.lower()
-            ]
-            criteria["required_industries"]["values"] = final_industries
-        # --- END OF FIX ---
-        
         if company_keywords:
             criteria["required_companies"] = company_keywords
 
@@ -1295,7 +1332,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
         return []
 
     search_query_text = " ".join(
-        company_keywords + 
+        (criteria.get("required_companies") or []) + 
         get_values_from_criteria_for_search(criteria.get("required_industries")) +
         get_values_from_criteria_for_search(criteria.get("required_functions")) +
         get_values_from_criteria_for_search(criteria.get("required_segments")) +
@@ -1303,6 +1340,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
         get_values_from_criteria_for_search(criteria.get("required_company_details")) +
         get_values_from_criteria_for_search(criteria.get("required_culture_type")) # --- NEW: Added culture to search ---
     )
+
 
     # A query is only too broad if it has no semantic keywords AND no hard filters at all.
     hard_filters_present = (
