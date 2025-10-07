@@ -20,6 +20,65 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+# --- Pricing and Token Configuration ---
+# Prices are per 1 million tokens in USD (as of late 2024 for these models)
+MODEL_PRICING = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 5.00, "output": 15.00},
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0} # Embeddings are priced on input
+}
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+class TokenCostTracker:
+    """A helper class to track token usage and associated costs."""
+    def __init__(self):
+        self.total_tokens = 0
+        self.total_cost = 0.0
+        self.session_details = []
+
+    def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
+        """Calculates the cost for a given model and token counts."""
+        pricing = MODEL_PRICING.get(model)
+        if not pricing:
+            return 0.0
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        return input_cost + output_cost
+
+    def add_usage(self, model: str, input_text: str = "", output_text: str = "", usage_type: str = "LLM Call"):
+        """Adds usage details and updates totals."""
+        input_tokens = len(tokenizer.encode(input_text)) if input_text else 0
+        output_tokens = len(tokenizer.encode(output_text)) if output_text else 0
+        
+        cost = self._calculate_cost(model, input_tokens, output_tokens)
+        
+        self.total_tokens += input_tokens + output_tokens
+        self.total_cost += cost
+        
+        self.session_details.append({
+            "type": usage_type,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": cost
+        })
+
+    def get_summary(self) -> str:
+        """Returns a formatted markdown summary of the session's usage."""
+        if self.total_tokens == 0:
+            return ""
+
+        summary_md = f"\n---\n\n**Session Usage Summary:**\n"
+        summary_md += f"- **Total Tokens:** `{self.total_tokens}`\n"
+        summary_md += f"- **Estimated Cost:** `${self.total_cost:.6f} USD`\n"
+        
+        # Optional: Add detailed breakdown
+        # summary_md += "\n**Breakdown:**\n"
+        # for detail in self.session_details:
+        #     summary_md += f"  - _{detail['type']}_ ({detail['model']}): In {detail['input_tokens']}, Out {detail['output_tokens']} -> ${detail['cost']:.6f}\n"
+
+        return summary_md
+
 # --- Database Configuration ---
 DB_NAME = "growton_ai"
 DB_USER = "postgres"
@@ -47,7 +106,7 @@ streaming_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, streaming=True)
 specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
 generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-tokenizer = tiktoken.get_encoding("cl100k_base")
+
 
 # --- Dynamic Taxonomy Generation ---
 
@@ -101,6 +160,8 @@ def generate_dynamic_taxonomy(seed_taxonomy: dict, category: str) -> dict:
             seed_taxonomy_json=json.dumps(seed_taxonomy, indent=2),
             category=category
         )
+        # Note: Token tracking for cached functions is complex. For simplicity, we omit it here,
+        # as these calls are infrequent (once every 24h).
         response = generation_llm.invoke(formatted_prompt)
         expanded_taxonomy = safe_json_loads(response.content, default_val=seed_taxonomy)
 
@@ -948,7 +1009,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
 
     return matching_candidates
 
-async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any], original_criteria: Dict[str, Any]) -> AsyncIterator[str]:
+async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any], original_criteria: Dict[str, Any], tracker: TokenCostTracker) -> AsyncIterator[str]:
     """
     Generates the final response with detailed, evidence-based reasoning.
     This function now processes one profile at a time to avoid context length errors.
@@ -1003,6 +1064,7 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
 """
     )    
     
+    full_response_content = ""
     for i, profile in enumerate(matching_profiles):
         profile['display_number'] = i + 1
         
@@ -1015,15 +1077,51 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
         )
 
         # Stream the response for this single profile
+        profile_response_content = ""
         async for chunk in streaming_llm.astream(final_prompt_formatted):
             yield chunk.content
+            profile_response_content += chunk.content
+        
+        full_response_content += profile_response_content
+        tracker.add_usage("gpt-4o-mini", final_prompt_formatted, profile_response_content, "Final Summary")
+
         yield "\n---\n\n" # Add a separator between candidates
 
 
-async def process_query_main(query: str, session_id: str) -> AsyncIterator[str]:
+async def process_query_main(query: str, session_id: str, tracker: TokenCostTracker) -> AsyncIterator[str]:
     """
     Main processing pipeline for a user query.
     """
+
+    def get_values_from_criteria(crit_val):
+        values = []
+        if isinstance(crit_val, dict):
+            values = crit_val.get("values", [])
+        elif isinstance(crit_val, list):
+            values = crit_val
+
+        # Defensive flattening
+        flat_values = []
+        for item in values:
+            if isinstance(item, str):
+                flat_values.append(item)
+            elif isinstance(item, list):
+                for sub_item in item:
+                    if isinstance(sub_item, str):
+                        flat_values.append(sub_item)
+        return flat_values
+
+    def get_list_from_llm_json(llm_json_response: Any) -> List[str]:
+        """Robustly extracts a list of strings from a JSON object that could be a list or a dict."""
+        if isinstance(llm_json_response, list):
+            return [str(item) for item in llm_json_response if isinstance(item, str)]
+        if isinstance(llm_json_response, dict):
+            for value in llm_json_response.values():
+                if isinstance(value, list):
+                    return [str(item) for item in value if isinstance(item, str)]
+        return []
+
+    # The try/finally block was moved from here to the Streamlit UI loop for better stability.
     normalized_query = normalize_query_with_llm(query)
 
     # 1. Extract Criteria using LLM with detailed definitions
@@ -1083,13 +1181,16 @@ You are an expert assistant tasked with extracting structured filtering criteria
     )
     try:
         yield "Extracting criteria... "
-        criteria_response = await llm.ainvoke(criteria_extraction_prompt.format(
-            query=normalized_query,
-            sales_taxonomy_keys=json.dumps(list(SALES_TAXONOMY.keys())),
-            segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys())),
-            company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys())),
-            culture_taxonomy_keys=json.dumps(list(CULTURE_TAXONOMY.keys()))
-        ))
+        prompt_text = criteria_extraction_prompt.format(
+                query=normalized_query,
+                sales_taxonomy_keys=json.dumps(list(SALES_TAXONOMY.keys())),
+                segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys())),
+                company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys())),
+                culture_taxonomy_keys=json.dumps(list(CULTURE_TAXONOMY.keys()))
+            )
+        criteria_response = await llm.ainvoke(prompt_text)
+        tracker.add_usage(llm.model_name, prompt_text, criteria_response.content, "Criteria Extraction")
+        
         criteria = safe_json_loads(criteria_response.content, {})
         original_criteria = copy.deepcopy(criteria)
 
@@ -1160,6 +1261,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 competitor_task=competitor_task
             )
             response = await specialist_llm.ainvoke(formatted_prompt)
+            tracker.add_usage(specialist_llm.model_name, formatted_prompt, response.content, "Competitor ID")
             llm_competitors = safe_json_loads(response.content, [])
 
             if llm_competitors:
@@ -1195,9 +1297,10 @@ You are an expert assistant tasked with extracting structured filtering criteria
         if "required_industries" not in criteria:
             criteria["required_industries"] = {"operator": "OR", "values": []}
         
-        existing_industries = set(criteria["required_industries"].get("values", []))
+        existing_industries = set(get_values_from_criteria(criteria["required_industries"]))
         competitor_set = set(final_competitors_list)
         criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
+
 
         # Always remove the trigger key
         del criteria["competitors_of"]
@@ -1250,40 +1353,14 @@ You are an expert assistant tasked with extracting structured filtering criteria
         company_keywords = criteria.pop("required_companies", [])
         competitor_search_was_run = bool(final_competitors_list)
 
-        def get_values_from_criteria(crit_val):
-            values = []
-            if isinstance(crit_val, dict):
-                values = crit_val.get("values", [])
-            elif isinstance(crit_val, list):
-                values = crit_val
-
-            # Defensive flattening
-            flat_values = []
-            for item in values:
-                if isinstance(item, str):
-                    flat_values.append(item)
-                elif isinstance(item, list):
-                    for sub_item in item:
-                        if isinstance(sub_item, str):
-                            flat_values.append(sub_item)
-            return flat_values
-
-        def get_list_from_llm_json(llm_json_response: Any) -> List[str]:
-            """Robustly extracts a list of strings from a JSON object that could be a list or a dict."""
-            if isinstance(llm_json_response, list):
-                return [str(item) for item in llm_json_response if isinstance(item, str)]
-            if isinstance(llm_json_response, dict):
-                for value in llm_json_response.values():
-                    if isinstance(value, list):
-                        return [str(item) for item in value if isinstance(item, str)]
-            return []
-
         # Expand industries, but only if we didn't just run a competitor search
         if not competitor_search_was_run and criteria.get("required_industries"):
             yield "Expanding keywords... "
             industry_keywords = get_values_from_criteria(criteria["required_industries"])
             if industry_keywords:
-                industry_keywords_response = await llm.ainvoke(keyword_expansion_prompt.format(keywords=industry_keywords, category="Industry"))
+                prompt_text = keyword_expansion_prompt.format(keywords=industry_keywords, category="Industry")
+                industry_keywords_response = await llm.ainvoke(prompt_text)
+                tracker.add_usage(llm.model_name, prompt_text, industry_keywords_response.content, "Keyword Expansion")
                 expanded_industries_raw = safe_json_loads(industry_keywords_response.content, [])
                 expanded_industries = get_list_from_llm_json(expanded_industries_raw)
                 industry_keywords.extend(expanded_industries)
@@ -1305,10 +1382,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
                 if unknown_functions:
                     logger.info(f"Found unknown function terms, expanding them on the fly: {unknown_functions}")
-                    unknown_functions_response = await llm.ainvoke(keyword_expansion_prompt.format(
-                        keywords=unknown_functions,
-                        category="Sales Job Titles"
-                    ))
+                    prompt_text = keyword_expansion_prompt.format(keywords=unknown_functions, category="Sales Job Titles")
+                    unknown_functions_response = await llm.ainvoke(prompt_text)
+                    tracker.add_usage(llm.model_name, prompt_text, unknown_functions_response.content, "Keyword Expansion")
                     expanded_unknown_raw = safe_json_loads(unknown_functions_response.content, [])
                     expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_functions.extend(unknown_functions)
@@ -1333,10 +1409,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
                 if unknown_segments:
                     logger.info(f"Found unknown segment terms, expanding them on the fly: {unknown_segments}")
-                    unknown_segments_response = await llm.ainvoke(keyword_expansion_prompt.format(
-                        keywords=unknown_segments,
-                        category="Customer Segments"
-                    ))
+                    prompt_text = keyword_expansion_prompt.format(keywords=unknown_segments, category="Customer Segments")
+                    unknown_segments_response = await llm.ainvoke(prompt_text)
+                    tracker.add_usage(llm.model_name, prompt_text, unknown_segments_response.content, "Keyword Expansion")
                     expanded_unknown_raw = safe_json_loads(unknown_segments_response.content, [])
                     expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_segments.extend(unknown_segments)
@@ -1361,10 +1436,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 
                 if unknown_details:
                     logger.info(f"Found unknown company detail terms, expanding them on the fly: {unknown_details}")
-                    unknown_details_response = await llm.ainvoke(keyword_expansion_prompt.format(
-                        keywords=unknown_details,
-                        category="Company Attributes (e.g., funding, business model)"
-                    ))
+                    prompt_text = keyword_expansion_prompt.format(keywords=unknown_details, category="Company Attributes (e.g., funding, business model)")
+                    unknown_details_response = await llm.ainvoke(prompt_text)
+                    tracker.add_usage(llm.model_name, prompt_text, unknown_details_response.content, "Keyword Expansion")
                     expanded_unknown_raw = safe_json_loads(unknown_details_response.content, [])
                     expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_details.extend(unknown_details)
@@ -1388,10 +1462,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 
                 if unknown_cultures:
                     logger.info(f"Found unknown culture terms, expanding them on the fly: {unknown_cultures}")
-                    unknown_cultures_response = await llm.ainvoke(keyword_expansion_prompt.format(
-                        keywords=unknown_cultures,
-                        category="Company Culture (e.g., startup, corporate)"
-                    ))
+                    prompt_text = keyword_expansion_prompt.format(keywords=unknown_cultures, category="Company Culture (e.g., startup, corporate)")
+                    unknown_cultures_response = await llm.ainvoke(prompt_text)
+                    tracker.add_usage(llm.model_name, prompt_text, unknown_cultures_response.content, "Keyword Expansion")
                     expanded_unknown_raw = safe_json_loads(unknown_cultures_response.content, [])
                     expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_cultures.extend(unknown_cultures)
@@ -1408,7 +1481,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 geographies_to_expand = geographies_to_expand_obj.get("values", [])
                 if geographies_to_expand and isinstance(geographies_to_expand, list):
                     yield "Expanding geographies... "
-                    geography_response = await llm.ainvoke(geography_expansion_prompt.format(geographies=json.dumps(geographies_to_expand)))
+                    prompt_text = geography_expansion_prompt.format(geographies=json.dumps(geographies_to_expand))
+                    geography_response = await llm.ainvoke(prompt_text)
+                    tracker.add_usage(llm.model_name, prompt_text, geography_response.content, "Geography Expansion")
                     logger.info(f"Raw geography expansion response from LLM: {geography_response.content}")
                     expanded_geographies_raw = safe_json_loads(geography_response.content, {})
                     expanded_geographies = get_list_from_llm_json(expanded_geographies_raw)
@@ -1419,7 +1494,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
         if criteria.get("required_locations"):
             locations_to_expand = get_values_from_criteria(criteria["required_locations"])
             if locations_to_expand:
-                location_response = await llm.ainvoke(location_expansion_prompt.format(locations=json.dumps(locations_to_expand)))
+                prompt_text = location_expansion_prompt.format(locations=json.dumps(locations_to_expand))
+                location_response = await llm.ainvoke(prompt_text)
+                tracker.add_usage(llm.model_name, prompt_text, location_response.content, "Location Expansion")
                 expanded_locations_raw = safe_json_loads(location_response.content, [])
                 expanded_locations = get_list_from_llm_json(expanded_locations_raw)
                 if isinstance(criteria["required_locations"], dict):
@@ -1446,33 +1523,14 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
     # 3. Initial Semantic Search against PostgreSQL
     yield "Performing initial semantic search... "
-    def get_values_from_criteria_for_search(crit_val):
-        values = []
-        if isinstance(crit_val, dict):
-            values = crit_val.get("values", [])
-        elif isinstance(crit_val, list):
-            values = crit_val
-
-        # Defensive flattening: ensures all items are strings.
-        flat_values = []
-        for item in values:
-            if isinstance(item, str):
-                flat_values.append(item)
-            elif isinstance(item, list):
-                # If we find a nested list, extend with its string elements
-                for sub_item in item:
-                    if isinstance(sub_item, str):
-                        flat_values.append(sub_item)
-        return flat_values
-
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
-        get_values_from_criteria_for_search(criteria.get("required_industries")) +
-        get_values_from_criteria_for_search(criteria.get("required_functions")) +
-        get_values_from_criteria_for_search(criteria.get("required_segments")) +
-        get_values_from_criteria_for_search(criteria.get("required_geographies")) +
-        get_values_from_criteria_for_search(criteria.get("required_company_details")) +
-        get_values_from_criteria_for_search(criteria.get("required_culture_type")) # --- NEW: Added culture to search ---
+        get_values_from_criteria(criteria.get("required_industries")) +
+        get_values_from_criteria(criteria.get("required_functions")) +
+        get_values_from_criteria(criteria.get("required_segments")) +
+        get_values_from_criteria(criteria.get("required_geographies")) +
+        get_values_from_criteria(criteria.get("required_company_details")) +
+        get_values_from_criteria(criteria.get("required_culture_type")) # --- NEW: Added culture to search ---
     )
 
 
@@ -1490,7 +1548,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
     # If there's semantic text, perform the search. Otherwise, we'll just filter the whole dataset.
     if search_query_text:
         query_embedding = embeddings.embed_query(search_query_text)
-
+        tracker.add_usage(embeddings.model, search_query_text, usage_type="Embedding")
+        
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -1516,8 +1575,11 @@ You are an expert assistant tasked with extracting structured filtering criteria
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
     # 5. Generate Final Response
-    async for token in generate_response_with_evidence(query, final_candidates, criteria, original_criteria):
+    async for token in generate_response_with_evidence(query, final_candidates, criteria, original_criteria, tracker):
         yield token
+        
+    # Yield the summary at the end of a successful run.
+    yield tracker.get_summary()
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
@@ -1563,6 +1625,9 @@ if 'session_id' not in st.session_state:
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
+if 'token_tracker' not in st.session_state:
+    st.session_state.token_tracker = TokenCostTracker()
+
 # Chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -1574,5 +1639,6 @@ if prompt := st.chat_input(""):
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"):
-        st.write_stream(process_query_main(prompt, st.session_state.session_id))
+        full_response = st.write_stream(process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker))
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
 
