@@ -13,6 +13,7 @@ import logging
 import tiktoken
 import asyncio
 from typing import List, Dict, Any, AsyncIterator, Tuple
+import copy
 
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -790,6 +791,37 @@ def check_company_culture_presence(profile: Dict[str, Any], criteria: Dict[str, 
             })
         return is_met
 
+def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """
+    Checks if a candidate has experience in any of the excluded geographies.
+    Returns True if there is NO match (i.e., the candidate passes the exclusion check).
+    Returns False if there IS a match (i.e., the candidate should be excluded).
+    """
+    criteria_obj = criteria.get("excluded_geographies")
+    if not criteria_obj:
+        return True # No exclusion criteria, so candidate passes.
+
+    values = []
+    if isinstance(criteria_obj, dict):
+        values = [v.lower() for v in criteria_obj.get("values", [])]
+    elif isinstance(criteria_obj, list):
+        values = [v.lower() for v in criteria_obj]
+
+    if not values:
+        return True
+
+    # Check against profile location and role details
+    profile_location = (profile.get('location') or '').lower()
+    if any(v in profile_location for v in values):
+        return False # Exclude based on current location
+
+    for role in profile.get('roles', []):
+        role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
+        if any(v in role_text for v in values):
+            return False # Exclude based on role description
+
+    return True # Candidate did not match any excluded geographies.
+
 
 # --- Strict Filtering Function ---
 
@@ -849,7 +881,10 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         # --- NEW: Added culture check ---
         if all_criteria_met and not check_company_culture_presence(profile, criteria):
             all_criteria_met = False
-
+        # --- NEW: Added exclusion check ---
+        if all_criteria_met and not check_excluded_geography_presence(profile, criteria):
+            all_criteria_met = False
+            
         # 4. Check for dynamic year requirements and calculate durations for sorting
         if all_criteria_met:
             for key, calc_func in [
@@ -913,7 +948,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
 
     return matching_candidates
 
-async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any]) -> AsyncIterator[str]:
+async def generate_response_with_evidence(query: str, matching_profiles: List[dict], criteria: Dict[str, Any], original_criteria: Dict[str, Any]) -> AsyncIterator[str]:
     """
     Generates the final response with detailed, evidence-based reasoning.
     This function now processes one profile at a time to avoid context length errors.
@@ -925,12 +960,13 @@ async def generate_response_with_evidence(query: str, matching_profiles: List[di
     yield f"Found {len(matching_profiles)} matching candidates. Here are the details:\n\n"
 
     final_answer_prompt_template = PromptTemplate(
-        input_variables=["query", "criteria_json", "matching_profile_json"],
+        input_variables=["query", "criteria_json", "matching_profile_json", "original_criteria_json"],
         template="""
 You are an expert recruitment analyst. Your task is to generate a concise, evidence-based summary for the single candidate provided, based on the user's query and the filtering criteria.
 
 **Original User Query:** {query}
-**Filtering Criteria Used (JSON):** {criteria_json}
+**Original Filtering Criteria (JSON):** {original_criteria_json}
+**Expanded Filtering Criteria Used (JSON):** {criteria_json}
 **Matching Candidate (JSON):** {matching_profile_json}
 
 **CRITICAL INSTRUCTIONS FOR DYNAMIC REASONING:**
@@ -938,23 +974,29 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
 1.  **Candidate Header:** Start with the candidate's name as a large Markdown header (e.g., # Name). Then, list their LinkedIn, Location, Headline, Total Experience Years, and Max People Managed.
 
 2.  **Create a "Reasoning" Section:**
-    - You **MUST** create a bullet point for **ONLY the keys present** in the `Filtering Criteria Used` JSON.
-    - **Do NOT** mention criteria like `min_total_experience` or `min_people_managed` if they are not in the `Filtering Criteria Used` JSON.
+    - You **MUST** create a bullet point for **ONLY the keys present** in the `Original Filtering Criteria` JSON. Do not mention keys that were only added during expansion.
+    - **Do NOT** mention criteria like `min_total_experience` or `min_people_managed` if they are not in the `Original Filtering Criteria` JSON.
+    - If there are `excluded_geographies` in the `Original Filtering Criteria`, you MUST mention this as a reasoning point.
 
 3.  **Generate Specific, Evidence-Based Reasoning:**
     - For each criterion (e.g., `required_segments`), look inside the candidate's `calculated_experience` object.
     - Find the matching key (e.g., `calculated_experience.required_segments`).
     - Use the `duration` and `roles` from that object to construct a detailed reason.
     - **Example Sentence Structure:** "The candidate meets the **SMB Experience** requirement with **[Duration] years** of experience, gained primarily from their roles at **[Company A]** and **[Company B]**."
-    - This creates a direct link between the requirement, the experience duration, and the companies where it was gained.
 
-4.  **Create a Correct "Experience Breakdown" Section:**
+4.  **SPECIAL INSTRUCTION FOR GEOGRAPHY:**
+    - Look at the `Original Filtering Criteria`. If `required_geographies` contains a broad region (like "APAC", "EMEA"), and the candidate's actual experience (`calculated_experience.required_geographies.roles`) is in a specific country within that region, you **MUST** state this connection explicitly.
+    - To find the specific country, look at the contributing roles or the `evidence_log`.
+    - **Example Sentence Structure for Geography:** "The candidate meets the **APAC Experience** requirement with **[Duration] years** of experience, specifically in **India**, which is a key market in the APAC region."
+    
+
+5.  **Create a Correct "Experience Breakdown" Section:**
     - Look for the `contributing_roles_details.roles` list in the candidate's JSON.
     - If it exists, you **MUST** format it as a bulleted list under the heading "Relevant Experience".
     - **Use this exact format for each role:** `* **{{company}}**: {{title}} ({{duration_years}} years)`
     - This section should only list the specific roles that contributed to meeting the primary search criterion.
 
-5. **No Conclusion:** Do not add any concluding remarks.
+6. **No Conclusion:** Do not add any concluding remarks.
 
 ---
 **Your Turn. Generate the response for the single candidate provided.**
@@ -968,6 +1010,7 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
         final_prompt_formatted = final_answer_prompt_template.format(
             query=query,
             criteria_json=json.dumps(criteria, indent=2),
+            original_criteria_json=json.dumps(original_criteria, indent=2),
             matching_profile_json=json.dumps(profile, indent=2) # Only one profile
         )
 
@@ -997,31 +1040,31 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `required_culture_type`: Company environment. **Map to keys:** {culture_taxonomy_keys}
 - `required_industries`: Broad industries (e.g., "SaaS", "Fintech"). Do NOT put specific company names here.
 - `competitors_of`: A list of companies for which to find competitors.
-- `required_geographies`: Regions of sales experience.
+- `required_geographies`: Regions of sales experience (e.g., "APAC", "EMEA").
+- `excluded_geographies`: Regions or countries to specifically exclude from the search.
 - `required_locations`: Candidate's physical base.
 - `top_n`: Integer for the number of candidates to return.
 
 **JSON STRUCTURE RULES:**
-- For each criterion, use an object with "operator" ("AND"/"OR") and "values" (list of mapped canonical keys or strings).
+- For inclusion criteria (required_*), use an object with "operator" ("AND"/"OR") and "values" (list of strings).
+- For exclusion criteria (excluded_*), use an object with "values" (a list of strings to exclude).
 - `required_companies` should be a simple list of strings.
-- If years of experience are mentioned with a criterion (e.g., "10 years in inside sales"), include a "min_years" (float) key in that criterion's object.
-- Use `min_total_experience` (float) only for general experience.
+- If years of experience are mentioned, include a "min_years" (float) key in that criterion's object.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
 | User Query                                    | Correct JSON Output                                                                                               |
 |-----------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| "experience in HCL AND Tech Mahindra"         | `{{"required_companies": ["HCL", "Tech Mahindra"]}}`                                                              |
-| "candidates from the SaaS industry"           | `{{"required_industries": {{"operator": "OR", "values": ["SaaS"]}}}}`                                             |
-| "candidates with startup culture experience"  | `{{"required_culture_type": {{"operator": "OR", "values": ["startup"]}}}}`                                        |
-| "more than 10 years in inside sales"          | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 10.0}}}}`               |
+| "APAC experience, but not India"              | `{{"required_geographies": {{"operator": "OR", "values": ["APAC"]}}, "excluded_geographies": {{"values": ["India"]}}}}` |
 | "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                        |
 | "top 10 profiles with SMB experience"         | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                   |
+
 
 **Available criteria keys:**
 - `min_total_experience` (float)
 - `min_people_managed` (integer)
-- `required_locations` (list of strings)
+- `required_locations` (object)
 - `required_geographies` (object)
+- `excluded_geographies` (object)
 - `required_companies` (list of strings)
 - `required_industries` (object)
 - `required_functions` (object)
@@ -1031,7 +1074,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `competitors_of` (list of strings)
 - `top_n` (integer)
 
-**CRITICAL INSTRUCTION**: Use `required_companies` for specific company names and `required_industries` for general categories.
+**CRITICAL INSTRUCTION**: Use `excluded_geographies` for negative constraints like "not in India", "excluding China", or "without USA experience".
 
 **User Query:** {query}
 
@@ -1048,10 +1091,22 @@ You are an expert assistant tasked with extracting structured filtering criteria
             culture_taxonomy_keys=json.dumps(list(CULTURE_TAXONOMY.keys()))
         ))
         criteria = safe_json_loads(criteria_response.content, {})
-        if not criteria:
-            raise ValueError("Failed to parse criteria.")
+        original_criteria = copy.deepcopy(criteria)
 
-        # Log the raw LLM response for debugging
+        # Fallback for simple keyword searches if LLM fails to extract structured criteria
+        if not criteria and normalized_query:
+            logger.warning(f"LLM failed to extract structured criteria. Treating '{normalized_query}' as a general keyword search.")
+            # Check if it looks like a company name query
+            if "worked at" in normalized_query or "worked in" in normalized_query or "from" in normalized_query:
+                 # A simple heuristic to guess the company name from the query
+                company_name = normalized_query.split(" in ")[-1].split(" at ")[-1].split(" from ")[-1].strip()
+                criteria["required_companies"] = [company_name]
+            else: # Treat as a general industry/keyword search
+                criteria["required_industries"] = {"operator": "OR", "values": [normalized_query]}
+
+        if not criteria: # Still no criteria after fallback
+            raise ValueError("Failed to parse criteria from query.")
+
         logger.info(f"Raw LLM criteria response: {criteria_response.content}")
 
         # Post-extraction override: Remove top_n for blunt queries, set to 0 for "all"
@@ -1071,7 +1126,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
         yield "I had trouble understanding the criteria in your query. Could you please rephrase it?"
         return
 
-    # --- NEW: Competitor Identification using dedicated LLM node ---
+    final_competitors_list = []
+    # --- Scalable Competitor Identification (Retrieval + Reranking) ---
     if "competitors_of" in criteria and criteria.get("competitors_of"):
         company_to_find_competitors_for = criteria["competitors_of"][0]
         
@@ -1080,66 +1136,68 @@ You are an expert assistant tasked with extracting structured filtering criteria
         if "top" in normalized_query.lower() and criteria.get("top_n"):
              competitor_task = f"identify the top {criteria['top_n']} direct competitors for the given company"
 
-        yield f"Identifying competitors for **{company_to_find_competitors_for}** using the company database as context... "
+        yield f"Identifying competitors for **{company_to_find_competitors_for}** using AI Brainstorm + DB Validation... "
 
         competitors_found = False
         try:
-            # This is the new dedicated "LLM node" for competitor analysis with a dynamic task
-            competitor_identification_prompt = PromptTemplate(
-                input_variables=["company_name", "company_list_json", "competitor_task"],
+            # 1. LLM BRAINSTORM: Ask the specialist LLM for a list of potential competitors.
+            brainstorm_prompt = PromptTemplate(
+                input_variables=["company_name", "competitor_task"],
                 template="""
-                You are an expert business analyst. Your task is to {competitor_task}.
-                You MUST ONLY select competitors from the provided JSON list of companies available in our database.
+                You are an expert business analyst with deep knowledge of corporate landscapes. Your task is to {competitor_task}.
+                When asked for 'all' competitors, you should provide a comprehensive and extensive list, including both major and niche competitors. Do not limit the list to only the most obvious ones.
+
+                Provide the output as a JSON-formatted list of company names.
 
                 **Target Company:**
                 {company_name}
-
-                **List of all available companies in the database:**
-                {company_list_json}
-
-                Analyze the list and return a JSON list of names that are direct competitors of the target company. If you cannot find any direct competitors in the list, return an empty list.
-
-                **JSON List of Competitors (must be names from the list above):**
+                
+                **JSON List of Competitors:**
                 """
             )
-
-            formatted_prompt = competitor_identification_prompt.format(
+            formatted_prompt = brainstorm_prompt.format(
                 company_name=company_to_find_competitors_for,
-                company_list_json=json.dumps(ALL_COMPANY_NAMES),
                 competitor_task=competitor_task
             )
-            
-            response = await llm.ainvoke(formatted_prompt)
-            competitors = safe_json_loads(response.content, [])
+            response = await specialist_llm.ainvoke(formatted_prompt)
+            llm_competitors = safe_json_loads(response.content, [])
 
-            if competitors:
-                yield f"Found potential competitors in DB via LLM analysis: `{', '.join(competitors)}`. Now searching for candidates...\n"
+            if llm_competitors:
+                # 2. DB VALIDATION: Cross-reference the LLM's list with our database.
+                db_company_names_lower = {name.lower() for name in ALL_COMPANY_NAMES}
+                validated_competitors = []
+                for competitor in llm_competitors:
+                    # Use a case-insensitive check to find matches.
+                    if competitor.lower() in db_company_names_lower:
+                        validated_competitors.append(competitor)
                 
-                # Funnel competitors into 'required_industries' to leverage existing OR logic
-                if "required_industries" not in criteria:
-                    criteria["required_industries"] = {"operator": "OR", "values": []}
-                
-                existing_industries = set(criteria["required_industries"].get("values", []))
-                competitor_set = set(competitors)
-                # Ensure the original company is not included in the competitor search
-                competitor_set.discard(company_to_find_competitors_for)
-                criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
-                
-                competitors_found = True
-            else:
-                yield f"The LLM could not identify any direct competitors for '{company_to_find_competitors_for}' from within the database list. "
+                if validated_competitors:
+                    # Final check to remove the original company, just in case
+                    target_company_lower = company_to_find_competitors_for.lower()
+                    final_competitors_list = [c for c in validated_competitors if target_company_lower not in c.lower()]
+                    
+                    if final_competitors_list:
+                        competitors_found = True
 
         except Exception as e:
-            logger.error(f"LLM error while finding competitors: {e}")
-            yield "There was an issue analyzing competitors with the LLM. "
-
-        # Fallback logic: if LLM fails, use the original company name as an industry search term
+            logger.error(f"Error during competitor identification: {e}")
+            yield "There was an issue identifying competitors. "
+        
+        # If competitors are not found, STOP execution.
         if not competitors_found:
-            yield "Falling back to use the original company name as a search keyword.\n"
-            if "required_industries" not in criteria:
-                criteria["required_industries"] = {"operator": "OR", "values": []}
-            if company_to_find_competitors_for not in criteria["required_industries"]["values"]:
-                 criteria["required_industries"]["values"].append(company_to_find_competitors_for)
+            yield "Could not identify any valid competitors from the database. Halting search."
+            return
+
+        # If we found competitors, add them to criteria and proceed
+        logger.info(f"Found and verified competitors: {', '.join(final_competitors_list)}")
+        yield f"**Found Competitors:** `{', '.join(final_competitors_list)}`\n\nNow searching for candidates from these companies...\n"
+        
+        if "required_industries" not in criteria:
+            criteria["required_industries"] = {"operator": "OR", "values": []}
+        
+        existing_industries = set(criteria["required_industries"].get("values", []))
+        competitor_set = set(final_competitors_list)
+        criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
 
         # Always remove the trigger key
         del criteria["competitors_of"]
@@ -1172,21 +1230,62 @@ You are an expert assistant tasked with extracting structured filtering criteria
         JSON List:
         """
     )
+    geography_expansion_prompt = PromptTemplate(
+        input_variables=["geographies"],
+        template="""
+        You are a geography and business market expert. For the given list of business regions (like APAC, EMEA, NA), expand them into a comprehensive JSON object. The JSON object must have a single key, "geographies", with a value that is a list of constituent countries and major business hubs.
+
+        For example:
+        - If the input is ["APAC"], the output should be: {{"geographies": ["APAC", "Asia Pacific", "India", "China", "Japan", "Australia", "Singapore", "Malaysia", "Indonesia"]}}
+        - If the input is ["India"], the output should be: {{"geographies": ["India", "Mumbai", "Bangalore", "Delhi", "Pune"]}}
+
+        The goal is to maximize search recall.
+
+        Initial Geographies: {geographies}
+
+        JSON Output:
+        """
+    )
     try:
-        yield "Expanding keywords... "
         company_keywords = criteria.pop("required_companies", [])
+        competitor_search_was_run = bool(final_competitors_list)
 
         def get_values_from_criteria(crit_val):
-            if isinstance(crit_val, dict): return crit_val.get("values", [])
-            if isinstance(crit_val, list): return crit_val
+            values = []
+            if isinstance(crit_val, dict):
+                values = crit_val.get("values", [])
+            elif isinstance(crit_val, list):
+                values = crit_val
+
+            # Defensive flattening
+            flat_values = []
+            for item in values:
+                if isinstance(item, str):
+                    flat_values.append(item)
+                elif isinstance(item, list):
+                    for sub_item in item:
+                        if isinstance(sub_item, str):
+                            flat_values.append(sub_item)
+            return flat_values
+
+        def get_list_from_llm_json(llm_json_response: Any) -> List[str]:
+            """Robustly extracts a list of strings from a JSON object that could be a list or a dict."""
+            if isinstance(llm_json_response, list):
+                return [str(item) for item in llm_json_response if isinstance(item, str)]
+            if isinstance(llm_json_response, dict):
+                for value in llm_json_response.values():
+                    if isinstance(value, list):
+                        return [str(item) for item in value if isinstance(item, str)]
             return []
 
-        # Expand industries
-        if criteria.get("required_industries"):
+        # Expand industries, but only if we didn't just run a competitor search
+        if not competitor_search_was_run and criteria.get("required_industries"):
+            yield "Expanding keywords... "
             industry_keywords = get_values_from_criteria(criteria["required_industries"])
             if industry_keywords:
                 industry_keywords_response = await llm.ainvoke(keyword_expansion_prompt.format(keywords=industry_keywords, category="Industry"))
-                expanded_industries = safe_json_loads(industry_keywords_response.content, [])
+                expanded_industries_raw = safe_json_loads(industry_keywords_response.content, [])
+                expanded_industries = get_list_from_llm_json(expanded_industries_raw)
                 industry_keywords.extend(expanded_industries)
                 if isinstance(criteria["required_industries"], dict):
                     criteria["required_industries"]["values"] = list(set(industry_keywords))
@@ -1210,7 +1309,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
                         keywords=unknown_functions,
                         category="Sales Job Titles"
                     ))
-                    expanded_unknown = safe_json_loads(unknown_functions_response.content, [])
+                    expanded_unknown_raw = safe_json_loads(unknown_functions_response.content, [])
+                    expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_functions.extend(unknown_functions)
                     expanded_functions.extend(expanded_unknown)
 
@@ -1237,7 +1337,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
                         keywords=unknown_segments,
                         category="Customer Segments"
                     ))
-                    expanded_unknown = safe_json_loads(unknown_segments_response.content, [])
+                    expanded_unknown_raw = safe_json_loads(unknown_segments_response.content, [])
+                    expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_segments.extend(unknown_segments)
                     expanded_segments.extend(expanded_unknown)
 
@@ -1264,7 +1365,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
                         keywords=unknown_details,
                         category="Company Attributes (e.g., funding, business model)"
                     ))
-                    expanded_unknown = safe_json_loads(unknown_details_response.content, [])
+                    expanded_unknown_raw = safe_json_loads(unknown_details_response.content, [])
+                    expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_details.extend(unknown_details)
                     expanded_details.extend(expanded_unknown)
 
@@ -1290,25 +1392,44 @@ You are an expert assistant tasked with extracting structured filtering criteria
                         keywords=unknown_cultures,
                         category="Company Culture (e.g., startup, corporate)"
                     ))
-                    expanded_unknown = safe_json_loads(unknown_cultures_response.content, [])
+                    expanded_unknown_raw = safe_json_loads(unknown_cultures_response.content, [])
+                    expanded_unknown = get_list_from_llm_json(expanded_unknown_raw)
                     expanded_cultures.extend(unknown_cultures)
                     expanded_cultures.extend(expanded_unknown)
 
                 if isinstance(criteria["required_culture_type"], dict):
                     all_cultures = list(set(expanded_cultures))
                     criteria["required_culture_type"]["values"] = all_cultures
+        
+        # Expand geographies
+        if criteria.get("required_geographies"):
+            geographies_to_expand_obj = criteria["required_geographies"]
+            if geographies_to_expand_obj and isinstance(geographies_to_expand_obj, dict):
+                geographies_to_expand = geographies_to_expand_obj.get("values", [])
+                if geographies_to_expand and isinstance(geographies_to_expand, list):
+                    yield "Expanding geographies... "
+                    geography_response = await llm.ainvoke(geography_expansion_prompt.format(geographies=json.dumps(geographies_to_expand)))
+                    logger.info(f"Raw geography expansion response from LLM: {geography_response.content}")
+                    expanded_geographies_raw = safe_json_loads(geography_response.content, {})
+                    expanded_geographies = get_list_from_llm_json(expanded_geographies_raw)
+                    criteria["required_geographies"]["values"] = list(set(geographies_to_expand + expanded_geographies))
 
 
         # Expand locations
         if criteria.get("required_locations"):
-            locations_to_expand = criteria["required_locations"]
+            locations_to_expand = get_values_from_criteria(criteria["required_locations"])
             if locations_to_expand:
                 location_response = await llm.ainvoke(location_expansion_prompt.format(locations=json.dumps(locations_to_expand)))
-                expanded_locations = safe_json_loads(location_response.content, [])
-                criteria["required_locations"] = list(set(locations_to_expand + expanded_locations))
+                expanded_locations_raw = safe_json_loads(location_response.content, [])
+                expanded_locations = get_list_from_llm_json(expanded_locations_raw)
+                if isinstance(criteria["required_locations"], dict):
+                    criteria["required_locations"]["values"] = list(set(locations_to_expand + expanded_locations))
+                elif isinstance(criteria["required_locations"], list):
+                     criteria["required_locations"] = list(set(locations_to_expand + expanded_locations))
+
 
         # Centralized cleanup logic for all expandable fields
-        for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details", "required_culture_type"]:
+        for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details", "required_culture_type", "excluded_geographies"]:
             if key in criteria and isinstance(criteria[key], dict) and "values" in criteria[key]:
                 original_values = criteria[key]["values"]
                 # Clean the "keywords" literal and any empty strings
@@ -1319,7 +1440,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
             criteria["required_companies"] = company_keywords
 
         logger.info(f"Full Criteria after expansion and filtering: {json.dumps(criteria)}")
-        yield f"Full Criteria: `{json.dumps(criteria)}`\n"
 
     except Exception as e:
         logger.error(f"Error expanding keywords: {e}")
@@ -1327,9 +1447,23 @@ You are an expert assistant tasked with extracting structured filtering criteria
     # 3. Initial Semantic Search against PostgreSQL
     yield "Performing initial semantic search... "
     def get_values_from_criteria_for_search(crit_val):
-        if isinstance(crit_val, dict): return crit_val.get("values", [])
-        if isinstance(crit_val, list): return crit_val
-        return []
+        values = []
+        if isinstance(crit_val, dict):
+            values = crit_val.get("values", [])
+        elif isinstance(crit_val, list):
+            values = crit_val
+
+        # Defensive flattening: ensures all items are strings.
+        flat_values = []
+        for item in values:
+            if isinstance(item, str):
+                flat_values.append(item)
+            elif isinstance(item, list):
+                # If we find a nested list, extend with its string elements
+                for sub_item in item:
+                    if isinstance(sub_item, str):
+                        flat_values.append(sub_item)
+        return flat_values
 
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
@@ -1382,7 +1516,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
     # 5. Generate Final Response
-    async for token in generate_response_with_evidence(query, final_candidates, criteria):
+    async for token in generate_response_with_evidence(query, final_candidates, criteria, original_criteria):
         yield token
 
 # --- Streamlit UI ---
