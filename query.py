@@ -1225,16 +1225,20 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
 
     # --- THIS IS THE CORRECTED PROMPT ---
     criteria_extraction_prompt = PromptTemplate(
-        input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys", "culture_taxonomy_keys"],
+        input_variables=["query", "sales_taxonomy_json", "segment_taxonomy_json", "company_details_taxonomy_json", "culture_taxonomy_json"],
         template="""
 You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and correctly associate any specified durations.
 
-**DEFINITIONS & CANONICAL KEYS:**
+**DEFINITIONS, TAXONOMIES & CANONICAL KEYS:**
 - `required_companies`: A list of specific company names. Use this when the user asks for experience *at* a company (e.g., "worked at Google", "from Microsoft").
-- `required_functions`: Sales roles. **You MUST map user input to one of these keys:** {sales_taxonomy_keys}. For example, "inside sales" maps to "Sales Development".
-- `required_segments`: Customer types. **You MUST map user input to one of these keys:** {segment_taxonomy_keys}
-- `required_company_details`: Company attributes like funding stage or business model. **Map to keys:** {company_details_taxonomy_keys}
-- `required_culture_type`: Company environment. **Map to keys:** {culture_taxonomy_keys}
+- `required_functions`: Sales roles. You **MUST** map user input to a canonical key from the sales taxonomy provided below.
+  - **Sales Taxonomy (map terms to the key):** {sales_taxonomy_json}
+- `required_segments`: Customer types. **You MUST** map user input to a canonical key from the segment taxonomy provided below.
+  - **Segment Taxonomy (map terms to the key):** {segment_taxonomy_json}
+- `required_company_details`: Company attributes. **You MUST** map user input to a canonical key from the company details taxonomy provided below.
+  - **Company Details Taxonomy (map terms to the key):** {company_details_taxonomy_json}
+- `required_culture_type`: Company environment. **You MUST** map user input to a canonical key from the culture taxonomy provided below.
+  - **Culture Taxonomy (map terms to the key):** {culture_taxonomy_json}
 - `required_industries`: Broad industries (e.g., "SaaS", "Fintech"). Do NOT put specific company names here.
 - `competitors_of`: A list of companies for which to find competitors.
 - `required_geographies`: Regions of sales experience (e.g., "APAC", "EMEA", "India").
@@ -1253,6 +1257,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 | User Query                                          | Correct JSON Output                                                                                                                                                             |
 |-----------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "APAC experience, but not India"                    | `{{"required_geographies": {{"operator": "OR", "values": ["APAC"]}}, "excluded_geographies": {{"values": ["India"]}}}}`                                                         |
+| "12 years as an Account Executive"                  | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 12.0}}}}`                                                                                       |
 | "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                                                                                              |
 | "top 10 profiles with SMB experience"               | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                                                                                  |
 | "SaaS candidates with 10+ years of hunting experience in the US" | `{{"required_industries": {{"operator": "OR", "values": ["saas"]}}, "required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 10.0}}, "required_geographies": {{"operator": "OR", "values": ["US"]}}}}` |
@@ -1274,7 +1279,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `competitors_of` (list of strings)
 - `top_n` (integer)
 
-**CRITICAL INSTRUCTION**: You **MUST** classify terms like "inside sales", "hunting", "farming" under `required_functions`.
+**CRITICAL INSTRUCTION**: Based on the taxonomies provided, you **MUST** correctly map user terms like "Account Executive", "inside sales", "hunter", etc., to their canonical keys (`Hunting`, `Sales Development`, etc.) inside the `required_functions` object.
 
 **User Query:** {query}
 
@@ -1285,10 +1290,10 @@ You are an expert assistant tasked with extracting structured filtering criteria
         yield "Extracting criteria... "
         prompt_text = criteria_extraction_prompt.format(
                 query=normalized_query,
-                sales_taxonomy_keys=json.dumps(list(SALES_TAXONOMY.keys())),
-                segment_taxonomy_keys=json.dumps(list(SEGMENT_SYNONYMS.keys())),
-                company_details_taxonomy_keys=json.dumps(list(COMPANY_DETAILS_TAXONOMY.keys())),
-                culture_taxonomy_keys=json.dumps(list(CULTURE_TAXONOMY.keys()))
+                sales_taxonomy_json=json.dumps(SALES_TAXONOMY, indent=2),
+                segment_taxonomy_json=json.dumps(SEGMENT_SYNONYMS, indent=2),
+                company_details_taxonomy_json=json.dumps(COMPANY_DETAILS_TAXONOMY, indent=2),
+                culture_taxonomy_json=json.dumps(CULTURE_TAXONOMY, indent=2)
             )
         criteria_response = await llm.ainvoke(prompt_text)
         tracker.add_usage(llm.model_name, prompt_text, criteria_response.content, "Criteria Extraction")
@@ -1708,13 +1713,10 @@ for message in st.session_state.messages:
 
 # This block runs when a response is being generated
 if st.session_state.get("generating", False):
-    # Display a stop button. If clicked, it sets the signal and reruns the script.
+    # Display a stop button. If clicked, it just sets the signal.
     if st.button("Stop Generation"):
         st.session_state.stop_signal = True
-        # A rerun isn't strictly necessary here, as the running stream will
-        # check the session state, but it can make the UI feel more responsive.
-        st.rerun()
-
+        
     # The actual generation process
     with st.chat_message("assistant"):
         prompt = st.session_state.messages[-1]["content"]
@@ -1724,6 +1726,7 @@ if st.session_state.get("generating", False):
             """A wrapper that checks the session state for a stop signal."""
             async for chunk in generator:
                 if st.session_state.get("stop_signal", False):
+                    logger.info("Stop signal received, halting generation.")
                     break
                 yield chunk
 
@@ -1731,13 +1734,15 @@ if st.session_state.get("generating", False):
         response_generator = process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker)
         wrapped_gen = stoppable_generator(response_generator)
         
-        # Stream the output
+        # Stream the output. This will now stop gracefully when the button is pressed.
         full_response = st.write_stream(wrapped_gen)
         
-        # Append the full response to the messages list
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        # Append the full (or partial) response to the messages list
+        # only if some content was generated.
+        if full_response:
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-    # Clean up state and rerun to reset the UI
+    # Clean up state and rerun to reset the UI for the next prompt.
     st.session_state.generating = False
     st.session_state.stop_signal = False
     st.rerun()
@@ -1754,3 +1759,5 @@ if prompt := st.chat_input("Search for candidates...", disabled=st.session_state
     st.session_state.stop_signal = False
     # Rerun the script to enter the "generating" block above
     st.rerun()
+
+
