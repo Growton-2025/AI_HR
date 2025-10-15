@@ -17,7 +17,7 @@ DB_NAME = "growton_ai"
 DB_USER = "postgres"
 DB_PASSWORD = "postgres"
 DB_HOST = "localhost"
-DB_PORT = "5432"
+DB_PORT = "5433"
 JSON_FILE_PATH = "enriched_candidate_profiles.json"
 EMBEDDING_MODEL = "text-embedding-3-small"
 

@@ -72,11 +72,6 @@ class TokenCostTracker:
         summary_md += f"- **Total Tokens:** `{self.total_tokens}`\n"
         summary_md += f"- **Estimated Cost:** `${self.total_cost:.6f} USD`\n"
         
-        # Optional: Add detailed breakdown
-        # summary_md += "\n**Breakdown:**\n"
-        # for detail in self.session_details:
-        #     summary_md += f"  - _{detail['type']}_ ({detail['model']}): In {detail['input_tokens']}, Out {detail['output_tokens']} -> ${detail['cost']:.6f}\n"
-
         return summary_md
 
 # --- Database Configuration ---
@@ -84,7 +79,7 @@ DB_NAME = "growton_ai"
 DB_USER = "postgres"
 DB_PASSWORD = "postgres"
 DB_HOST = "localhost"
-DB_PORT = "5432"
+DB_PORT = "5433"
 
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -160,8 +155,6 @@ def generate_dynamic_taxonomy(seed_taxonomy: dict, category: str) -> dict:
             seed_taxonomy_json=json.dumps(seed_taxonomy, indent=2),
             category=category
         )
-        # Note: Token tracking for cached functions is complex. For simplicity, we omit it here,
-        # as these calls are infrequent (once every 24h).
         response = generation_llm.invoke(formatted_prompt)
         expanded_taxonomy = safe_json_loads(response.content, default_val=seed_taxonomy)
 
@@ -201,15 +194,30 @@ STATIC_COMPANY_DETAILS_TAXONOMY = {
     "saas": ["saas", "software as a service"]
 }
 
-# --- NEW: Culture Taxonomy ---
 STATIC_CULTURE_TAXONOMY = {
     "startup": ["startup", "fast-paced", "agile environment", "high-growth", "early-stage"],
     "corporate": ["corporate", "mnc", "multinational", "large enterprise", "structured environment", "established company"],
     "remote": ["remote-first", "fully remote", "distributed team"]
 }
 
+# --- NEW CODE BLOCK: Geography Mapping for Region Expansion ---
+STATIC_GEOGRAPHY_MAP = {
+    # APAC
+    "singapore": "apac", "malaysia": "apac", "indonesia": "apac", "thailand": "apac", "vietnam": "apac",
+    "philippines": "apac", "australia": "apac", "new zealand": "apac", "japan": "apac", "south korea": "apac",
+    "india": "apac", "hong kong": "apac",
+    # EMEA
+    "united kingdom": "emea", "uk": "emea", "germany": "emea", "france": "emea", "spain": "emea", "italy": "emea",
+    "netherlands": "emea", "sweden": "emea", "norway": "emea", "denmark": "emea", "finland": "emea",
+    "united arab emirates": "emea", "uae": "emea", "saudi arabia": "emea", "south africa": "emea", "israel": "emea",
+    # Americas / NA / LATAM
+    "united states": "americas", "usa": "americas", "canada": "americas", "mexico": "americas",
+    "brazil": "latam", "argentina": "latam", "colombia": "latam"
+}
+# --- END NEW CODE BLOCK ---
 
-# --- ✨ DYNAMIC TAXONOMY INITIALIZATION ✨ ---
+
+# --- Dynamic Taxonomy Initialization ---
 SALES_TAXONOMY = generate_dynamic_taxonomy(
     seed_taxonomy=STATIC_SALES_TAXONOMY,
     category="Sales Functions"
@@ -225,22 +233,60 @@ COMPANY_DETAILS_TAXONOMY = generate_dynamic_taxonomy(
     category="Company Attributes (Funding, Business Model)"
 )
 
-# --- NEW: Initialize Culture Taxonomy ---
 CULTURE_TAXONOMY = generate_dynamic_taxonomy(
     seed_taxonomy=STATIC_CULTURE_TAXONOMY,
     category="Company Culture Types"
 )
 
+# --- NEW CODE BLOCK: Geography Map Generation ---
+@st.cache_data(ttl=86400) # Cache for 24 hours
+def generate_dynamic_geography_map(seed_map: dict) -> dict:
+    """
+    Uses an LLM to expand a seed geography map with more countries and variations.
+    The result is cached to avoid repeated LLM calls.
+    """
+    logger.info("Generating dynamic geography map... (This will be cached)")
 
-# Log the results to see what the LLM created
+    prompt_template = PromptTemplate(
+        input_variables=["seed_map_json"],
+        template="""
+        You are an expert geographer. Your task is to expand the given seed JSON map of countries to regions (like apac, emea).
+        Add many more countries for each region. The keys should be lowercase country names or common abbreviations, and values should be the lowercase region name (e.g., "apac", "emea", "latam", "americas").
+        Ensure the final output is a single, flat, valid JSON object.
+
+        **Seed Map:**
+        {seed_map_json}
+
+        **Expanded JSON Output:**
+        """
+    )
+    try:
+        formatted_prompt = prompt_template.format(seed_map_json=json.dumps(seed_map, indent=2))
+        response = generation_llm.invoke(formatted_prompt)
+        expanded_map = safe_json_loads(response.content, default_val=seed_map)
+
+        if expanded_map == seed_map:
+            logger.warning("LLM failed to generate an expanded geography map. Falling back to the static seed.")
+            return seed_map
+
+        logger.info("Successfully generated and cached dynamic geography map.")
+        return expanded_map
+    except Exception as e:
+        logger.error(f"An error occurred during geography map generation: {e}")
+        return seed_map
+
+GEOGRAPHY_COUNTRY_TO_REGION_MAP = generate_dynamic_geography_map(STATIC_GEOGRAPHY_MAP)
+# --- END NEW CODE BLOCK ---
+
+
 logger.info(f"Loaded Sales Taxonomy with {sum(len(v) for v in SALES_TAXONOMY.values())} total terms.")
 logger.info(f"Loaded Segment Taxonomy with {sum(len(v) for v in SEGMENT_SYNONYMS.values())} total terms.")
 logger.info(f"Loaded Company Details Taxonomy with {sum(len(v) for v in COMPANY_DETAILS_TAXONOMY.values())} total terms.")
 logger.info(f"Loaded Culture Taxonomy with {sum(len(v) for v in CULTURE_TAXONOMY.values())} total terms.")
+logger.info(f"Loaded Geography Map with {len(GEOGRAPHY_COUNTRY_TO_REGION_MAP)} total entries.")
 
 
 # --- Database Connection Pool ---
-# Using a simple connection function for this script's structure
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     try:
@@ -284,11 +330,9 @@ def load_all_profiles_from_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Fetch all candidates using the core fields needed for the app
     cur.execute("SELECT id, name, linkedin, location, headline, about, total_experience_years, max_people_managed FROM candidates")
     candidates_raw = cur.fetchall()
 
-    # Fetch all roles and join with companies table to get company details
     cur.execute("""
         SELECT
             r.candidate_id,
@@ -310,12 +354,10 @@ def load_all_profiles_from_db():
     roles_raw = cur.fetchall()
     roles_by_candidate = {}
     for role in roles_raw:
-        # Map by index based on the new SELECT statement
         candidate_id = role[0]
         if candidate_id not in roles_by_candidate:
             roles_by_candidate[candidate_id] = []
 
-        # Construct the company_details dictionary with all the fetched fields
         company_details = {
             "funding_stage": role[5],
             "revenue": role[6],
@@ -325,19 +367,17 @@ def load_all_profiles_from_db():
             "customer_presence": role[10] if role[10] is not None else [],
             "culture_type": role[11],
             "headquarters": role[12],
-            # Adding 'industry' for compatibility with downstream functions, mapping it from product_service.
             "industry": role[8] or ""
         }
 
         roles_by_candidate[candidate_id].append({
-            "company": role[1], # company_name
+            "company": role[1],
             "title": role[2],
             "details": role[3],
             "duration_years": float(role[4]) if role[4] is not None else 0.0,
             "company_details": company_details
         })
 
-    # Combine candidates and their roles
     profiles = []
     for cand in candidates_raw:
         candidate_id = cand[0]
@@ -439,7 +479,6 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
 
     all_search_terms = {}
     for v in req_values:
-        # Use the SEGMENT_SYNONYMS for expansion
         all_search_terms[v] = SEGMENT_SYNONYMS.get(v, [v])
 
     for role in profile.get('roles', []):
@@ -456,31 +495,62 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
                     'title': role.get('title', ''),
                     'duration_years': duration
                 })
-                break # Avoid double counting a role if it matches multiple synonyms
+                break
     return total_duration, contributing_roles
 
+# --- MODIFIED FUNCTION: calculate_geography_experience_duration ---
 def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    """Calculates the total duration for roles that meet the geography criteria."""
+    """
+    Calculates the total duration for roles that meet the geography criteria.
+    This now includes reverse lookup logic: if a user searches for a country (e.g., "Singapore"),
+    it will match roles that mention the broader region (e.g., "APAC"). It also retains the
+    original logic of inferring experience from company office locations.
+    """
     total_duration = 0.0
     contributing_roles = []
     if not criteria_obj or not isinstance(criteria_obj, dict):
         return 0.0, []
 
+    # Note: The `geography_expansion_prompt` already expands regions in the query.
+    # e.g., a search for "APAC" becomes a search for ["APAC", "Singapore", "India", ...]
+    # The logic here handles the opposite case: a search for "Singapore" matching a profile with "APAC".
     req_values = [v.lower() for v in criteria_obj.get("values", [])]
     if not req_values:
         return 0.0, []
 
+    # Pre-calculate regions for all search terms to be efficient
+    regions_for_req_values = {v: GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(v) for v in req_values}
+    regions_to_check = {region for region in regions_for_req_values.values() if region}
+
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
-        if any(v in role_text for v in req_values):
+
+        company_details = role.get('company_details', {})
+        company_office_locations = company_details.get('customer_presence', [])
+        company_locations_text = ' '.join([loc.lower() for loc in company_office_locations])
+        company_hq_text = (company_details.get('headquarters') or '').lower()
+
+        combined_search_text = f"{role_text} {company_locations_text} {company_hq_text}"
+
+        # Check if any of the required values (e.g., "singapore") are in the text
+        direct_match = any(v in combined_search_text for v in req_values)
+
+        # Check if any of the corresponding regions (e.g., "apac") are in the text
+        region_match = any(r in combined_search_text for r in regions_to_check)
+
+        if direct_match or region_match:
             duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({
-                'company': role.get('company', ''),
-                'title': role.get('title', ''),
-                'duration_years': duration
-            })
+            # To avoid double-counting, we add this role only once per criteria check
+            if not any(cr['company'] == role.get('company', '') and cr['title'] == role.get('title', '') for cr in contributing_roles):
+                total_duration += duration
+                contributing_roles.append({
+                    'company': role.get('company', ''),
+                    'title': role.get('title', ''),
+                    'duration_years': duration
+                })
+
     return total_duration, contributing_roles
+# --- END MODIFIED FUNCTION ---
 
 def calculate_company_details_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
     """Calculates the total duration for roles that meet the company detail criteria."""
@@ -515,12 +585,10 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
 
 def check_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     """Checks if the candidate has ever worked in a specifically named company."""
-    # This key is a simple list, not a dict with operator/values
     required_companies = criteria.get("required_companies")
     if not required_companies or not isinstance(required_companies, list):
-        return True # No requirement, so it passes
+        return True
 
-    # Case-insensitive matching
     required_companies_lower = [c.lower() for c in required_companies]
     found_companies = set()
 
@@ -528,9 +596,8 @@ def check_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) ->
         for role in profile.get('roles', []):
             if company_name in (role.get('company') or '').lower():
                 found_companies.add(company_name)
-                break # Move to the next required company
+                break
 
-    # For companies, we assume AND logic. The user wants experience in ALL specified companies.
     is_met = found_companies == set(required_companies_lower)
     if is_met:
         profile['evidence_log'].append({
@@ -645,7 +712,6 @@ def check_customer_segments(profile: Dict[str, Any], criteria: Dict[str, Any]) -
     if not values:
         return True
 
-    # Expand synonyms for all values
     all_search_terms = {}
     for v in values:
         all_search_terms[v] = SEGMENT_SYNONYMS.get(v, [v])
@@ -720,8 +786,12 @@ def check_location_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -
             })
         return is_met
 
+# --- MODIFIED FUNCTION: check_geography_experience ---
 def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    """Checks if the candidate has experience in the required geographies, supporting AND/OR logic."""
+    """
+    Checks if a candidate has any experience in the required geographies.
+    This now includes reverse lookup logic and adds detailed evidence to the profile's evidence_log.
+    """
     criteria_obj = criteria.get("required_geographies")
     if not criteria_obj:
         return True
@@ -738,29 +808,74 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
         return True
 
     found_values = set()
+    evidence_reasons = [] # To store the detailed reasons
+
     for v in values:
+        # Get the corresponding region for the search term, if it exists.
+        # e.g., if v is "singapore", region_for_v becomes "apac"
+        region_for_v = GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(v)
+
+        # 1. Check candidate's primary location
+        profile_location_lower = (profile.get('location') or '').lower()
+        if v in profile_location_lower:
+            if v not in found_values:
+                evidence_reasons.append(f"candidate's primary location is '{profile.get('location')}' which directly matches the search for '{v}'")
+            found_values.add(v)
+            continue # Move to the next required value
+
+        if region_for_v and region_for_v in profile_location_lower:
+            if v not in found_values:
+                evidence_reasons.append(f"candidate's primary location is '{profile.get('location')}' which contains the region '{region_for_v}', matching the search for '{v}'")
+            found_values.add(v)
+            continue
+
+        # 2. If not in primary location, check roles
+        is_found_in_roles = False
         for role in profile.get('roles', []):
             role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
-            if v in role_text:
+            
+            company_details = role.get('company_details', {})
+            company_office_locations = company_details.get('customer_presence', [])
+            company_locations_text = ' '.join([loc.lower() for loc in company_office_locations])
+            company_hq_text = (company_details.get('headquarters') or '').lower()
+            
+            combined_search_text = f"{role_text} {company_locations_text} {company_hq_text}"
+            
+            # Check for direct match (e.g., "singapore" in text) OR
+            # region match (e.g., "apac" in text if searching for "singapore")
+            if v in combined_search_text:
+                if v not in found_values:
+                    evidence_reasons.append(f"experience at '{role.get('company')}' shows presence in '{v}', as inferred from company/role details")
                 found_values.add(v)
-                break
+                is_found_in_roles = True
+                break # Found this value, move to the next required value
 
+            if region_for_v and region_for_v in combined_search_text:
+                if v not in found_values:
+                     evidence_reasons.append(f"experience at '{role.get('company')}' implies '{region_for_v}' presence, matching the search for '{v}'")
+                found_values.add(v)
+                is_found_in_roles = True
+                break
+        
+        if is_found_in_roles:
+            continue
+
+    is_met = False
     if op == "AND":
         is_met = found_values == set(values)
-        if is_met:
-            profile['evidence_log'].append({
-                "criterion": "geography_presence (AND)",
-                "source_text": f"Profile confirms experience in all required geographies: {', '.join(values)}."
-            })
-        return is_met
     else: # OR
         is_met = bool(found_values)
-        if is_met:
-            profile['evidence_log'].append({
-                "criterion": "geography_presence (OR)",
-                "source_text": f"Profile confirms experience in at least one required geography. Found: {', '.join(found_values)}."
-            })
-        return is_met
+
+    if is_met:
+        # Combine reasons into a single log entry.
+        source_text = f"Profile confirms experience in {', '.join(found_values)}. Reasons: {'; '.join(evidence_reasons)}."
+        profile['evidence_log'].append({
+            "criterion": f"geography_presence ({op})",
+            "source_text": source_text
+        })
+    
+    return is_met
+# --- END MODIFIED FUNCTION ---
 
 def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     """Checks if the candidate has ever worked in a company matching the company detail criteria."""
@@ -783,7 +898,6 @@ def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> 
     for v in values:
         for role in profile.get('roles', []):
             company_details = role.get('company_details', {})
-            # Combine multiple company fields into one text block for searching
             details_text = (
                 f"{(company_details.get('funding_stage') or '').lower()} "
                 f"{(company_details.get('business_model') or '').lower()} "
@@ -860,7 +974,7 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
     """
     criteria_obj = criteria.get("excluded_geographies")
     if not criteria_obj:
-        return True # No exclusion criteria, so candidate passes.
+        return True
 
     values = []
     if isinstance(criteria_obj, dict):
@@ -871,17 +985,16 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
     if not values:
         return True
 
-    # Check against profile location and role details
     profile_location = (profile.get('location') or '').lower()
     if any(v in profile_location for v in values):
-        return False # Exclude based on current location
+        return False
 
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         if any(v in role_text for v in values):
-            return False # Exclude based on role description
+            return False
 
-    return True # Candidate did not match any excluded geographies.
+    return True
 
 
 # --- Strict Filtering Function ---
@@ -891,7 +1004,6 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
     logger.info("Applying detailed filters with reasoning...")
     matching_candidates = []
 
-    # Determine the primary criterion for sorting (e.g., required_segments for SMB experience)
     sort_criterion = None
     if criteria.get("required_segments"):
         sort_criterion = "required_segments"
@@ -906,7 +1018,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
     elif criteria.get("required_culture_type"):
         sort_criterion = "required_culture_type"
     else:
-        sort_criterion = "required_functions"  # Default to functions if none specified
+        sort_criterion = "required_functions"
 
     for profile in profiles:
         profile['evidence_log'] = []
@@ -914,17 +1026,14 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         profile['calculated_experience'] = {}
         all_criteria_met = True
 
-        # 1. Check Total Experience (if specified)
         min_total_exp = criteria.get("min_total_experience")
         if min_total_exp and (profile.get("total_experience_years") or 0) < min_total_exp:
             all_criteria_met = False
 
-        # 2. Check Team Management Size (if specified)
         min_managed = criteria.get("min_people_managed")
         if min_managed and (profile.get("max_people_managed") or 0) < min_managed:
             all_criteria_met = False
 
-        # 3. Check for presence in required fields (AND/OR logic)
         if all_criteria_met and not check_company_presence(profile, criteria):
             all_criteria_met = False
         if all_criteria_met and not check_functional_presence(profile, criteria):
@@ -939,14 +1048,11 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             all_criteria_met = False
         if all_criteria_met and not check_company_details(profile, criteria):
             all_criteria_met = False
-        # --- NEW: Added culture check ---
         if all_criteria_met and not check_company_culture_presence(profile, criteria):
             all_criteria_met = False
-        # --- NEW: Added exclusion check ---
         if all_criteria_met and not check_excluded_geography_presence(profile, criteria):
             all_criteria_met = False
             
-        # 4. Check for dynamic year requirements and calculate durations for sorting
         if all_criteria_met:
             for key, calc_func in [
                 ("required_functions", calculate_functional_experience_duration),
@@ -971,7 +1077,6 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                         all_criteria_met = False
                         break
                 elif crit_obj and isinstance(crit_obj, dict):
-                    # Calculate duration even if no min_years, for sorting purposes
                     duration, roles = calc_func(profile, crit_obj)
                     profile['calculated_experience'][key] = {
                         "duration": duration,
@@ -981,9 +1086,7 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                     }
 
         if all_criteria_met:
-            # If specific experience was calculated, use it for the breakdown. Otherwise, fall back to default functional breakdown.
             if profile['calculated_experience']:
-                # Prioritize the first calculated experience for the main display breakdown
                 first_calc_key = next(iter(profile['calculated_experience']))
                 profile['contributing_roles_details'] = {'roles': profile['calculated_experience'][first_calc_key]['roles']}
             else:
@@ -992,14 +1095,12 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
 
             matching_candidates.append(profile)
 
-    # Sort candidates by the duration of the primary criterion (e.g., SMB experience)
     if matching_candidates and sort_criterion:
         matching_candidates.sort(
             key=lambda x: x['calculated_experience'].get(sort_criterion, {}).get('duration', 0.0),
             reverse=True
         )
 
-    # Limit to top_n candidates, or return all if top_n is 0 or not specified
     top_n = criteria.get("top_n")
     if top_n is None or top_n == 0:
         logger.info(f"No top_n specified or top_n is 0, returning all {len(matching_candidates)} candidates.")
@@ -1046,9 +1147,11 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
     - **Example Sentence Structure:** "The candidate meets the **SMB Experience** requirement with **[Duration] years** of experience, gained primarily from their roles at **[Company A]** and **[Company B]**."
 
 4.  **SPECIAL INSTRUCTION FOR GEOGRAPHY:**
-    - Look at the `Original Filtering Criteria`. If `required_geographies` contains a broad region (like "APAC", "EMEA"), and the candidate's actual experience (`calculated_experience.required_geographies.roles`) is in a specific country within that region, you **MUST** state this connection explicitly.
-    - To find the specific country, look at the contributing roles or the `evidence_log`.
-    - **Example Sentence Structure for Geography:** "The candidate meets the **APAC Experience** requirement with **[Duration] years** of experience, specifically in **India**, which is a key market in the APAC region."
+    - The reasoning for a geography match is provided in the `evidence_log` with the criterion `geography_presence`.
+    - You **MUST** use the `source_text` from this log entry to construct your reasoning sentence. Do not invent reasons.
+    - **Example 1 (Region Match):** If the log says "Reasons: candidate's primary location is 'Singapore, APAC' which contains the region 'apac', matching the search for 'singapore'", your output should be something like: "Meets the **Singapore Experience** requirement because their primary location is listed as APAC."
+    - **Example 2 (Company Operations):** If the log says "Reasons: experience at 'Acme Inc' shows presence in 'singapore', as inferred from company/role details", your output should be: "Meets the **Singapore Experience** requirement due to experience at Acme Inc, which has operations in that region."
+    - Combine this reason with the duration from `calculated_experience.required_geographies` to form a complete sentence like: "The candidate has **[Duration] years** of **[Geography] Experience**, meeting the requirement because their primary location is in APAC."
     
 
 5.  **Create a Correct "Experience Breakdown" Section:**
@@ -1068,15 +1171,13 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
     for i, profile in enumerate(matching_profiles):
         profile['display_number'] = i + 1
         
-        # Format the prompt for each individual profile
         final_prompt_formatted = final_answer_prompt_template.format(
             query=query,
             criteria_json=json.dumps(criteria, indent=2),
             original_criteria_json=json.dumps(original_criteria, indent=2),
-            matching_profile_json=json.dumps(profile, indent=2) # Only one profile
+            matching_profile_json=json.dumps(profile, indent=2)
         )
 
-        # Stream the response for this single profile
         profile_response_content = ""
         async for chunk in streaming_llm.astream(final_prompt_formatted):
             yield chunk.content
@@ -1085,7 +1186,7 @@ You are an expert recruitment analyst. Your task is to generate a concise, evide
         full_response_content += profile_response_content
         tracker.add_usage("gpt-4o-mini", final_prompt_formatted, profile_response_content, "Final Summary")
 
-        yield "\n---\n\n" # Add a separator between candidates
+        yield "\n---\n\n"
 
 
 async def process_query_main(query: str, session_id: str, tracker: TokenCostTracker) -> AsyncIterator[str]:
@@ -1100,7 +1201,6 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
         elif isinstance(crit_val, list):
             values = crit_val
 
-        # Defensive flattening
         flat_values = []
         for item in values:
             if isinstance(item, str):
@@ -1121,40 +1221,42 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
                     return [str(item) for item in value if isinstance(item, str)]
         return []
 
-    # The try/finally block was moved from here to the Streamlit UI loop for better stability.
     normalized_query = normalize_query_with_llm(query)
 
-    # 1. Extract Criteria using LLM with detailed definitions
+    # --- THIS IS THE CORRECTED PROMPT ---
     criteria_extraction_prompt = PromptTemplate(
         input_variables=["query", "sales_taxonomy_keys", "segment_taxonomy_keys", "company_details_taxonomy_keys", "culture_taxonomy_keys"],
         template="""
-You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc.
+You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and correctly associate any specified durations.
 
 **DEFINITIONS & CANONICAL KEYS:**
 - `required_companies`: A list of specific company names. Use this when the user asks for experience *at* a company (e.g., "worked at Google", "from Microsoft").
-- `required_functions`: Sales roles. **Map user input to one of these keys:** {sales_taxonomy_keys}
-- `required_segments`: Customer types. **Map user input to one of these keys:** {segment_taxonomy_keys}
+- `required_functions`: Sales roles. **You MUST map user input to one of these keys:** {sales_taxonomy_keys}. For example, "inside sales" maps to "Sales Development".
+- `required_segments`: Customer types. **You MUST map user input to one of these keys:** {segment_taxonomy_keys}
 - `required_company_details`: Company attributes like funding stage or business model. **Map to keys:** {company_details_taxonomy_keys}
 - `required_culture_type`: Company environment. **Map to keys:** {culture_taxonomy_keys}
 - `required_industries`: Broad industries (e.g., "SaaS", "Fintech"). Do NOT put specific company names here.
 - `competitors_of`: A list of companies for which to find competitors.
-- `required_geographies`: Regions of sales experience (e.g., "APAC", "EMEA").
+- `required_geographies`: Regions of sales experience (e.g., "APAC", "EMEA", "India").
 - `excluded_geographies`: Regions or countries to specifically exclude from the search.
 - `required_locations`: Candidate's physical base.
 - `top_n`: Integer for the number of candidates to return.
+- `min_total_experience`: The candidate's entire career duration. Only use this if the query explicitly says "total experience" or "overall experience".
 
-**JSON STRUCTURE RULES:**
+**JSON STRUCTURE & DURATION RULES:**
 - For inclusion criteria (required_*), use an object with "operator" ("AND"/"OR") and "values" (list of strings).
 - For exclusion criteria (excluded_*), use an object with "values" (a list of strings to exclude).
 - `required_companies` should be a simple list of strings.
-- If years of experience are mentioned, include a "min_years" (float) key in that criterion's object.
+- **Duration Rule:** When a duration (e.g., '10 years', '5+ years') is mentioned with a specific function, industry, or segment, it **MUST** be captured using the `min_years` (float) key inside that specific criterion's object. Do **NOT** use `min_total_experience` unless explicitly stated.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
-| User Query                                    | Correct JSON Output                                                                                               |
-|-----------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| "APAC experience, but not India"              | `{{"required_geographies": {{"operator": "OR", "values": ["APAC"]}}, "excluded_geographies": {{"values": ["India"]}}}}` |
-| "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                        |
-| "top 10 profiles with SMB experience"         | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                   |
+| User Query                                          | Correct JSON Output                                                                                                                                                             |
+|-----------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| "APAC experience, but not India"                    | `{{"required_geographies": {{"operator": "OR", "values": ["APAC"]}}, "excluded_geographies": {{"values": ["India"]}}}}`                                                         |
+| "candidates who have worked at competitors of Oracle" | `{{"competitors_of": ["Oracle"]}}`                                                                                                                                              |
+| "top 10 profiles with SMB experience"               | `{{"required_segments": {{"operator": "OR", "values": ["smb"]}}, "top_n": 10}}`                                                                                                  |
+| "SaaS candidates with 10+ years of hunting experience in the US" | `{{"required_industries": {{"operator": "OR", "values": ["saas"]}}, "required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 10.0}}, "required_geographies": {{"operator": "OR", "values": ["US"]}}}}` |
+| "25+ years of inside sales experience in India"       | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 25.0}}, "required_geographies": {{"operator": "OR", "values": ["India"]}}}}`        |
 
 
 **Available criteria keys:**
@@ -1172,7 +1274,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `competitors_of` (list of strings)
 - `top_n` (integer)
 
-**CRITICAL INSTRUCTION**: Use `excluded_geographies` for negative constraints like "not in India", "excluding China", or "without USA experience".
+**CRITICAL INSTRUCTION**: You **MUST** classify terms like "inside sales", "hunting", "farming" under `required_functions`.
 
 **User Query:** {query}
 
@@ -1194,23 +1296,19 @@ You are an expert assistant tasked with extracting structured filtering criteria
         criteria = safe_json_loads(criteria_response.content, {})
         original_criteria = copy.deepcopy(criteria)
 
-        # Fallback for simple keyword searches if LLM fails to extract structured criteria
         if not criteria and normalized_query:
             logger.warning(f"LLM failed to extract structured criteria. Treating '{normalized_query}' as a general keyword search.")
-            # Check if it looks like a company name query
             if "worked at" in normalized_query or "worked in" in normalized_query or "from" in normalized_query:
-                 # A simple heuristic to guess the company name from the query
                 company_name = normalized_query.split(" in ")[-1].split(" at ")[-1].split(" from ")[-1].strip()
                 criteria["required_companies"] = [company_name]
-            else: # Treat as a general industry/keyword search
+            else:
                 criteria["required_industries"] = {"operator": "OR", "values": [normalized_query]}
 
-        if not criteria: # Still no criteria after fallback
+        if not criteria:
             raise ValueError("Failed to parse criteria from query.")
 
         logger.info(f"Raw LLM criteria response: {criteria_response.content}")
 
-        # Post-extraction override: Remove top_n for blunt queries, set to 0 for "all"
         normalized_query_lower = normalized_query.lower()
         if "all" in normalized_query_lower:
             criteria["top_n"] = 0
@@ -1228,11 +1326,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
         return
 
     final_competitors_list = []
-    # --- Scalable Competitor Identification (Retrieval + Reranking) ---
     if "competitors_of" in criteria and criteria.get("competitors_of"):
         company_to_find_competitors_for = criteria["competitors_of"][0]
         
-        # Determine the dynamic task for the LLM based on the user's query
         competitor_task = "identify all direct competitors for the given company"
         if "top" in normalized_query.lower() and criteria.get("top_n"):
              competitor_task = f"identify the top {criteria['top_n']} direct competitors for the given company"
@@ -1241,7 +1337,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
         competitors_found = False
         try:
-            # 1. LLM BRAINSTORM: Ask the specialist LLM for a list of potential competitors.
             brainstorm_prompt = PromptTemplate(
                 input_variables=["company_name", "competitor_task"],
                 template="""
@@ -1265,16 +1360,13 @@ You are an expert assistant tasked with extracting structured filtering criteria
             llm_competitors = safe_json_loads(response.content, [])
 
             if llm_competitors:
-                # 2. DB VALIDATION: Cross-reference the LLM's list with our database.
                 db_company_names_lower = {name.lower() for name in ALL_COMPANY_NAMES}
                 validated_competitors = []
                 for competitor in llm_competitors:
-                    # Use a case-insensitive check to find matches.
                     if competitor.lower() in db_company_names_lower:
                         validated_competitors.append(competitor)
                 
                 if validated_competitors:
-                    # Final check to remove the original company, just in case
                     target_company_lower = company_to_find_competitors_for.lower()
                     final_competitors_list = [c for c in validated_competitors if target_company_lower not in c.lower()]
                     
@@ -1285,12 +1377,10 @@ You are an expert assistant tasked with extracting structured filtering criteria
             logger.error(f"Error during competitor identification: {e}")
             yield "There was an issue identifying competitors. "
         
-        # If competitors are not found, STOP execution.
         if not competitors_found:
             yield "Could not identify any valid competitors from the database. Halting search."
             return
 
-        # If we found competitors, add them to criteria and proceed
         logger.info(f"Found and verified competitors: {', '.join(final_competitors_list)}")
         yield f"**Found Competitors:** `{', '.join(final_competitors_list)}`\n\nNow searching for candidates from these companies...\n"
         
@@ -1301,11 +1391,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
         competitor_set = set(final_competitors_list)
         criteria["required_industries"]["values"] = list(existing_industries.union(competitor_set))
 
-
-        # Always remove the trigger key
         del criteria["competitors_of"]
-    # --- END OF STEP ---
-
    
     keyword_expansion_prompt = PromptTemplate(
     input_variables=["keywords", "category"],
@@ -1338,8 +1424,10 @@ You are an expert assistant tasked with extracting structured filtering criteria
         template="""
         You are a geography and business market expert. For the given list of business regions (like APAC, EMEA, NA), expand them into a comprehensive JSON object. The JSON object must have a single key, "geographies", with a value that is a list of constituent countries and major business hubs.
 
+        **SPECIAL RULE**: When expanding "APAC", you MUST exclude "China" from the list of countries, as China experience is typically specified separately.
+
         For example:
-        - If the input is ["APAC"], the output should be: {{"geographies": ["APAC", "Asia Pacific", "India", "China", "Japan", "Australia", "Singapore", "Malaysia", "Indonesia"]}}
+        - If the input is ["APAC"], the output should be: {{"geographies": ["APAC", "Asia Pacific", "India", "Japan", "Australia", "Singapore", "Malaysia", "Indonesia"]}}
         - If the input is ["India"], the output should be: {{"geographies": ["India", "Mumbai", "Bangalore", "Delhi", "Pune"]}}
 
         The goal is to maximize search recall.
@@ -1353,7 +1441,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
         company_keywords = criteria.pop("required_companies", [])
         competitor_search_was_run = bool(final_competitors_list)
 
-        # Expand industries, but only if we didn't just run a competitor search
         if not competitor_search_was_run and criteria.get("required_industries"):
             yield "Expanding keywords... "
             industry_keywords = get_values_from_criteria(criteria["required_industries"])
@@ -1367,7 +1454,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 if isinstance(criteria["required_industries"], dict):
                     criteria["required_industries"]["values"] = list(set(industry_keywords))
 
-        # Expand functions with a fallback for unknown terms
         if criteria.get("required_functions"):
             function_keywords = get_values_from_criteria(criteria["required_functions"])
             if function_keywords:
@@ -1394,7 +1480,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     all_funcs = list(set(expanded_functions))
                     criteria["required_functions"]["values"] = all_funcs
 
-        # Expand segments with a fallback for unknown terms
         if criteria.get("required_segments"):
             segment_keywords = get_values_from_criteria(criteria["required_segments"])
             if segment_keywords:
@@ -1421,7 +1506,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     all_segs = list(set(expanded_segments))
                     criteria["required_segments"]["values"] = all_segs
 
-        # Expand company details with a fallback for unknown terms
         if criteria.get("required_company_details"):
             cd_keywords = get_values_from_criteria(criteria["required_company_details"])
             if cd_keywords:
@@ -1448,7 +1532,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     all_details = list(set(expanded_details))
                     criteria["required_company_details"]["values"] = all_details
 
-        # --- NEW: Expand culture types ---
         if criteria.get("required_culture_type"):
             culture_keywords = get_values_from_criteria(criteria["required_culture_type"])
             if culture_keywords:
@@ -1474,7 +1557,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     all_cultures = list(set(expanded_cultures))
                     criteria["required_culture_type"]["values"] = all_cultures
         
-        # Expand geographies
         if criteria.get("required_geographies"):
             geographies_to_expand_obj = criteria["required_geographies"]
             if geographies_to_expand_obj and isinstance(geographies_to_expand_obj, dict):
@@ -1489,8 +1571,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
                     expanded_geographies = get_list_from_llm_json(expanded_geographies_raw)
                     criteria["required_geographies"]["values"] = list(set(geographies_to_expand + expanded_geographies))
 
-
-        # Expand locations
         if criteria.get("required_locations"):
             locations_to_expand = get_values_from_criteria(criteria["required_locations"])
             if locations_to_expand:
@@ -1504,12 +1584,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 elif isinstance(criteria["required_locations"], list):
                      criteria["required_locations"] = list(set(locations_to_expand + expanded_locations))
 
-
-        # Centralized cleanup logic for all expandable fields
         for key in ["required_industries", "required_functions", "required_geographies", "required_segments", "required_company_details", "required_culture_type", "excluded_geographies"]:
             if key in criteria and isinstance(criteria[key], dict) and "values" in criteria[key]:
                 original_values = criteria[key]["values"]
-                # Clean the "keywords" literal and any empty strings
                 cleaned_values = [v for v in original_values if v and v.lower() != 'keywords']
                 criteria[key]["values"] = cleaned_values
         
@@ -1521,7 +1598,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
     except Exception as e:
         logger.error(f"Error expanding keywords: {e}")
 
-    # 3. Initial Semantic Search against PostgreSQL
     yield "Performing initial semantic search... "
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
@@ -1530,11 +1606,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
         get_values_from_criteria(criteria.get("required_segments")) +
         get_values_from_criteria(criteria.get("required_geographies")) +
         get_values_from_criteria(criteria.get("required_company_details")) +
-        get_values_from_criteria(criteria.get("required_culture_type")) # --- NEW: Added culture to search ---
+        get_values_from_criteria(criteria.get("required_culture_type"))
     )
 
-
-    # A query is only too broad if it has no semantic keywords AND no hard filters at all.
     hard_filters_present = (
         criteria.get("required_locations") or
         criteria.get("min_people_managed") is not None or
@@ -1545,7 +1619,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
         return
 
-    # If there's semantic text, perform the search. Otherwise, we'll just filter the whole dataset.
     if search_query_text:
         query_embedding = embeddings.embed_query(search_query_text)
         tracker.add_usage(embeddings.model, search_query_text, usage_type="Embedding")
@@ -1567,18 +1640,14 @@ You are an expert assistant tasked with extracting structured filtering criteria
         initial_candidate_pool = [PROFILES_BY_ID[id] for id in initial_candidate_ids if id in PROFILES_BY_ID]
         yield f"Found {len(initial_candidate_pool)} potential matches. "
     else:
-        # If the search is only by hard filters, the initial pool is all candidates.
         initial_candidate_pool = list(PROFILES_BY_ID.values())
 
 
-    # 4. Strict Python Filtering
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
-    # 5. Generate Final Response
     async for token in generate_response_with_evidence(query, final_candidates, criteria, original_criteria, tracker):
         yield token
         
-    # Yield the summary at the end of a successful run.
     yield tracker.get_summary()
 
 # --- Streamlit UI ---
@@ -1587,13 +1656,13 @@ st.markdown(
     """
     <style>
     section[data-testid="stSidebar"] {
-        width: 280px !important;  /* Adjust this value as needed for your preferred width */
+        width: 280px !important;
         min-width: 250px !important;
         max-width: 300px !important;
     }
-    section[data-testid="stSidebar"] > div {  /* Targets the inner content wrapper for better control */
+    section[data-testid="stSidebar"] > div {
         height: 100%;
-        overflow-y: auto;  /* Adds scrolling if content overflows, preventing expansion */
+        overflow-y: auto;
     }
     </style>
     """,
@@ -1610,7 +1679,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Sidebar summary
 st.sidebar.subheader("📊 Dataset Summary")
 total_profiles = len(PROFILES_BY_ID)
 total_exp = sum(p.get("total_experience_years") or 0 for p in PROFILES_BY_ID.values())
@@ -1618,27 +1686,71 @@ avg_experience = total_exp / total_profiles if total_profiles > 0 else 0
 st.sidebar.markdown(f"**Total Profiles:** {total_profiles}")
 st.sidebar.markdown(f"**Avg. Experience:** {round(avg_experience, 1)} years")
 
-# Session state
+# --- Session State Management ---
 if 'session_id' not in st.session_state:
     st.session_state.session_id = hashlib.sha256(os.urandom(32)).hexdigest()
-
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-
 if 'token_tracker' not in st.session_state:
     st.session_state.token_tracker = TokenCostTracker()
+# Add state for controlling the generation flow
+if "generating" not in st.session_state:
+    st.session_state.generating = False
+if "stop_signal" not in st.session_state:
+    st.session_state.stop_signal = False
 
-# Chat history
+# --- Chat History Display ---
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Chat input
-if prompt := st.chat_input(""):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# --- Core Logic for Generation and Stopping ---
+
+# This block runs when a response is being generated
+if st.session_state.get("generating", False):
+    # Display a stop button. If clicked, it sets the signal and reruns the script.
+    if st.button("Stop Generation"):
+        st.session_state.stop_signal = True
+        # A rerun isn't strictly necessary here, as the running stream will
+        # check the session state, but it can make the UI feel more responsive.
+        st.rerun()
+
+    # The actual generation process
     with st.chat_message("assistant"):
-        full_response = st.write_stream(process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker))
+        prompt = st.session_state.messages[-1]["content"]
+        
+        # Wrapper to check for the stop signal
+        async def stoppable_generator(generator):
+            """A wrapper that checks the session state for a stop signal."""
+            async for chunk in generator:
+                if st.session_state.get("stop_signal", False):
+                    break
+                yield chunk
+
+        # Create the main generator and wrap it
+        response_generator = process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker)
+        wrapped_gen = stoppable_generator(response_generator)
+        
+        # Stream the output
+        full_response = st.write_stream(wrapped_gen)
+        
+        # Append the full response to the messages list
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 
+    # Clean up state and rerun to reset the UI
+    st.session_state.generating = False
+    st.session_state.stop_signal = False
+    st.rerun()
+
+# --- Chat Input Form ---
+
+# The input is disabled while a response is being generated
+if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating", False)):
+    # Add the user's message to the chat history
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    # Set the generating flag to True to start the process
+    st.session_state.generating = True
+    # Ensure the stop signal is reset for the new run
+    st.session_state.stop_signal = False
+    # Rerun the script to enter the "generating" block above
+    st.rerun()
