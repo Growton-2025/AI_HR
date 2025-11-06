@@ -90,7 +90,7 @@ if not openai_api_key:
     st.stop()
 
 try:
-    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("Successfully connected to Redis.")
 except redis.ConnectionError as e:

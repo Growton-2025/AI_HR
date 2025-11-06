@@ -18990,5 +18990,23 @@
     "culture_type": "Innovative and research-driven",
     "headquarters": "Shenzhen, China",
     "business_model": "B2B"
+  },
+  "MongoDB": {
+    "product_service": "Database management system",
+    "customer_segment": [
+      "Developers",
+      "Enterprises",
+      "Startups"
+    ],
+    "customer_presence": [
+      "North America",
+      "Europe",
+      "Asia"
+    ],
+    "funding_stage": "Public",
+    "revenue": "Over $1 billion",
+    "culture_type": "Innovative and collaborative",
+    "headquarters": "New York, NY, USA",
+    "business_model": "Subscription-based"
   }
 }
