@@ -11,3 +11,4 @@ openai
 plotly
 folium
 streamlit-folium
+openpyxl
