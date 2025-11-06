@@ -39,18 +39,21 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CONCURRENCY_LIMIT = 20  # Max parallel AI calls AND max DB connections
 
+# postgresql://growton_ai_user:QDIt4TrRF57WmjjycR7hGU8Uojg1xBw0@dpg-d46deqa4d50c73avjb1g-a.singapore-postgres.render.com/growton_ai_zcaz
+
 # --- Database Configuration ---
-DB_NAME = "growton_ai"
-DB_USER = "postgres"
-DB_PASSWORD = "postgres"
-DB_HOST = "localhost"
-DB_PORT = "5433"
+DB_NAME = "growton_ai_zcaz"
+DB_USER = "growton_ai_user"
+DB_PASSWORD = "QDIt4TrRF57WmjjycR7hGU8Uojg1xBw0"
+DB_HOST = "dpg-d46deqa4d50c73avjb1g-a.singapore-postgres.render.com"
+DB_PORT = "5432"
 
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY environment variable not set.")
     exit(1)
 
 # === Database Helper Functions (from ingest_data.py) ===
+
 
 def get_db_connection_params():
     """Returns a dictionary of DB connection parameters."""
@@ -59,7 +62,8 @@ def get_db_connection_params():
         "user": DB_USER,
         "password": DB_PASSWORD,
         "host": DB_HOST,
-        "port": DB_PORT
+        "port": DB_PORT,
+        "sslmode": "require"
     }
 
 def create_schema(conn):

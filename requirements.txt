@@ -1,6 +1,7 @@
 streamlit
 langchain-openai
 langchain
+langchain-core  # Explicitly added
 python-dotenv
 psycopg2-binary
 pgvector
