@@ -8,3 +8,6 @@ pgvector
 redis
 tiktoken
 openai
+plotly
+folium
+streamlit-folium
