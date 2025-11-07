@@ -1,3 +1,4 @@
+
 import streamlit as st
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 #from langchain.prompts import PromptTemplate
@@ -77,12 +78,17 @@ class TokenCostTracker:
         
         return summary_md
 
-
+# --- Database Configuration ---
 DB_NAME = "growton_ai"
-DB_USER = "growton_ai_user"
-DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
-DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
-DB_PORT = "5432"
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
+DB_HOST = "localhost"
+DB_PORT = "5433"
+# DB_NAME = "growton_ai"
+# DB_USER = "growton_ai_user"
+# DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
+# DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
+# DB_PORT = "5432"
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
@@ -90,7 +96,8 @@ if not openai_api_key:
     st.stop()
 
 try:
-    redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    #redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("Successfully connected to Redis.")
 except redis.ConnectionError as e:
@@ -226,7 +233,7 @@ SALES_TAXONOMY = generate_dynamic_taxonomy(
 
 SEGMENT_SYNONYMS = generate_dynamic_taxonomy(
     seed_taxonomy=STATIC_SEGMENT_SYNONYMS,
-    category="Customer Seggents"
+    category="Customer Segments"
 )
 
 COMPANY_DETAILS_TAXONOMY = generate_dynamic_taxonomy(
@@ -562,34 +569,6 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
     return total_duration, contributing_roles
 
 
-def calculate_company_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    """Calculates the total duration for roles at a specific company."""
-    total_duration = 0.0
-    contributing_roles = []
-    if not criteria_obj or not isinstance(criteria_obj, dict):
-        return 0.0, []
-
-    company_name = criteria_obj.get("company_name")
-    if not company_name:
-        return 0.0, []
-    
-    company_name_lower = company_name.lower()
-
-    for role in profile.get('roles', []):
-        role_company = (role.get('company') or '').lower()
-        
-        # Using 'in' for flexibility (e.g., "HCL" vs "HCL Technologies Ltd")
-        if company_name_lower in role_company:
-            duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({
-                'company': role.get('company', ''),
-                'title': role.get('title', ''),
-                'duration_years': duration
-            })
-    return total_duration, contributing_roles
-
-
 # --- Presence Check Functions ---
 
 def check_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
@@ -900,7 +879,7 @@ def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> 
             details_text = (
                 f"{(company_details.get('funding_stage') or '').lower()} "
                 f"{(company_details.get('business_model') or '').lower()} "
-                f"{(company_details.get('product_service', '') or '').lower()}"
+                f"{(company_details.get('product_service') or '').lower()}"
             )
             if v in details_text:
                 found_values.add(v)
@@ -995,43 +974,25 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
     return True
 
 def check_tenure_in_latest_role(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    """Checks tenure in the most recent role against min, max, and exact requirements."""
+    """Checks if the candidate's tenure in their most recent role meets the minimum requirement."""
     min_tenure = criteria.get("min_tenure_in_latest_role")
-    exact_tenure = criteria.get("exact_tenure_in_latest_role")
-    max_tenure = criteria.get("max_tenure_in_latest_role")
-
-    if not min_tenure and not exact_tenure and not max_tenure:
-        return True  # No tenure criteria for latest role
+    if not min_tenure:
+        return True
 
     roles = profile.get('roles', [])
     if not roles:
-        return False  # No roles, so fails any check
+        return False
 
     latest_role = roles[0]
     latest_role_duration = latest_role.get('duration_years', 0.0)
-
-    if min_tenure and latest_role_duration < min_tenure:
-        return False  # Fails min check
-
-    if max_tenure and latest_role_duration > max_tenure:
-        return False  # Fails max check
-
-    if exact_tenure:
-        # Use a small buffer (e.g., 0.1 years) for float comparison
-        if not (exact_tenure - 0.1 <= latest_role_duration <= exact_tenure + 0.1):
-            return False  # Fails exact check
-
-    # If we passed all checks, log it and return True
-    evidence_parts = []
-    if min_tenure: evidence_parts.append(f"min {min_tenure} yrs")
-    if exact_tenure: evidence_parts.append(f"exactly {exact_tenure} yrs")
-    if max_tenure: evidence_parts.append(f"max {max_tenure} yrs")
     
-    profile['evidence_log'].append({
-        "criterion": "tenure_in_latest_role",
-        "source_text": f"Candidate's latest role at {latest_role.get('company')} lasted {latest_role_duration:.1f} years, meeting the requirement ({', '.join(evidence_parts)})."
-    })
-    return True
+    is_met = latest_role_duration >= min_tenure
+    if is_met:
+        profile['evidence_log'].append({
+            "criterion": "min_tenure_in_latest_role",
+            "source_text": f"Candidate's latest role at {latest_role.get('company')} lasted {latest_role_duration} years, meeting the minimum of {min_tenure} years."
+        })
+    return is_met
 
 def check_avg_tenure_in_last_n_roles(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     """Checks if the candidate's average tenure in their last N roles meets the minimum requirement."""
@@ -1091,26 +1052,12 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         profile['calculated_experience'] = {}
         all_criteria_met = True
 
-        # --- Total Experience Checks (Min, Max, Exact) ---
-        total_exp = profile.get("total_experience_years") or 0.0
-        
         min_total_exp = criteria.get("min_total_experience")
-        if min_total_exp and total_exp < min_total_exp:
+        if min_total_exp and (profile.get("total_experience_years") or 0) < min_total_exp:
             all_criteria_met = False
-
-        exact_total_exp = criteria.get("exact_total_experience")
-        if all_criteria_met and exact_total_exp:
-            # Use a small buffer (e.g., 0.1 years) for float comparison
-            if not (exact_total_exp - 0.1 <= total_exp <= exact_total_exp + 0.1):
-                all_criteria_met = False
-        
-        max_total_exp = criteria.get("max_total_experience")
-        if all_criteria_met and max_total_exp and total_exp > max_total_exp:
-            all_criteria_met = False
-        # --- End Total Experience Checks ---
 
         min_managed = criteria.get("min_people_managed")
-        if all_criteria_met and min_managed and (profile.get("max_people_managed") or 0) < min_managed:
+        if min_managed and (profile.get("max_people_managed") or 0) < min_managed:
             all_criteria_met = False
 
         if all_criteria_met and not check_company_presence(profile, criteria):
@@ -1145,79 +1092,28 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                 ("required_company_details", calculate_company_details_experience_duration)
             ]:
                 crit_obj = criteria.get(key)
-                if crit_obj and isinstance(crit_obj, dict):
+                if crit_obj and isinstance(crit_obj, dict) and crit_obj.get("min_years"):
+                    min_y = crit_obj["min_years"]
                     duration, roles = calc_func(profile, crit_obj)
-                    
-                    # Store calculation regardless of filter, for sorting
+
                     profile['calculated_experience'][key] = {
                         "duration": duration,
                         "roles": roles,
                         "label": ", ".join(crit_obj.get("values",[])),
-                        # Store all requirements for potential display/reasoning
-                        "required_min": crit_obj.get("min_years"),
-                        "required_exact": crit_obj.get("exact_years"),
-                        "required_max": crit_obj.get("max_years"),
+                        "required": min_y
                     }
 
-                    # Now, apply filters
-                    min_y = crit_obj.get("min_years")
-                    if min_y and duration < min_y:
+                    if duration < min_y:
                         all_criteria_met = False
                         break
-
-                    exact_y = crit_obj.get("exact_years")
-                    if all_criteria_met and exact_y:
-                         # Use a small buffer (e.t., 0.1 years) for float comparison
-                        if not (exact_y - 0.1 <= duration <= exact_y + 0.1):
-                            all_criteria_met = False
-                            break
-                    
-                    max_y = crit_obj.get("max_years")
-                    if all_criteria_met and max_y and duration > max_y:
-                        all_criteria_met = False
-                        break
-
-            # --- NEW: Handle Company-Specific Tenure ---
-            if all_criteria_met: # Check again in case the loop above set it to False
-                company_tenure_criteria = criteria.get("company_tenure")
-                if company_tenure_criteria and isinstance(company_tenure_criteria, list):
-                    for i, tenure_obj in enumerate(company_tenure_criteria):
-                        if not isinstance(tenure_obj, dict) or not tenure_obj.get("company_name"):
-                            continue
-                        
-                        duration, roles = calculate_company_experience_duration(profile, tenure_obj)
-                        
-                        # Use a unique key for calculated_experience
-                        key = f"company_tenure_{i}"
-                        profile['calculated_experience'][key] = {
-                            "duration": duration,
-                            "roles": roles,
-                            "label": tenure_obj.get("company_name"),
-                            "required_min": tenure_obj.get("min_years"),
-                            "required_exact": tenure_obj.get("exact_years"),
-                            "required_max": tenure_obj.get("max_years"),
-                        }
-
-                        # Apply filters
-                        min_y = tenure_obj.get("min_years")
-                        if min_y and duration < min_y:
-                            all_criteria_met = False
-                            break # Fails this company tenure obj
-
-                        exact_y = tenure_obj.get("exact_years")
-                        if all_criteria_met and exact_y:
-                            if not (exact_y - 0.1 <= duration <= exact_y + 0.1):
-                                all_criteria_met = False
-                                break # Fails this company tenure obj
-
-                        max_y = tenure_obj.get("max_years")
-                        if all_criteria_met and max_y and duration > max_y:
-                            all_criteria_met = False
-                            break # Fails this company tenure obj
-                    
-                    if not all_criteria_met:
-                        continue # Go to the next profile
-            # --- END NEW BLOCK ---
+                elif crit_obj and isinstance(crit_obj, dict):
+                    duration, roles = calc_func(profile, crit_obj)
+                    profile['calculated_experience'][key] = {
+                        "duration": duration,
+                        "roles": roles,
+                        "label": ", ".join(crit_obj.get("values",[])),
+                        "required": 0.0
+                    }
 
         if all_criteria_met:
             if profile['calculated_experience']:
@@ -1256,9 +1152,9 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
 
         **Instructions:**
         - Use the `calculated_experience` and `evidence_log` from the candidate's JSON to find evidence.
-        - For tenure criteria (like 'tenure_in_latest_role' or 'avg_tenure'), use the `source_text` from the `evidence_log`.
-        - For other criteria (like 'required_functions' or 'company_tenure'), mention the duration from `calculated_experience`.
-        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed" unless they were the *only* criteria.
+        - For tenure criteria, use the `source_text` from the `evidence_log`.
+        - For other criteria, mention the duration from `calculated_experience`.
+        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed".
         - The entire reasoning must be a single, flowing paragraph without bullet points or newlines.
         - Do not include the markdown pipe `|` characters. Just the text.
 
@@ -1318,8 +1214,7 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
 You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and correctly associate any specified durations or tenure requirements.
 
 **DEFINITIONS, TAXONOMIES & CANONICAL KEYS:**
-- `required_companies`: List of specific company names. **Use this for simple presence checks only.**
-- `company_tenure`: A list of objects for company-specific duration checks. Each object has "company_name" and duration keys (e.g., "min_years", "exact_years").
+- `required_companies`: List of specific company names.
 - `required_functions`: Sales roles. **MUST** map to a key from the sales taxonomy.
   - **Sales Taxonomy:** {sales_taxonomy_json}
 - `required_segments`: Customer types. **MUST** map to a key from the segment taxonomy.
@@ -1334,11 +1229,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `excluded_geographies`: Regions or countries to specifically exclude.
 - `required_locations`: Candidate's physical base.
 - `top_n`: Integer for the number of candidates to return.
+- `min_total_experience`: The candidate's entire career duration.
+- `min_tenure_in_latest_role`: Minimum years in the most recent company.
 - `avg_tenure_in_last_n_roles`: An object with `avg_years` and `num_roles` for average tenure calculations.
-
-**NEW DURATION & TENURE KEYS:**
-- `min_total_experience`, `exact_total_experience`, `max_total_experience` (float)
-- `min_tenure_in_latest_role`, `exact_tenure_in_latest_role`, `max_tenure_in_latest_role` (float)
 
 **NEW LOCATION RULE:**
 - Queries like "Candidates in [Location]", "Find people in [Location]", or "[Job Title] in [Location]" **MUST** be mapped to `required_locations`.
@@ -1346,25 +1239,15 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
 **JSON STRUCTURE & DURATION RULES:**
 - For inclusion criteria (required_*), use an object with "operator" ("AND"/"OR") and "values".
-- **Exception**: `required_companies` (for presence check) can be a simple list of strings.
-- **Duration Rule:** If a duration is mentioned with a function, industry, or segment, capture it appropriately inside that criterion's object:
-    - 'at least 5 years', '5+ years' -> `"min_years": 5.0`
-    - 'exactly 5 years', '5 years' -> `"exact_years": 5.0`
-    - 'at most 5 years', 'up to 5 years' -> `"max_years": 5.0`
-- **Company Tenure Rule:** If a duration is linked to a *specific company*, use the `company_tenure` list.
-- **Tenure Rule:** Capture specific tenure requests using the new tenure keys (e.g., `exact_tenure_in_latest_role`).
+- **Exception**: `required_companies` can be a simple list of strings if no operator is needed, OR an object.
+- **Duration Rule:** If a duration (e.g., '10 years') is mentioned with a function, industry, or segment, capture it as `min_years` inside that criterion's object.
+- **Tenure Rule:** Capture specific tenure requests using `min_tenure_in_latest_role` or `avg_tenure_in_last_n_roles`.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
 | User Query                                                    | Correct JSON Output                                                                                                                                                             |
 |---------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "12 years as an Account Executive"                            | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 12.0}}}}`                                                                                       |
-| "exactly 10 years total experience"                           | `{{"exact_total_experience": 10.0}}`                                                                                                                                            |
-| "max 15 years total experience"                               | `{{"max_total_experience": 15.0}}`                                                                                                                                              |
-| "exactly 3 years in SaaS"                                     | `{{"required_industries": {{"operator": "OR", "values": ["SaaS"], "exact_years": 3.0}}}}`                                                                                       |
-| "worked in recent company for exactly 2 yrs"                  | `{{"exact_tenure_in_latest_role": 2.0}}`                                                                                                                                        |
-| "at most 4 years in their last role"                          | `{{"max_tenure_in_latest_role": 4.0}}`                                                                                                                                          |
-| "exactly 3 yrs of exp in HCL Technologies Ltd"                | `{{"company_tenure": [{{"company_name": "HCL Technologies Ltd", "exact_years": 3.0}}]}}`                                                                                        |
-| "at least 5 years at Google"                                  | `{{"company_tenure": [{{"company_name": "Google", "min_years": 5.0}}]}}`                                                                                                        |
+| "worked in recent company at least more than 2 yrs"           | `{{"min_tenure_in_latest_role": 2.0}}`                                                                                                                                           |
 | "avg work exp of 3 yrs in last 2 companies"                   | `{{"avg_tenure_in_last_n_roles": {{"avg_years": 3.0, "num_roles": 2}}}}`                                                                                                        |
 | "inside sales with 5 years exp and avg tenure of 2y in last 3 roles" | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 5.0}}, "avg_tenure_in_last_n_roles": {{"avg_years": 2.0, "num_roles": 3}}}}` |
 | "Candidates in Florida"                                       | `{{"required_locations": {{"operator": "OR", "values": ["Florida"]}}}}`                                                                                                         |
@@ -1373,13 +1256,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
 
 **Available criteria keys:**
-- `min_total_experience`, `exact_total_experience`, `max_total_experience` (float)
+- `min_total_experience` (float)
 - `min_people_managed` (integer)
 - `required_locations` (object)
 - `required_geographies` (object)
 - `excluded_geographies` (object)
 - `required_companies` (list of strings)
-- `company_tenure` (list of objects)
 - `required_industries` (object)
 - `required_functions` (object)
 - `required_segments` (object)
@@ -1387,7 +1269,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `required_culture_type` (object)
 - `competitors_of` (list of strings)
 - `top_n` (integer)
-- `min_tenure_in_latest_role`, `exact_tenure_in_latest_role`, `max_tenure_in_latest_role` (float)
+- `min_tenure_in_latest_role` (float)
 - `avg_tenure_in_last_n_roles` (object with "avg_years" and "num_roles")
 
 **CRITICAL INSTRUCTION**: Map user terms to their canonical keys using the provided taxonomies.
@@ -1704,7 +1586,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 tracker.add_usage(llm.model_name, prompt_text, location_response.content, "Location Expansion")
                 logger.info(f"Raw location expansion response from LLM: {location_response.content}")
                 expanded_locations_raw = safe_json_loads(location_response.content, [])
-                expanded_locations = get_list_from_llllm_json(expanded_locations_raw)
+                expanded_locations = get_list_from_llm_json(expanded_locations_raw)
                 
                 all_locations = list(set(locations_to_expand + expanded_locations))
                 
@@ -1728,17 +1610,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
         logger.error(f"Error expanding keywords: {e}")
 
     yield "Performing initial semantic search..."
-    
-    # --- FIX 1: Add company_tenure names to search_query_text ---
-    company_tenure_names = []
-    if criteria.get("company_tenure"):
-        for tenure_obj in criteria.get("company_tenure", []):
-            if isinstance(tenure_obj, dict) and tenure_obj.get("company_name"):
-                company_tenure_names.append(tenure_obj["company_name"])
-
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
-        company_tenure_names + # <-- ADDED
         get_values_from_criteria(criteria.get("required_industries")) +
         get_values_from_criteria(criteria.get("required_functions")) +
         get_values_from_criteria(criteria.get("required_segments")) +
@@ -1747,17 +1620,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
         get_values_from_criteria(criteria.get("required_culture_type"))
     )
 
-    # --- FIX 2: Add company_tenure to hard_filters_present check ---
     hard_filters_present = (
         criteria.get("required_locations") or
         criteria.get("min_people_managed") is not None or
         criteria.get("min_total_experience") is not None or
-        criteria.get("exact_total_experience") is not None or
-        criteria.get("max_total_experience") is not None or
-        criteria.get("required_companies") or
-        criteria.get("company_tenure") # <-- ADDED
+        criteria.get("required_companies")
     )
-    
     if not search_query_text and not hard_filters_present:
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
         return
@@ -1783,7 +1651,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
         initial_candidate_pool = [PROFILES_BY_ID[id] for id in initial_candidate_ids if id in PROFILES_BY_ID]
         yield f"Found {len(initial_candidate_pool)} potential matches. "
     else:
-        # This branch will now be correctly reached if only hard filters (like company_tenure) are present
         initial_candidate_pool = list(PROFILES_BY_ID.values())
 
 
@@ -1844,6 +1711,271 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
     # 4. After the loop finishes (or is stopped), send the final 'complete' message
     yield {"type": "complete", "data": processed_candidates, "summary": tracker.get_summary()}
+
+# --- Excel Export Helper ---
+def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
+    """Converts a dictionary of selected profiles to an Excel file in memory."""
+    if not profiles_dict:
+        return b""
+    
+    profiles_list = list(profiles_dict.values())
+    flat_data = []
+    for p in profiles_list:
+        # Simple role summarization
+        roles_summary = []
+        for role in p.get('roles', []):
+            company = role.get('company', 'N/A')
+            title = role.get('title', 'N/A')
+            duration = role.get('duration_years', 0)
+            roles_summary.append(f"{title} at {company} ({duration:.1f} yrs)")
+
+        flat_data.append({
+            "Name": p.get("name"),
+            "LinkedIn": p.get("linkedin"),
+            "Location": p.get("location"),
+            "Relevance Summary": p.get("reasoning", "N/A"),
+            "Total Experience (Yrs)": p.get("total_experience_years"),
+            "Max People Managed": p.get("max_people_managed"),
+            "Roles": " | ".join(roles_summary)
+        })
+    
+    df = pd.DataFrame(flat_data)
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Selected Profiles')
+        # Auto-adjust column widths
+        for column in df:
+            column_length = max(df[column].astype(str).map(len).max(), len(column))
+            col_idx = df.columns.get_loc(column)
+            writer.sheets['Selected Profiles'].column_dimensions[chr(65 + col_idx)].width = column_length + 2
+
+    return output.getvalue()
+
+# --- UI Helper Function ---
+def display_profile_with_checkbox(profile: Dict[str, Any], container):
+    """Helper to render a single profile with its checkbox inside a given container."""
+    with container.container(border=True):
+        col1, col2 = st.columns([0.6, 0.4])
+        with col1:
+            # The checkbox's state is controlled by session_state
+            is_selected = st.checkbox(
+                f"**{profile.get('name', 'N/A')}**", 
+                key=f"select_{profile['id']}",
+                value=(profile['id'] in st.session_state.selected_profiles)
+            )
+            st.markdown(f"[{profile.get('linkedin', '#')}]({profile.get('linkedin', '#')})")
+        
+        with col2:
+             st.caption(f"Total Exp: {profile.get('total_experience_years', 0):.1f} yrs | Location: {profile.get('location', 'N/A')}")
+
+        # Show reasoning, or a placeholder if it's somehow missing
+        st.markdown(f"**Relevance:** {profile.get('reasoning', '*Reasoning not available.*')}")
+
+        # This logic updates the session state when the user clicks the box
+        if is_selected:
+            if profile['id'] not in st.session_state.selected_profiles:
+                st.session_state.selected_profiles[profile['id']] = profile
+        elif profile['id'] in st.session_state.selected_profiles:
+            del st.session_state.selected_profiles[profile['id']]
+
+# --- Streamlit UI ---
+st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] {
+        width: 320px !important;
+        min-width: 300px !important;
+        max-width: 350px !important;
+    }
+    section[data-testid="stSidebar"] > div {
+        height: 100%;
+        overflow-y: auto;
+    }
+    .result-container {
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+st.markdown(
+    """
+    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 30px;">
+        <img src="https://media.licdn.com/dms/image/v2/D560BAQF7O3De5SQ1vA/company-logo_200_200/company-logo_200_200/0/1708433749265/letsgrowton_logo?e=2147483647&v=beta&t=GerSYeinV4BZI9iFhaAo1dfHFDS1Ym5cwhYYwQXEWJo"
+             style="width:50px;height:50px;">
+        <h1 style="margin: 0; font-size: 2.2em;">Growton AI</h1>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+st.sidebar.subheader("📊 Dataset Summary")
+total_profiles = len(PROFILES_BY_ID)
+total_exp = sum(p.get("total_experience_years") or 0 for p in PROFILES_BY_ID.values())
+avg_experience = total_exp / total_profiles if total_profiles > 0 else 0
+st.sidebar.markdown(f"**Total Profiles:** {total_profiles}")
+st.sidebar.markdown(f"**Avg. Experience:** {round(avg_experience, 1)} years")
+st.sidebar.markdown("---")
+
+# --- Session State Management ---
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = hashlib.sha256(os.urandom(32)).hexdigest()
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'token_tracker' not in st.session_state:
+    st.session_state.token_tracker = TokenCostTracker()
+if 'generating' not in st.session_state:
+    st.session_state.generating = False
+if 'stop_signal' not in st.session_state:
+    st.session_state.stop_signal = False
+if 'last_results' not in st.session_state:
+    st.session_state.last_results = []
+if 'selected_profiles' not in st.session_state:
+    st.session_state.selected_profiles = {} # Stores profile data by ID
+
+# --- Chat History Display ---
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# --- Generation Logic ---
+if st.session_state.get("generating"):
+    if st.button("Stop Generation"):
+        st.session_state.stop_signal = True
+        # No rerun, just set the signal. The loop below will catch it.
+
+    # --- Placeholders for live updates ---
+    status_placeholder = st.empty()
+    progress_bar = st.empty()
+    summary_placeholder = st.empty()
+    
+    # This container will hold the results as they stream in
+    st.markdown("---")
+    st.subheader("Search Results")
+    results_container = st.container()
+    
+    prompt = st.session_state.messages[-1]["content"]
+    
+    async def run_generation_and_display():
+        """Runs the query and displays results as they arrive."""
+        
+        # Clear previous results from state for this new run
+        st.session_state.last_results = []
+        
+        generator = process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker)
+        
+        async for item in generator:
+            if st.session_state.get("stop_signal", False):
+                logger.info("Stop signal received, halting generation.")
+                status_placeholder.warning("Generation stopped by user.")
+                break
+            
+            if isinstance(item, str):
+                # Handle status strings
+                status_placeholder.info(item)
+            
+            elif isinstance(item, dict):
+                msg_type = item.get("type")
+                
+                if msg_type == "progress_start":
+                    total = item.get("total", 0)
+                    if total > 0:
+                        status_placeholder.info(f"Found {total} candidates. Generating summaries...")
+                        progress_bar.progress(0.0, text="0%")
+
+                elif msg_type == "profile_chunk":
+                    profile = item.get("data")
+                    if profile:
+                        # Add to state
+                        st.session_state.last_results.append(profile)
+                        
+                        # Update progress bar
+                        current = item.get("current", 0)
+                        total = item.get("total", 1) # Avoid division by zero
+                        progress_percent = current / total
+                        progress_bar.progress(progress_percent, text=f"{current}/{total} ({progress_percent:.0%})")
+                        
+                        # Use our new helper to draw the profile *immediately*
+                        display_profile_with_checkbox(profile, results_container)
+
+                elif msg_type == "complete":
+                    final_data = item.get("data", [])
+                    final_summary = item.get("summary", "")
+                    
+                    # Final sync of session state
+                    st.session_state.last_results = final_data
+                    
+                    if not final_data:
+                        status_placeholder.info("No candidates were found that strictly match all criteria.")
+                    
+                    if final_summary:
+                        summary_placeholder.markdown(final_summary)
+
+                    # Add final summary to chat history
+                    assistant_message = f"Found {len(final_data)} candidates."
+                    if final_summary:
+                        assistant_message += f"\n\n{final_summary}"
+                    st.session_state.messages.append({"role": "assistant", "content": assistant_message})
+                    
+                    break # Generation is finished
+
+    # Run the streaming function
+    asyncio.run(run_generation_and_display())
+    
+    # Generation is complete, update state and rerun to show the 'Export' section
+    st.session_state.generating = False
+    st.session_state.stop_signal = False
+    st.rerun()
+
+
+# --- Results Display with Checkboxes ---
+if st.session_state.last_results:
+    st.markdown("---")
+    st.subheader("Search Results")
+    
+    # This container will hold the results after the page reruns
+    results_container = st.container()
+    for profile in st.session_state.last_results:
+        # Use the same helper function to re-draw the profiles
+        display_profile_with_checkbox(profile, results_container)
+
+    st.markdown("---")
+    st.subheader("Export Selection")
+    
+    # The rest of your export logic stays exactly the same
+    selected_count = len(st.session_state.selected_profiles)
+    st.write(f"You have selected **{selected_count}** profile(s).")
+    
+    if selected_count > 0:
+        # Preview Section
+        if st.button("Preview Selection"):
+            preview_data = [{ "Name": p['name'], "LinkedIn": p['linkedin'], "Location": p['location']} for p in st.session_state.selected_profiles.values()]
+            st.dataframe(preview_data)
+
+        # Download Button
+        excel_data = profiles_to_excel(st.session_state.selected_profiles)
+        st.download_button(
+            label="📥 Download Selected Profiles as Excel",
+            data=excel_data,
+            file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+# --- Chat Input Form ---
+if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating")):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.generating = True
+    st.session_state.stop_signal = False
+    # Clear previous results and selections for a new search
+    st.session_state.last_results = []
+    st.session_state.selected_profiles = {}
+    st.rerun()
 
 # --- Excel Export Helper ---
 def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:

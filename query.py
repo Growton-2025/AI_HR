@@ -78,17 +78,16 @@ class TokenCostTracker:
         return summary_md
 
 # --- Database Configuration ---
-# DB_NAME = "growton_ai"
-# DB_USER = "postgres"
-# DB_PASSWORD = "postgres"
-# DB_HOST = "localhost"
-# DB_PORT = "5433"
 DB_NAME = "growton_ai"
-DB_USER = "growton_ai_user"
-DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
-DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
-DB_PORT = "5432"
-
+DB_USER = "postgres"
+DB_PASSWORD = "postgres"
+DB_HOST = "localhost"
+DB_PORT = "5433"
+# DB_NAME = "growton_ai"
+# DB_USER = "growton_ai_user"
+# DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
+# DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
+# DB_PORT = "5432"
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
@@ -96,7 +95,8 @@ if not openai_api_key:
     st.stop()
 
 try:
-    redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    #redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("Successfully connected to Redis.")
 except redis.ConnectionError as e:
@@ -232,7 +232,7 @@ SALES_TAXONOMY = generate_dynamic_taxonomy(
 
 SEGMENT_SYNONYMS = generate_dynamic_taxonomy(
     seed_taxonomy=STATIC_SEGMENT_SYNONYMS,
-    category="Customer Seggents"
+    category="Customer Segments"
 )
 
 COMPANY_DETAILS_TAXONOMY = generate_dynamic_taxonomy(
@@ -568,34 +568,6 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
     return total_duration, contributing_roles
 
 
-def calculate_company_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    """Calculates the total duration for roles at a specific company."""
-    total_duration = 0.0
-    contributing_roles = []
-    if not criteria_obj or not isinstance(criteria_obj, dict):
-        return 0.0, []
-
-    company_name = criteria_obj.get("company_name")
-    if not company_name:
-        return 0.0, []
-    
-    company_name_lower = company_name.lower()
-
-    for role in profile.get('roles', []):
-        role_company = (role.get('company') or '').lower()
-        
-        # Using 'in' for flexibility (e.g., "HCL" vs "HCL Technologies Ltd")
-        if company_name_lower in role_company:
-            duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({
-                'company': role.get('company', ''),
-                'title': role.get('title', ''),
-                'duration_years': duration
-            })
-    return total_duration, contributing_roles
-
-
 # --- Presence Check Functions ---
 
 def check_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
@@ -906,7 +878,7 @@ def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> 
             details_text = (
                 f"{(company_details.get('funding_stage') or '').lower()} "
                 f"{(company_details.get('business_model') or '').lower()} "
-                f"{(company_details.get('product_service', '') or '').lower()}"
+                f"{(company_details.get('product_service') or '').lower()}"
             )
             if v in details_text:
                 found_values.add(v)
@@ -1001,43 +973,25 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
     return True
 
 def check_tenure_in_latest_role(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    """Checks tenure in the most recent role against min, max, and exact requirements."""
+    """Checks if the candidate's tenure in their most recent role meets the minimum requirement."""
     min_tenure = criteria.get("min_tenure_in_latest_role")
-    exact_tenure = criteria.get("exact_tenure_in_latest_role")
-    max_tenure = criteria.get("max_tenure_in_latest_role")
-
-    if not min_tenure and not exact_tenure and not max_tenure:
-        return True  # No tenure criteria for latest role
+    if not min_tenure:
+        return True
 
     roles = profile.get('roles', [])
     if not roles:
-        return False  # No roles, so fails any check
+        return False
 
     latest_role = roles[0]
     latest_role_duration = latest_role.get('duration_years', 0.0)
-
-    if min_tenure and latest_role_duration < min_tenure:
-        return False  # Fails min check
-
-    if max_tenure and latest_role_duration > max_tenure:
-        return False  # Fails max check
-
-    if exact_tenure:
-        # Use a small buffer (e.g., 0.1 years) for float comparison
-        if not (exact_tenure - 0.1 <= latest_role_duration <= exact_tenure + 0.1):
-            return False  # Fails exact check
-
-    # If we passed all checks, log it and return True
-    evidence_parts = []
-    if min_tenure: evidence_parts.append(f"min {min_tenure} yrs")
-    if exact_tenure: evidence_parts.append(f"exactly {exact_tenure} yrs")
-    if max_tenure: evidence_parts.append(f"max {max_tenure} yrs")
     
-    profile['evidence_log'].append({
-        "criterion": "tenure_in_latest_role",
-        "source_text": f"Candidate's latest role at {latest_role.get('company')} lasted {latest_role_duration:.1f} years, meeting the requirement ({', '.join(evidence_parts)})."
-    })
-    return True
+    is_met = latest_role_duration >= min_tenure
+    if is_met:
+        profile['evidence_log'].append({
+            "criterion": "min_tenure_in_latest_role",
+            "source_text": f"Candidate's latest role at {latest_role.get('company')} lasted {latest_role_duration} years, meeting the minimum of {min_tenure} years."
+        })
+    return is_met
 
 def check_avg_tenure_in_last_n_roles(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     """Checks if the candidate's average tenure in their last N roles meets the minimum requirement."""
@@ -1097,26 +1051,12 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
         profile['calculated_experience'] = {}
         all_criteria_met = True
 
-        # --- Total Experience Checks (Min, Max, Exact) ---
-        total_exp = profile.get("total_experience_years") or 0.0
-        
         min_total_exp = criteria.get("min_total_experience")
-        if min_total_exp and total_exp < min_total_exp:
+        if min_total_exp and (profile.get("total_experience_years") or 0) < min_total_exp:
             all_criteria_met = False
-
-        exact_total_exp = criteria.get("exact_total_experience")
-        if all_criteria_met and exact_total_exp:
-            # Use a small buffer (e.g., 0.1 years) for float comparison
-            if not (exact_total_exp - 0.1 <= total_exp <= exact_total_exp + 0.1):
-                all_criteria_met = False
-        
-        max_total_exp = criteria.get("max_total_experience")
-        if all_criteria_met and max_total_exp and total_exp > max_total_exp:
-            all_criteria_met = False
-        # --- End Total Experience Checks ---
 
         min_managed = criteria.get("min_people_managed")
-        if all_criteria_met and min_managed and (profile.get("max_people_managed") or 0) < min_managed:
+        if min_managed and (profile.get("max_people_managed") or 0) < min_managed:
             all_criteria_met = False
 
         if all_criteria_met and not check_company_presence(profile, criteria):
@@ -1151,79 +1091,28 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                 ("required_company_details", calculate_company_details_experience_duration)
             ]:
                 crit_obj = criteria.get(key)
-                if crit_obj and isinstance(crit_obj, dict):
+                if crit_obj and isinstance(crit_obj, dict) and crit_obj.get("min_years"):
+                    min_y = crit_obj["min_years"]
                     duration, roles = calc_func(profile, crit_obj)
-                    
-                    # Store calculation regardless of filter, for sorting
+
                     profile['calculated_experience'][key] = {
                         "duration": duration,
                         "roles": roles,
                         "label": ", ".join(crit_obj.get("values",[])),
-                        # Store all requirements for potential display/reasoning
-                        "required_min": crit_obj.get("min_years"),
-                        "required_exact": crit_obj.get("exact_years"),
-                        "required_max": crit_obj.get("max_years"),
+                        "required": min_y
                     }
 
-                    # Now, apply filters
-                    min_y = crit_obj.get("min_years")
-                    if min_y and duration < min_y:
+                    if duration < min_y:
                         all_criteria_met = False
                         break
-
-                    exact_y = crit_obj.get("exact_years")
-                    if all_criteria_met and exact_y:
-                         # Use a small buffer (e.t., 0.1 years) for float comparison
-                        if not (exact_y - 0.1 <= duration <= exact_y + 0.1):
-                            all_criteria_met = False
-                            break
-                    
-                    max_y = crit_obj.get("max_years")
-                    if all_criteria_met and max_y and duration > max_y:
-                        all_criteria_met = False
-                        break
-
-            # --- NEW: Handle Company-Specific Tenure ---
-            if all_criteria_met: # Check again in case the loop above set it to False
-                company_tenure_criteria = criteria.get("company_tenure")
-                if company_tenure_criteria and isinstance(company_tenure_criteria, list):
-                    for i, tenure_obj in enumerate(company_tenure_criteria):
-                        if not isinstance(tenure_obj, dict) or not tenure_obj.get("company_name"):
-                            continue
-                        
-                        duration, roles = calculate_company_experience_duration(profile, tenure_obj)
-                        
-                        # Use a unique key for calculated_experience
-                        key = f"company_tenure_{i}"
-                        profile['calculated_experience'][key] = {
-                            "duration": duration,
-                            "roles": roles,
-                            "label": tenure_obj.get("company_name"),
-                            "required_min": tenure_obj.get("min_years"),
-                            "required_exact": tenure_obj.get("exact_years"),
-                            "required_max": tenure_obj.get("max_years"),
-                        }
-
-                        # Apply filters
-                        min_y = tenure_obj.get("min_years")
-                        if min_y and duration < min_y:
-                            all_criteria_met = False
-                            break # Fails this company tenure obj
-
-                        exact_y = tenure_obj.get("exact_years")
-                        if all_criteria_met and exact_y:
-                            if not (exact_y - 0.1 <= duration <= exact_y + 0.1):
-                                all_criteria_met = False
-                                break # Fails this company tenure obj
-
-                        max_y = tenure_obj.get("max_years")
-                        if all_criteria_met and max_y and duration > max_y:
-                            all_criteria_met = False
-                            break # Fails this company tenure obj
-                    
-                    if not all_criteria_met:
-                        continue # Go to the next profile
-            # --- END NEW BLOCK ---
+                elif crit_obj and isinstance(crit_obj, dict):
+                    duration, roles = calc_func(profile, crit_obj)
+                    profile['calculated_experience'][key] = {
+                        "duration": duration,
+                        "roles": roles,
+                        "label": ", ".join(crit_obj.get("values",[])),
+                        "required": 0.0
+                    }
 
         if all_criteria_met:
             if profile['calculated_experience']:
@@ -1262,9 +1151,9 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
 
         **Instructions:**
         - Use the `calculated_experience` and `evidence_log` from the candidate's JSON to find evidence.
-        - For tenure criteria (like 'tenure_in_latest_role' or 'avg_tenure'), use the `source_text` from the `evidence_log`.
-        - For other criteria (like 'required_functions' or 'company_tenure'), mention the duration from `calculated_experience`.
-        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed" unless they were the *only* criteria.
+        - For tenure criteria, use the `source_text` from the `evidence_log`.
+        - For other criteria, mention the duration from `calculated_experience`.
+        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed".
         - The entire reasoning must be a single, flowing paragraph without bullet points or newlines.
         - Do not include the markdown pipe `|` characters. Just the text.
 
@@ -1324,8 +1213,7 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
 You are an expert assistant tasked with extracting structured filtering criteria from a user's query for a candidate search system. Your goal is to categorize user intent into functions, segments, industries, etc., and correctly associate any specified durations or tenure requirements.
 
 **DEFINITIONS, TAXONOMIES & CANONICAL KEYS:**
-- `required_companies`: List of specific company names. **Use this for simple presence checks only.**
-- `company_tenure`: A list of objects for company-specific duration checks. Each object has "company_name" and duration keys (e.g., "min_years", "exact_years").
+- `required_companies`: List of specific company names.
 - `required_functions`: Sales roles. **MUST** map to a key from the sales taxonomy.
   - **Sales Taxonomy:** {sales_taxonomy_json}
 - `required_segments`: Customer types. **MUST** map to a key from the segment taxonomy.
@@ -1340,11 +1228,9 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `excluded_geographies`: Regions or countries to specifically exclude.
 - `required_locations`: Candidate's physical base.
 - `top_n`: Integer for the number of candidates to return.
+- `min_total_experience`: The candidate's entire career duration.
+- `min_tenure_in_latest_role`: Minimum years in the most recent company.
 - `avg_tenure_in_last_n_roles`: An object with `avg_years` and `num_roles` for average tenure calculations.
-
-**NEW DURATION & TENURE KEYS:**
-- `min_total_experience`, `exact_total_experience`, `max_total_experience` (float)
-- `min_tenure_in_latest_role`, `exact_tenure_in_latest_role`, `max_tenure_in_latest_role` (float)
 
 **NEW LOCATION RULE:**
 - Queries like "Candidates in [Location]", "Find people in [Location]", or "[Job Title] in [Location]" **MUST** be mapped to `required_locations`.
@@ -1352,25 +1238,15 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
 **JSON STRUCTURE & DURATION RULES:**
 - For inclusion criteria (required_*), use an object with "operator" ("AND"/"OR") and "values".
-- **Exception**: `required_companies` (for presence check) can be a simple list of strings.
-- **Duration Rule:** If a duration is mentioned with a function, industry, or segment, capture it appropriately inside that criterion's object:
-    - 'at least 5 years', '5+ years' -> `"min_years": 5.0`
-    - 'exactly 5 years', '5 years' -> `"exact_years": 5.0`
-    - 'at most 5 years', 'up to 5 years' -> `"max_years": 5.0`
-- **Company Tenure Rule:** If a duration is linked to a *specific company*, use the `company_tenure` list.
-- **Tenure Rule:** Capture specific tenure requests using the new tenure keys (e.g., `exact_tenure_in_latest_role`).
+- **Exception**: `required_companies` can be a simple list of strings if no operator is needed, OR an object.
+- **Duration Rule:** If a duration (e.g., '10 years') is mentioned with a function, industry, or segment, capture it as `min_years` inside that criterion's object.
+- **Tenure Rule:** Capture specific tenure requests using `min_tenure_in_latest_role` or `avg_tenure_in_last_n_roles`.
 
 **EXAMPLES TABLE (Follow this logic exactly):**
 | User Query                                                    | Correct JSON Output                                                                                                                                                             |
 |---------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "12 years as an Account Executive"                            | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 12.0}}}}`                                                                                       |
-| "exactly 10 years total experience"                           | `{{"exact_total_experience": 10.0}}`                                                                                                                                            |
-| "max 15 years total experience"                               | `{{"max_total_experience": 15.0}}`                                                                                                                                              |
-| "exactly 3 years in SaaS"                                     | `{{"required_industries": {{"operator": "OR", "values": ["SaaS"], "exact_years": 3.0}}}}`                                                                                       |
-| "worked in recent company for exactly 2 yrs"                  | `{{"exact_tenure_in_latest_role": 2.0}}`                                                                                                                                        |
-| "at most 4 years in their last role"                          | `{{"max_tenure_in_latest_role": 4.0}}`                                                                                                                                          |
-| "exactly 3 yrs of exp in HCL Technologies Ltd"                | `{{"company_tenure": [{{"company_name": "HCL Technologies Ltd", "exact_years": 3.0}}]}}`                                                                                        |
-| "at least 5 years at Google"                                  | `{{"company_tenure": [{{"company_name": "Google", "min_years": 5.0}}]}}`                                                                                                        |
+| "worked in recent company at least more than 2 yrs"           | `{{"min_tenure_in_latest_role": 2.0}}`                                                                                                                                           |
 | "avg work exp of 3 yrs in last 2 companies"                   | `{{"avg_tenure_in_last_n_roles": {{"avg_years": 3.0, "num_roles": 2}}}}`                                                                                                        |
 | "inside sales with 5 years exp and avg tenure of 2y in last 3 roles" | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 5.0}}, "avg_tenure_in_last_n_roles": {{"avg_years": 2.0, "num_roles": 3}}}}` |
 | "Candidates in Florida"                                       | `{{"required_locations": {{"operator": "OR", "values": ["Florida"]}}}}`                                                                                                         |
@@ -1379,13 +1255,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
 
 **Available criteria keys:**
-- `min_total_experience`, `exact_total_experience`, `max_total_experience` (float)
+- `min_total_experience` (float)
 - `min_people_managed` (integer)
 - `required_locations` (object)
 - `required_geographies` (object)
 - `excluded_geographies` (object)
 - `required_companies` (list of strings)
-- `company_tenure` (list of objects)
 - `required_industries` (object)
 - `required_functions` (object)
 - `required_segments` (object)
@@ -1393,7 +1268,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 - `required_culture_type` (object)
 - `competitors_of` (list of strings)
 - `top_n` (integer)
-- `min_tenure_in_latest_role`, `exact_tenure_in_latest_role`, `max_tenure_in_latest_role` (float)
+- `min_tenure_in_latest_role` (float)
 - `avg_tenure_in_last_n_roles` (object with "avg_years" and "num_roles")
 
 **CRITICAL INSTRUCTION**: Map user terms to their canonical keys using the provided taxonomies.
@@ -1710,7 +1585,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
                 tracker.add_usage(llm.model_name, prompt_text, location_response.content, "Location Expansion")
                 logger.info(f"Raw location expansion response from LLM: {location_response.content}")
                 expanded_locations_raw = safe_json_loads(location_response.content, [])
-                expanded_locations = get_list_from_llllm_json(expanded_locations_raw)
+                expanded_locations = get_list_from_llm_json(expanded_locations_raw)
                 
                 all_locations = list(set(locations_to_expand + expanded_locations))
                 
@@ -1734,17 +1609,8 @@ You are an expert assistant tasked with extracting structured filtering criteria
         logger.error(f"Error expanding keywords: {e}")
 
     yield "Performing initial semantic search..."
-    
-    # --- FIX 1: Add company_tenure names to search_query_text ---
-    company_tenure_names = []
-    if criteria.get("company_tenure"):
-        for tenure_obj in criteria.get("company_tenure", []):
-            if isinstance(tenure_obj, dict) and tenure_obj.get("company_name"):
-                company_tenure_names.append(tenure_obj["company_name"])
-
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
-        company_tenure_names + # <-- ADDED
         get_values_from_criteria(criteria.get("required_industries")) +
         get_values_from_criteria(criteria.get("required_functions")) +
         get_values_from_criteria(criteria.get("required_segments")) +
@@ -1753,17 +1619,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
         get_values_from_criteria(criteria.get("required_culture_type"))
     )
 
-    # --- FIX 2: Add company_tenure to hard_filters_present check ---
     hard_filters_present = (
         criteria.get("required_locations") or
         criteria.get("min_people_managed") is not None or
         criteria.get("min_total_experience") is not None or
-        criteria.get("exact_total_experience") is not None or
-        criteria.get("max_total_experience") is not None or
-        criteria.get("required_companies") or
-        criteria.get("company_tenure") # <-- ADDED
+        criteria.get("required_companies")
     )
-    
     if not search_query_text and not hard_filters_present:
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
         return
@@ -1789,7 +1650,6 @@ You are an expert assistant tasked with extracting structured filtering criteria
         initial_candidate_pool = [PROFILES_BY_ID[id] for id in initial_candidate_ids if id in PROFILES_BY_ID]
         yield f"Found {len(initial_candidate_pool)} potential matches. "
     else:
-        # This branch will now be correctly reached if only hard filters (like company_tenure) are present
         initial_candidate_pool = list(PROFILES_BY_ID.values())
 
 
@@ -1850,53 +1710,7 @@ You are an expert assistant tasked with extracting structured filtering criteria
 
     # 4. After the loop finishes (or is stopped), send the final 'complete' message
     yield {"type": "complete", "data": processed_candidates, "summary": tracker.get_summary()}
-    
-    # --- NEW: Parallel Processing with asyncio.Semaphore and as_completed ---
-    CONCURRENCY_LIMIT = 10
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-    async def get_reasoning_with_semaphore(profile):
-        """Wrapper to apply semaphore to the reasoning generation."""
-        async with semaphore:
-            if st.session_state.get("stop_signal", False):
-                return None  # Stop processing this profile
-            reasoning = await generate_reasoning_for_profile(profile, original_criteria, tracker)
-            profile['reasoning'] = reasoning
-            return profile
-
-    tasks = [get_reasoning_with_semaphore(profile) for profile in final_candidates]
-    
-    processed_candidates = []
-    
-    for i, future in enumerate(asyncio.as_completed(tasks)):
-        if st.session_state.get("stop_signal", False):
-            # Cancel remaining tasks
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            yield "\n\nGeneration stopped by user."
-            break
-
-        try:
-            processed_profile = await future
-            if processed_profile:  # Will be None if it was stopped before starting
-                processed_candidates.append(processed_profile)
-                yield {
-                    "type": "profile_chunk",
-                    "data": processed_profile,
-                    "current": len(processed_candidates),
-                    "total": len(final_candidates)
-                }
-        except asyncio.CancelledError:
-            logger.info("A reasoning task was cancelled.")
-            continue
-
-    # Re-sort the results to match the original ranking from filtering
-    original_order_map = {p['id']: i for i, p in enumerate(final_candidates)}
-    processed_candidates.sort(key=lambda p: original_order_map.get(p['id'], float('inf')))
-
-    # 4. After the loop finishes (or is stopped), send the final 'complete' message
-    yield {"type": "complete", "data": processed_candidates, "summary": tracker.get_summary()}
 # --- Excel Export Helper ---
 def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
     """Converts a dictionary of selected profiles to an Excel file in memory."""
