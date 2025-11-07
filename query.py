@@ -78,16 +78,16 @@ class TokenCostTracker:
         return summary_md
 
 # --- Database Configuration ---
-DB_NAME = "growton_ai"
-DB_USER = "postgres"
-DB_PASSWORD = "postgres"
-DB_HOST = "localhost"
-DB_PORT = "5433"
 # DB_NAME = "growton_ai"
-# DB_USER = "growton_ai_user"
-# DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
-# DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
-# DB_PORT = "5432"
+# DB_USER = "postgres"
+# DB_PASSWORD = "postgres"
+# DB_HOST = "localhost"
+# DB_PORT = "5433"
+DB_NAME = "growton_ai"
+DB_USER = "growton_ai_user"
+DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
+DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
+DB_PORT = "5432"
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
@@ -95,8 +95,8 @@ if not openai_api_key:
     st.stop()
 
 try:
-    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-    #redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
+    #redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("Successfully connected to Redis.")
 except redis.ConnectionError as e:
