@@ -98,26 +98,97 @@ if not openai_api_key:
 try:
     #redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
-    redis_client.ping()
-    logger.info("Successfully connected to Redis.")
-except redis.ConnectionError as e:
-    st.error(f"Failed to connect to Redis: {e}")
+    # --- MODIFIED: Connect to Render Redis ---
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        redis_client = redis.from_url(redis_url, decode_responses=True)
+        redis_client.ping()
+        logger.info("Successfully connected to Render Redis.")
+    else:
+        logger.warning("REDIS_URL not found. Redis caching will be disabled.")
+        redis_client = None
+    # --- END MODIFICATION ---
+except (redis.exceptions.ConnectionError, redis.exceptions.BusyLoadingError) as e:
+    logger.error(f"Failed to connect to Redis: {e}. Caching will be disabled.")
+    redis_client = None
+
+
+# --- Model Initialization ---
+try:
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_api_key)
+    # This is the "smarter" LLM for complex criteria extraction
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, openai_api_key=openai_api_key)
+    # This is the "specialist" LLM for reasoning
+    specialist_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, openai_api_key=openai_api_key)
+    # This is the "fast" LLM for general chat and streaming
+    streaming_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, openai_api_key=openai_api_key, streaming=True)
+    # This is the "generation" LLM for taxonomy expansion
+    generation_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, openai_api_key=openai_api_key)
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI models: {e}")
+    st.error(f"Failed to initialize OpenAI models. Please check your API key and network connection. Error: {e}")
     st.stop()
 
-# --- LLM and Embeddings Initialization ---
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
-streaming_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, streaming=True)
-specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
-generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+# --- Streamlit UI (Top) ---
+st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
 
+# --- MODIFICATION: Apply styles correctly ---
+st.markdown(
+    """
+    <style>
+    /* Ensure sidebar width is constrained */
+    section[data-testid="stSidebar"] {
+        width: 320px !important;
+        min-width: 300px !important;
+        max-width: 350px !important;
+    }
+    /* Allow sidebar content to scroll */
+    section[data-testid="stSidebar"] > div {
+        height: 100%;
+        overflow-y: auto;
+    } 
+    /* Add a subtle border to result containers */
+    .result-container {
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# --- END MODIFICATION ---
 
-# --- Dynamic Taxonomy Generation ---
+st.title("Growton AI")
+
+# --- Helper Functions ---
+@st.cache_data(ttl=3600) # Cache for 1 hour
+def get_db_stats():
+    """Fetches high-level stats from the database."""
+    logger.info("Fetching DB stats...")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("SELECT COUNT(id) FROM candidates")
+        total_profiles = cur.fetchone()[0]
+        
+        cur.execute("SELECT AVG(total_experience_years) FROM candidates WHERE total_experience_years IS NOT NULL")
+        avg_experience = cur.fetchone()[0]
+        
+        cur.close()
+        conn.close()
+        logger.info("Successfully fetched DB stats.")
+        return total_profiles, avg_experience
+    except Exception as e:
+        logger.error(f"Could not fetch DB stats: {e}")
+        return 0, 0.0
 
 def safe_json_loads(json_str: str, default_val: Any = None) -> Any:
-    """Safely loads a JSON string, stripping markdown and handling errors."""
-    if default_val is None:
-        default_val = {}
+    """Safely decodes a JSON string, handling LLM-related artifacts."""
+    if not json_str:
+        return default_val
     try:
         # Clean the string from common LLM output artifacts
         cleaned_str = json_str.strip()
@@ -449,6 +520,61 @@ def load_all_profiles_from_db():
 # Load data into a global variable for the app session
 PROFILES_BY_ID = {p['id']: p for p in load_all_profiles_from_db()}
 ALL_COMPANY_NAMES = load_all_company_names_from_db()
+
+# --- Sidebar UI ---
+total_profiles, avg_experience = get_db_stats()
+st.sidebar.markdown("### 📈 Database Stats")
+st.sidebar.markdown(f"**Total Profiles:** {total_profiles}")
+st.sidebar.markdown(f"**Avg. Experience:** {round(avg_experience, 1)} years")
+st.sidebar.markdown("---")
+
+# --- Session State Management ---
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = hashlib.sha256(os.urandom(32)).hexdigest()
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'token_tracker' not in st.session_state:
+    st.session_state.token_tracker = TokenCostTracker()
+if 'generating' not in st.session_state:
+    st.session_state.generating = False
+if 'stop_signal' not in st.session_state:
+    st.session_state.stop_signal = False
+if 'last_results' not in st.session_state:
+    st.session_state.last_results = []
+if 'selected_profiles' not in st.session_state:
+    st.session_state.selected_profiles = {} # Stores profile data by ID
+
+
+# --- MODIFICATION: Load from Redis *after* initializing session state ---
+if not st.session_state.messages and redis_client:
+    try:
+        redis_key = f"chat_history:{st.session_state.session_id}"
+        history = redis_client.lrange(redis_key, 0, -1)
+        if history:
+            loaded_messages = []
+            for msg_json in history:
+                msg = safe_json_loads(msg_json)
+                if msg:
+                    loaded_messages.append(msg)
+            
+            if loaded_messages:
+                st.session_state.messages = loaded_messages
+                
+                # --- NEW: Repopulate last_results and selected_profiles ---
+                # Find the most recent assistant message that has results
+                for msg in reversed(st.session_state.messages):
+                    if msg.get("role") == "assistant" and "results" in msg:
+                        st.session_state.last_results = msg["results"]
+                        # We don't save selection state, so selected_profiles
+                        # should be reset to ensure checkboxes are correct.
+                        st.session_state.selected_profiles = {}
+                        break # Found the last search result
+                
+                logger.info(f"Loaded {len(st.session_state.messages)} messages and {len(st.session_state.last_results)} results from Redis.")
+        
+    except Exception as e:
+        logger.error(f"Failed to load chat history from Redis: {e}")
+# --- END MODIFICATION ---
 
 # --- Core Logic ---
 
@@ -1812,6 +1938,44 @@ You are an expert assistant tasked with extracting structured filtering criteria
     processed_candidates.sort(key=lambda p: original_order_map.get(p['id'], float('inf')))
 
     # 4. After the loop finishes (or is stopped), send the final 'complete' message
+    
+    # --- MODIFIED: Save assistant message to Redis ---
+    assistant_message = f"Found {len(processed_candidates)} candidates."
+    if tracker.get_summary():
+        assistant_message += f"\n\n{tracker.get_summary()}"
+    
+    message_to_save = {
+        "role": "assistant", 
+        "content": assistant_message,
+        "results": processed_candidates  # <-- ADD THIS
+    }
+    st.session_state.messages.append(message_to_save)
+    
+    if redis_client:
+        try:
+            redis_key = f"chat_history:{st.session_state.session_id}"
+            # --- MODIFICATION: Need to handle non-serializable data ---
+            # Create a copy to save, as the main 'message_to_save' is used in the app
+            message_to_save_redis = copy.deepcopy(message_to_save)
+            
+            # The profile objects in 'results' might be complex.
+            # Let's assume the profile dict is JSON serializable.
+            # If it fails, we'll strip 'results'.
+
+            message_json = json.dumps(message_to_save_redis) 
+            redis_client.rpush(redis_key, message_json)
+            redis_client.expire(redis_key, 86400) # Refresh expiry
+        except TypeError as e:
+            # Fallback if results are not serializable
+            logger.error(f"Failed to save full results to Redis (serialization error): {e}. Saving message without results.")
+            message_to_save_redis.pop("results", None) # Remove results
+            message_json = json.dumps(message_to_save_redis) # Save without results
+            redis_client.rpush(redis_key, message_json)
+            redis_client.expire(redis_key, 86400)
+        except Exception as e:
+            logger.error(f"Failed to save assistant search message to Redis: {e}")
+    # --- END MODIFICATION ---
+
     yield {"type": "complete", "data": processed_candidates, "summary": tracker.get_summary()}
 
 # --- Excel Export Helper ---
@@ -1855,17 +2019,22 @@ def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
     return output.getvalue()
 
 # --- UI Helper Function ---
-def display_profile_with_checkbox(profile: Dict[str, Any], container):
+def display_profile_with_checkbox(profile: Dict[str, Any], container, key_prefix: str = ""):
     """Helper to render a single profile with its checkbox inside a given container."""
     with container.container(border=True):
         col1, col2 = st.columns([0.6, 0.4])
         with col1:
+            # --- MODIFICATION: Use key_prefix to ensure unique keys ---
+            unique_key = f"{key_prefix}_select_{profile['id']}"
+            
             # The checkbox's state is controlled by session_state
             is_selected = st.checkbox(
                 f"**{profile.get('name', 'N/A')}**", 
-                key=f"select_{profile['id']}",
+                key=unique_key, # <--- Use unique_key
                 value=(profile['id'] in st.session_state.selected_profiles)
             )
+            # --- END MODIFICATION ---
+            
             st.markdown(f"[{profile.get('linkedin', '#')}]({profile.get('linkedin', '#')})")
         
         with col2:
@@ -1881,69 +2050,48 @@ def display_profile_with_checkbox(profile: Dict[str, Any], container):
         elif profile['id'] in st.session_state.selected_profiles:
             del st.session_state.selected_profiles[profile['id']]
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
-st.markdown(
-    """
-    <style>
-    section[data-testid="stSidebar"] {
-        width: 320px !important;
-        min-width: 300px !important;
-        max-width: 350px !important;
-    }
-    section[data-testid="stSidebar"] > div {
-        height: 100%;
-        overflow-y: auto;
-    }
-    .result-container {
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-st.markdown(
-    """
-    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 30px;">
-        <img src="https://media.licdn.com/dms/image/v2/D560BAQF7O3De5SQ1vA/company-logo_200_200/company-logo_200_200/0/1708433749265/letsgrowton_logo?e=2147483647&v=beta&t=GerSYeinV4BZI9iFhaAo1dfHFDS1Ym5cwhYYwQXEWJo"
-             style="width:50px;height:50px;">
-        <h1 style="margin: 0; font-size: 2.2em;">Growton AI</h1>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-st.sidebar.subheader("Dataset Summary")
-total_profiles = len(PROFILES_BY_ID)
-total_exp = sum(p.get("total_experience_years") or 0 for p in PROFILES_BY_ID.values())
-avg_experience = total_exp / total_profiles if total_profiles > 0 else 0
-st.sidebar.markdown(f"**Total Profiles:** {total_profiles}")
-st.sidebar.markdown(f"**Avg. Experience:** {round(avg_experience, 1)} years")
-st.sidebar.markdown("---")
-
-# --- Session State Management ---
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = hashlib.sha256(os.urandom(32)).hexdigest()
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'token_tracker' not in st.session_state:
-    st.session_state.token_tracker = TokenCostTracker()
-if 'generating' not in st.session_state:
-    st.session_state.generating = False
-if 'stop_signal' not in st.session_state:
-    st.session_state.stop_signal = False
-if 'last_results' not in st.session_state:
-    st.session_state.last_results = []
-if 'selected_profiles' not in st.session_state:
-    st.session_state.selected_profiles = {} # Stores profile data by ID
-
 # --- Chat History Display ---
-for message in st.session_state.messages:
+for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        
+        # --- NEW: Render results if present ---
+        if "results" in message and message["results"]:
+            st.markdown("---")
+            st.subheader("Search Results")
+            results_container = st.container()
+            
+            # We need to re-bind the checkbox state from session_state.selected_profiles
+            # The display_profile_with_checkbox function already does this.
+            
+            for profile in message["results"]:
+                # --- MODIFICATION: Pass a unique prefix for history items ---
+                display_profile_with_checkbox(profile, results_container, key_prefix=f"history_{i}")
+                # --- END MODIFICATION ---
+            
+            st.markdown("---")
+            st.subheader("Export Selection")
+            selected_count = len(st.session_state.selected_profiles)
+            st.write(f"You have selected **{selected_count}** profile(s).")
+            
+            if selected_count > 0:
+                # Create unique keys for buttons inside a loop
+                preview_key = f"preview_{i}_{message['role']}"
+                download_key = f"download_{i}_{message['role']}"
+
+                if st.button("Preview Selection", key=preview_key):
+                    preview_data = [{ "Name": p['name'], "LinkedIn": p['linkedin'], "Location": p['location']} for p in st.session_state.selected_profiles.values()]
+                    st.dataframe(preview_data)
+
+                excel_data = profiles_to_excel(st.session_state.selected_profiles)
+                st.download_button(
+                    label=" Download Selected Profiles as Excel",
+                    data=excel_data,
+                    file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officed_document.spreadsheetml.sheet",
+                    key=download_key
+                )
+        # --- END NEW ---
 
 # --- Generation Logic ---
 if st.session_state.get("generating"):
@@ -1966,8 +2114,10 @@ if st.session_state.get("generating"):
     async def run_generation_and_display(query: str):
         """Runs the query and displays results as they arrive."""
         
-        # Clear previous results from state for this new run
+        # --- MODIFICATION: Clear previous results *only* when a new search starts ---
         st.session_state.last_results = []
+        st.session_state.selected_profiles = {}
+        # --- END MODIFICATION ---
         
         generator = process_query_main(query, st.session_state.session_id, st.session_state.token_tracker)
         
@@ -2003,7 +2153,9 @@ if st.session_state.get("generating"):
                         progress_bar.progress(progress_percent, text=f"{current}/{total} ({progress_percent:.0%})")
                         
                         # Use our new helper to draw the profile *immediately*
-                        display_profile_with_checkbox(profile, results_container)
+                        # --- MODIFICATION: Pass a unique prefix for streaming items ---
+                        display_profile_with_checkbox(profile, results_container, key_prefix="streaming")
+                        # --- END MODIFICATION ---
 
                 elif msg_type == "complete":
                     final_data = item.get("data", [])
@@ -2018,11 +2170,8 @@ if st.session_state.get("generating"):
                     if final_summary:
                         summary_placeholder.markdown(final_summary)
 
-                    # Add final summary to chat history
-                    assistant_message = f"Found {len(final_data)} candidates."
-                    if final_summary:
-                        assistant_message += f"\n\n{final_summary}"
-                    st.session_state.messages.append({"role": "assistant", "content": assistant_message})
+                    # Assistant message is now saved to state and Redis
+                    # inside process_query_main, so no need to do it here.
                     
                     break # Generation is finished
         
@@ -2036,8 +2185,33 @@ if st.session_state.get("generating"):
         logger.info("Handling general conversation...")
         status_placeholder.info("Thinking...")
         
+        # --- MODIFICATION: Add context from last search results ---
+        system_prompt = "You are an expert Talent Acquisition Partner. Be professional, proactive, and concise. Your goal is to help find candidates and discuss hiring strategy. Ask about hiring needs."
+        
+        if st.session_state.last_results:
+            try:
+                # Summarize the last results to provide context
+                context_summary = "\n\nCONTEXT ON LAST SEARCH:\n"
+                context_summary += f"The last search returned {len(st.session_state.last_results)} candidate(s). "
+                context_summary += "Here is a summary of who was found and why (do not list all candidates, just use this info to answer questions about them):\n"
+                
+                # Get info for up to 10 candidates to keep it manageable
+                for profile in st.session_state.last_results[:10]:
+                    name = profile.get('name', 'N/A')
+                    reason = profile.get('reasoning', 'No reasoning available.')
+                    context_summary += f"- {name}: {reason}\n"
+                
+                if len(st.session_state.last_results) > 10:
+                    context_summary += f"- ...and {len(st.session_state.last_results) - 10} more."
+
+                system_prompt += context_summary
+                logger.info("Added last_results context to general conversation.")
+            except Exception as e:
+                logger.error(f"Failed to build context from last_results: {e}")
+        # --- END MODIFICATION ---
+
         # 1. Build the message list
-        message_list = [SystemMessage(content="You are an expert Talent Acquisition Partner. Be professional, proactive, and concise. Your goal is to help find candidates and discuss hiring strategy. Ask about hiring needs.")]
+        message_list = [SystemMessage(content=system_prompt)]
         
         # Add recent history for context
         for msg in st.session_state.messages[:-1]: # All but the latest prompt
@@ -2067,7 +2241,20 @@ if st.session_state.get("generating"):
             
             # 3. Add usage and history
             st.session_state.token_tracker.add_usage(streaming_llm.model_name, prompt_for_tracking, full_response, "General Conversation")
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
+            # --- MODIFIED: Save assistant message to Redis ---
+            message_to_save = {"role": "assistant", "content": full_response}
+            st.session_state.messages.append(message_to_save)
+            
+            if redis_client:
+                try:
+                    redis_key = f"chat_history:{st.session_state.session_id}"
+                    message_json = json.dumps(message_to_save)
+                    redis_client.rpush(redis_key, message_json)
+                    redis_client.expire(redis_key, 86400) # Refresh expiry
+                except Exception as e:
+                    logger.error(f"Failed to save assistant general message to Redis: {e}")
+            # --- END MODIFICATION ---
             
             summary = st.session_state.token_tracker.get_summary()
             summary_placeholder.markdown(summary)
@@ -2110,45 +2297,63 @@ if st.session_state.get("generating"):
 
 
 # --- Results Display with Checkboxes ---
-if st.session_state.last_results:
-    st.markdown("---")
-    st.subheader("Search Results")
+# --- MODIFICATION: This block is now removed, as rendering is done in the chat history loop ---
+# if st.session_state.last_results:
+#     st.markdown("---")
+#     st.subheader("Search Results")
     
-    # This container will hold the results after the page reruns
-    results_container = st.container()
-    for profile in st.session_state.last_results:
-        # Use the same helper function to re-draw the profiles
-        display_profile_with_checkbox(profile, results_container)
+#     # This container will hold the results after the page reruns
+#     results_container = st.container()
+#     for profile in st.session_state.last_results:
+#         # Use the same helper function to re-draw the profiles
+#         display_profile_with_checkbox(profile, results_container)
 
-    st.markdown("---")
-    st.subheader("Export Selection")
+#     st.markdown("---")
+#     st.subheader("Export Selection")
     
-    # The rest of your export logic stays exactly the same
-    selected_count = len(st.session_state.selected_profiles)
-    st.write(f"You have selected **{selected_count}** profile(s).")
+#     # The rest of your export logic stays exactly the same
+#     selected_count = len(st.session_state.selected_profiles)
+#     st.write(f"You have selected **{selected_count}** profile(s).")
     
-    if selected_count > 0:
-        # Preview Section
-        if st.button("Preview Selection"):
-            preview_data = [{ "Name": p['name'], "LinkedIn": p['linkedin'], "Location": p['location']} for p in st.session_state.selected_profiles.values()]
-            st.dataframe(preview_data)
+#     if selected_count > 0:
+#         # Preview Section
+#         if st.button("Preview Selection"):
+#             preview_data = [{ "Name": p['name'], "LinkedIn": p['linkedin'], "Location": p['location']} for p in st.session_state.selected_profiles.values()]
+#             st.dataframe(preview_data)
 
-        # Download Button
-        excel_data = profiles_to_excel(st.session_state.selected_profiles)
-        st.download_button(
-            label=" Download Selected Profiles as Excel",
-            data=excel_data,
-            file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officed_document.spreadsheetml.sheet",
-        )
+#         # Download Button
+#         excel_data = profiles_to_excel(st.session_state.selected_profiles)
+#         st.download_button(
+#             label=" Download Selected Profiles as Excel",
+#             data=excel_data,
+#             file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+#             mime="application/vnd.openxmlformats-officed_document.spreadsheetml.sheet",
+#         )
 
 
 # --- Chat Input Form ---
 if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating"), key="main_chat_input"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # --- MODIFIED: Save user message to Redis ---
+    message_to_save = {"role": "user", "content": prompt}
+    st.session_state.messages.append(message_to_save)
+    
+    if redis_client:
+        try:
+            redis_key = f"chat_history:{st.session_state.session_id}"
+            message_json = json.dumps(message_to_save)
+            redis_client.rpush(redis_key, message_json)
+            redis_client.expire(redis_key, 86400) # Refresh expiry (24 hours)
+        except Exception as e:
+            logger.error(f"Failed to save user message to Redis: {e}")
+    # --- END MODIFICATION ---
+
     st.session_state.generating = True
     st.session_state.stop_signal = False
-    # Clear previous results and selections for a new search
-    st.session_state.last_results = []
-    st.session_state.selected_profiles = {}
+    
+    # --- MODIFICATION: Removed state clearing from here ---
+    # We now clear results inside run_generation_and_display
+    # to preserve context for follow-up questions.
+    # --- END MODIFICATION ---
+    
     st.rerun()
