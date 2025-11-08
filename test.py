@@ -79,16 +79,16 @@ class TokenCostTracker:
         return summary_md
 
 # --- Database Configuration ---
-DB_NAME = "growton_ai"
-DB_USER = "postgres"
-DB_PASSWORD = "postgres"
-DB_HOST = "localhost"
-DB_PORT = "5433"
 # DB_NAME = "growton_ai"
-# DB_USER = "growton_ai_user"
-# DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
-# DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
-# DB_PORT = "5432"
+# DB_USER = "postgres"
+# DB_PASSWORD = "postgres"
+# DB_HOST = "localhost"
+# DB_PORT = "5433"
+DB_NAME = "growton_ai"
+DB_USER = "growton_ai_user"
+DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
+DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
+DB_PORT = "5432"
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
