@@ -1,8 +1,8 @@
-
 import streamlit as st
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 #from langchain.prompts import PromptTemplate
 from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 import os
 import json
@@ -132,6 +132,52 @@ def safe_json_loads(json_str: str, default_val: Any = None) -> Any:
     except (json.JSONDecodeError, TypeError):
         logger.warning(f"Could not parse JSON string: '{json_str}'")
         return default_val
+
+async def classify_intent(query: str, tracker: TokenCostTracker) -> str:
+    """Classifies user intent as 'candidate_search' or 'general_conversation'."""
+    logger.info(f"Classifying intent for query: {query}")
+    
+    prompt_template = PromptTemplate(
+        input_variables=["query"],
+        template="""
+        You are an expert intent classifier for an HR recruitment bot. Your job is to determine if the user's query is a request to search for candidates or a general conversational query.
+
+        - If the query is asking to find people, looking for candidates, specifying job titles, skills, experience, locations, or any criteria related to finding a person, classify it as "candidate_search".
+        - If the query is a greeting, a question about you (the bot), a general HR question (e.g., "what is a good interview question?"), or anything not related to searching the candidate database, classify it as "general_conversation".
+
+        Examples:
+        Query: "Hi there" -> general_conversation
+        Query: "Find me sales managers in APAC" -> candidate_search
+        Query: "Who are you?" -> general_conversation
+        Query: "looking for engineers with 5 years of python" -> candidate_search
+        Query: "What is your purpose?" -> general_conversation
+        Query: "avg tenure of 3 years in last 2 companies" -> candidate_search
+        Query: "That's great, thanks!" -> general_conversation
+
+        Respond with ONLY "candidate_search" or "general_conversation".
+
+        User Query: {query}
+        Classification:
+        """
+    )
+    
+    formatted_prompt = prompt_template.format(query=query)
+    
+    try:
+        response = await llm.ainvoke(formatted_prompt)
+        intent = response.content.strip().lower()
+        tracker.add_usage(llm.model_name, formatted_prompt, response.content, "Intent Classification")
+        
+        if "candidate_search" in intent:
+            logger.info("Intent classified as: candidate_search")
+            return "candidate_search"
+        else:
+            logger.info("Intent classified as: general_conversation")
+            return "general_conversation"
+    except Exception as e:
+        logger.error(f"Error during intent classification: {e}")
+        # Default to candidate search if classification fails, to maintain original behavior
+        return "candidate_search"
 
 @st.cache_data(ttl=86400) # Cache the taxonomy for 24 hours
 def generate_dynamic_taxonomy(seed_taxonomy: dict, category: str) -> dict:
@@ -556,7 +602,7 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
         details_text = (
             f"{(company_details.get('funding_stage') or '').lower()} "
             f"{(company_details.get('business_model') or '').lower()} "
-            f"{(company_details.get('product_service') or '').lower()}"
+            f"{(company_details.get('product_service', '') or '').lower()}"
         )
         if any(v in details_text for v in req_values):
             duration = role.get('duration_years', 0.0) or 0.0
@@ -879,7 +925,7 @@ def check_company_details(profile: Dict[str, Any], criteria: Dict[str, Any]) -> 
             details_text = (
                 f"{(company_details.get('funding_stage') or '').lower()} "
                 f"{(company_details.get('business_model') or '').lower()} "
-                f"{(company_details.get('product_service') or '').lower()}"
+                f"{(company_details.get('product_service', '') or '').lower()}"
             )
             if v in details_text:
                 found_values.add(v)
@@ -1120,14 +1166,48 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
                 first_calc_key = next(iter(profile['calculated_experience']))
                 profile['contributing_roles_details'] = {'roles': profile['calculated_experience'][first_calc_key]['roles']}
             else:
-                _, roles_list = calculate_functional_experience_duration(profile, criteria.get("required_functions", {}))
+                # Fallback if no specific experience was calculated but presence checks passed
+                # Try to get roles from 'required_functions' if it exists, otherwise empty
+                func_crit = criteria.get("required_functions", {})
+                if not isinstance(func_crit, dict):
+                    func_crit = {"values": []} # Handle case where it might be a list
+                
+                _, roles_list = calculate_functional_experience_duration(profile, func_crit)
                 profile['contributing_roles_details'] = {'roles': roles_list}
+
 
             matching_candidates.append(profile)
 
     if matching_candidates and sort_criterion:
+        # Handle cases where the sort_criterion might not have been calculated (e.g., no min_years)
+        # In that case, we invent a duration just for sorting based on presence
+        if sort_criterion not in matching_candidates[0].get('calculated_experience', {}):
+            calc_func_map = {
+                "required_functions": calculate_functional_experience_duration,
+                "required_industries": calculate_industry_experience_duration,
+                "required_segments": calculate_segment_experience_duration,
+                "required_geographies": calculate_geography_experience_duration,
+                "required_company_details": calculate_company_details_experience_duration
+            }
+            sort_calc_func = calc_func_map.get(sort_criterion)
+            
+            if sort_calc_func:
+                logger.info(f"Sorting by '{sort_criterion}' (presence-based duration) as min_years was not specified.")
+                for profile in matching_candidates:
+                    crit_obj = criteria.get(sort_criterion, {})
+                    if not isinstance(crit_obj, dict):
+                         crit_obj = {"values": []}
+                    duration, _ = sort_calc_func(profile, crit_obj)
+                    if 'calculated_experience' not in profile:
+                         profile['calculated_experience'] = {}
+                    if sort_criterion not in profile['calculated_experience']:
+                        profile['calculated_experience'][sort_criterion] = {"duration": duration}
+            else:
+                 logger.warning(f"Could not find a calculation function for sort_criterion: {sort_criterion}")
+
+        # Now perform the sort
         matching_candidates.sort(
-            key=lambda x: x['calculated_experience'].get(sort_criterion, {}).get('duration', 0.0),
+            key=lambda x: x.get('calculated_experience', {}).get(sort_criterion, {}).get('duration', 0.0),
             reverse=True
         )
 
@@ -1154,7 +1234,7 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
         - Use the `calculated_experience` and `evidence_log` from the candidate's JSON to find evidence.
         - For tenure criteria, use the `source_text` from the `evidence_log`.
         - For other criteria, mention the duration from `calculated_experience`.
-        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed".
+        - **DO NOT** mention static details like "Total Experience Years" or "Max People Managed" unless they were a specific criterion.
         - The entire reasoning must be a single, flowing paragraph without bullet points or newlines.
         - Do not include the markdown pipe `|` characters. Just the text.
 
@@ -1162,9 +1242,24 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
         """
     )
     
+    # Create a cleaner profile for the LLM to reduce token count and noise
+    clean_profile = {
+        "id": profile.get("id"),
+        "name": profile.get("name"),
+        "evidence_log": profile.get("evidence_log"),
+        "calculated_experience": profile.get("calculated_experience")
+    }
+
+    # Add back any criteria that were simple checks
+    if "min_people_managed" in original_criteria:
+        clean_profile["max_people_managed"] = profile.get("max_people_managed")
+    if "min_total_experience" in original_criteria:
+        clean_profile["total_experience_years"] = profile.get("total_experience_years")
+
+
     formatted_prompt = prompt_template.format(
         original_criteria_json=json.dumps(original_criteria, indent=2),
-        matching_profile_json=json.dumps(profile, indent=2)
+        matching_profile_json=json.dumps(clean_profile, indent=2)
     )
 
     response = await specialist_llm.ainvoke(formatted_prompt)
@@ -1247,12 +1342,13 @@ You are an expert assistant tasked with extracting structured filtering criteria
 | User Query                                                    | Correct JSON Output                                                                                                                                                             |
 |---------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | "12 years as an Account Executive"                            | `{{"required_functions": {{"operator": "OR", "values": ["Hunting"], "min_years": 12.0}}}}`                                                                                       |
+| "10 years in SMB sales"                                       | `{{"required_segments": {{"operator": "OR", "values": ["smb"], "min_years": 10.0}}}}`                                                                                           |
 | "worked in recent company at least more than 2 yrs"           | `{{"min_tenure_in_latest_role": 2.0}}`                                                                                                                                           |
 | "avg work exp of 3 yrs in last 2 companies"                   | `{{"avg_tenure_in_last_n_roles": {{"avg_years": 3.0, "num_roles": 2}}}}`                                                                                                        |
 | "inside sales with 5 years exp and avg tenure of 2y in last 3 roles" | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"], "min_years": 5.0}}, "avg_tenure_in_last_n_roles": {{"avg_years": 2.0, "num_roles": 3}}}}` |
 | "Candidates in Florida"                                       | `{{"required_locations": {{"operator": "OR", "values": ["Florida"]}}}}`                                                                                                         |
 | "Find people in the US"                                       | `{{"required_locations": {{"operator": "OR", "values": ["US"]}}}}`                                                                                                               |
-| "Sales leaders with APAC experience"                          | `{{"required_functions": {{"operator": "OR", "values": ["Sales Development"]}}, "required_geographies": {{"operator": "OR", "values": ["APAC"]}}}}`                             |
+| "Sales leaders with APAC experience"                          | `{{"required_functions": {{"operator": "OR", "values": ["Hunting", "Farming"]}}, "required_geographies": {{"operator": "OR", "values": ["APAC"]}}}}`                             |
 
 
 **Available criteria keys:**
@@ -1704,6 +1800,12 @@ You are an expert assistant tasked with extracting structured filtering criteria
         except asyncio.CancelledError:
             logger.info("A reasoning task was cancelled.")
             continue
+        except Exception as e:
+            logger.error(f"Error processing profile reasoning: {e}")
+            # Yield an error message for this specific profile?
+            # For now, just log and continue
+            continue
+
 
     # Re-sort the results to match the original ranking from filtering
     original_order_map = {p['id']: i for i, p in enumerate(final_candidates)}
@@ -1814,7 +1916,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.sidebar.subheader("📊 Dataset Summary")
+st.sidebar.subheader("Dataset Summary")
 total_profiles = len(PROFILES_BY_ID)
 total_exp = sum(p.get("total_experience_years") or 0 for p in PROFILES_BY_ID.values())
 avg_experience = total_exp / total_profiles if total_profiles > 0 else 0
@@ -1861,13 +1963,13 @@ if st.session_state.get("generating"):
     
     prompt = st.session_state.messages[-1]["content"]
     
-    async def run_generation_and_display():
+    async def run_generation_and_display(query: str):
         """Runs the query and displays results as they arrive."""
         
         # Clear previous results from state for this new run
         st.session_state.last_results = []
         
-        generator = process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker)
+        generator = process_query_main(query, st.session_state.session_id, st.session_state.token_tracker)
         
         async for item in generator:
             if st.session_state.get("stop_signal", False):
@@ -1923,14 +2025,88 @@ if st.session_state.get("generating"):
                     st.session_state.messages.append({"role": "assistant", "content": assistant_message})
                     
                     break # Generation is finished
+        
+        # Ensure generation stops
+        st.session_state.generating = False
+        st.session_state.stop_signal = False
+        st.rerun()
 
-    # Run the streaming function
-    asyncio.run(run_generation_and_display())
-    
-    # Generation is complete, update state and rerun to show the 'Export' section
-    st.session_state.generating = False
-    st.session_state.stop_signal = False
-    st.rerun()
+    async def run_general_conversation(query: str):
+        """Handles general conversational queries."""
+        logger.info("Handling general conversation...")
+        status_placeholder.info("Thinking...")
+        
+        # 1. Build the message list
+        message_list = [SystemMessage(content="You are an expert Talent Acquisition Partner. Be professional, proactive, and concise. Your goal is to help find candidates and discuss hiring strategy. Ask about hiring needs.")]
+        
+        # Add recent history for context
+        for msg in st.session_state.messages[:-1]: # All but the latest prompt
+            if msg["role"] == "user":
+                message_list.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                message_list.append(AIMessage(content=msg["content"]))
+        
+        # Add the final user query
+        message_list.append(HumanMessage(content=query))
+        
+        # Create the prompt string *only* for token tracking
+        prompt_for_tracking = "\n".join([f"{msg.type}: {msg.content}" for msg in message_list])
+        
+        try:
+            # Use streaming_llm for a better chat experience
+            full_response = ""
+            with st.chat_message("assistant"):
+                response_placeholder = st.empty()
+                # 2. Pass the list to astream
+                async for chunk in streaming_llm.astream(message_list):
+                    if st.session_state.get("stop_signal", False):
+                        break
+                    full_response += chunk.content
+                    response_placeholder.markdown(full_response + "▌")
+                response_placeholder.markdown(full_response)
+            
+            # 3. Add usage and history
+            st.session_state.token_tracker.add_usage(streaming_llm.model_name, prompt_for_tracking, full_response, "General Conversation")
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
+            summary = st.session_state.token_tracker.get_summary()
+            summary_placeholder.markdown(summary)
+            
+        except Exception as e:
+            logger.error(f"Error during general conversation: {e}")
+            st.session_state.messages.append({"role": "assistant", "content": "Sorry, I ran into a bit of trouble answering that."})
+        
+        status_placeholder.empty()
+        st.session_state.generating = False
+        st.session_state.stop_signal = False
+        st.rerun()
+
+    async def route_query(query: str):
+        """Classifies intent and routes to the correct handler."""
+        intent = await classify_intent(query, st.session_state.token_tracker)
+        
+        if st.session_state.get("stop_signal", False):
+             logger.info("Stop signal received before starting task.")
+             status_placeholder.warning("Generation stopped.")
+             st.session_state.generating = False
+             st.session_state.stop_signal = False
+             st.rerun()
+             return
+
+        if intent == "candidate_search":
+            await run_generation_and_display(query)
+        else:
+            await run_general_conversation(query)
+
+    # Run the main routing function
+    try:
+        asyncio.run(route_query(prompt))
+    except Exception as e:
+        logger.error(f"Error during async routing: {e}")
+        st.session_state.generating = False
+        st.session_state.stop_signal = False
+        st.error(f"An unexpected error occurred: {e}")
+        st.rerun()
 
 
 # --- Results Display with Checkboxes ---
@@ -1960,280 +2136,15 @@ if st.session_state.last_results:
         # Download Button
         excel_data = profiles_to_excel(st.session_state.selected_profiles)
         st.download_button(
-            label="📥 Download Selected Profiles as Excel",
+            label=" Download Selected Profiles as Excel",
             data=excel_data,
             file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officed_document.spreadsheetml.sheet",
         )
 
 
 # --- Chat Input Form ---
-if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating")):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.session_state.generating = True
-    st.session_state.stop_signal = False
-    # Clear previous results and selections for a new search
-    st.session_state.last_results = []
-    st.session_state.selected_profiles = {}
-    st.rerun()
-
-# --- Excel Export Helper ---
-def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
-    """Converts a dictionary of selected profiles to an Excel file in memory."""
-    if not profiles_dict:
-        return b""
-    
-    profiles_list = list(profiles_dict.values())
-    flat_data = []
-    for p in profiles_list:
-        # Simple role summarization
-        roles_summary = []
-        for role in p.get('roles', []):
-            company = role.get('company', 'N/A')
-            title = role.get('title', 'N/A')
-            duration = role.get('duration_years', 0)
-            roles_summary.append(f"{title} at {company} ({duration:.1f} yrs)")
-
-        flat_data.append({
-            "Name": p.get("name"),
-            "LinkedIn": p.get("linkedin"),
-            "Location": p.get("location"),
-            "Relevance Summary": p.get("reasoning", "N/A"),
-            "Total Experience (Yrs)": p.get("total_experience_years"),
-            "Max People Managed": p.get("max_people_managed"),
-            "Roles": " | ".join(roles_summary)
-        })
-    
-    df = pd.DataFrame(flat_data)
-    
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Selected Profiles')
-        # Auto-adjust column widths
-        for column in df:
-            column_length = max(df[column].astype(str).map(len).max(), len(column))
-            col_idx = df.columns.get_loc(column)
-            writer.sheets['Selected Profiles'].column_dimensions[chr(65 + col_idx)].width = column_length + 2
-
-    return output.getvalue()
-
-# --- UI Helper Function ---
-def display_profile_with_checkbox(profile: Dict[str, Any], container):
-    """Helper to render a single profile with its checkbox inside a given container."""
-    with container.container(border=True):
-        col1, col2 = st.columns([0.6, 0.4])
-        with col1:
-            # The checkbox's state is controlled by session_state
-            is_selected = st.checkbox(
-                f"**{profile.get('name', 'N/A')}**", 
-                key=f"select_{profile['id']}",
-                value=(profile['id'] in st.session_state.selected_profiles)
-            )
-            st.markdown(f"[{profile.get('linkedin', '#')}]({profile.get('linkedin', '#')})")
-        
-        with col2:
-             st.caption(f"Total Exp: {profile.get('total_experience_years', 0):.1f} yrs | Location: {profile.get('location', 'N/A')}")
-
-        # Show reasoning, or a placeholder if it's somehow missing
-        st.markdown(f"**Relevance:** {profile.get('reasoning', '*Reasoning not available.*')}")
-
-        # This logic updates the session state when the user clicks the box
-        if is_selected:
-            if profile['id'] not in st.session_state.selected_profiles:
-                st.session_state.selected_profiles[profile['id']] = profile
-        elif profile['id'] in st.session_state.selected_profiles:
-            del st.session_state.selected_profiles[profile['id']]
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="Growton AI - Candidate Search", layout="wide")
-st.markdown(
-    """
-    <style>
-    section[data-testid="stSidebar"] {
-        width: 320px !important;
-        min-width: 300px !important;
-        max-width: 350px !important;
-    }
-    section[data-testid="stSidebar"] > div {
-        height: 100%;
-        overflow-y: auto;
-    }
-    .result-container {
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-st.markdown(
-    """
-    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 30px;">
-        <img src="https://media.licdn.com/dms/image/v2/D560BAQF7O3De5SQ1vA/company-logo_200_200/company-logo_200_200/0/1708433749265/letsgrowton_logo?e=2147483647&v=beta&t=GerSYeinV4BZI9iFhaAo1dfHFDS1Ym5cwhYYwQXEWJo"
-             style="width:50px;height:50px;">
-        <h1 style="margin: 0; font-size: 2.2em;">Growton AI</h1>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-st.sidebar.subheader("📊 Dataset Summary")
-total_profiles = len(PROFILES_BY_ID)
-total_exp = sum(p.get("total_experience_years") or 0 for p in PROFILES_BY_ID.values())
-avg_experience = total_exp / total_profiles if total_profiles > 0 else 0
-st.sidebar.markdown(f"**Total Profiles:** {total_profiles}")
-st.sidebar.markdown(f"**Avg. Experience:** {round(avg_experience, 1)} years")
-st.sidebar.markdown("---")
-
-# --- Session State Management ---
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = hashlib.sha256(os.urandom(32)).hexdigest()
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'token_tracker' not in st.session_state:
-    st.session_state.token_tracker = TokenCostTracker()
-if 'generating' not in st.session_state:
-    st.session_state.generating = False
-if 'stop_signal' not in st.session_state:
-    st.session_state.stop_signal = False
-if 'last_results' not in st.session_state:
-    st.session_state.last_results = []
-if 'selected_profiles' not in st.session_state:
-    st.session_state.selected_profiles = {} # Stores profile data by ID
-
-# --- Chat History Display ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# --- Generation Logic ---
-if st.session_state.get("generating"):
-    if st.button("Stop Generation"):
-        st.session_state.stop_signal = True
-        # No rerun, just set the signal. The loop below will catch it.
-
-    # --- Placeholders for live updates ---
-    status_placeholder = st.empty()
-    progress_bar = st.empty()
-    summary_placeholder = st.empty()
-    
-    # This container will hold the results as they stream in
-    st.markdown("---")
-    st.subheader("Search Results")
-    results_container = st.container()
-    
-    prompt = st.session_state.messages[-1]["content"]
-    
-    async def run_generation_and_display():
-        """Runs the query and displays results as they arrive."""
-        
-        # Clear previous results from state for this new run
-        st.session_state.last_results = []
-        
-        generator = process_query_main(prompt, st.session_state.session_id, st.session_state.token_tracker)
-        
-        async for item in generator:
-            if st.session_state.get("stop_signal", False):
-                logger.info("Stop signal received, halting generation.")
-                status_placeholder.warning("Generation stopped by user.")
-                break
-            
-            if isinstance(item, str):
-                # Handle status strings
-                status_placeholder.info(item)
-            
-            elif isinstance(item, dict):
-                msg_type = item.get("type")
-                
-                if msg_type == "progress_start":
-                    total = item.get("total", 0)
-                    if total > 0:
-                        status_placeholder.info(f"Found {total} candidates. Generating summaries...")
-                        progress_bar.progress(0.0, text="0%")
-
-                elif msg_type == "profile_chunk":
-                    profile = item.get("data")
-                    if profile:
-                        # Add to state
-                        st.session_state.last_results.append(profile)
-                        
-                        # Update progress bar
-                        current = item.get("current", 0)
-                        total = item.get("total", 1) # Avoid division by zero
-                        progress_percent = current / total
-                        progress_bar.progress(progress_percent, text=f"{current}/{total} ({progress_percent:.0%})")
-                        
-                        # Use our new helper to draw the profile *immediately*
-                        display_profile_with_checkbox(profile, results_container)
-
-                elif msg_type == "complete":
-                    final_data = item.get("data", [])
-                    final_summary = item.get("summary", "")
-                    
-                    # Final sync of session state
-                    st.session_state.last_results = final_data
-                    
-                    if not final_data:
-                        status_placeholder.info("No candidates were found that strictly match all criteria.")
-                    
-                    if final_summary:
-                        summary_placeholder.markdown(final_summary)
-
-                    # Add final summary to chat history
-                    assistant_message = f"Found {len(final_data)} candidates."
-                    if final_summary:
-                        assistant_message += f"\n\n{final_summary}"
-                    st.session_state.messages.append({"role": "assistant", "content": assistant_message})
-                    
-                    break # Generation is finished
-
-    # Run the streaming function
-    asyncio.run(run_generation_and_display())
-    
-    # Generation is complete, update state and rerun to show the 'Export' section
-    st.session_state.generating = False
-    st.session_state.stop_signal = False
-    st.rerun()
-
-
-# --- Results Display with Checkboxes ---
-if st.session_state.last_results:
-    st.markdown("---")
-    st.subheader("Search Results")
-    
-    # This container will hold the results after the page reruns
-    results_container = st.container()
-    for profile in st.session_state.last_results:
-        # Use the same helper function to re-draw the profiles
-        display_profile_with_checkbox(profile, results_container)
-
-    st.markdown("---")
-    st.subheader("Export Selection")
-    
-    # The rest of your export logic stays exactly the same
-    selected_count = len(st.session_state.selected_profiles)
-    st.write(f"You have selected **{selected_count}** profile(s).")
-    
-    if selected_count > 0:
-        # Preview Section
-        if st.button("Preview Selection"):
-            preview_data = [{ "Name": p['name'], "LinkedIn": p['linkedin'], "Location": p['location']} for p in st.session_state.selected_profiles.values()]
-            st.dataframe(preview_data)
-
-        # Download Button
-        excel_data = profiles_to_excel(st.session_state.selected_profiles)
-        st.download_button(
-            label="📥 Download Selected Profiles as Excel",
-            data=excel_data,
-            file_name=f"selected_profiles_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-
-# --- Chat Input Form ---
-if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating")):
+if prompt := st.chat_input("Search for candidates...", disabled=st.session_state.get("generating"), key="main_chat_input"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.session_state.generating = True
     st.session_state.stop_signal = False
