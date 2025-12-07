@@ -1,0 +1,72 @@
+{
+  "bootstrapped": [
+    "bootstrapped",
+    "self-funded",
+    "self-financed",
+    "independently funded",
+    "owner-funded",
+    "privately funded",
+    "self-sustained"
+  ],
+  "seed": [
+    "seed",
+    "seed stage",
+    "pre-seed",
+    "early-stage funding",
+    "initial funding",
+    "startup capital",
+    "angel funding",
+    "seed capital"
+  ],
+  "series-a": [
+    "series a",
+    "series-a",
+    "first institutional round",
+    "series a funding",
+    "series a investment",
+    "growth funding"
+  ],
+  "series-b": [
+    "series b",
+    "series-b",
+    "second institutional round",
+    "series b funding",
+    "series b investment",
+    "expansion funding"
+  ],
+  "public": [
+    "public",
+    "publicly traded",
+    "ipo",
+    "initial public offering",
+    "listed company",
+    "stock market listed",
+    "public corporation",
+    "publicly listed"
+  ],
+  "b2b": [
+    "b2b",
+    "business-to-business",
+    "enterprise sales",
+    "commercial sales",
+    "inter-business",
+    "corporate sales"
+  ],
+  "b2c": [
+    "b2c",
+    "business-to-consumer",
+    "retail sales",
+    "consumer sales",
+    "direct-to-consumer",
+    "end-user sales"
+  ],
+  "saas": [
+    "saas",
+    "software as a service",
+    "cloud software",
+    "subscription software",
+    "on-demand software",
+    "cloud-based service",
+    "software subscription model"
+  ]
+}

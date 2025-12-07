@@ -1,0 +1,45 @@
+{
+  "enterprise": [
+    "enterprise",
+    "large enterprise",
+    "large customers",
+    "corporate accounts",
+    "major accounts",
+    "key accounts",
+    "strategic accounts",
+    "global accounts",
+    "large-scale clients",
+    "big business",
+    "multinational corporations",
+    "Fortune 500 companies",
+    "blue-chip companies"
+  ],
+  "mid-market": [
+    "mid-market",
+    "medium size customers",
+    "mid-sized businesses",
+    "mid-tier companies",
+    "medium enterprises",
+    "middle market",
+    "intermediate businesses",
+    "mid-cap companies",
+    "mid-segment clients",
+    "mid-level accounts",
+    "mid-size firms"
+  ],
+  "smb": [
+    "smb",
+    "small business",
+    "small and medium business",
+    "sme",
+    "small enterprises",
+    "small and medium enterprises",
+    "small-scale businesses",
+    "micro businesses",
+    "local businesses",
+    "startups",
+    "boutique firms",
+    "independent businesses",
+    "small-cap companies"
+  ]
+}

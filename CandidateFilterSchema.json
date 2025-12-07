@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CandidateFilter",
+  "type": "object",
+  "description": "A schema for filtering candidates based on user queries. All fields are optional.",
+  "properties": {
+    "total_experience_years": {
+      "type": "object",
+      "description": "Filter by candidate's total career experience (from candidates.total_experience_years)",
+      "properties": {
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "exact": { "type": "number" }
+      }
+    },
+    "location": {
+      "type": "object",
+      "description": "Filter by candidate's current location (from candidates.location or candidates.city)",
+      "properties": {
+        "operator": { "enum": ["AND", "OR"], "default": "OR" },
+        "values": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "skills": {
+      "type": "object",
+      "description": "Filter by candidate's skills (from candidates.skills)",
+      "properties": {
+        "operator": { "enum": ["AND", "OR"], "default": "AND" },
+        "values": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "management_experience": {
+      "type": "object",
+      "description": "Filter by team management experience (from candidates.max_people_managed or candidates.years_team_management)",
+      "properties": {
+        "min_team_size": { "type": "number", "description": "Corresponds to candidates.max_people_managed" },
+        "min_years_managing": { "type": "number", "description": "Corresponds to candidates.years_team_management" }
+      }
+    },
+    "education": {
+      "type": "object",
+      "description": "Filter by education history (from education table)",
+      "properties": {
+        "degree": { "type": "string" },
+        "college": { "type": "string" }
+      }
+    },
+    "experience_gaps": {
+        "type": "object",
+        "description": "Filter by career gaps (from candidates.has_gap_years or experience_gaps table)",
+        "properties": {
+            "has_gaps": { "type": "boolean", "description": "True to find candidates with gaps, False for those without." },
+            "max_gap_duration_months": { "type": "number", "description": "Find candidates with no single gap longer than this." }
+        }
+    },
+    "roles": {
+      "type": "array",
+      "description": "Filter by specific roles. This will JOIN roles and companies. All criteria inside an object are AND-ed.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string", "description": "e.g., 'Account Executive', 'Sales Manager'" },
+          "min_duration_years": { "type": "number", "description": "Minimum years in a role with this title" },
+          "company": {
+            "type": "object",
+            "description": "Filter the company for this specific role (from companies table)",
+            "properties": {
+              "name": { "type": "string" },
+              "funding_stage": { "type": "string" },
+              "business_model": { "type": "string", "description": "e.g., 'B2B', 'SaaS', 'B2C'" },
+              "customer_segment": { "type": "string", "description": "e.g., 'Enterprise', 'SMB'" },
+              "culture_type": { "type": "string", "description": "e.g., 'Startup', 'Corporate'" }
+            }
+          }
+        }
+      }
+    },
+    "precomputed_scores": {
+        "type": "object",
+        "description": "Filter using the pre-calculated scores (e.g., functional_experience_score)",
+        "properties": {
+            "functional_score": { "type": "object", "properties": { "min": { "type": "number" } } },
+            "industry_score": { "type": "object", "properties": { "min": { "type": "number" } } },
+            "segment_score": { "type": "object", "properties": { "min": { "type": "number" } } },
+            "geography_score": { "type": "object", "properties": { "min": { "type": "number" } } }
+        }
+    }
+  }
+}
