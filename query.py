@@ -91,10 +91,10 @@ if not openai_api_key:
     st.stop()
 
 # --- Redis Configuration (Azure Redis Cache Support) ---
-redis_host = os.getenv("REDIS_HOST", "localhost")
-redis_port = int(os.getenv("REDIS_PORT", "6379"))
-redis_password = os.getenv("REDIS_PASSWORD", None)
-redis_ssl = os.getenv("REDIS_SSL", "false").lower() == "true"
+redis_host = os.getenv("REDIS_HOST")
+redis_port = int(os.getenv("REDIS_PORT", "6380"))
+redis_password = os.getenv("REDIS_PASSWORD")
+redis_ssl = os.getenv("REDIS_SSL", "true")
 
 try:
     redis_client = redis.Redis(
