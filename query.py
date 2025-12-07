@@ -77,28 +77,37 @@ class TokenCostTracker:
         
         return summary_md
 
-# --- Database Configuration ---
-# DB_NAME = "growton_ai"
-# DB_USER = "postgres"
-# DB_PASSWORD = "postgres"
-# DB_HOST = "localhost"
-# DB_PORT = "5433"
-DB_NAME = "growton_ai"
-DB_USER = "growton_ai_user"
-DB_PASSWORD = "j8BpdJ42APcQPfQsuZMiBCoE7nxHNfOM"
-DB_HOST = "dpg-d46agkchg0os73eev130-a.singapore-postgres.render.com"
-DB_PORT = "5432"
+# --- Database Configuration (Azure PostgreSQL) ---
+DB_NAME = os.getenv("DB_NAME", "growton")
+DB_USER = os.getenv("DB_USER", "growton")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
+DB_HOST = os.getenv("DB_HOST", "growton-2026.postgres.database.azure.com")
+DB_PORT = os.getenv("DB_PORT", "5432")
+
 # --- OpenAI and Redis Configuration ---
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     st.error("OpenAI API key not found. Please set it in the .env file.")
     st.stop()
 
+# --- Redis Configuration (Azure Redis Cache Support) ---
+redis_host = os.getenv("REDIS_HOST", "localhost")
+redis_port = int(os.getenv("REDIS_PORT", "6379"))
+redis_password = os.getenv("REDIS_PASSWORD", None)
+redis_ssl = os.getenv("REDIS_SSL", "false").lower() == "true"
+
 try:
-    #redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-    redis_client = redis.Redis(host='red-d46duqur433s73ckm440', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=redis_password,
+        db=0,
+        decode_responses=True,
+        ssl=redis_ssl,
+        ssl_cert_reqs=None if redis_ssl else None  # For Azure Redis
+    )
     redis_client.ping()
-    logger.info("Successfully connected to Redis.")
+    logger.info(f"Successfully connected to Redis at {redis_host}:{redis_port} (SSL: {redis_ssl})")
 except redis.ConnectionError as e:
     st.error(f"Failed to connect to Redis: {e}")
     st.stop()

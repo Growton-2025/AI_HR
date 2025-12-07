@@ -1,7 +1,7 @@
 streamlit
 langchain-openai
 langchain
-langchain-core  # Explicitly added
+langchain-core
 python-dotenv
 psycopg2-binary
 pgvector
@@ -12,3 +12,5 @@ plotly
 folium
 streamlit-folium
 openpyxl
+pandas
+python-dateutil

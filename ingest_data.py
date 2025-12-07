@@ -42,10 +42,10 @@ CONCURRENCY_LIMIT = 20  # Max parallel AI calls AND max DB connections
 # postgresql://growton_ai_user:QDIt4TrRF57WmjjycR7hGU8Uojg1xBw0@dpg-d46deqa4d50c73avjb1g-a.singapore-postgres.render.com/growton_ai_zcaz
 
 # --- Database Configuration ---
-DB_NAME = "growton_ai_zcaz"
-DB_USER = "growton_ai_user"
-DB_PASSWORD = "QDIt4TrRF57WmjjycR7hGU8Uojg1xBw0"
-DB_HOST = "dpg-d46deqa4d50c73avjb1g-a.singapore-postgres.render.com"
+DB_NAME = "growton"
+DB_USER = "growton"
+DB_PASSWORD = "Postgres-2026"
+DB_HOST = "growton-2026.postgres.database.azure.com"
 DB_PORT = "5432"
 
 if not OPENAI_API_KEY:
