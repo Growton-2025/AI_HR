@@ -94,7 +94,7 @@ if not openai_api_key:
 redis_host = os.getenv("REDIS_HOST")
 redis_port = int(os.getenv("REDIS_PORT", "6380"))
 redis_password = os.getenv("REDIS_PASSWORD")
-redis_ssl = os.getenv("REDIS_SSL", "true")
+redis_ssl = os.getenv("REDIS_SSL", "false").lower() == "true"
 
 try:
     redis_client = redis.Redis(
