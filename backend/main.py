@@ -50,8 +50,12 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
-@app.get("/api/debug")
-async def debug_check():
+@app.get("/api/ping")
+def ping_check():
+    return {"message": "pong"}
+
+@app.get("/api/debug_db")
+async def debug_db():
     from backend.db.connection import get_db_connection, return_db_connection
     from backend.pipeline.query import redis_client
     
