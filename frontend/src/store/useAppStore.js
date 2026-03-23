@@ -2,15 +2,13 @@ import { create } from 'zustand'
 import axios from 'axios'
 
 // API base URL
-// API base URL
-// const API_BASE = '/api'
-const API_BASE = '/api'
+const API_URL = import.meta.env.VITE_API_URL || ''
+const API_BASE = `${API_URL}/api`
 
 // WebSocket URL
-// WebSocket URL
-// const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-// const WS_URL = `${protocol}//${window.location.host}/api/ws/search`
-const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws/search`
+const BACKEND_HOST = API_URL ? API_URL.replace(/^https?:\/\//, '') : window.location.host
+const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+const WS_URL = `${protocol}//${BACKEND_HOST}/api/ws/search`
 
 // Global App Store
 import { persist } from 'zustand/middleware'
