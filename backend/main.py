@@ -53,6 +53,38 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
+@app.get("/api/debug")
+async def debug_check():
+    from backend.db.connection import get_db_connection, return_db_connection
+    from backend.pipeline.query import redis_client
+    
+    results = {"db": "testing...", "redis": "testing..."}
+    
+    # Test DB
+    try:
+        conn = get_db_connection(max_retries=1)
+        if conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                results["db"] = "ok"
+            return_db_connection(conn)
+        else:
+            results["db"] = "failed (no connection)"
+    except Exception as e:
+        results["db"] = f"failed: {str(e)}"
+        
+    # Test Redis
+    try:
+        if redis_client:
+            redis_client.ping()
+            results["redis"] = "ok"
+        else:
+            results["redis"] = "not initialized"
+    except Exception as e:
+        results["redis"] = f"failed: {str(e)}"
+        
+    return results
+
 # Include API Routers
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(roles.router, prefix="/api/roles", tags=["roles"])
