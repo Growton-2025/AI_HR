@@ -89,7 +89,7 @@ coverage.xml
 
 # Frontend Build
 # We are NOT ignoring dist because we want to push the build to Azure
-# frontend/dist/
+frontend/dist/
 
 # Project Environment
 .env
