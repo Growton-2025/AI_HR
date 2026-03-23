@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments (local only)
+venv/
+myenv/
+*.venv
+env/
+ENV/
+.venv/
+
+# Local Environment Variables (keep .env for deployment)
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project Specific
+individual/
+!individual/requirements.txt
+!individual/startup.sh
+
+# Logs (local only)
+backend_log.txt
+frontend_log.txt
+backend_otp_log.txt
+ingest_log.txt
+
+# Large Data Files (local only)
+enriched_candidate_profiles.json
+search_results.json
+
+# Cache
+.cache/
+*.cache
+
+# Coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.pytest_cache/
+nosetests.xml
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Frontend Build
+# We are NOT ignoring dist because we want to push the build to Azure
+# frontend/dist/
+
+# Project Environment
+.env
+frontend/.env

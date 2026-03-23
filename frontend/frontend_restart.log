@@ -1,0 +1,10 @@
+
+> growton-ai-frontend@1.0.0 dev
+> vite --port 5173
+
+
+  VITE v5.4.21  ready in 219 ms
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+  ➜  press h + enter to show help

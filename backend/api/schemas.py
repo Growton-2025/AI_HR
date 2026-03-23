@@ -1,0 +1,72 @@
+
+from pydantic import BaseModel
+from typing import List, Optional
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+    role: Optional[str] = None
+
+class User(BaseModel):
+    id: Optional[int] = None
+    username: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    disabled: Optional[bool] = None
+    role: Optional[str] = "recruiter"
+    permissions: Optional[dict] = {}
+
+class UserInDB(User):
+    hashed_password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str = "google-oauth-mock"  # For Google Auth, password isn't used directly
+
+class SearchRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+
+class RoleCreate(BaseModel):
+    name: str
+
+class AssignmentDetail(BaseModel):
+    candidate_id: int
+    priority: Optional[str] = "--"
+    feedback: Optional[str] = ""
+
+class CandidateAssignment(BaseModel):
+    assignments: List[AssignmentDetail]
+
+class CandidateFeedback(BaseModel):
+    candidate_id: int
+    priority: str
+    feedback: str
+
+class GoogleAuthRequest(BaseModel):
+    token: str  # Google ID token from frontend
+
+# Registration schemas
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    phone: Optional[str] = None
+
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp_code: str
+
+class ResendOTPRequest(BaseModel):
+    email: str
+
+class RegisterResponse(BaseModel):
+    message: str
+    email: str
+
+
+class ChatReplyRequest(BaseModel):
+    message: str
