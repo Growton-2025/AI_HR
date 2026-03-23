@@ -14,17 +14,21 @@ from backend.pipeline import query
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load data in background to prevent startup blocking
+    # DONT let startup block! Let it yield immediately so Azure is happy.
+    print("Backend is starting up...")
     asyncio.create_task(load_data_async())
     yield
-    # Cleanup: Close all database connections
     from backend.db.connection import close_all_connections
     close_all_connections()
 
 async def load_data_async():
+    await asyncio.sleep(2) # Wait for the app to be fully up
     print("Starting background data loading...")
-    await asyncio.to_thread(query.initialize_cache)
-    print("Background data loading complete.")
+    try:
+        await asyncio.to_thread(query.initialize_cache)
+        print("Background data loading complete.")
+    except Exception as e:
+        print(f"DATABASE CONNECTION FAILED on startup: {e}")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
