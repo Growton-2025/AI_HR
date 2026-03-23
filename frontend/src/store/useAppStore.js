@@ -2,11 +2,16 @@ import { create } from 'zustand'
 import axios from 'axios'
 
 // API base URL
-const API_URL = import.meta.env.VITE_API_URL || ''
-const API_BASE = `${API_URL}/api`
+// On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
+// causing cross-origin preflight failures.
+const API_URL = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '')
+const isLocalHost = typeof window !== 'undefined' &&
+    /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(window.location.host)
+const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
+const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
 
 // WebSocket URL
-const BACKEND_HOST = API_URL ? API_URL.replace(/^https?:\/\//, '') : window.location.host
+const BACKEND_HOST = useAbsoluteApi ? API_URL.replace(/^https?:\/\//, '') : window.location.host
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
 const WS_URL = `${protocol}//${BACKEND_HOST}/api/ws/search`
 
