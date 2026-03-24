@@ -761,9 +761,9 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
             all_criteria_met = False
 
         checks = [
-            check_company_presence, check_functional_presence, check_industry_presence,
-            check_customer_segments, check_location_presence, check_geography_experience,
-            check_company_details, check_company_culture_presence, check_excluded_geography_presence,
+            check_company_presence,
+            check_location_presence, check_geography_experience,
+            check_excluded_geography_presence,
             check_tenure_in_latest_role, check_avg_tenure_in_last_n_roles
         ]
         
