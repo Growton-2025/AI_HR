@@ -46,6 +46,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def read_root():
+    return {"message": "Growton AI Backend is running"}
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
