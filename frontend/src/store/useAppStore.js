@@ -14,7 +14,7 @@ if (!API_URL && !isLocalHost) {
 }
 
 const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
-const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
+export const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
 
 // WebSocket URL
 const BACKEND_HOST = useAbsoluteApi ? API_URL.replace(/^https?:\/\//, '') : window.location.host

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useAppStore } from '../store/useAppStore';
+import { useAppStore, API_BASE } from '../store/useAppStore';
 import axios from 'axios';
 import {
   Search, ExternalLink, ChevronLeft, ChevronRight, Filter,
@@ -8,8 +8,6 @@ import {
   Activity, MessageSquareMore, Users, Plus, Edit2, Check, Download, 
   Mail, Phone, MessageSquare, Linkedin, Send
 } from 'lucide-react';
-
-const API_BASE = '/api';
 
 // ── Status pill config ────────────────────────────────────────
 const RECRUITMENT_STAGES = [
