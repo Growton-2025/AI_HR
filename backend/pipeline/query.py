@@ -830,9 +830,11 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
         - Single flowing paragraph. No bullets.
         """
     )
+    # Create a safe copy for JSON serialization (remove numpy arrays like 'embedding')
+    profile_safe = {k: v for k, v in profile.items() if k != "embedding"}
     formatted_prompt = prompt_template.format(
         original_criteria_json=json.dumps(original_criteria, indent=2),
-        matching_profile_json=json.dumps(profile, indent=2)
+        matching_profile_json=json.dumps(profile_safe, indent=2)
     )
     response = await specialist_llm.ainvoke(formatted_prompt)
     content = response.content.replace('\n', ' ').replace('|', '')
