@@ -943,7 +943,16 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
                    ids = [row[0] for row in cur.fetchall()]
                 conn.close()
                 # Fetch full objects from cache
-                initial_candidate_pool = [PROFILES_BY_ID[pid] for pid in ids if pid in PROFILES_BY_ID]
+                # Initialize candidates without the numpy ndarray embedding
+                cached_profiles = [PROFILES_BY_ID[pid] for pid in ids if pid in PROFILES_BY_ID]
+                
+                # Strip numpy arrays
+                initial_candidate_pool = []
+                for p in cached_profiles:
+                    cand_dict = dict(p)
+                    cand_dict.pop('embedding', None)
+                    initial_candidate_pool.append(cand_dict)
+                    
                 logger.info(f"Vector search returned {len(initial_candidate_pool)} candidates.")
         except Exception as e:
             logger.error(f"Vector search failed: {e}. Falling back to full scan.")
