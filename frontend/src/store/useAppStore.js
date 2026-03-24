@@ -4,9 +4,15 @@ import axios from 'axios'
 // API base URL
 // On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
 // causing cross-origin preflight failures.
-const API_URL = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '')
+let API_URL = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '')
 const isLocalHost = typeof window !== 'undefined' &&
     /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(window.location.host)
+
+// Fallback to absolute production URL if env var failed to inject
+if (!API_URL && !isLocalHost) {
+  API_URL = 'https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net';
+}
+
 const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
 const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
 
