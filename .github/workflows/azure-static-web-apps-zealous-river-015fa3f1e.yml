@@ -28,7 +28,7 @@ jobs:
           npm run build
         env:
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
-          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_CLIENT_ID: "759905236770-b867otn611a5inf07opasmso9s3nmt2u.apps.googleusercontent.com"
 
       - name: Build And Deploy
         id: builddeploy
