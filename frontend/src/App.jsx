@@ -18,7 +18,7 @@ if (initToken) {
 }
 
 function App() {
-    const { isAuthenticated, token, fetchStats, fetchRoles } = useAppStore()
+    const { isAuthenticated, token, fetchStats, fetchRoles, sidebarWidth } = useAppStore()
     const location = useLocation()
     const [isReady, setIsReady] = useState(false)
     const [isProfileLoaded, setIsProfileLoaded] = useState(false)
@@ -65,33 +65,60 @@ function App() {
         return null // don't render until profile and role are fetched
     }
 
+    const isFullBleed = ['/', '/dashboard', '/talent-pool', '/screening'].includes(location.pathname)
+
     return (
         <div className="app-layout">
             <Sidebar />
-            <main className="main-content">
-                {location.pathname !== '/screening' && location.pathname !== '/talent-pool' && location.pathname !== '/' && location.pathname !== '/dashboard' && (
-                    <div style={{ marginBottom: '36px' }}>
-                        <h1 className="main-title">Talent Intelligence Platform</h1>
-                        <p className="subtitle">Find and engage top candidates with AI-powered matching</p>
+            <main
+                className="main-content"
+                style={{
+                    marginLeft: sidebarWidth,
+                    width: `calc(100% - ${sidebarWidth}px)`,
+                    transition: 'none',
+                    padding: isFullBleed ? 0 : undefined,
+                    minHeight: '100vh',
+                    boxSizing: 'border-box',
+                }}
+            >
+                {!isFullBleed ? (
+                    <div style={{ padding: '40px 60px' }}>
+                        <div style={{ marginBottom: '36px' }}>
+                            <h1 className="main-title">Talent Intelligence Platform</h1>
+                            <p className="subtitle">Find and engage top candidates with AI-powered matching</p>
+                        </div>
+                        <Routes>
+                            <Route path="/login" element={<Navigate to="/" replace />} />
+                            <Route path="/" element={<Dashboard />} />
+                            <Route path="/dashboard" element={<Navigate to="/" replace />} />
+                            <Route path="/screening" element={<Screening />} />
+                            <Route path="/roles" element={<Roles />} />
+                            <Route path="/talent-pool" element={<TalentPool />} />
+                            <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
+                            <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
+                            <Route path="/calls" element={<ComingSoon title="Call Management" description="Schedule and manage candidate interviews" />} />
+                            <Route path="/admin/users" element={<UserManagement />} />
+                        </Routes>
                     </div>
+                ) : (
+                    <Routes>
+                        <Route path="/login" element={<Navigate to="/" replace />} />
+                        <Route path="/" element={<Dashboard />} />
+                        <Route path="/dashboard" element={<Navigate to="/" replace />} />
+                        <Route path="/screening" element={<Screening />} />
+                        <Route path="/roles" element={<Roles />} />
+                        <Route path="/talent-pool" element={<TalentPool />} />
+                        <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
+                        <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
+                        <Route path="/calls" element={<ComingSoon title="Call Management" description="Schedule and manage candidate interviews" />} />
+                        <Route path="/admin/users" element={<UserManagement />} />
+                    </Routes>
                 )}
-
-                <Routes>
-                    <Route path="/login" element={<Navigate to="/" replace />} />
-                    <Route path="/" element={<Dashboard />} />
-                    <Route path="/dashboard" element={<Navigate to="/" replace />} />
-                    <Route path="/screening" element={<Screening />} />
-                    <Route path="/roles" element={<Roles />} />
-                    <Route path="/talent-pool" element={<TalentPool />} />
-                    <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
-                    <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
-                    <Route path="/calls" element={<ComingSoon title="Call Management" description="Schedule and manage candidate interviews" />} />
-                    <Route path="/admin/users" element={<UserManagement />} />
-                </Routes>
             </main>
         </div>
     )
 }
 
 export default App
+
 

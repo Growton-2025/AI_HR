@@ -82,8 +82,8 @@ body {
    ========================================= */
 
 .app-sidebar {
-  width: 280px;
-  min-width: 280px;
+  /* width set dynamically via JS */
+  min-width: 0;
   height: 100vh;
   position: fixed;
   top: 0;
@@ -95,7 +95,6 @@ body {
   flex-direction: column;
   border-right: 1px solid #27272a;
   z-index: 9999;
-  /* Max z-index */
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -277,27 +276,22 @@ body {
    Main Content Styles
    ========================================= */
 
-/* =========================================
-   Main Content Styles
-   ========================================= */
-
 .main-content {
   flex: 1;
   min-width: 0;
-  margin-left: 280px;
-  /* Critical: Push content right */
-  width: calc(100% - 280px);
-  /* Ensure width is correct */
-  padding: 40px 60px;
+  /* margin-left and width set dynamically via JS (sidebarWidth) */
+  margin-left: 260px;
+  width: calc(100% - 260px);
+  padding: 0;
   min-height: 100vh;
   position: relative;
   z-index: 1;
   background: #f8fafc;
-  /* Very light slate */
   background-image:
     radial-gradient(at 0% 0%, rgba(249, 115, 22, 0.03) 0px, transparent 50%),
     radial-gradient(at 100% 0%, rgba(124, 58, 237, 0.03) 0px, transparent 50%);
 }
+
 
 /* Headers */
 .main-title {

@@ -31,7 +31,7 @@ function Roles() {
     const [isSyncing, setIsSyncing] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
     const [isLoadingRole, setIsLoadingRole] = useState(false)
-    const [hrCampaignId, setHrCampaignId] = useState('332760') // Default
+    const { heyreachCampaignId, setHeyreachCampaignId, lookupHeyReachCampaign } = useAppStore()
 
 
     // Initial Load
@@ -97,20 +97,11 @@ function Roles() {
 
     const handleLookupHrCampaign = async () => {
         if (!viewingRole?.name) return
-        try {
-            const token = localStorage.getItem('token')
-            const response = await fetch(`/api/outreach/heyreach/find-campaign/${encodeURIComponent(viewingRole.name)}`, {
-                headers: { 'Authorization': `Bearer ${token}` }
-            })
-            if (response.ok) {
-                const data = await response.json()
-                setHrCampaignId(data.campaign_id.toString())
-                toast.success(`Found campaign ID: ${data.campaign_id}`)
-            } else {
-                toast.error('No matching campaign found in HeyReach')
-            }
-        } catch (error) {
-            toast.error('Lookup failed')
+        const res = await lookupHeyReachCampaign(viewingRole.name)
+        if (res.success) {
+            toast.success(`Found campaign ID: ${res.campaign_id}`)
+        } else {
+            toast.error(res.error || 'No matching campaign found in HeyReach')
         }
     }
 
@@ -195,7 +186,7 @@ function Roles() {
                 candidate_ids: candidateIds,
                 role_id: roleId,
                 role_name: viewingRole.name,
-                campaign_id: parseInt(hrCampaignId),
+                campaign_id: parseInt(heyreachCampaignId),
                 sender_account_id: 113572 // From user snippet
             })
 
@@ -504,8 +495,8 @@ function Roles() {
                                 <span style={{ fontSize: '11px', fontWeight: 600, color: '#475569' }}>Campaign ID:</span>
                                 <input
                                     type="text"
-                                    value={hrCampaignId}
-                                    onChange={(e) => setHrCampaignId(e.target.value)}
+                                    value={heyreachCampaignId}
+                                    onChange={(e) => setHeyreachCampaignId(e.target.value)}
                                     placeholder="ID"
                                     style={{
                                         padding: '2px 6px',

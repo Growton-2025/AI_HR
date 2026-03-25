@@ -261,6 +261,46 @@ export const useAppStore = create(persist((set, get) => ({
         return request
     },
 
+    // HeyReach Global State
+    heyreachCampaignId: '332760',
+    setHeyreachCampaignId: (id) => set({ heyreachCampaignId: id }),
+
+    lookupHeyReachCampaign: async (name) => {
+        try {
+            const res = await axios.get(`${API_BASE}/outreach/heyreach/find-campaign/${encodeURIComponent(name)}`)
+            if (res.data.campaign_id) {
+                set({ heyreachCampaignId: res.data.campaign_id.toString() })
+                return { success: true, campaign_id: res.data.campaign_id }
+            }
+            return { success: false, error: 'No campaign found' }
+        } catch (e) {
+            console.error('Failed to lookup campaign:', e)
+            return { success: false, error: e.response?.data?.detail || 'Lookup failed' }
+        }
+    },
+    
+    // Sidebar State
+    sidebarWidth: 260,
+    setSidebarWidth: (w) => set({ sidebarWidth: Math.max(60, Math.min(420, w)) }),
+
+    updateCandidateField: async (candidateId, data) => {
+        try {
+            const res = await axios.patch(`${API_BASE}/candidates/${candidateId}`, data)
+            // Update cache locally
+            const { talentPoolCache } = get()
+            if (talentPoolCache.candidates) {
+                const updated = talentPoolCache.candidates.map(c => 
+                    c.id === candidateId ? { ...c, ...data } : c
+                )
+                set({ talentPoolCache: { ...talentPoolCache, candidates: updated } })
+            }
+            return { success: true, data: res.data }
+        } catch (e) {
+            console.error('Failed to update candidate field:', e)
+            return { success: false, error: e.response?.data?.detail || 'Update failed' }
+        }
+    },
+
     // Search State
     searchQuery: '',
     setSearchQuery: (query) => set({ searchQuery: query }),
@@ -767,6 +807,8 @@ export const useAppStore = create(persist((set, get) => ({
         analyticsLastFetchedAt: state.analyticsLastFetchedAt,
         user: state.user,
         talentPoolCache: state.talentPoolCache,
+        heyreachCampaignId: state.heyreachCampaignId, // Persist selection
+        isSidebarCollapsed: state.isSidebarCollapsed,
         // Persist recruiters so list shows instantly on page load (stale-while-revalidate)
         recruiters: state.recruiters,
     }),

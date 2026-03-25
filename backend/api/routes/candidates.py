@@ -204,3 +204,42 @@ async def websocket_search(websocket: WebSocket):
     except Exception as e:
         print(f"Unexpected WebSocket error: {e}")
 
+@router.patch("/candidates/{candidate_id}")
+async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user: schemas.User = Depends(deps.get_current_user)):
+    """Update candidate fields manually"""
+    from backend.db.connection import get_db_connection, return_db_connection
+    
+    # 1. Update Database
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        cur = conn.cursor()
+        for field, value in data.items():
+            # Basic whitelist for security
+            if field not in ['email', 'mobile_phone', 'linkedin', 'notes', 'name', 'first_name', 'last_name']:
+                continue
+            
+            # Map frontend names to DB column names if different
+            db_field = 'mobile_phone' if field == 'phone' else field
+            
+            cur.execute(f"UPDATE candidates SET {db_field} = %s, updated_at = NOW() WHERE id = %s", (value, candidate_id))
+        
+        conn.commit()
+        cur.close()
+        return_db_connection(conn)
+    except Exception as e:
+        if conn: return_db_connection(conn)
+        raise HTTPException(status_code=500, detail=f"Database update failed: {e}")
+
+    # 2. Update Cache
+    if candidate_id in PROFILES_BY_ID:
+        profile = PROFILES_BY_ID[candidate_id]
+        for field, value in data.items():
+            profile[field] = value
+            # Handle alias
+            if field == 'phone': profile['mobile_phone'] = value
+        PROFILES_BY_ID[candidate_id] = profile
+
+    return {"success": True, "data": data}

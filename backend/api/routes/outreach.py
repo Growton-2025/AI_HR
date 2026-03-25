@@ -306,8 +306,11 @@ async def shortlist_outreach(
             print(f"⚠️ Clay enrichment error for {name}: {clay_e}")
 
 
-    # Step 2: Trigger Smartlead email campaign (if email exists)
-    if email:
+    # Step 2: Trigger Smartlead email campaign (if email exists and is valid)
+    def is_valid_email(e):
+        return e and str(e).strip().lower() not in ["", "na", "n/a", "none"]
+
+    if is_valid_email(email):
         try:
             bot = get_smartlead_bot()
             sender_email = os.getenv("SMARTLEAD_SENDER_EMAIL")

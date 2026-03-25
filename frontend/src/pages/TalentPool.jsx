@@ -1,38 +1,102 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore, API_BASE } from '../store/useAppStore';
 import axios from 'axios';
+import { toast } from 'sonner';
 import {
   Search, ExternalLink, ChevronLeft, ChevronRight, Filter,
   User, Building2, MapPin, Briefcase, BarChart2,
   SlidersHorizontal, RefreshCw, UserPlus, X, ChevronDown,
-  Activity, MessageSquareMore, Users, Plus, Edit2, Check, Download, 
+  Activity, MessageSquareMore, Users, Plus, Edit2, Check, Download,
   Mail, Phone, MessageSquare, Linkedin, Send
 } from 'lucide-react';
 
 // ── Status pill config ────────────────────────────────────────
 const RECRUITMENT_STAGES = [
-  'To be started', 'Shortlisted', 'Rejected', 'For Future', 
-  'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 
-  'Followup / In conversation', 'Shortlist - Rejected', 'High CTC', 
+  'To be started', 'Shortlisted', 'Rejected', 'For Future',
+  'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested',
+  'Followup / In conversation', 'Shortlist - Rejected', 'High CTC',
   'Duplicate', 'Not responding', 'Internal Review', 'Shared with customer'
 ];
 
 const STATUS_STYLES = {
-  'to be started':          { bg: '#f1f5f9', color: '#64748b', dot: '#94a3b8' },
-  'shortlisted':            { bg: '#dcfce7', color: '#16a34a', dot: '#16a34a' },
-  'rejected':               { bg: '#fee2e2', color: '#b91c1c', dot: '#ef4444' },
-  'for future':             { bg: '#fff7ed', color: '#9a3412', dot: '#f97316' },
+  'to be started': { bg: '#f1f5f9', color: '#64748b', dot: '#94a3b8' },
+  'shortlisted': { bg: '#dcfce7', color: '#16a34a', dot: '#16a34a' },
+  'rejected': { bg: '#fee2e2', color: '#b91c1c', dot: '#ef4444' },
+  'for future': { bg: '#fff7ed', color: '#9a3412', dot: '#f97316' },
   'reached out - linkedin': { bg: '#e0f2fe', color: '#0369a1', dot: '#0284c7' },
-  'reached out - phone':    { bg: '#dbeafe', color: '#1d4ed8', dot: '#1d4ed8' },
-  'not interested':         { bg: '#f1f5f9', color: '#475569', dot: '#64748b' },
+  'reached out - phone': { bg: '#dbeafe', color: '#1d4ed8', dot: '#1d4ed8' },
+  'not interested': { bg: '#f1f5f9', color: '#475569', dot: '#64748b' },
   'followup / in conversation': { bg: '#fef9c3', color: '#854d0e', dot: '#ca8a04' },
-  'shortlist - rejected':   { bg: '#fef2f2', color: '#991b1b', dot: '#dc2626' },
-  'high ctc':               { bg: '#fce7f3', color: '#be185d', dot: '#db2777' },
-  'duplicate':              { bg: '#f3f4f6', color: '#374151', dot: '#4b5563' },
-  'not responding':         { bg: '#fff1f2', color: '#9f1239', dot: '#e11d48' },
-  'internal review':        { bg: '#f3e8ff', color: '#7e22ce', dot: '#9333ea' },
-  'shared with customer':   { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
+  'shortlist - rejected': { bg: '#fef2f2', color: '#991b1b', dot: '#dc2626' },
+  'high ctc': { bg: '#fce7f3', color: '#be185d', dot: '#db2777' },
+  'duplicate': { bg: '#f3f4f6', color: '#374151', dot: '#4b5563' },
+  'not responding': { bg: '#fff1f2', color: '#9f1239', dot: '#e11d48' },
+  'internal review': { bg: '#f3e8ff', color: '#7e22ce', dot: '#9333ea' },
+  'shared with customer': { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
 };
+
+// ── Clickable Editable Cell (renders as <td>) ────────────────
+function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—' }) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [tempValue, setTempValue] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const isNA = !value || ['na', 'n/a', 'none'].includes(value.toString().toLowerCase());
+
+  const handleSave = async () => {
+    if (tempValue !== value) {
+      setLoading(true);
+      await onUpdate(id, { [field]: tempValue });
+      setLoading(false);
+    }
+    setIsEditing(false);
+  };
+
+  if (isEditing) {
+    return (
+      <td style={{ padding: '0 14px', borderRight: '1px solid #f1f5f9' }}>
+        <input
+          autoFocus
+          value={tempValue}
+          onChange={(e) => setTempValue(e.target.value)}
+          onBlur={handleSave}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') handleSave();
+            if (e.key === 'Escape') setIsEditing(false);
+          }}
+          style={{
+            width: '100%', padding: '4px 6px', border: '1px solid #f97316',
+            borderRadius: '4px', fontSize: '12px', fontFamily: 'inherit', outline: 'none',
+          }}
+        />
+      </td>
+    );
+  }
+
+  return (
+    <td
+      onClick={() => { setIsEditing(true); setTempValue(isNA ? '' : (value || '')); }}
+      style={{
+        padding: '13px 14px', borderRight: '1px solid #f1f5f9',
+        fontSize: '12px', cursor: 'pointer',
+        color: isNA ? '#f97316' : '#334155',
+      }}
+      title="Click to edit"
+    >
+      <span style={{
+        padding: isNA ? '2px 6px' : '0',
+        borderRadius: '4px',
+        background: isNA ? 'rgba(249,115,22,0.06)' : 'transparent',
+        border: isNA ? '1px dashed rgba(249,115,22,0.4)' : 'none',
+        display: 'inline-block',
+      }}>
+        {isNA ? (value || placeholder) : value}
+        {loading && ' ...'}
+      </span>
+    </td>
+  );
+}
+
 
 function StatusDropdown({ status, candidateId, onUpdate, onShortlisted }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -77,7 +141,7 @@ function StatusDropdown({ status, candidateId, onUpdate, onShortlisted }) {
 
   return (
     <div style={{ position: 'relative' }} ref={dropdownRef}>
-      <button 
+      <button
         onClick={() => !loading && setIsOpen(!isOpen)}
         disabled={loading}
         style={{
@@ -135,7 +199,7 @@ function StatusDropdown({ status, candidateId, onUpdate, onShortlisted }) {
 
 function ShortlistCard({ data, onClose }) {
   const [closing, setClosing] = useState(false);
-  
+
   useEffect(() => {
     const timer = setTimeout(() => { setClosing(true); setTimeout(onClose, 300); }, 10000);
     return () => clearTimeout(timer);
@@ -144,7 +208,7 @@ function ShortlistCard({ data, onClose }) {
   const OutreachBadge = ({ status, label }) => {
     const config = {
       started: { bg: '#dcfce7', color: '#15803d', icon: '✓', text: 'Triggered' },
-      error:   { bg: '#fee2e2', color: '#b91c1c', icon: '✕', text: 'Failed' },
+      error: { bg: '#fee2e2', color: '#b91c1c', icon: '✕', text: 'Failed' },
       not_started: { bg: '#f1f5f9', color: '#64748b', icon: '—', text: 'No data' },
       no_campaign_id: { bg: '#fef9c3', color: '#854d0e', icon: '!', text: 'No campaign' },
     };
@@ -199,7 +263,7 @@ function ShortlistCard({ data, onClose }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px' }}>
             <Linkedin size={13} color="#0077b5" />
             <a href={data.linkedin} target="_blank" rel="noreferrer"
-               style={{ color: '#0077b5', fontWeight: 600, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              style={{ color: '#0077b5', fontWeight: 600, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               LinkedIn Profile
             </a>
           </div>
@@ -221,66 +285,118 @@ function ShortlistCard({ data, onClose }) {
 function EditableNotes({ candidateId, initialNotes }) {
   const [notes, setNotes] = useState(initialNotes || '');
   const [isEditing, setIsEditing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const updateCandidateNotes = useAppStore(state => state.updateCandidateNotes);
 
   useEffect(() => {
     setNotes(initialNotes || '');
   }, [initialNotes]);
 
-  const handleBlur = async () => {
+  const handleSave = async () => {
+    if (notes === (initialNotes || '')) {
+      setIsEditing(false);
+      return;
+    }
+    setIsSaving(true);
+    await updateCandidateNotes(candidateId, notes);
+    setIsSaving(false);
     setIsEditing(false);
-    if (notes !== (initialNotes || '')) {
-      await updateCandidateNotes(candidateId, notes);
-    }
-  };
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.target.blur();
-    }
   };
 
   return (
     <div style={{ width: '100%', minWidth: 100 }}>
-      {isEditing ? (
-        <textarea
-          autoFocus
-          value={notes}
-          onChange={e => setNotes(e.target.value)}
-          onBlur={handleBlur}
-          onKeyDown={handleKeyDown}
-          rows={1}
-          style={{
-            width: '100%',
-            padding: '4px 8px',
-            border: '1.5px solid #f97316',
-            borderRadius: '6px',
-            fontSize: '12px',
-            outline: 'none',
-            fontFamily: 'inherit',
-            resize: 'none',
-            display: 'block'
-          }}
-        />
-      ) : (
-        <div 
-          onClick={() => setIsEditing(true)}
-          style={{ 
-            fontSize: '12.5px', 
-            color: notes ? '#334155' : '#94a3b8',
-            fontStyle: notes ? 'normal' : 'italic',
-            cursor: 'text',
-            minHeight: '20px',
-            padding: '4px 0',
-            maxWidth: '180px',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap'
-          }}
-        >
-          {notes || 'Add notes...'}
+      {isEditing && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(15, 23, 42, 0.4)', backdropFilter: 'blur(4px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 9999, padding: '20px'
+        }} onClick={() => !isSaving && setIsEditing(false)}>
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: '#fff', width: '100%', maxWidth: '500px',
+              borderRadius: '16px', display: 'flex', flexDirection: 'column',
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)', overflow: 'hidden'
+            }}
+          >
+            <div style={{ padding: '20px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f8fafc' }}>
+              <div style={{ fontSize: '16px', fontWeight: 800, color: '#0f172a' }}>Candidate Notes</div>
+              <button disabled={isSaving} onClick={() => setIsEditing(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', borderRadius: '50%', color: '#64748b' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = 'none'}>
+                <X size={18} />
+              </button>
+            </div>
+
+            <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <textarea
+                autoFocus
+                value={notes}
+                maxLength={5000}
+                onChange={e => setNotes(e.target.value)}
+                placeholder="Add notes about this candidate..."
+                rows={6}
+                style={{
+                  width: '100%', padding: '12px', boxSizing: 'border-box', border: '1.5px solid #e2e8f0',
+                  borderRadius: '10px', fontSize: '13.5px', outline: 'none',
+                  fontFamily: 'inherit', resize: 'vertical', minHeight: '120px',
+                  color: '#0f172a', transition: 'border-color 0.15s'
+                }}
+                onFocus={e => e.target.style.borderColor = '#f97316'}
+                onBlur={e => e.target.style.borderColor = '#e2e8f0'}
+              />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: '12px', color: notes.length >= 5000 ? '#ef4444' : '#64748b', fontWeight: 600 }}>
+                {notes.length} / 5000
+              </div>
+            </div>
+
+            <div style={{ padding: '16px 20px', background: '#f8fafc', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
+              <button
+                disabled={isSaving}
+                onClick={() => setIsEditing(false)}
+                style={{ padding: '8px 16px', borderRadius: '8px', border: '1.5px solid #e2e8f0', background: '#fff', color: '#475569', fontSize: '13.5px', fontWeight: 600, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                disabled={isSaving}
+                onClick={handleSave}
+                style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', background: '#f97316', color: '#fff', fontSize: '13.5px', fontWeight: 600, cursor: isSaving ? 'wait' : 'pointer', opacity: isSaving ? 0.7 : 1 }}
+              >
+                {isSaving ? 'Saving...' : 'Save Notes'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
+
+      <div
+        onClick={() => setIsEditing(true)}
+        style={{
+          fontSize: '12.5px',
+          color: initialNotes ? '#334155' : '#94a3b8',
+          fontStyle: initialNotes ? 'normal' : 'italic',
+          cursor: 'pointer',
+          minHeight: '20px',
+          padding: '4px 8px',
+          borderRadius: '6px',
+          maxWidth: '180px',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          border: '1px solid transparent',
+          transition: 'all 0.15s'
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.background = '#f1f5f9';
+          e.currentTarget.style.borderColor = '#e2e8f0';
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.background = 'transparent';
+          e.currentTarget.style.borderColor = 'transparent';
+        }}
+      >
+        {notes || 'Click to add notes...'}
+      </div>
     </div>
   );
 }
@@ -407,25 +523,25 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
           {minValue} - {maxValue} yrs
         </span>
       </div>
-      
+
       <div style={{ position: 'relative', height: 20, display: 'flex', alignItems: 'center', padding: '0 4px' }}>
         {/* Track Background */}
         <div style={{ position: 'absolute', left: 4, right: 4, height: 4, background: '#e2e8f0', borderRadius: 2 }} />
-        
+
         {/* Active Range Highlight */}
-        <div style={{ 
-          position: 'absolute', 
-          left: `calc(4px + ${minPos}%)`, 
-          width: `${maxPos - minPos}%`, 
-          height: 4, 
-          background: '#3b82f6', 
+        <div style={{
+          position: 'absolute',
+          left: `calc(4px + ${minPos}%)`,
+          width: `${maxPos - minPos}%`,
+          height: 4,
+          background: '#3b82f6',
           borderRadius: 2,
           zIndex: 1
         }} />
-        
+
         {/* Dual Range Inputs Layered */}
-        <input 
-          type="range" min={min} max={max} value={minValue} 
+        <input
+          type="range" min={min} max={max} value={minValue}
           onChange={e => {
             const val = Math.min(Number(e.target.value), maxValue - 1);
             onChange(val, maxValue);
@@ -436,8 +552,8 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
           }}
           className="dual-range-input"
         />
-        <input 
-          type="range" min={min} max={max} value={maxValue} 
+        <input
+          type="range" min={min} max={max} value={maxValue}
           onChange={e => {
             const val = Math.max(Number(e.target.value), minValue + 1);
             onChange(minValue, val);
@@ -448,8 +564,9 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
           }}
           className="dual-range-input"
         />
-        
-        <style dangerouslySetInnerHTML={{ __html: `
+
+        <style dangerouslySetInnerHTML={{
+          __html: `
           .dual-range-input::-webkit-slider-thumb {
             appearance: none;
             pointer-events: auto;
@@ -499,9 +616,9 @@ const readPersistedContactInfo = () => {
 function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick }) {
   if (!analytics) return null;
   const { summary } = analytics;
-  
-  const conversionRate = summary.total_sourced > 0 
-    ? Math.round((summary.shortlisted / summary.total_sourced) * 100) 
+
+  const conversionRate = summary.total_sourced > 0
+    ? Math.round((summary.shortlisted / summary.total_sourced) * 100)
     : 0;
 
   const cards = [
@@ -519,10 +636,10 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
         {cards.map((card, i) => {
           const Icon = card.icon;
           return (
-            <div 
+            <div
               key={i}
               onClick={() => card.status && onStatClick(card.status)}
-              style={{ 
+              style={{
                 background: '#fff', padding: '16px', borderRadius: '16px', border: '1.5px solid #f1f5f9',
                 cursor: card.status ? 'pointer' : 'default', transition: 'all 0.2s',
                 display: 'flex', alignItems: 'center', gap: '16px',
@@ -535,7 +652,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
                 <Icon size={20} />
               </div>
               <div>
-                 <div style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.02em', marginTop: '4px' }}>{card.label}</div>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.02em', marginTop: '4px' }}>{card.label}</div>
               </div>
             </div>
           );
@@ -549,11 +666,11 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
           </div>
           <div style={{ display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '4px' }}>
             {recruiterPerf.map((perf, i) => (
-              <div 
-                key={i} 
+              <div
+                key={i}
                 onClick={() => onRecruiterClick(perf.recruiter)}
-                style={{ 
-                  minWidth: '160px', background: '#fff', padding: '10px 14px', borderRadius: '12px', border: '1px solid #e2e8f0', 
+                style={{
+                  minWidth: '160px', background: '#fff', padding: '10px 14px', borderRadius: '12px', border: '1px solid #e2e8f0',
                   display: 'flex', flexDirection: 'column', gap: '4px', cursor: 'pointer', transition: 'all 0.15s'
                 }}
                 onMouseEnter={e => e.currentTarget.style.borderColor = '#f97316'}
@@ -582,18 +699,21 @@ function ConversationModal({ candidate, onClose }) {
   const [loading, setLoading] = useState(true);
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
-  
+
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
   const sendChatReply = useAppStore(state => state.sendChatReply);
+  const { heyreachCampaignId, setHeyreachCampaignId, triggerHeyReachOutreach, updateCandidateField } = useAppStore();
+  const [isTriggering, setIsTriggering] = useState(false);
+  const [hasTriggered, setHasTriggered] = useState(false);
   const messagesEndRef = useRef(null);
 
   const loadMessages = async () => {
     setLoading(true);
     const res = await fetchChatHistory(0, candidate.id, platform);
     if (res.success) {
-        setMessages(res.messages || []);
+      setMessages(res.messages || []);
     } else {
-        setMessages([]);
+      setMessages([]);
     }
     setLoading(false);
   };
@@ -632,7 +752,7 @@ function ConversationModal({ candidate, onClose }) {
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       zIndex: 9999, padding: '20px'
     }} onClick={onClose}>
-      <div 
+      <div
         onClick={e => e.stopPropagation()}
         style={{
           background: '#fff', width: '100%', maxWidth: '600px', height: '80vh',
@@ -645,7 +765,7 @@ function ConversationModal({ candidate, onClose }) {
           <div>
             <div style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a' }}>{candidate.first_name} {candidate.last_name || ''}</div>
             <div style={{ fontSize: '13px', color: '#64748b', display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
-               <MessageSquare size={14}/> Conversations
+              <MessageSquare size={14} /> Conversations
             </div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', borderRadius: '50%', color: '#64748b' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = 'none'}>
@@ -654,7 +774,7 @@ function ConversationModal({ candidate, onClose }) {
         </div>
 
         <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', padding: '0 20px', background: '#fff' }}>
-          <button 
+          <button
             onClick={() => setPlatform('linkedin')}
             style={{
               padding: '14px 20px', background: 'none', border: 'none', borderBottom: platform === 'linkedin' ? '2px solid #0077b5' : '2px solid transparent',
@@ -664,7 +784,7 @@ function ConversationModal({ candidate, onClose }) {
           >
             <Linkedin size={16} /> LinkedIn
           </button>
-          <button 
+          <button
             onClick={() => setPlatform('email')}
             style={{
               padding: '14px 20px', background: 'none', border: 'none', borderBottom: platform === 'email' ? '2px solid #f97316' : '2px solid transparent',
@@ -677,92 +797,164 @@ function ConversationModal({ candidate, onClose }) {
         </div>
 
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#f8fafc' }}>
-                <div style={{ flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  {loading ? (
-                    <div style={{ textAlign: 'center', padding: '40px', color: '#94a3b8', fontSize: '14px' }}>Loading conversations...</div>
-                  ) : messages.length === 0 ? (
-                    <div style={{ textAlign: 'center', padding: '40px', color: '#94a3b8', fontSize: '14px' }}>No messages found on {platform === 'linkedin' ? 'LinkedIn' : 'Email'}.</div>
-                  ) : (
-                    messages.map((msg, i) => {
-                      const isCandidate = msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
-                      const senderName = isCandidate ? `${candidate.first_name}` : 'You';
-                      const time = msg.time || msg.created_at || msg.timestamp;
-                      const body = msg.email_body || msg.message || msg.text || '';
-                      
-                      return (
-                        <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end' }}>
-                            <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
-                                {senderName} &bull; {formatTime(time)}
-                            </div>
-                            <div style={{
-                                maxWidth: '85%',
-                                padding: '12px 16px',
-                                borderRadius: '16px',
-                                background: isCandidate ? '#fff' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
-                                color: isCandidate ? '#0f172a' : '#fff',
-                                fontSize: '13.5px',
-                                lineHeight: '1.5',
-                                boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                                border: isCandidate ? '1px solid #e2e8f0' : 'none',
-                                borderBottomLeftRadius: isCandidate ? '4px' : '16px',
-                                borderBottomRightRadius: isCandidate ? '16px' : '4px',
-                                whiteSpace: 'pre-wrap'
-                            }}>
-                                <div dangerouslySetInnerHTML={{ __html: body }} style={{ maxWidth: '100%', overflowWrap: 'break-word', wordWrap: 'break-word' }} />
-                            </div>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#f8fafc' }}>
+            <div style={{ flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {loading ? (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#94a3b8', fontSize: '14px' }}>Loading conversations...</div>
+              ) : messages.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '40px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
+                  <div style={{ color: '#94a3b8', fontSize: '14px' }}>No messages found on {platform === 'linkedin' ? 'LinkedIn' : 'Email'}.</div>
+
+                  {platform === 'linkedin' && !hasTriggered && candidate.li_status !== 'in_campaign' && (
+                    candidate.status?.toLowerCase() === 'shortlisted' ? (
+                      <div style={{
+                        background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '20px',
+                        width: '100%', maxWidth: '340px', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05)',
+                        display: 'flex', flexDirection: 'column', gap: '12px'
+                      }}>
+                        <div style={{ fontSize: '12px', fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', textAlign: 'left' }}>
+                          Start HeyReach Outreach
                         </div>
-                      );
-                    })
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <div style={{
+                            flex: 1, display: 'flex', alignItems: 'center', gap: '6px',
+                            background: '#f8fafc', padding: '6px 10px', borderRadius: '8px', border: '1px solid #e2e8f0'
+                          }}>
+                            <span style={{ fontSize: '11px', fontWeight: 600, color: '#64748b' }}>Campaign ID:</span>
+                            <input
+                              type="text"
+                              value={heyreachCampaignId}
+                              onChange={(e) => setHeyreachCampaignId(e.target.value)}
+                              style={{
+                                border: 'none', background: 'transparent', fontSize: '13px',
+                                fontWeight: 'bold', color: '#0369a1', width: '70px', outline: 'none'
+                              }}
+                            />
+                          </div>
+                          <button
+                            onClick={async () => {
+                              if (!heyreachCampaignId) return alert('Please enter a Campaign ID');
+                              setIsTriggering(true);
+                              const res = await triggerHeyReachOutreach({
+                                candidate_ids: [candidate.id],
+                                role_id: 0, // Talent Pool context
+                                campaign_id: parseInt(heyreachCampaignId),
+                                sender_account_id: 113572 // Default
+                              });
+                              if (res.success) {
+                                toast.success('Outreach triggered successfully!');
+                                setHasTriggered(true);
+                                setTimeout(loadMessages, 3000);
+                              } else {
+                                toast.error(res.error || 'Failed to trigger outreach');
+                              }
+                              setIsTriggering(false);
+                            }}
+                            disabled={isTriggering}
+                            style={{
+                              background: '#0a66c2', color: '#fff', border: 'none',
+                              borderRadius: '8px', padding: '8px 16px', fontSize: '13px',
+                              fontWeight: 600, cursor: 'pointer', opacity: isTriggering ? 0.7 : 1
+                            }}
+                          >
+                            {isTriggering ? 'Triggering...' : 'Start'}
+                          </button>
+                        </div>
+                        <p style={{ fontSize: '11px', color: '#94a3b8', margin: 0, textAlign: 'left' }}>
+                          Candidate will be pushed to HeyReach campaign.
+                        </p>
+                      </div>
+                    ) : (
+                      <div style={{
+                        fontSize: '12px', color: '#64748b', background: '#f1f5f9',
+                        padding: '10px 16px', borderRadius: '10px', border: '1px solid #e2e8f0'
+                      }}>
+                        LinkedIn outreach can only be started for <b>Shortlisted</b> candidates.
+                      </div>
+                    )
                   )}
-                  <div ref={messagesEndRef} />
                 </div>
-                
-                <div style={{ padding: '16px 20px', background: '#fff', borderTop: '1px solid #e2e8f0' }}>
-                    <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end', background: '#f8fafc', padding: '8px 12px', borderRadius: '16px', border: '1px solid #e2e8f0' }}>
-                        <textarea
-                            value={replyText}
-                            onChange={(e) => setReplyText(e.target.value)}
-                            placeholder={`Reply via ${platform === 'linkedin' ? 'LinkedIn' : 'Email'}...`}
-                            rows={1}
-                            style={{
-                                flex: 1, border: 'none', background: 'transparent', outline: 'none',
-                                resize: 'none', fontSize: '14px', color: '#0f172a', padding: '8px 4px',
-                                minHeight: '38px', maxHeight: '120px', fontFamily: 'inherit'
-                            }}
-                            onInput={(e) => {
-                                e.target.style.height = 'auto';
-                                e.target.style.height = (e.target.scrollHeight) + 'px';
-                            }}
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter' && !e.shiftKey) {
-                                    e.preventDefault();
-                                    handleSend();
-                                }
-                            }}
-                        />
-                        <button
-                            onClick={handleSend}
-                            disabled={sending || !replyText.trim()}
-                            style={{
-                                width: '38px', height: '38px', borderRadius: '50%',
-                                background: sending || !replyText.trim() ? '#e2e8f0' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
-                                color: sending || !replyText.trim() ? '#94a3b8' : '#fff',
-                                border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                cursor: sending || !replyText.trim() ? 'not-allowed' : 'pointer',
-                                transition: 'all 0.2s', padding: 0, flexShrink: 0, marginBottom: '2px'
-                            }}
-                        >
-                            <Send size={18} style={{ marginLeft: '2px' }} />
-                        </button>
+              ) : (
+                messages.map((msg, i) => {
+                  const isCandidate = msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
+                  const senderName = isCandidate ? `${candidate.first_name}` : 'You';
+                  const time = msg.time || msg.created_at || msg.timestamp;
+                  const body = msg.email_body || msg.message || msg.text || '';
+
+                  return (
+                    <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end' }}>
+                      <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
+                        {senderName} &bull; {formatTime(time)}
+                      </div>
+                      <div style={{
+                        maxWidth: '85%',
+                        padding: '12px 16px',
+                        borderRadius: '16px',
+                        background: isCandidate ? '#fff' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
+                        color: isCandidate ? '#0f172a' : '#fff',
+                        fontSize: '13.5px',
+                        lineHeight: '1.5',
+                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+                        border: isCandidate ? '1px solid #e2e8f0' : 'none',
+                        borderBottomLeftRadius: isCandidate ? '4px' : '16px',
+                        borderBottomRightRadius: isCandidate ? '16px' : '4px',
+                        whiteSpace: 'pre-wrap'
+                      }}>
+                        <div dangerouslySetInnerHTML={{ __html: body }} style={{ maxWidth: '100%', overflowWrap: 'break-word', wordWrap: 'break-word' }} />
+                      </div>
                     </div>
-                </div>
+                  );
+                })
+              )}
+              <div ref={messagesEndRef} />
             </div>
+
+            <div style={{ padding: '16px 20px', background: '#fff', borderTop: '1px solid #e2e8f0' }}>
+              <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end', background: '#f8fafc', padding: '8px 12px', borderRadius: '16px', border: '1px solid #e2e8f0' }}>
+                <textarea
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  placeholder={`Reply via ${platform === 'linkedin' ? 'LinkedIn' : 'Email'}...`}
+                  rows={1}
+                  style={{
+                    flex: 1, border: 'none', background: 'transparent', outline: 'none',
+                    resize: 'none', fontSize: '14px', color: '#0f172a', padding: '8px 4px',
+                    minHeight: '38px', maxHeight: '120px', fontFamily: 'inherit'
+                  }}
+                  onInput={(e) => {
+                    e.target.style.height = 'auto';
+                    e.target.style.height = (e.target.scrollHeight) + 'px';
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                />
+                <button
+                  onClick={handleSend}
+                  disabled={sending || !replyText.trim()}
+                  style={{
+                    width: '38px', height: '38px', borderRadius: '50%',
+                    background: sending || !replyText.trim() ? '#e2e8f0' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
+                    color: sending || !replyText.trim() ? '#94a3b8' : '#fff',
+                    border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    cursor: sending || !replyText.trim() ? 'not-allowed' : 'pointer',
+                    transition: 'all 0.2s', padding: 0, flexShrink: 0, marginBottom: '2px'
+                  }}
+                >
+                  <Send size={18} style={{ marginLeft: '2px' }} />
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
 
 export default function TalentPool() {
   const { user } = useAppStore();
@@ -780,10 +972,10 @@ export default function TalentPool() {
           <p style={{ color: '#64748b', lineHeight: 1.6, marginBottom: '32px', fontSize: '15px' }}>
             The <b>Talent Pool</b> feature has not been enabled for your account yet. Please contact your administrator to enable this tool.
           </p>
-          <button 
+          <button
             onClick={() => window.location.href = '/'}
-            style={{ 
-              width: '100%', padding: '14px 24px', background: '#f97316', color: '#fff', 
+            style={{
+              width: '100%', padding: '14px 24px', background: '#f97316', color: '#fff',
               border: 'none', borderRadius: '14px', fontWeight: 700, cursor: 'pointer',
               fontSize: '15px', transition: 'all 0.2s', boxShadow: '0 4px 6px -1px rgba(249, 115, 22, 0.2)'
             }}
@@ -814,7 +1006,6 @@ export default function TalentPool() {
     status: '', created_by: '',
     min_exp: 0, max_exp: 40,
   });
-  const [stability, setStability] = useState(false);
   const [activeStatusTab, setActiveStatusTab] = useState('');
   const [sortBy, setSortBy] = useState('name');
   const [sortDir, setSortDir] = useState('asc');
@@ -826,6 +1017,8 @@ export default function TalentPool() {
   const analytics = useAppStore(state => state.analytics);
   const fetchAnalytics = useAppStore(state => state.fetchAnalytics);
   const shortlistAndOutreach = useAppStore(state => state.shortlistAndOutreach);
+  const updateCandidateField = useAppStore(state => state.updateCandidateField);
+  const { heyreachCampaignId } = useAppStore();
   const didInitRef = useRef(false);
 
   // Poll Clay/DB updates aggressively for enriching records so contact data appears quickly.
@@ -915,10 +1108,21 @@ export default function TalentPool() {
       return { ...prev, [candidateId]: next };
     });
 
-    const res = await shortlistAndOutreach(candidateId);
+    const res = await shortlistAndOutreach(candidateId, {
+      hr_campaign_id: parseInt(heyreachCampaignId)
+    });
     setShortlistingId(null);
     if (res.success) {
       const d = res.data;
+      toast.success(`Successfully shortlisted ${d.name || 'candidate'}`);
+      // Notify about skips if any
+      if (d.email_outreach === 'skipped') {
+        toast.warning(`Smartlead: ${d.email_outreach_msg || 'Email missing'}`);
+      }
+      if (d.linkedin_outreach === 'skipped') {
+        toast.warning(`HeyReach: ${d.li_outreach_msg || 'LinkedIn URL missing'}`);
+      }
+      fetchAnalytics();
       setContactInfo(prev => ({
         ...prev,
         [candidateId]: {
@@ -930,6 +1134,7 @@ export default function TalentPool() {
       }));
       setShortlistCard(d);
     } else {
+      toast.error(res.error || 'Operation failed');
       setContactInfo(prev => ({
         ...prev,
         [candidateId]: {
@@ -938,7 +1143,7 @@ export default function TalentPool() {
           enriching: false
         }
       }));
-      setShortlistCard({ name: 'Candidate', email: '', phone: '', linkedin: '', email_outreach: 'error', linkedin_outreach: 'error' });
+      // setShortlistCard({ name: 'Candidate', email: '', phone: '', linkedin: '', email_outreach: 'error', linkedin_outreach: 'error' }); // Removed as per instruction, toast handles error
     }
   };
   const debounceRef = useRef(null);
@@ -974,7 +1179,7 @@ export default function TalentPool() {
 
   // Load metadata (dropdown options)
   useEffect(() => {
-    axios.get(`${API_BASE}/candidates/browse/meta`).then(r => setMeta(r.data)).catch(() => {});
+    axios.get(`${API_BASE}/candidates/browse/meta`).then(r => setMeta(r.data)).catch(() => { });
     fetchAnalytics();
   }, [fetchAnalytics]);
 
@@ -984,16 +1189,16 @@ export default function TalentPool() {
       params.set('page', pg);
       params.set('page_size', pageSize);
       if (globalSearch) params.set('q', globalSearch);
-      
+
       const titleSearch = [...(filters.title || []), filters.titleInput].filter(Boolean).join(',');
       if (titleSearch) params.set('title', titleSearch);
-      
+
       const companySearch = [...(filters.company || []), filters.companyInput].filter(Boolean).join(',');
       if (companySearch) params.set('company', companySearch);
-      
+
       const citySearch = [...(filters.city || []), filters.cityInput].filter(Boolean).join(',');
       if (citySearch) params.set('city', citySearch);
-      
+
       const productSearch = [...(filters.product_service || []), filters.productInput].filter(Boolean).join(',');
       if (productSearch) params.set('product_service', productSearch);
 
@@ -1002,15 +1207,14 @@ export default function TalentPool() {
       if (filters.min_exp !== undefined && filters.min_exp !== '') params.set('min_exp', filters.min_exp);
       if (filters.max_exp !== undefined && filters.max_exp !== '') params.set('max_exp', filters.max_exp);
       if (filters.created_by) params.set('created_by', filters.created_by);
-      if (stability) params.set('min_avg_tenure', '2');
       params.set('sort_by', sortBy);
       params.set('sort_dir', sortDir);
 
       const paramsString = params.toString();
       const currentCache = useAppStore.getState().talentPoolCache;
-      
+
       const isInstantHit = currentCache?.lastParamsString === paramsString && currentCache?.data;
-      
+
       if (!isInstantHit) {
         setLoading(true);
       } else {
@@ -1025,7 +1229,7 @@ export default function TalentPool() {
       }
 
       const res = await useAppStore.getState().fetchTalentPool(paramsString);
-      
+
       if (res.success && res.data) {
         setCandidates(res.data.candidates);
         setTotal(res.data.total);
@@ -1039,7 +1243,7 @@ export default function TalentPool() {
     } finally {
       setLoading(false);
     }
-  }, [globalSearch, filters, activeStatusTab, stability, sortBy, sortDir, pageSize, mergeContactInfoFromRows]);
+  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, mergeContactInfoFromRows]);
 
   // Debounced refetch
   useEffect(() => {
@@ -1063,24 +1267,23 @@ export default function TalentPool() {
   const setFilter = (key, val) => setFilters(f => ({ ...f, [key]: val }));
 
   const clearFilters = () => {
-    setFilters({ 
+    setFilters({
       title: [], titleInput: '',
       company: [], companyInput: '',
       city: [], cityInput: '',
       product_service: [], productInput: '',
       status: '', created_by: '',
-      min_exp: 0, max_exp: 40 
+      min_exp: 0, max_exp: 40
     });
     setGlobalSearch('');
-    setStability(false);
     setActiveStatusTab('');
     setPage(1);
   };
 
-  const hasFilters = globalSearch || 
+  const hasFilters = globalSearch ||
     filters.title || filters.company || filters.city || filters.product_service || filters.status ||
     filters.min_exp !== 0 || filters.max_exp !== 40 ||
-    stability || activeStatusTab;
+    activeStatusTab;
 
   // Status tabs: All + each status
   const statusTabs = ['', ...Object.keys(statusCounts)];
@@ -1112,7 +1315,7 @@ export default function TalentPool() {
   };
 
   return (
-    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 0, height: 'calc(100vh - 80px)', overflow: 'hidden' }}>
+    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 0, height: '100vh', overflow: 'hidden' }}>
 
       {/* ── Left Filter Sidebar ── */}
       <aside style={{
@@ -1137,55 +1340,34 @@ export default function TalentPool() {
         <TagFilterInput label="City" values={filters.city} inputValue={filters.cityInput} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} />
 
         <TagFilterInput label="Expertise / Product" values={filters.product_service} inputValue={filters.productInput} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} />
-        
+
         {role === 'admin' && (
-          <SelectFilter 
-            label="Recruiter" 
-            value={filters.created_by || ''} 
-            onChange={v => setFilter('created_by', v)} 
-            options={meta.recruiters || []} 
-            placeholder="All Recruiters" 
+          <SelectFilter
+            label="Recruiter"
+            value={filters.created_by || ''}
+            onChange={v => setFilter('created_by', v)}
+            options={meta.recruiters || []}
+            placeholder="All Recruiters"
           />
         )}
 
         <SelectFilter label="Status" value={filters.status} onChange={v => setFilter('status', v)} options={meta.statuses} placeholder="All Statuses" />
 
-        <RangeSlider 
-          label="Total Experience" 
-          min={0} 
-          max={40} 
-          minValue={filters.min_exp} 
-          maxValue={filters.max_exp} 
+        <RangeSlider
+          label="Total Experience"
+          min={0}
+          max={40}
+          minValue={filters.min_exp}
+          maxValue={filters.max_exp}
           onChange={(min, max) => {
             setFilters(prev => ({ ...prev, min_exp: min, max_exp: max }));
-          }} 
+          }}
         />
 
-        {/* Stability */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-          <input type="checkbox" id="stability" checked={stability} onChange={e => setStability(e.target.checked)}
-            style={{ width: 14, height: 14, accentColor: '#f97316', cursor: 'pointer' }} />
-          <label htmlFor="stability" style={{ fontSize: 12, color: '#475569', cursor: 'pointer', fontWeight: 500 }}>
-            &gt; 2 years average
-          </label>
-        </div>
       </aside>
 
       {/* ── Main Content ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f8fafc' }}>
-        
-        <StatisticsDashboard 
-          analytics={analytics} 
-          role={role} 
-          onStatClick={(status) => {
-            setActiveStatusTab(status);
-            setPage(1);
-          }} 
-          onRecruiterClick={(email) => {
-            setFilter('created_by', email);
-            setPage(1);
-          }}
-        />
 
         {/* Top bar */}
         <div style={{ padding: '14px 20px', background: '#fff', borderBottom: '1.5px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -1214,18 +1396,6 @@ export default function TalentPool() {
             <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 500 }}>
               {loading ? '...' : `${total.toLocaleString()} candidates`}
             </span>
-            <button
-              style={{
-                display: 'flex', alignItems: 'center', gap: 7,
-                padding: '8px 14px', background: '#f97316', border: 'none',
-                borderRadius: 9, color: '#fff', fontSize: 13, fontWeight: 700,
-                cursor: 'pointer', transition: 'all 0.15s'
-              }}
-              onMouseEnter={e => e.target.style.background = '#ea580c'}
-              onMouseLeave={e => e.target.style.background = '#f97316'}
-            >
-              <UserPlus size={15} /> Add Candidate
-            </button>
             <button onClick={() => fetchCandidates(page)}
               style={{ width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', color: '#64748b' }}>
               <RefreshCw size={14} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
@@ -1239,7 +1409,7 @@ export default function TalentPool() {
             const isActive = activeStatusTab === tab;
             const count = tab === '' ? total : (statusCounts[tab] || 0);
             const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
-            
+
             return (
               <button key={tab || 'all'}
                 onClick={() => { setActiveStatusTab(tab); setPage(1); }}
@@ -1270,10 +1440,10 @@ export default function TalentPool() {
                   <>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: style.dot || '#94a3b8' }} />
                     {tab}
-                    <span style={{ 
+                    <span style={{
                       marginLeft: 4, padding: '1px 6px', borderRadius: 10, fontSize: 10,
-                      background: isActive ? '#f97316' : '#e2e8f0', 
-                      color: isActive ? '#fff' : '#64748b' 
+                      background: isActive ? '#f97316' : '#e2e8f0',
+                      color: isActive ? '#fff' : '#64748b'
                     }}>
                       {count}
                     </span>
@@ -1345,58 +1515,91 @@ export default function TalentPool() {
                   onMouseEnter={e => e.currentTarget.style.background = '#fafafa'}
                   onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                 >
-                  <td style={{ padding: '13px 14px', fontSize: 13, fontWeight: 600, color: '#0f172a', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.last_name || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', borderRight: '1px solid #f1f5f9' }}>{c.title || c.headline || ''}</td>
                   <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
                     {c.linkedin
                       ? <a href={c.linkedin} target="_blank" rel="noreferrer" style={{ color: '#2563eb', display: 'flex', alignItems: 'center' }} onClick={e => e.stopPropagation()}>
-                          <ExternalLink size={14} />
-                        </a>
-                      : <span style={{ color: '#cbd5e1' }}></span>}
+                        <ExternalLink size={14} />
+                      </a>
+                      : <span style={{ color: '#94a3b8', fontSize: 11, fontWeight: 500 }}>NA</span>}
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, fontWeight: 700, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.company || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.company || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #f1f5f9' }}>{c.product_service || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.city || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #f1f5f9' }}>{c.location_type || ''}</td>
                   <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
                     <ExpBar value={c.total_experience_years || 0} />
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, fontWeight: 600, color: '#374151', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>
                     {c.avg_tenure_years > 0 ? `${c.avg_tenure_years}y` : ''}
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>
-                    {contactInfo[c.id]?.enriching && !(contactInfo[c.id]?.email || c.email)
-                      ? <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#f97316', fontSize: 11, fontWeight: 600, animation: 'pulse 1.5s ease-in-out infinite' }}>
-                          <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#f97316', display: 'inline-block', animation: 'pulse 1.5s ease-in-out infinite' }} />
-                          Fetching via Clay...
-                        </span>
-                      : (contactInfo[c.id]?.email || c.email)
-                        ? <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Mail size={12} color="#f97316" />{contactInfo[c.id]?.email || c.email}</span>
-                        : <span style={{ color: '#d1d5db', fontSize: 11 }}>— shortlist to fetch</span>}
-                  </td>
-                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#374151', borderRight: '1px solid #f1f5f9' }}>
-                    {contactInfo[c.id]?.enriching && !(contactInfo[c.id]?.phone || c.phone)
-                      ? <span style={{ color: '#94a3b8', fontSize: 11 }}>fetching...</span>
-                      : (contactInfo[c.id]?.phone || c.phone)
-                        ? <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Phone size={12} color="#64748b" />{contactInfo[c.id]?.phone || c.phone}</span>
-                        : <span style={{ color: '#d1d5db', fontSize: 11 }}>—</span>}
-                  </td>
+                  {(() => {
+                    const emailVal = contactInfo[c.id]?.email || c.email;
+                    const isShortlisted = contactInfo[c.id]?.enriching === false || c.enrichment_finished || ['Shortlisted', 'Followup / In conversation', 'In Conversation', 'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 'Shared with customer'].includes(c.status);
+                    const isEnriching = contactInfo[c.id]?.enriching && !emailVal;
+                    const isNA = !emailVal || ['na', 'n/a', 'none'].includes((emailVal || '').toLowerCase());
+
+                    if (isEnriching) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
+                    }
+                    if (!isShortlisted) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#d1d5db', borderRight: '1px solid #f1f5f9' }}>—</td>;
+                    }
+                    if (!isNA) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#334155', borderRight: '1px solid #f1f5f9' }}>{emailVal}</td>;
+                    }
+                    return (
+                      <ClickableEditableCell
+                        id={c.id}
+                        field="email"
+                        value={emailVal}
+                        onUpdate={updateCandidateField}
+                        placeholder="NA"
+                      />
+                    );
+                  })()}
+                  {(() => {
+                    const phoneVal = contactInfo[c.id]?.phone || c.mobile_phone;
+                    const isShortlisted = contactInfo[c.id]?.enriching === false || c.enrichment_finished || ['Shortlisted', 'Followup / In conversation', 'In Conversation', 'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 'Shared with customer'].includes(c.status);
+                    const isEnriching = contactInfo[c.id]?.enriching && !phoneVal;
+                    const isNA = !phoneVal || ['na', 'n/a', 'none'].includes((phoneVal || '').toLowerCase());
+
+                    if (isEnriching) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
+                    }
+                    if (!isShortlisted) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#d1d5db', borderRight: '1px solid #f1f5f9' }}>—</td>;
+                    }
+                    if (!isNA) {
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#334155', borderRight: '1px solid #f1f5f9' }}>{phoneVal}</td>;
+                    }
+                    return (
+                      <ClickableEditableCell
+                        id={c.id}
+                        field="phone"
+                        value={phoneVal}
+                        onUpdate={updateCandidateField}
+                        placeholder="NA"
+                      />
+                    );
+                  })()}
                   <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
-                    <StatusDropdown 
-                      status={c.status} 
-                      candidateId={c.id} 
+                    <StatusDropdown
+                      status={c.status}
+                      candidateId={c.id}
                       onUpdate={(id, newStatus) => {
                         setCandidates(prev => prev.map(cand => cand.id === id ? { ...cand, status: newStatus } : cand));
                       }}
                       onShortlisted={handleShortlisted}
                     />
                   </td>
-                  <td 
+                  <td
                     onClick={() => setSelectedCandidateForChat(c)}
-                    style={{ 
-                        padding: '13px 14px', fontSize: 12, color: '#2563eb', fontWeight: 600, borderRight: '1px solid #f1f5f9',
-                        cursor: 'pointer', textDecoration: c.response ? 'underline' : 'none'
+                    style={{
+                      padding: '13px 14px', fontSize: 12, color: '#2563eb', borderRight: '1px solid #f1f5f9',
+                      cursor: 'pointer', textDecoration: c.response ? 'underline' : 'none'
                     }}
                   >
                     {c.response || 'View Chat'}
@@ -1406,11 +1609,11 @@ export default function TalentPool() {
                   </td>
                   {isSemanticSearch && (
                     <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
-                      <div style={{ 
-                        display: 'inline-flex', padding: '4px 8px', borderRadius: '6px', 
+                      <div style={{
+                        display: 'inline-flex', padding: '4px 8px', borderRadius: '6px',
                         background: c.match_score > 80 ? '#dcfce7' : c.match_score > 60 ? '#fef9c3' : '#f1f5f9',
                         color: c.match_score > 80 ? '#166534' : c.match_score > 60 ? '#854d0e' : '#475569',
-                        fontSize: '11px', fontWeight: 800
+                        fontSize: '11px'
                       }}>
                         {c.match_score}% Match
                       </div>
@@ -1427,7 +1630,7 @@ export default function TalentPool() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ fontSize: 13, color: '#94a3b8' }}>Rows per page:</span>
-              <select 
+              <select
                 value={pageSize}
                 onChange={e => {
                   setPageSize(Number(e.target.value));
@@ -1456,20 +1659,20 @@ export default function TalentPool() {
             {(() => {
               const pages = [];
               const range = 2; // Number of pages to show around current page
-              
+
               for (let i = 1; i <= totalPages; i++) {
                 if (
-                  i === 1 || 
-                  i === totalPages || 
+                  i === 1 ||
+                  i === totalPages ||
                   (i >= page - range && i <= page + range)
                 ) {
                   pages.push(
                     <button key={i} onClick={() => setPage(i)}
-                      style={{ 
-                        width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', 
-                        background: i === page ? '#f97316' : '#f8fafc', 
-                        border: `1.5px solid ${i === page ? '#f97316' : '#e2e8f0'}`, 
-                        borderRadius: 7, cursor: 'pointer', fontSize: 13, 
+                      style={{
+                        width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: i === page ? '#f97316' : '#f8fafc',
+                        border: `1.5px solid ${i === page ? '#f97316' : '#e2e8f0'}`,
+                        borderRadius: 7, cursor: 'pointer', fontSize: 13,
                         fontWeight: i === page ? 700 : 500, color: i === page ? '#fff' : '#64748b',
                         transition: 'all 0.15s'
                       }}
@@ -1480,7 +1683,7 @@ export default function TalentPool() {
                     </button>
                   );
                 } else if (
-                  i === page - range - 1 || 
+                  i === page - range - 1 ||
                   i === page + range + 1
                 ) {
                   pages.push(<span key={`ell-${i}`} style={{ color: '#94a3b8', fontSize: 14 }}>...</span>);
@@ -1504,9 +1707,9 @@ export default function TalentPool() {
       `}</style>
 
       {selectedCandidateForChat && (
-        <ConversationModal 
-          candidate={selectedCandidateForChat} 
-          onClose={() => setSelectedCandidateForChat(null)} 
+        <ConversationModal
+          candidate={selectedCandidateForChat}
+          onClose={() => setSelectedCandidateForChat(null)}
         />
       )}
 

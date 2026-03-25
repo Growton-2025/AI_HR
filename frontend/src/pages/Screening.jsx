@@ -127,7 +127,7 @@ function Screening() {
 
     // Step 1: Search Interface + Results
     return (
-        <div style={{ width: '100%', position: 'relative', minHeight: '100vh' }}>
+        <div style={{ width: '100%', position: 'relative', minHeight: '100vh', padding: '40px 40px 40px' }}>
             <h2 className="screen-header">Candidate Screening</h2>
             <p className="subtitle">
                 Find your perfect candidate using natural language. Describe the role, skills, and requirements.

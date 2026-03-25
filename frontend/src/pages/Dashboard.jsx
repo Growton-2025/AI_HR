@@ -125,11 +125,11 @@ const Dashboard = () => {
   const total = current.data.reduce((s, d) => s + d.value, 0);
 
   return (
-    <div style={{ padding: '0 20px 40px', fontFamily: '"Inter", sans-serif' }}>
+    <div style={{ padding: '40px 40px 40px', fontFamily: '"Inter", sans-serif' }}>
       {/* Header */}
       <div style={{ marginBottom: '36px' }}>
         <h1 style={{ fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px', marginBottom: '6px' }}>
-          Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}
+          Welcome back!
         </h1>
         <p style={{ fontSize: '15px', color: '#64748b' }}>
           Here's your team's talent pipeline at a glance.
