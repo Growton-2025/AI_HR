@@ -177,40 +177,44 @@ class SmartleadBot:
         if not lead_id:
             return None
 
-        # 2. Fetch Message History
-        # If campaign_id is not provided, we should try to find which campaign this lead is active in
+        # 2. Use ONLY the provided campaign_id for a "clean" history
+        # (Ignore lead_campaign_data to avoid pulling old "trash" messages)
         potential_campaigns = [active_campaign_id] if active_campaign_id else []
         
-        # Smartlead might return campaign info in the lead data
-        if data and isinstance(data, list) and len(data) > 0:
-            lead_info = data[0]
-            # Some Smartlead responses include campaign_id or a list of campaigns
-            if lead_info.get('campaign_id') and lead_info.get('campaign_id') not in potential_campaigns:
-                potential_campaigns.append(lead_info.get('campaign_id'))
+        all_messages = []
+        seen_message_ids = set()
 
-        messages = []
         for cid in potential_campaigns:
             if not cid: continue
             url = f"{self.base_url}/api/v1/campaigns/{cid}/leads/{lead_id}/message-history?api_key={self.api_key}"
             res = requests.get(url)
             if res.status_code == 200:
                 raw = res.json()
+                new_msgs = []
                 if raw and isinstance(raw, dict):
-                    messages = raw.get('data') or raw.get('history') or raw.get('messages') or []
+                    new_msgs = raw.get('data') or raw.get('history') or raw.get('messages') or []
                 elif raw and isinstance(raw, list):
-                    messages = raw
+                    new_msgs = raw
                 
-                if messages:
-                    print(f"✅ Found {len(messages)} messages in campaign {cid}")
-                    break
+                if new_msgs:
+                    print(f"✅ Found {len(new_msgs)} messages in campaign {cid}")
+                    for msg in new_msgs:
+                        mid = msg.get('message_id') or msg.get('stats_id')
+                        if mid not in seen_message_ids:
+                            all_messages.append(msg)
+                            seen_message_ids.add(mid)
         
+        # Sort messages by time (ascending)
+        if all_messages:
+            all_messages.sort(key=lambda x: x.get('time') or x.get('created_at') or x.get('timestamp') or '', reverse=False)
+
         # Ensure each message has an 'email_body' field for frontend consistency
-        if isinstance(messages, list):
-            for msg in messages:
+        if all_messages:
+            for msg in all_messages:
                 if 'email_body' not in msg:
                     msg['email_body'] = msg.get('html_body') or msg.get('body') or msg.get('message') or ""
         
-        return messages
+        return all_messages
 
     def get_lead_activity(self, lead_email):
         """Fetch detailed activity for sync: Sent messages, Replies, Timestamps"""

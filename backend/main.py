@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.core.config import settings
-from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse
+from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse, calls
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -22,10 +22,14 @@ async def lifespan(app: FastAPI):
     close_all_connections()
 
 async def load_data_async():
-    await asyncio.sleep(2) # Wait for the app to be fully up
+    await asyncio.sleep(0.5) # Wait for the app to be fully up
     print("Starting background data loading...")
     try:
-        await asyncio.to_thread(query.initialize_cache)
+        # Run initialization in parallel
+        await asyncio.gather(
+            asyncio.to_thread(calls.ensure_calls_schema_ready),
+            asyncio.to_thread(query.initialize_cache)
+        )
         print("Background data loading complete.")
     except Exception as e:
         print(f"DATABASE CONNECTION FAILED on startup: {e}")
@@ -97,6 +101,7 @@ app.include_router(browse.router, prefix="/api", tags=["browse"])
 app.include_router(candidates.router, prefix="/api", tags=["candidates"])
 app.include_router(stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(outreach.router, prefix="/api/outreach", tags=["outreach"])
+app.include_router(calls.router, prefix="/api/calls", tags=["calls"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
 from backend.api.routes import enrichment

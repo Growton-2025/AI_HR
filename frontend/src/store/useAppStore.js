@@ -310,10 +310,12 @@ export const useAppStore = create(persist((set, get) => ({
     statusMessage: '',
     searchResults: [],
     usage: null,
+    _searchFallbackTimer: null,
 
     // Search via REST (synchronous)
-    searchCandidates: async (query) => {
-        set({ isSearching: true, searchResults: [], statusMessage: 'Screening...', searchProgress: 0 })
+    searchCandidates: async (query, options = {}) => {
+        const initialStatus = options.initialStatus || 'Screening...'
+        set({ isSearching: true, searchResults: [], statusMessage: initialStatus, searchProgress: 0, searchTotal: 0 })
         try {
             const res = await axios.post(`${API_BASE}/search`, { query })
             set({
@@ -325,22 +327,86 @@ export const useAppStore = create(persist((set, get) => ({
             })
         } catch (e) {
             set({ statusMessage: 'Screening failed: ' + e.message, isSearching: false })
+        } finally {
+            const fallbackTimer = get()._searchFallbackTimer
+            if (fallbackTimer) {
+                window.clearTimeout(fallbackTimer)
+            }
+            set({ _ws: null, _searchFallbackTimer: null })
         }
     },
 
     // Search via WebSocket (streaming)
     searchCandidatesStream: (query) => {
-        set({ isSearching: true, searchResults: [], statusMessage: 'Connecting...', searchProgress: 0, searchTotal: 0 })
+        const existingWs = get()._ws
+        if (existingWs) {
+            try {
+                existingWs.close()
+            } catch (_) {}
+        }
+
+        const existingFallbackTimer = get()._searchFallbackTimer
+        if (existingFallbackTimer) {
+            window.clearTimeout(existingFallbackTimer)
+        }
+
+        set({
+            isSearching: true,
+            searchResults: [],
+            statusMessage: 'Connecting...',
+            searchProgress: 0,
+            searchTotal: 0,
+            _searchFallbackTimer: null,
+        })
 
         const ws = new WebSocket(WS_URL)
+        let finished = false
+
+        const clearFallbackTimer = () => {
+            const timerId = get()._searchFallbackTimer
+            if (timerId) {
+                window.clearTimeout(timerId)
+                set({ _searchFallbackTimer: null })
+            }
+        }
+
+        const fallbackToRest = () => {
+            if (finished || !get().isSearching) {
+                return
+            }
+            finished = true
+            clearFallbackTimer()
+            try {
+                ws.close()
+            } catch (_) {}
+            set({ _ws: null })
+            get().searchCandidates(query, {
+                initialStatus: 'Realtime screening unavailable. Running standard search...'
+            })
+        }
+
+        const armFallbackTimer = (delayMs) => {
+            clearFallbackTimer()
+            const timerId = window.setTimeout(() => {
+                fallbackToRest()
+            }, delayMs)
+            set({ _searchFallbackTimer: timerId })
+        }
+
+        armFallbackTimer(8000)
 
         ws.onopen = () => {
+            if (finished) return
             ws.send(JSON.stringify({ query }))
             set({ statusMessage: 'Processing query...' })
+            armFallbackTimer(12000)
         }
 
         ws.onmessage = (event) => {
+            if (finished) return
+
             const data = JSON.parse(event.data)
+            armFallbackTimer(20000)
 
             switch (data.type) {
                 case 'status':
@@ -359,6 +425,8 @@ export const useAppStore = create(persist((set, get) => ({
                     break
 
                 case 'complete':
+                    finished = true
+                    clearFallbackTimer()
                     set({
                         searchResults: data.candidates,
                         usage: data.usage,
@@ -366,11 +434,15 @@ export const useAppStore = create(persist((set, get) => ({
                         isSearching: false,
                         searchProgress: 100
                     })
+                    set({ _ws: null })
                     ws.close()
                     break
 
                 case 'error':
+                    finished = true
+                    clearFallbackTimer()
                     set({ statusMessage: 'Error: ' + data.message, isSearching: false })
+                    set({ _ws: null })
                     ws.close()
                     break
             }
@@ -378,12 +450,17 @@ export const useAppStore = create(persist((set, get) => ({
 
         ws.onerror = (error) => {
             console.error('WebSocket error:', error)
-            set({ statusMessage: 'Connection error', isSearching: false })
+            fallbackToRest()
         }
 
         ws.onclose = () => {
+            clearFallbackTimer()
+            if (finished) {
+                set({ _ws: null })
+                return
+            }
             if (get().isSearching) {
-                set({ isSearching: false })
+                fallbackToRest()
             }
         }
 
@@ -393,14 +470,38 @@ export const useAppStore = create(persist((set, get) => ({
 
     stopSearch: () => {
         const ws = get()._ws
+        const fallbackTimer = get()._searchFallbackTimer
         if (ws) {
             ws.close()
         }
-        set({ isSearching: false, statusMessage: 'Screening stopped' })
+        if (fallbackTimer) {
+            window.clearTimeout(fallbackTimer)
+        }
+        set({ isSearching: false, statusMessage: 'Screening stopped', _ws: null, _searchFallbackTimer: null })
     },
 
     clearSearch: () => {
-        set({ searchQuery: '', searchResults: [], statusMessage: '', searchProgress: 0, usage: null })
+        const ws = get()._ws
+        const fallbackTimer = get()._searchFallbackTimer
+        if (ws) {
+            try {
+                ws.close()
+            } catch (_) {}
+        }
+        if (fallbackTimer) {
+            window.clearTimeout(fallbackTimer)
+        }
+        set({
+            searchQuery: '',
+            searchResults: [],
+            statusMessage: '',
+            searchProgress: 0,
+            searchTotal: 0,
+            usage: null,
+            isSearching: false,
+            _ws: null,
+            _searchFallbackTimer: null,
+        })
     },
 
     // Selection State
@@ -727,7 +828,9 @@ export const useAppStore = create(persist((set, get) => ({
     fetchChatHistory: async (roleId, candidateId, platform = 'email') => {
         try {
             const endpoint = platform === 'linkedin' ? 'linkedin' : 'email'
-            const res = await axios.get(`${API_BASE}/outreach/chat/${endpoint}/${roleId}/${candidateId}`)
+            const res = await axios.get(`${API_BASE}/outreach/chat/${endpoint}/${roleId}/${candidateId}?cb=${Date.now()}`, {
+                headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache', 'Expires': '0' }
+            })
             return { success: true, messages: res.data.messages }
         } catch (error) {
             console.error(`Failed to fetch ${platform} chat history:`, error)
@@ -763,54 +866,344 @@ export const useAppStore = create(persist((set, get) => ({
 
     // Talent Pool Cache
     talentPoolCache: { data: null, lastParamsString: null },
+    talentPoolRequest: null,
+    talentPoolRequestParamsString: '',
 
     fetchTalentPool: async (paramsString) => {
-        const cache = get().talentPoolCache
-        const isCached = cache.lastParamsString === paramsString && cache.data
-        
-        if (isCached) {
-            // Silently background fetch to check for updates
-            axios.get(`${API_BASE}/candidates/browse?${paramsString}`)
-                .then(res => {
-                    set({ talentPoolCache: { data: res.data, lastParamsString: paramsString } })
-                })
-                .catch(err => console.error("Background talent pool fetch failed", err))
-                
-            return { success: true, data: cache.data, cached: true }
+        const state = get()
+        const cache = state.talentPoolCache
+
+        if (state.talentPoolRequest && state.talentPoolRequestParamsString === paramsString) {
+            return state.talentPoolRequest
         }
 
-        try {
-            const res = await axios.get(`${API_BASE}/candidates/browse?${paramsString}`)
-            set({ talentPoolCache: { data: res.data, lastParamsString: paramsString } })
-            return { success: true, data: res.data, cached: false }
-        } catch (error) {
-            console.error('Failed to fetch talent pool:', error)
-            if (cache.data) return { success: true, data: cache.data, cached: true }
-            return { success: false, error: 'Failed' }
+        const request = axios.get(`${API_BASE}/candidates/browse?${paramsString}`)
+            .then(res => {
+                if (get().talentPoolRequestParamsString === paramsString) {
+                    set({
+                        talentPoolCache: { data: res.data, lastParamsString: paramsString },
+                        talentPoolRequest: null,
+                        talentPoolRequestParamsString: '',
+                    })
+                }
+                return { success: true, data: res.data, cached: false }
+            })
+            .catch(error => {
+                console.error('Failed to fetch talent pool:', error)
+                if (get().talentPoolRequestParamsString === paramsString) {
+                    set({ talentPoolRequest: null, talentPoolRequestParamsString: '' })
+                }
+                const latestCache = get().talentPoolCache
+                if (latestCache.lastParamsString === paramsString && latestCache.data) {
+                    return { success: true, data: latestCache.data, cached: true }
+                }
+                if (cache.lastParamsString === paramsString && cache.data) {
+                    return { success: true, data: cache.data, cached: true }
+                }
+                return { success: false, error: 'Failed' }
+            })
+
+        set({
+            talentPoolRequest: request,
+            talentPoolRequestParamsString: paramsString,
+        })
+
+        return request
+    },
+
+    // Calls and Tasks
+    callLists: [],
+    calls: [],
+    callStats: { due_today: 0, upcoming: 0, completed: 0, active_lists: 0 },
+    callListsLastFetchedAt: 0,
+    callListsRequest: null,
+    callsCache: {},
+    callsCacheFetchedAt: {},
+    callsLastFetchedAt: 0,
+    callsLastQueryKey: '',
+    callsRequest: null,
+    callsRequestQueryKey: '',
+    callStatsLastFetchedAt: 0,
+    callStatsRequest: null,
+
+    fetchCallLists: async (options = {}) => {
+        const force = typeof options === 'boolean' ? options : options.force === true
+        const maxAgeMs = 30 * 1000
+        const state = get()
+        const isFresh = state.callLists.length > 0 &&
+            state.callListsLastFetchedAt &&
+            (Date.now() - state.callListsLastFetchedAt < maxAgeMs)
+
+        if (!force && isFresh) {
+            return { success: true, data: state.callLists, cached: true }
         }
+
+        if (state.callListsRequest) {
+            return state.callListsRequest
+        }
+
+        const request = axios.get(`${API_BASE}/calls/lists`)
+            .then(res => {
+                set({
+                    callLists: res.data,
+                    callListsLastFetchedAt: Date.now(),
+                    callListsRequest: null,
+                })
+                return { success: true, data: res.data, cached: false }
+            })
+            .catch(e => {
+                console.error('Failed to fetch call lists:', e)
+                set({ callListsRequest: null })
+                if (get().callLists.length) {
+                    return { success: true, data: get().callLists, cached: true }
+                }
+                return { success: false, error: e.response?.data?.detail || 'Failed to fetch call lists' }
+            })
+
+        set({ callListsRequest: request })
+        return request
+    },
+
+    createCallList: async (name) => {
+        try {
+            const res = await axios.post(`${API_BASE}/calls/lists`, { name })
+            set(state => ({
+                callLists: [res.data, ...state.callLists],
+                callListsLastFetchedAt: Date.now(),
+            }))
+            return { success: true, data: res.data }
+        } catch (e) {
+            console.error('Failed to create call list:', e)
+            return { success: false, error: e.response?.data?.detail || 'Failed to create list' }
+        }
+    },
+
+    addCandidatesToCallList: async (candidateIds, listId) => {
+        try {
+            const uniqueCandidateIds = [...new Set((candidateIds || []).map(Number).filter(Boolean))]
+            if (!uniqueCandidateIds.length) {
+                return { success: true, data: { success: true, added_count: 0 } }
+            }
+
+            const res = await axios.post(`${API_BASE}/calls/add-candidates`, { candidate_ids: uniqueCandidateIds, list_id: listId })
+            const targetListId = Number(listId)
+            const addedCount = Number(res.data?.added_count || 0)
+            set(state => ({
+                callLists: state.callLists.map(list =>
+                    list.id === targetListId
+                        ? { ...list, candidate_count: (list.candidate_count || 0) + addedCount }
+                        : list
+                ),
+                callsCache: {},
+                callsCacheFetchedAt: {},
+                callsLastFetchedAt: 0,
+                callsLastQueryKey: '',
+            }))
+            get().fetchCallStats({ force: true })
+            get().fetchCallLists({ force: true })
+            get().fetchCalls({ due_filter: 'today', status: 'pending' }, { force: true, updateState: false })
+            return { success: true, data: res.data }
+        } catch (e) {
+            console.error('Failed to add candidates to list:', e)
+            return { success: false, error: e.response?.data?.detail || 'Failed' }
+        }
+    },
+
+    fetchCalls: async (params = {}, options = {}) => {
+        const force = typeof options === 'boolean' ? options : options.force === true
+        const updateState = typeof options === 'object' ? options.updateState !== false : true
+        const queryParams = new URLSearchParams(params).toString()
+        const queryKey = queryParams || '__all__'
+        const maxAgeMs = 15 * 1000
+        const state = get()
+        const cachedData = state.callsCache[queryKey]
+        const cachedAt = state.callsCacheFetchedAt[queryKey] || 0
+        const isFresh = Array.isArray(cachedData) &&
+            cachedAt &&
+            (Date.now() - cachedAt < maxAgeMs)
+
+        if (!force && isFresh) {
+            if (updateState) {
+                set({
+                    calls: cachedData,
+                    callsLastFetchedAt: cachedAt,
+                    callsLastQueryKey: queryKey,
+                })
+            }
+            return { success: true, data: cachedData, cached: true }
+        }
+
+        if (state.callsRequest && state.callsRequestQueryKey === queryKey) {
+            if (!updateState) {
+                return state.callsRequest
+            }
+            return state.callsRequest.then(result => {
+                if (result?.success) {
+                    set({
+                        calls: result.data || [],
+                        callsLastFetchedAt: get().callsCacheFetchedAt[queryKey] || Date.now(),
+                        callsLastQueryKey: queryKey,
+                    })
+                }
+                return result
+            })
+        }
+
+        const request = axios.get(`${API_BASE}/calls?${queryParams}`)
+            .then(res => {
+                if (get().callsRequestQueryKey === queryKey) {
+                    const fetchedAt = Date.now()
+                    const nextState = {
+                        callsCache: {
+                            ...get().callsCache,
+                            [queryKey]: res.data,
+                        },
+                        callsCacheFetchedAt: {
+                            ...get().callsCacheFetchedAt,
+                            [queryKey]: fetchedAt,
+                        },
+                        callsRequest: null,
+                        callsRequestQueryKey: '',
+                    }
+                    if (updateState) {
+                        nextState.calls = res.data
+                        nextState.callsLastFetchedAt = fetchedAt
+                        nextState.callsLastQueryKey = queryKey
+                    }
+                    set(nextState)
+                }
+                return { success: true, data: res.data, cached: false }
+            })
+            .catch(e => {
+                console.error('Failed to fetch calls:', e)
+                if (get().callsRequestQueryKey === queryKey) {
+                    set({ callsRequest: null, callsRequestQueryKey: '' })
+                }
+                const fallbackData = get().callsCache[queryKey]
+                if (Array.isArray(fallbackData)) {
+                    if (updateState) {
+                        set({
+                            calls: fallbackData,
+                            callsLastFetchedAt: get().callsCacheFetchedAt[queryKey] || 0,
+                            callsLastQueryKey: queryKey,
+                        })
+                    }
+                    return { success: true, data: fallbackData, cached: true }
+                }
+                return { success: false, error: e.response?.data?.detail || 'Failed to fetch calls' }
+            })
+
+        set({
+            callsRequest: request,
+            callsRequestQueryKey: queryKey,
+        })
+        return request
+    },
+
+    updateCall: async (callId, data) => {
+        try {
+            await axios.patch(`${API_BASE}/calls/${callId}`, data)
+            set(state => ({
+                calls: state.calls.filter(c => c.id !== callId),
+                callsCache: {},
+                callsCacheFetchedAt: {},
+                callsLastFetchedAt: 0,
+                callsLastQueryKey: '',
+                callsRequestQueryKey: '',
+            }))
+            get().fetchCallStats({ force: true })
+            return { success: true }
+        } catch (e) {
+            console.error('Failed to update call:', e)
+            return { success: false }
+        }
+    },
+
+    deleteCall: async (callId) => {
+        try {
+            const existingCall = get().calls.find(c => c.id === callId)
+            const res = await axios.delete(`${API_BASE}/calls/${callId}`)
+            const listId = Number(res.data?.list_id || existingCall?.list_id)
+            set(state => ({
+                calls: state.calls.filter(c => c.id !== callId),
+                callLists: state.callLists.map(list =>
+                    list.id === listId
+                        ? { ...list, candidate_count: Math.max(0, (list.candidate_count || 0) - 1) }
+                        : list
+                ),
+                callsCache: {},
+                callsCacheFetchedAt: {},
+                callsLastFetchedAt: 0,
+                callsRequestQueryKey: '',
+            }))
+            get().fetchCallStats({ force: true })
+            return { success: true }
+        } catch (e) {
+            console.error('Failed to delete call:', e)
+            return { success: false }
+        }
+    },
+
+    deleteCallList: async (listId) => {
+        try {
+            await axios.delete(`${API_BASE}/calls/lists/${listId}`)
+            set(state => ({
+                callLists: state.callLists.filter(l => l.id !== listId),
+                calls: state.calls.filter(call => call.list_id !== listId),
+                callsCache: {},
+                callsCacheFetchedAt: {},
+                callListsLastFetchedAt: 0,
+                callsLastFetchedAt: 0,
+                callsLastQueryKey: '',
+                callsRequestQueryKey: '',
+            }))
+            get().fetchCallStats({ force: true })
+            return { success: true }
+        } catch (e) {
+            console.error('Failed to delete call list:', e)
+            return { success: false }
+        }
+    },
+
+    fetchCallStats: async (options = {}) => {
+        const force = typeof options === 'boolean' ? options : options.force === true
+        const maxAgeMs = 15 * 1000
+        const state = get()
+        const isFresh = state.callStatsLastFetchedAt &&
+            (Date.now() - state.callStatsLastFetchedAt < maxAgeMs)
+
+        if (!force && isFresh) {
+            return { success: true, data: state.callStats, cached: true }
+        }
+
+        if (state.callStatsRequest) {
+            return state.callStatsRequest
+        }
+
+        const request = axios.get(`${API_BASE}/calls/stats`)
+            .then(res => {
+                set({
+                    callStats: res.data,
+                    callStatsLastFetchedAt: Date.now(),
+                    callStatsRequest: null,
+                })
+                return { success: true, data: res.data, cached: false }
+            })
+            .catch(e => {
+                console.error('Failed to fetch call stats:', e)
+                set({ callStatsRequest: null })
+                return { success: false, error: e.response?.data?.detail || 'Failed to fetch call stats' }
+            })
+
+        set({ callStatsRequest: request })
+        return request
     }
 }), {
-    name: 'app-storage',
+    name: 'app-storage-v2',
     partialize: (state) => ({
-        // Persist roles for instant display on refresh (stale-while-revalidate)
-        roles: state.roles,
-        rolesLastFetchedAt: state.rolesLastFetchedAt,
-        roleDetailsCache: state.roleDetailsCache, // Added for instant role load
-        outreachStatusCache: state.outreachStatusCache, // Added for instant status load
-        searchResults: state.searchResults,
-        selectedCandidates: state.selectedCandidates,
-        candidatePriorities: state.candidatePriorities,
-        candidateFeedback: state.candidateFeedback,
-        searchQuery: state.searchQuery,
-        stats: state.stats,
-        analytics: state.analytics,
-        analyticsLastFetchedAt: state.analyticsLastFetchedAt,
         user: state.user,
-        talentPoolCache: state.talentPoolCache,
-        heyreachCampaignId: state.heyreachCampaignId, // Persist selection
+        heyreachCampaignId: state.heyreachCampaignId,
         isSidebarCollapsed: state.isSidebarCollapsed,
-        // Persist recruiters so list shows instantly on page load (stale-while-revalidate)
-        recruiters: state.recruiters,
     }),
 }))
 

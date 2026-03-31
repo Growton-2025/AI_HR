@@ -1,5 +1,6 @@
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone as tz_module
 from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -33,7 +34,7 @@ class OutreachStatusResponse(BaseModel):
 
 class HeyReachTriggerRequest(BaseModel):
     candidate_ids: List[int]
-    role_id: int
+    role_id: Optional[int] = 0
     role_name: Optional[str] = None
     campaign_id: int
     sender_account_id: int
@@ -436,6 +437,10 @@ Recruitment Team"""
                 profile["email"] = email
             if mobile_phone:
                 profile["phone"] = mobile_phone
+            # Also sync HeyReach status if it was triggered
+            if 'hr_campaign_id' in locals() and hr_campaign_id:
+                profile["heyreach_campaign_id"] = str(hr_campaign_id)
+                profile["li_status"] = "in_campaign"
     except Exception:
         pass
 
@@ -530,22 +535,81 @@ async def get_linkedin_chat_history(
     
     try:
         cur = conn.cursor()
+        # Fetch LinkedIn URL
         cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
-        row = cur.fetchone()
+        cand_row = cur.fetchone()
+        
+        # Fetch outreach timestamp to use as cutoff
+        if role_id == 0:
+            # In Talent Pool context, look for the most recent outreach across ALL roles
+            # to serve as a global cutoff for "fresh" conversations.
+            cur.execute("""
+                SELECT updated_at, heyreach_campaign_id, li_conversation_id
+                FROM candidate_outreach 
+                WHERE candidate_id = %s 
+                ORDER BY updated_at DESC LIMIT 1
+            """, (candidate_id,))
+        else:
+            role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+            cur.execute(f"""
+                SELECT updated_at, heyreach_campaign_id, li_conversation_id
+                FROM candidate_outreach 
+                WHERE candidate_id = %s AND {role_where}
+                ORDER BY updated_at DESC LIMIT 1
+            """, (candidate_id, *role_params))
+        
+        outreach_row = cur.fetchone()
+        print(f"DEBUG: Outreach record for cand {candidate_id}: {outreach_row}")
+        if outreach_row is None:
+            # Let's count all records for this candidate to see if we're missing them
+            cur.execute("SELECT COUNT(*) FROM candidate_outreach WHERE candidate_id = %s", (candidate_id,))
+            cnt = cur.fetchone()[0]
+            print(f"DEBUG: Total outreach records for cand {candidate_id}: {cnt}")
+        
         cur.close()
         return_db_connection(conn)
         
-        if not row or not row[0]:
+        if not cand_row or not cand_row[0]:
             return {"messages": []}
             
-        profile_url = row[0]
+        profile_url = cand_row[0]
         bot = HeyReachBot()
-        messages = bot.get_li_chat_history(profile_url)
+        heyreach_campaign_id = outreach_row[1] if outreach_row and len(outreach_row) > 1 else None
+        li_conversation_id = outreach_row[2] if outreach_row and len(outreach_row) > 2 else None
+        messages = bot.get_li_chat_history(
+            profile_url,
+            campaign_id=int(heyreach_campaign_id) if heyreach_campaign_id else None,
+            conversation_id=li_conversation_id
+        )
         
         return {"messages": messages or []}
     except Exception as e:
         if conn: return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Failed to fetch LinkedIn chat history: {e}")
+
+def _clean_email_body(body: str) -> str:
+    """Strip common email quote markers and signatures to show only the new message."""
+    if not body: return ""
+    
+    # Strip common quote markers and everything after them
+    markers = [
+        r'<div[^>]*class=["\'][^"\']*(?:gmail_quote|smartlead-quote)[^"\']*["\']',
+        r'<blockquote',
+        r'On\s+.*wrote:',
+        r'--\s*<br', # Signature start
+        r'<div>\s*On\s+.*wrote:',
+        r'<hr[^>]*>\s*<b>From:</b>', # Forwarded message
+    ]
+    
+    cleaned = body
+    for marker in markers:
+        parts = re.split(marker, cleaned, flags=re.IGNORECASE)
+        if parts:
+            cleaned = parts[0]
+            
+    # Clean up trailing tags, whitespace, and empty paragraphs
+    cleaned = re.sub(r'(<br\s*/?>|<p[^>]*>\s*</p>|\s)+$', '', cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
 
 @router.get("/chat/{role_id}/{candidate_id}")
 async def get_chat_history(
@@ -562,7 +626,7 @@ async def get_chat_history(
         cur = conn.cursor()
         role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
         cur.execute(f"""
-            SELECT c.email, co.campaign_id
+            SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at
             FROM candidate_outreach co
             JOIN candidates c ON c.id = co.candidate_id
             WHERE co.candidate_id = %s AND {role_where}
@@ -574,12 +638,46 @@ async def get_chat_history(
         if not row:
             raise HTTPException(status_code=404, detail="Candidate outreach record not found")
             
-        email, campaign_id = row
+        email, campaign_id, initial_msg_text, initial_msg_at = row
+
         if not campaign_id:
+            # No campaign yet — return initial message if stored
+            if initial_msg_text:
+                return {"messages": [{
+                    "type": "SENT", "email_body": initial_msg_text,
+                    "time": initial_msg_at.isoformat() if initial_msg_at else None,
+                    "sender_name": "You"
+                }]}
             return {"messages": []}
             
         bot = get_smartlead_bot()
+        print(f"DEBUG: Fetching Email history for {email} (campaign_id: {campaign_id})")
         messages = bot.get_chat_history(email, campaign_id)
+        print(f"DEBUG: Found {len(messages) if messages else 0} Emails")
+        
+        # Prepend the initial outreach message if Smartlead hasn't stored it yet
+        if initial_msg_text:
+            initial_entry = {
+                "type": "SENT",
+                "email_body": initial_msg_text,
+                "time": initial_msg_at.isoformat() if initial_msg_at else None,
+                "sender_name": "You"
+            }
+            if not messages:
+                messages = [initial_entry]
+            else:
+                # Only prepend if no message with same text already exists (avoid duplicates)
+                already_present = any(
+                    (m.get('email_body') or '').strip() == initial_msg_text.strip()
+                    for m in messages
+                )
+                if not already_present:
+                    messages = [initial_entry] + messages
+        
+        if messages and isinstance(messages, list):
+            for msg in messages:
+                if 'email_body' in msg:
+                    msg['email_body'] = _clean_email_body(msg['email_body'])
         
         return {"messages": messages or []}
     except HTTPException:
@@ -623,24 +721,38 @@ async def send_likedin_chat_reply(
             
         profile_url = row[0]
         
-        # Check for cached conversation ID
+        # Check for cached conversation ID / campaign ID
         conv_id = None
+        campaign_id = None
         conn2 = get_db_connection()
         if conn2:
             try:
                 with conn2.cursor() as cur2:
                     role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
                     cur2.execute(
-                        f"SELECT li_conversation_id FROM candidate_outreach WHERE candidate_id = %s AND {role_where}",
+                        f"""
+                        SELECT heyreach_campaign_id, li_conversation_id
+                        FROM candidate_outreach
+                        WHERE candidate_id = %s AND {role_where}
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
                         (candidate_id, *role_params)
                     )
                     cached = cur2.fetchone()
-                    if cached: conv_id = cached[0]
+                    if cached:
+                        campaign_id = cached[0]
+                        conv_id = cached[1]
             finally:
                 return_db_connection(conn2)
                 
         bot = HeyReachBot()
-        success = bot.send_li_message(profile_url, request.message, conversation_id=conv_id)
+        success = bot.send_li_message(
+            profile_url,
+            request.message,
+            conversation_id=conv_id,
+            campaign_id=int(campaign_id) if campaign_id else None
+        )
         
         if success:
             return {"success": True}
@@ -687,19 +799,82 @@ async def send_chat_reply(
                     if msg_type in ['INBOX', 'REPLY']:
                         latest_msg = msg
                         break
-                if not latest_msg: latest_msg = history[0]
-                estats_id = latest_msg.get('email_stats_id') or latest_msg.get('stats_id')
-                res = bot.reply_to_email_thread(
-                    campaign_id=campaign_id,
-                    email_stats_id=str(estats_id) if estats_id else None,
-                    message=request.message,
-                    reply_message_id=str(latest_msg.get('message_id')),
-                    reply_email_time=latest_msg.get('time') or latest_msg.get('created_at'),
-                    reply_email_body=latest_msg.get('email_body')
-                )
-                if res: return {"success": True}
+                if not latest_msg and history:
+                    latest_msg = history[0]
+                
+                if latest_msg:
+                    estats_id = latest_msg.get('email_stats_id') or latest_msg.get('stats_id')
+                    res = bot.reply_to_email_thread(
+                        campaign_id=campaign_id,
+                        email_stats_id=str(estats_id) if estats_id else None,
+                        message=request.message,
+                        reply_message_id=str(latest_msg.get('message_id')),
+                        reply_email_time=latest_msg.get('time') or latest_msg.get('created_at'),
+                        reply_email_body=latest_msg.get('email_body')
+                    )
+                    if res: return {"success": True}
         
-        raise HTTPException(status_code=400, detail="Could not identify suitable email thread for default reply")
+        # Fallback: Campaign doesn't exist OR it exists but has no history yet. Trigger a new one.
+        candidates = get_candidate_details([candidate_id])
+        if not candidates:
+            raise HTTPException(status_code=404, detail="Candidate details not found")
+        cand = candidates[0]
+        
+        bot = get_smartlead_bot()
+        sender_email = os.getenv("SMARTLEAD_SENDER_EMAIL")
+        timezone = os.getenv("SMARTLEAD_DEFAULT_TIMEZONE", "Asia/Kolkata")
+        campaign_name = f"Quick Chat - {cand['name']}"
+
+        campaign_id = bot.create_campaign(campaign_name)
+        if not campaign_id:
+            raise HTTPException(status_code=500, detail="Failed to create Smartlead campaign")
+        
+        bot.add_email_account(sender_email)
+        subject = "Following up regarding your profile"
+        bot.set_email_sequence(subject, request.message)
+        
+        start_time = datetime.now(tz_module.utc) + timedelta(minutes=1)
+
+        bot.set_schedule(tz=timezone, start_hour="00:00", end_hour="23:59",
+                         start_time=start_time, days_of_the_week=[0, 1, 2, 3, 4, 5, 6])
+        bot.update_campaign_settings(follow_up_percentage=50)
+        bot.add_leads([{"first_name": cand["first_name"], "last_name": cand["last_name"], "email": cand["email"]}])
+        bot.start_campaign()
+        
+        # Record in DB
+        conn2 = get_db_connection()
+        if conn2:
+            try:
+                with conn2.cursor() as cur2:
+                    role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+                    cur2.execute(f"SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND {role_where}", (candidate_id, *role_params))
+                    if cur2.fetchone():
+                        cur2.execute(f"""
+                            UPDATE candidate_outreach
+                            SET campaign_id = %s,
+                                campaign_name = %s,
+                                status = 'in_campaign',
+                                initial_message = %s,
+                                initial_message_at = NOW(),
+                                updated_at = NOW()
+                            WHERE candidate_id = %s AND {role_where}
+                        """, (campaign_id, campaign_name, request.message, candidate_id, *role_params))
+                    else:
+                        # Use NULL for recruitment_role_id if role_id is 0
+                        real_role_id = role_id if role_id != 0 else None
+                        cur2.execute("""
+                            INSERT INTO candidate_outreach
+                            (candidate_id, recruitment_role_id, campaign_id, campaign_name, status, initial_message, initial_message_at, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, 'in_campaign', %s, NOW(), NOW(), NOW())
+                        """, (candidate_id, real_role_id, campaign_id, campaign_name, request.message))
+                    conn2.commit()
+                    return {"success": True, "triggered": True}
+            finally:
+                return_db_connection(conn2)
+        
+        raise HTTPException(status_code=400, detail="Could not identify suitable email thread or trigger new outreach")
+
+
     except HTTPException:
         if conn: return_db_connection(conn)
         raise
@@ -774,7 +949,10 @@ async def sync_responses(
         if linkedin:
             try:
                 print(f"DEBUG: Starting HeyReach sync for {linkedin}")
-                activity = hr_bot.get_lead_activity(linkedin)
+                activity = hr_bot.get_lead_activity(
+                    linkedin,
+                    campaign_id=int(hr_campaign_id) if hr_campaign_id else None
+                )
                 if activity:
                     print(f"DEBUG: HeyReach activity found for {linkedin}: {activity}")
                     update_data["li_status"] = 'replied' if activity['is_replied'] else 'message_sent'
@@ -880,13 +1058,15 @@ async def trigger_heyreach_outreach(
 
     bot = get_heyreach_bot()
     
-    # Dynamic Campaign Lookup: If role_name is provided, try to find a matching campaign
     campaign_id = request.campaign_id
-    if request.role_name:
+    if (not campaign_id or campaign_id <= 0) and request.role_name:
         found_id = bot.find_campaign_by_name(request.role_name)
         if found_id:
             print(f"DEBUG: Found matching HeyReach campaign '{request.role_name}' with ID {found_id}")
             campaign_id = found_id
+
+    if not campaign_id or campaign_id <= 0:
+        raise HTTPException(status_code=400, detail="A valid HeyReach campaign ID is required")
     
     success_count = 0
 
@@ -894,7 +1074,6 @@ async def trigger_heyreach_outreach(
     for candidate in candidates:
         res = bot.push_lead(
             campaign_id=campaign_id,
-
             account_id=request.sender_account_id,
             first_name=candidate["first_name"],
             last_name=candidate["last_name"],
@@ -903,6 +1082,9 @@ async def trigger_heyreach_outreach(
         print(f"DEBUG: HeyReach push result for candidate {candidate['id']}: {res}")
         if res is not None:
             success_count += 1
+
+            # Handle role_id = 0 for Talent Pool context (save as NULL in DB)
+            db_role_id = request.role_id if (request.role_id or 0) > 0 else None
 
             # Record in DB
             conn = get_db_connection()
@@ -919,14 +1101,28 @@ async def trigger_heyreach_outreach(
                             li_status = 'in_campaign',
                             updated_at = NOW()
 
-                    """, (candidate["id"], request.role_id, str(campaign_id)))
+                    """, (candidate["id"], db_role_id, str(campaign_id)))
                     conn.commit()
                     cur.close()
                     return_db_connection(conn)
+
+                    # Synchronize cache
+                    try:
+                        from backend.pipeline.query import update_profile_cache
+                        update_profile_cache(candidate["id"], {
+                            "heyreach_campaign_id": str(campaign_id),
+                            "li_status": "in_campaign"
+                        })
+                    except Exception as cache_e:
+                        print(f"Warning: could not update profile cache: {cache_e}")
+
                 except Exception as e:
                     print(f"Error recording HeyReach outreach: {e}")
                     if conn: return_db_connection(conn)
 
+
+    if success_count == 0:
+        raise HTTPException(status_code=502, detail="Failed to add any candidates to the HeyReach campaign")
 
     return {
         "success": True,

@@ -1,0 +1,917 @@
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { 
+  Phone, Calendar, CheckCircle2, List, PhoneCall, 
+  Search, RefreshCw, MoreHorizontal, User, 
+  Trash2, X, ChevronLeft, Send, MessageSquare, 
+  CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
+  ListHeart, Layers, PhoneIncoming
+} from 'lucide-react';
+import { useAppStore } from '../store/useAppStore';
+import { toast } from 'sonner';
+
+const formatLocalDate = (dateString) => {
+  if (!dateString) return 'N/A';
+  // dateString is typically YYYY-MM-DD
+  const [year, month, day] = dateString.split('-').map(Number);
+  if (!year || !month || !day) return dateString;
+  const date = new Date(year, month - 1, day);
+  return date.toLocaleDateString(undefined, { 
+    month: 'short', 
+    day: 'numeric', 
+    year: 'numeric' 
+  });
+};
+
+const TABS = [
+  { id: 'today', label: 'Due Today', icon: Clock },
+  { id: 'upcoming', label: 'Upcoming', icon: Calendar },
+  { id: 'completed', label: 'Completed', icon: CheckCircle2 },
+  { id: 'lists', label: 'Call Lists', icon: Layers },
+];
+
+const OUTCOMES = [
+  'Left Voicemail',
+  'Connected - Interested',
+  'Connected - Not Interested',
+  'Connected - Follow up later',
+  'No Answer',
+  'Wrong Number'
+];
+
+function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
+  const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState('');
+  const messagesEndRef = useRef(null);
+  const stateRef = useRef({ messages: [], loaded: false });
+  const requestSeqRef = useRef(0);
+
+  useEffect(() => {
+    stateRef.current = { messages, loaded };
+  }, [messages, loaded]);
+
+  const loadMessages = useCallback(async ({ showLoader = false, silent = false } = {}) => {
+    const requestSeq = ++requestSeqRef.current;
+    const hasCachedMessages = stateRef.current.messages.length > 0 || stateRef.current.loaded;
+    const shouldBlock = showLoader && !hasCachedMessages;
+
+    if (shouldBlock) {
+      setLoading(true);
+    } else if (!silent) {
+      setRefreshing(true);
+    }
+
+    const res = await fetchChatHistory(0, candidateId, platform);
+    if (requestSeqRef.current !== requestSeq) return;
+
+    if (res.success) {
+      setMessages(res.messages || []);
+      setError('');
+    } else {
+      setError(res.error || `Failed to fetch ${platform} history`);
+    }
+
+    setLoaded(true);
+    setLoading(false);
+    if (!silent) setRefreshing(false);
+  }, [candidateId, fetchChatHistory, platform]);
+
+  useEffect(() => {
+    requestSeqRef.current = 0;
+    stateRef.current = { messages: [], loaded: false };
+    setMessages([]);
+    setError('');
+    setLoaded(false);
+    setLoading(true);
+    setRefreshing(false);
+    loadMessages({ showLoader: true });
+  }, [candidateId, platform, loadMessages]);
+
+  useEffect(() => {
+    const interval = setInterval(() => loadMessages({ silent: true }), 5000);
+    return () => clearInterval(interval);
+  }, [loadMessages]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const accent = platform === 'linkedin' ? '#0a66c2' : '#f97316';
+  const icon = platform === 'linkedin' ? <ExternalLink size={18} /> : <Mail size={18} />;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '400px', background: '#f8fafc' }}>
+      <div style={{ padding: '18px 24px', borderBottom: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#0f172a' }}>
+          <div style={{
+            width: '38px',
+            height: '38px',
+            borderRadius: '12px',
+            background: platform === 'linkedin' ? '#eff6ff' : '#fff7ed',
+            color: accent,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}>
+            {icon}
+          </div>
+          <div>
+            <div style={{ fontSize: '13px', fontWeight: 800 }}>{platform === 'linkedin' ? 'LinkedIn Responses' : 'Email Responses'}</div>
+            <div style={{ fontSize: '12px', color: '#64748b' }}>{candidateName || 'Candidate'} conversation history</div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{
+            padding: '7px 12px',
+            borderRadius: '999px',
+            background: refreshing ? '#eff6ff' : '#fff',
+            border: `1px solid ${refreshing ? '#bfdbfe' : '#e2e8f0'}`,
+            color: refreshing ? '#2563eb' : '#64748b',
+            fontSize: '11px',
+            fontWeight: 700,
+            transition: 'all 0.2s ease'
+          }}>
+            {loading && !loaded
+              ? 'Loading thread...'
+              : refreshing
+                ? 'Checking for replies...'
+                : error && messages.length === 0
+                  ? 'Refresh failed'
+                  : `${messages.length} message${messages.length === 1 ? '' : 's'}`}
+          </div>
+          <button
+            onClick={() => loadMessages({ showLoader: messages.length === 0 })}
+            style={{
+              width: '34px',
+              height: '34px',
+              borderRadius: '10px',
+              border: '1px solid #e2e8f0',
+              background: '#fff',
+              color: '#64748b',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+          >
+            <RefreshCw size={15} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
+          </button>
+        </div>
+      </div>
+
+      <div style={{ position: 'relative', flex: 1, padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: '16px', overflowY: 'auto' }}>
+        {loading && !loaded ? (
+          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '16px', flex: 1 }}>
+            {Array.from({ length: 4 }).map((_, idx) => {
+              const isIncoming = idx % 2 === 0;
+              return (
+                <div key={`call-thread-skeleton-${idx}`} style={{ display: 'flex', flexDirection: 'column', alignItems: isIncoming ? 'flex-start' : 'flex-end', gap: '6px' }}>
+                  <div style={{ width: 92, height: 10, borderRadius: 999, background: '#e2e8f0' }} />
+                  <div style={{
+                    width: `${isIncoming ? 56 : 44}%`,
+                    minWidth: '190px',
+                    maxWidth: '78%',
+                    height: idx === 2 ? 66 : 50,
+                    borderRadius: isIncoming ? '8px 18px 18px 18px' : '18px 8px 18px 18px',
+                    background: 'linear-gradient(90deg,#f1f5f9 20%,#e2e8f0 50%,#f1f5f9 80%)',
+                    backgroundSize: '200% 100%',
+                    animation: 'shimmer 1.2s linear infinite'
+                  }} />
+                </div>
+              );
+            })}
+          </div>
+        ) : messages.length === 0 ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ maxWidth: '340px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
+              <div style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: '20px',
+                background: platform === 'linkedin' ? '#eff6ff' : '#fff7ed',
+                color: accent,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}>
+                {icon}
+              </div>
+              <div style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>
+                {error ? `Could not load ${platform} conversation` : `No ${platform} responses yet`}
+              </div>
+              <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
+                {error
+                  ? 'The latest refresh did not complete. You can retry without leaving the call workspace.'
+                  : 'New replies will appear here automatically as the candidate responds.'}
+              </div>
+              {error && (
+                <button
+                  onClick={() => loadMessages({ showLoader: true })}
+                  style={{
+                    padding: '10px 14px',
+                    borderRadius: '10px',
+                    border: '1px solid #e2e8f0',
+                    background: '#fff',
+                    color: '#0f172a',
+                    fontWeight: 700,
+                    cursor: 'pointer'
+                  }}
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          messages.map((msg, idx) => {
+            const isCandidate = msg.type === 'REPLY' || msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
+            const senderName = isCandidate ? candidateName?.split(' ')?.[0] || 'Candidate' : 'You';
+            const time = msg.time || msg.created_at || msg.timestamp;
+            const body = msg.email_body || msg.message || msg.text || '';
+            const formattedTime = time ? new Date(time) : null;
+            const readableTime = formattedTime && !isNaN(formattedTime.getTime())
+              ? `${formattedTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} ${formattedTime.toLocaleDateString()}`
+              : time;
+
+            return (
+              <div key={`${platform}-message-${idx}`} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end', animation: 'msgFadeIn 0.24s ease' }}>
+                <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
+                  {senderName}{readableTime ? ` • ${readableTime}` : ''}
+                </div>
+                <div style={{
+                  maxWidth: '80%',
+                  padding: '10px 15px',
+                  borderRadius: isCandidate ? '6px 18px 18px 18px' : '18px 6px 18px 18px',
+                  background: isCandidate ? '#fff' : accent,
+                  color: isCandidate ? '#0f172a' : '#fff',
+                  fontSize: '14px',
+                  lineHeight: '1.5',
+                  boxShadow: isCandidate ? '0 1px 4px rgba(0,0,0,0.07)' : '0 10px 18px -14px rgba(15,23,42,0.5)',
+                  border: isCandidate ? '1px solid #e2e8f0' : 'none',
+                  overflowWrap: 'break-word'
+                }}>
+                  <div dangerouslySetInnerHTML={{ __html: body }} />
+                </div>
+              </div>
+            );
+          })
+        )}
+        {refreshing && messages.length > 0 && (
+          <div style={{
+            position: 'sticky',
+            top: 0,
+            alignSelf: 'center',
+            padding: '6px 12px',
+            borderRadius: '999px',
+            background: '#fff',
+            border: '1px solid #e2e8f0',
+            color: '#64748b',
+            fontSize: '11px',
+            fontWeight: 700,
+            boxShadow: '0 10px 20px -14px rgba(15,23,42,0.35)'
+          }}>
+            Syncing latest replies...
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+    </div>
+  );
+}
+
+export default function Calls() {
+  const { 
+    calls, fetchCalls, 
+    callLists, fetchCallLists,
+    callsLastQueryKey,
+    callStats, fetchCallStats,
+    updateCall, deleteCall, deleteCallList
+  } = useAppStore();
+
+  const [activeTab, setActiveTab] = useState('today');
+  const [loading, setLoading] = useState(false);
+  const [selectedList, setSelectedList] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [callingCandidate, setCallingCandidate] = useState(null); // The call object
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const statsPromise = fetchCallStats();
+      if (activeTab === 'lists' && !selectedList) {
+        const [listsRes, statsRes] = await Promise.all([fetchCallLists(), statsPromise]);
+        if (!listsRes?.success || !statsRes?.success) throw new Error('Failed to fetch call data');
+      } else {
+        const params = {};
+        if (activeTab === 'today') params.due_filter = 'today';
+        else if (activeTab === 'upcoming') params.due_filter = 'upcoming';
+        else if (activeTab === 'completed') params.status = 'completed';
+        
+        if (selectedList) {
+          params.list_id = selectedList.id;
+          params.status = 'pending'; // Default to pending in list view
+        } else if (activeTab === 'today' || activeTab === 'upcoming') {
+          params.status = 'pending';
+        }
+
+        const [callsRes, statsRes] = await Promise.all([fetchCalls(params), statsPromise]);
+        if (!callsRes?.success || !statsRes?.success) throw new Error('Failed to fetch call data');
+      }
+    } catch (e) {
+      toast.error('Failed to fetch data');
+    } finally {
+      setLoading(false);
+    }
+  }, [activeTab, selectedList, fetchCalls, fetchCallLists, fetchCallStats]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const stats = [
+    { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#2563eb', bg: '#eff6ff' },
+    { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#f59e0b', bg: '#fffbeb' },
+    { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#10b981', bg: '#ecfdf5' },
+    { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#8b5cf6', bg: '#f5f3ff' },
+  ];
+
+  const handleDial = (call) => {
+    setCallingCandidate(call);
+  };
+
+  const handleDeleteCall = async (callId) => {
+    if (!window.confirm('Remove this candidate from the call list?')) return;
+    const res = await deleteCall(callId);
+    if (res.success) toast.success('Removed from list');
+    else toast.error('Failed to remove');
+  };
+
+  const handleDeleteList = async (listId, name) => {
+    if (!window.confirm(`Delete the list "${name}"? This will remove all associated tasks.`)) return;
+    const res = await deleteCallList(listId);
+    if (res.success) {
+      if (selectedList?.id === listId) setSelectedList(null);
+      toast.success('List deleted');
+    }
+    else toast.error('Failed to delete list');
+  };
+
+  const filteredCalls = (calls || []).filter(c => 
+    (c.candidate_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (c.candidate_title || '').toLowerCase().includes(searchQuery.toLowerCase())
+  );
+  const currentCallsQueryKey = selectedList
+    ? `list_id=${selectedList.id}`
+    : activeTab === 'today'
+      ? 'due_filter=today&status=pending'
+      : activeTab === 'upcoming'
+        ? 'due_filter=upcoming&status=pending'
+        : activeTab === 'completed'
+          ? 'status=completed'
+          : '';
+  const showCallsLoading = activeTab !== 'lists' && loading && callsLastQueryKey !== currentCallsQueryKey;
+  const showListsLoading = activeTab === 'lists' && !selectedList && loading && !callLists.length;
+
+  return (
+    <div style={{ padding: '32px', background: '#f8fafc', minHeight: '100vh', fontFamily: '"Inter", sans-serif' }}>
+      <header style={{ marginBottom: '32px' }}>
+        <h1 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Tasks Dashboard</h1>
+        <p style={{ color: '#64748b', fontSize: '15px' }}>Track your calling progress and lists</p>
+      </header>
+
+      {/* Stats Cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '20px', marginBottom: '40px' }}>
+        {stats.map((stat, i) => (
+          <div key={i} style={{ padding: '24px', background: '#fff', borderRadius: '20px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.01)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+              <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: stat.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <stat.icon size={20} color={stat.color} />
+              </div>
+              <span style={{ fontSize: '12px', fontWeight: 700, color: '#94a3b8', letterSpacing: '0.05em' }}>{stat.label}</span>
+            </div>
+            <div style={{ fontSize: '32px', fontWeight: 800, color: '#0f172a' }}>{stat.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', gap: '32px' }}>
+        {TABS.map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => { setActiveTab(tab.id); setSelectedList(null); }}
+            style={{
+              padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #2563eb' : '2px solid transparent',
+              color: activeTab === tab.id ? '#2563eb' : '#64748b', fontSize: '14px', fontWeight: 600,
+              cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '-1px',
+              transition: 'all 0.2s'
+            }}
+          >
+            <tab.icon size={18} />
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Content Area */}
+      <div style={{ background: '#fff', borderRadius: '24px', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+        {activeTab === 'lists' && !selectedList ? (
+          <div style={{ padding: '24px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
+              {showListsLoading && Array.from({ length: 4 }).map((_, idx) => (
+                <div
+                  key={`list-skeleton-${idx}`}
+                  style={{ padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', background: '#fff' }}
+                >
+                  <div style={{ width: 40, height: 40, borderRadius: 12, background: '#e2e8f0', marginBottom: 16 }} />
+                  <div style={{ width: '55%', height: 16, borderRadius: 8, background: '#e2e8f0', marginBottom: 10 }} />
+                  <div style={{ width: '35%', height: 12, borderRadius: 8, background: '#f1f5f9' }} />
+                </div>
+              ))}
+              {callLists.map(list => (
+                <div 
+                  key={list.id} 
+                  onClick={() => setSelectedList(list)}
+                  style={{ 
+                    padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', cursor: 'pointer',
+                    transition: 'all 0.2s'
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#2563eb'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.transform = 'none'; }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
+                    <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: '#eff6ff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <List size={20} color="#2563eb" />
+                    </div>
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteList(list.id, list.name);
+                      }}
+                      style={{ padding: '6px', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', borderRadius: '8px' }}
+                      onMouseEnter={e => e.currentTarget.style.color = '#ef4444'}
+                      onMouseLeave={e => e.currentTarget.style.color = '#94a3b8'}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                  <h3 style={{ fontSize: '16px', fontWeight: 700, color: '#0f172a', marginBottom: '4px' }}>{list.name}</h3>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <User size={12} color="#94a3b8" />
+                    <span style={{ fontSize: '13px', color: '#64748b' }}>{list.candidate_count} Candidates</span>
+                  </div>
+                </div>
+              ))}
+              {(callLists || []).length === 0 && (
+                <div style={{ gridColumn: '1/-1', py: 60, textAlign: 'center', color: '#94a3b8' }}>No call lists found yet.</div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div style={{ minHeight: '400px' }}>
+            <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px' }}>
+              {selectedList && (
+                <button 
+                  onClick={() => setSelectedList(null)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px' }}
+                >
+                  <ChevronLeft size={20} />
+                </button>
+              )}
+              <h2 style={{ fontSize: '16px', fontWeight: 700, color: '#0f172a' }}>
+                {selectedList ? selectedList.name : activeTab === 'today' ? 'Due Today' : activeTab === 'upcoming' ? 'Upcoming' : 'Completed'}
+              </h2>
+              {selectedList && (
+                <span style={{ fontSize: '12px', background: '#eff6ff', color: '#2563eb', padding: '2px 8px', borderRadius: '20px', fontWeight: 600 }}>
+                  {(filteredCalls || []).length} Contacts
+                </span>
+              )}
+              
+              <div style={{ position: 'relative', marginLeft: 'auto', width: '240px' }}>
+                <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
+                <input 
+                  type="text" 
+                  placeholder="Search candidates..."
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  style={{ 
+                    width: '100%', padding: '8px 12px 8px 32px', borderRadius: '10px', 
+                    border: '1px solid #e2e8f0', fontSize: '13px', outline: 'none'
+                  }}
+                />
+              </div>
+            </div>
+
+            <div style={{ padding: '0 24px' }}>
+              {showCallsLoading && Array.from({ length: 5 }).map((_, idx) => (
+                <div
+                  key={`call-skeleton-${idx}`}
+                  style={{ padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px' }}
+                >
+                  <div style={{ width: 40, height: 40, borderRadius: '50%', background: '#e2e8f0' }} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ width: '28%', height: 14, borderRadius: 8, background: '#e2e8f0', marginBottom: 8 }} />
+                    <div style={{ width: '44%', height: 12, borderRadius: 8, background: '#f1f5f9', marginBottom: 8 }} />
+                    <div style={{ width: '36%', height: 10, borderRadius: 8, background: '#f8fafc' }} />
+                  </div>
+                </div>
+              ))}
+              {!showCallsLoading && (
+                <>
+              {(filteredCalls || []).map(call => (
+                <div 
+                  key={call.id}
+                  style={{ 
+                    padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', 
+                    alignItems: 'center', gap: '16px'
+                  }}
+                >
+                  <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#64748b' }}>
+                    {call.candidate_name?.split(' ').map(n => n[0]).join('') || '?' }
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <h3 style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a', marginBottom: '2px' }}>{call.candidate_name || 'Anonymous'}</h3>
+                    <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '4px' }}>
+                      {call.task_title || call.candidate_title || 'No Title'}
+                    </p>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px', color: '#94a3b8' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <Phone size={12} /> {call.candidate_phone || 'N/A'}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <Calendar size={12} /> 
+                        {call.status === 'completed' 
+                          ? `Completed: ${call.completed_at ? new Date(call.completed_at).toLocaleDateString() : 'Unknown'}`
+                          : `Due: ${formatLocalDate(call.due_date)}`
+                        }
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button 
+                      onClick={() => handleDeleteCall(call.id)}
+                      style={{ padding: '8px', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', borderRadius: '8px' }}
+                      onMouseEnter={e => e.currentTarget.style.color = '#ef4444'}
+                      onMouseLeave={e => e.currentTarget.style.color = '#94a3b8'}
+                      title="Remove from list"
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                    <button 
+                      onClick={() => handleDial(call)}
+                      disabled={call.status === 'completed'}
+                      style={{ 
+                        padding: '8px 16px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
+                        background: call.status === 'completed' ? '#f1f5f9' : '#2563eb',
+                        color: call.status === 'completed' ? '#94a3b8' : '#fff',
+                        border: 'none', cursor: call.status === 'completed' ? 'not-allowed' : 'pointer',
+                        display: 'flex', alignItems: 'center', gap: '8px'
+                      }}
+                    >
+                      <PhoneCall size={16} /> 
+                      {call.status === 'completed' ? 'Completed' : 'Dial Now'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {(filteredCalls || []).length === 0 && (
+                <div style={{ padding: '60px', textAlign: 'center', color: '#94a3b8' }}>No candidates matching your query.</div>
+              )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {callingCandidate && (
+        <CallingModal 
+          call={callingCandidate} 
+          onClose={() => setCallingCandidate(null)} 
+          onRefresh={fetchData} 
+        />
+      )}
+    </div>
+  );
+}
+
+function CallingModal({ call, onClose, onRefresh }) {
+  const [activeTab, setActiveTab] = useState('calls');
+  const [callState, setCallState] = useState('connecting'); // 'connecting', 'active', 'ended'
+  const [outcome, setOutcome] = useState('');
+  const [notes, setNotes] = useState('');
+  const [createFollowup, setCreateFollowup] = useState(false);
+  const [followupTitle, setFollowupTitle] = useState(call.task_title || '');
+  const [followupDueDate, setFollowupDueDate] = useState('');
+  const [saving, setSaving] = useState(false);
+  const { updateCall } = useAppStore();
+
+  useEffect(() => {
+    if (callState === 'connecting') {
+      const timer = setTimeout(() => setCallState('active'), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [callState]);
+
+  const handleEndCall = () => {
+    setCallState('ended');
+  };
+
+  const handleSaveLog = async () => {
+    if (!outcome) {
+      toast.error('Please select an outcome');
+      return;
+    }
+    if (createFollowup && !followupDueDate) {
+      toast.error('Please select a due date for the follow-up task');
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        status: createFollowup ? 'pending' : 'completed',
+        outcome,
+        notes,
+        duration: Math.floor(Math.random() * 300) + 30 // Dummy duration
+      };
+
+      if (createFollowup) {
+        payload.due_date = followupDueDate;
+        payload.task_title = followupTitle.trim();
+      }
+
+      await updateCall(call.id, payload);
+      toast.success(createFollowup ? 'Follow-up task scheduled' : 'Call log saved');
+      onRefresh();
+      onClose();
+    } catch (e) {
+      toast.error('Failed to save log');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const tabs = [
+    { id: 'linkedin', label: 'LinkedIn', icon: ExternalLink },
+    { id: 'email', label: 'Email', icon: MessageSquare },
+    { id: 'calls', label: 'Calls', icon: Phone },
+    { id: 'tasks', label: 'Tasks', icon: CheckSquare },
+  ];
+  const callStatusMeta = callState === 'connecting'
+    ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: `Getting ${call.candidate_name?.split(' ')[0] || 'Candidate'} on the line...` }
+    : callState === 'active'
+      ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: `Live call with ${call.candidate_name || 'Candidate'}` }
+      : { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome while the conversation is fresh.' };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+      <div style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '720px', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
+        <div style={{ padding: '24px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '4px' }}>{call.candidate_name}</h2>
+            <p style={{ fontSize: '13px', color: '#64748b' }}>Candidate Conversations</p>
+          </div>
+          <div style={{ display: 'flex', background: '#f1f5f9', padding: '4px', borderRadius: '12px', gap: '4px' }}>
+            {tabs.map(tab => (
+              <button 
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                style={{ 
+                  padding: '6px 12px', borderRadius: '8px', border: 'none', background: activeTab === tab.id ? '#fff' : 'transparent',
+                  color: activeTab === tab.id ? '#0f172a' : '#64748b', fontSize: '12px', fontWeight: 700, 
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px',
+                  boxShadow: activeTab === tab.id ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+                }}
+              >
+                <tab.icon size={14} />
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8' }}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div style={{ minHeight: '400px', background: '#fff' }}>
+          {activeTab === 'calls' ? (
+            <div style={{ padding: '32px 40px 40px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+              <div style={{
+                alignSelf: 'stretch',
+                marginBottom: '28px',
+                padding: '14px 16px',
+                borderRadius: '16px',
+                background: callStatusMeta.bg,
+                color: callStatusMeta.tone,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '12px',
+                transition: 'all 0.25s ease'
+              }}>
+                <div>
+                  <div style={{ fontSize: '12px', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase' }}>{callStatusMeta.label}</div>
+                  <div style={{ fontSize: '13px', marginTop: '4px' }}>{callStatusMeta.message}</div>
+                </div>
+                <div style={{
+                  padding: '6px 10px',
+                  borderRadius: '999px',
+                  background: '#fff',
+                  border: `1px solid ${callStatusMeta.tone}22`,
+                  fontSize: '11px',
+                  fontWeight: 800
+                }}>
+                  {call.list_name || 'Call Task'}
+                </div>
+              </div>
+              {callState !== 'ended' ? (
+                <>
+                  <div style={{ 
+                    width: '120px', height: '120px', borderRadius: '50%', background: '#eff6ff', 
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '32px',
+                    position: 'relative',
+                    transition: 'transform 0.25s ease, box-shadow 0.25s ease',
+                    transform: callState === 'connecting' ? 'scale(1)' : 'scale(1.03)',
+                    boxShadow: callState === 'connecting' ? '0 0 0 0 rgba(37,99,235,0.18)' : '0 18px 30px -24px rgba(37,99,235,0.5)'
+                  }}>
+                    <Phone size={48} color="#2563eb" />
+                    {callState === 'connecting' && (
+                      <div style={{ 
+                        position: 'absolute', inset: -10, borderRadius: '50%', 
+                        border: '2px solid #2563eb', animation: 'ping 2s cubic-bezier(0, 0, 0.2, 1) infinite' 
+                      }} />
+                    )}
+                  </div>
+                  <h3 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>
+                    {callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` : `Active call with ${call.candidate_name || 'Candidate'}`}
+                  </h3>
+                  <p style={{ fontSize: '18px', color: '#64748b', fontWeight: 500, marginBottom: '16px' }}>{call.candidate_phone}</p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#2563eb', fontSize: '14px', fontWeight: 700, marginBottom: '40px' }}>
+                    <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} />
+                    {callState === 'connecting' ? 'Connecting' : 'Connected'}
+                  </div>
+                  <button 
+                    onClick={handleEndCall}
+                    style={{ 
+                      width: '100%', padding: '16px', background: '#fee2e2', color: '#ef4444', 
+                      border: 'none', borderRadius: '16px', fontSize: '15px', fontWeight: 700, 
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+                    }}
+                  >
+                    <X size={20} /> End Call
+                  </button>
+                </>
+              ) : (
+                <div style={{ width: '100%' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px' }}>
+                    <PhoneCall size={18} color="#2563eb" />
+                    <span style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>Log Call Details</span>
+                    <span style={{ marginLeft: 'auto', fontSize: '12px', background: '#fff', padding: '4px 8px', borderRadius: '8px', border: '1px solid #e2e8f0', color: '#64748b' }}>
+                      {call.list_name || 'test'}
+                    </span>
+                  </div>
+
+                  <div style={{ marginBottom: '24px' }}>
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Outcome / Stage</label>
+                    <select 
+                      value={outcome}
+                      onChange={e => setOutcome(e.target.value)}
+                      style={{ 
+                        width: '100%', padding: '12px 16px', borderRadius: '12px', 
+                        border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none'
+                      }}
+                    >
+                      <option value="">Select an outcome...</option>
+                      {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  </div>
+
+                  <div style={{ marginBottom: '24px' }}>
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Notes & Next Steps</label>
+                    <textarea 
+                      placeholder="Summarize the call and note any next steps..."
+                      value={notes}
+                      onChange={e => setNotes(e.target.value)}
+                      style={{ 
+                        width: '100%', padding: '12px 16px', borderRadius: '12px', 
+                        border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none',
+                        minHeight: '100px', fontFamily: 'inherit', resize: 'none'
+                      }}
+                    />
+                  </div>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', marginBottom: '32px' }}>
+                    <input 
+                      type="checkbox" 
+                      checked={createFollowup}
+                      onChange={e => setCreateFollowup(e.target.checked)}
+                      style={{ width: '16px', height: '16px' }} 
+                    />
+                    <span style={{ fontSize: '14px', color: '#0f172a', fontWeight: 500 }}>Create a follow-up task</span>
+                  </label>
+
+                  {createFollowup && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: '12px', marginBottom: '32px' }}>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>
+                          Task Title
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="e.g. Send JD"
+                          value={followupTitle}
+                          onChange={e => setFollowupTitle(e.target.value)}
+                          style={{
+                            width: '100%',
+                            padding: '12px 16px',
+                            borderRadius: '12px',
+                            border: '1.5px solid #e2e8f0',
+                            fontSize: '14px',
+                            outline: 'none'
+                          }}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>
+                          Due Date
+                        </label>
+                        <input
+                          type="date"
+                          value={followupDueDate}
+                          onChange={e => setFollowupDueDate(e.target.value)}
+                          min={new Date().toISOString().split('T')[0]}
+                          style={{
+                            width: '100%',
+                            padding: '12px 16px',
+                            borderRadius: '12px',
+                            border: '1.5px solid #e2e8f0',
+                            fontSize: '14px',
+                            outline: 'none'
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', gap: '12px' }}>
+                    <button 
+                      onClick={() => setCallState('active')}
+                      style={{ flex: 1, padding: '14px', background: '#fff', color: '#64748b', border: '1.5px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, cursor: 'pointer' }}
+                    >Cancel</button>
+                    <button 
+                      onClick={handleSaveLog}
+                      disabled={saving}
+                      style={{ 
+                        flex: 1, padding: '14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '12px', 
+                        fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer'
+                      }}
+                    >
+                      {saving ? 'Saving...' : 'Save Call Log'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : activeTab === 'linkedin' || activeTab === 'email' ? (
+            <ConversationHistoryPanel
+              candidateId={call.candidate_id}
+              candidateName={call.candidate_name}
+              platform={activeTab}
+            />
+          ) : (
+            <div style={{ padding: '32px', textAlign: 'center', color: '#94a3b8', background: '#f8fafc', minHeight: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <div style={{ maxWidth: '340px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>Task follow-up workspace</div>
+                <div style={{ fontSize: '13px', lineHeight: 1.6 }}>
+                  End the call to save notes, update the outcome, and schedule the next action from one place.
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        @keyframes ping {
+          0% { transform: scale(1); opacity: 1; }
+          70%, 100% { transform: scale(1.5); opacity: 0; }
+        }
+        @keyframes shimmer {
+          0% { background-position: 200% 0; }
+          100% { background-position: -200% 0; }
+        }
+        @keyframes msgFadeIn {
+          from { opacity: 0; transform: translateY(8px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
+    </div>
+  );
+}

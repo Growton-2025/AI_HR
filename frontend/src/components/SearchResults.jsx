@@ -27,6 +27,15 @@ function SearchResults() {
         return <span className={classes[priority]}>{priority}</span>
     }
 
+    const getPrioritySelectClass = (priority) => {
+        const classes = {
+            'High': 'priority-select-high',
+            'Medium': 'priority-select-medium',
+            'Low': 'priority-select-low'
+        }
+        return classes[priority] || 'priority-select-default'
+    }
+
     const selectedCount = Object.keys(selectedCandidates).length
 
     return (
@@ -84,7 +93,7 @@ function SearchResults() {
                                 </td>
                                 <td>
                                     <select
-                                        className="select-field"
+                                        className={`select-field priority-select ${getPrioritySelectClass(priority)}`}
                                         value={priority}
                                         onChange={(e) => setCandidatePriority(id, e.target.value)}
                                     >
@@ -127,19 +136,14 @@ function SearchResults() {
 
             {/* Feedback Section for Selected Candidates */}
             {selectedCount > 0 && (
-                <div style={{ marginTop: '24px' }}>
+                <div className="feedback-panel">
                     <div className="section-label">Feedback for Selected Candidates</div>
 
-                    <div style={{
-                        background: '#f5f3ff',
-                        padding: '12px 16px',
-                        borderRadius: '8px',
-                        borderLeft: '4px solid #7c3aed',
-                        marginBottom: '16px'
-                    }}>
-                        <span style={{ fontWeight: 500, color: '#7c3aed' }}>
+                    <div className="feedback-banner">
+                        <span className="feedback-banner-count">
                             {selectedCount} candidate(s) selected
-                        </span> — Add your feedback below
+                        </span>
+                        <span className="feedback-banner-text">Add your feedback below</span>
                     </div>
 
                     {Object.entries(selectedCandidates).map(([id, candidate]) => {
@@ -148,17 +152,16 @@ function SearchResults() {
                         const feedback = candidateFeedback[numId] || ''
 
                         return (
-                            <div key={id} style={{ marginBottom: '16px' }}>
-                                <div style={{ fontWeight: 600, marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    {candidate.name}
+                            <div key={id} className="feedback-card">
+                                <div className="feedback-card-title">
+                                    <span>{candidate.name}</span>
                                     {getPriorityBadge(priority)}
                                 </div>
                                 <textarea
-                                    className="textarea-field"
+                                    className="textarea-field feedback-textarea"
                                     placeholder="Enter your feedback about this candidate..."
                                     value={feedback}
                                     onChange={(e) => setCandidateFeedback(numId, e.target.value)}
-                                    style={{ minHeight: '80px' }}
                                 />
                             </div>
                         )

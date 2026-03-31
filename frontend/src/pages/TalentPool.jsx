@@ -9,31 +9,7 @@ import {
   Activity, MessageSquareMore, Users, Plus, Edit2, Check, Download,
   Mail, Phone, MessageSquare, Linkedin, Send
 } from 'lucide-react';
-
-// ── Status pill config ────────────────────────────────────────
-const RECRUITMENT_STAGES = [
-  'To be started', 'Shortlisted', 'Rejected', 'For Future',
-  'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested',
-  'Followup / In conversation', 'Shortlist - Rejected', 'High CTC',
-  'Duplicate', 'Not responding', 'Internal Review', 'Shared with customer'
-];
-
-const STATUS_STYLES = {
-  'to be started': { bg: '#f1f5f9', color: '#64748b', dot: '#94a3b8' },
-  'shortlisted': { bg: '#dcfce7', color: '#16a34a', dot: '#16a34a' },
-  'rejected': { bg: '#fee2e2', color: '#b91c1c', dot: '#ef4444' },
-  'for future': { bg: '#fff7ed', color: '#9a3412', dot: '#f97316' },
-  'reached out - linkedin': { bg: '#e0f2fe', color: '#0369a1', dot: '#0284c7' },
-  'reached out - phone': { bg: '#dbeafe', color: '#1d4ed8', dot: '#1d4ed8' },
-  'not interested': { bg: '#f1f5f9', color: '#475569', dot: '#64748b' },
-  'followup / in conversation': { bg: '#fef9c3', color: '#854d0e', dot: '#ca8a04' },
-  'shortlist - rejected': { bg: '#fef2f2', color: '#991b1b', dot: '#dc2626' },
-  'high ctc': { bg: '#fce7f3', color: '#be185d', dot: '#db2777' },
-  'duplicate': { bg: '#f3f4f6', color: '#374151', dot: '#4b5563' },
-  'not responding': { bg: '#fff1f2', color: '#9f1239', dot: '#e11d48' },
-  'internal review': { bg: '#f3e8ff', color: '#7e22ce', dot: '#9333ea' },
-  'shared with customer': { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
-};
+import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown';
 
 // ── Clickable Editable Cell (renders as <td>) ────────────────
 function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—' }) {
@@ -94,106 +70,6 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—'
         {loading && ' ...'}
       </span>
     </td>
-  );
-}
-
-
-function StatusDropdown({ status, candidateId, onUpdate, onShortlisted }) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const dropdownRef = useRef(null);
-
-  useEffect(() => {
-    if (!isOpen) return undefined;
-
-    function handleClickOutside(event) {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
-        setIsOpen(false);
-      }
-    }
-
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [isOpen]);
-
-  const handleUpdate = async (newStatus) => {
-    if (newStatus === status) {
-      setIsOpen(false);
-      return;
-    }
-    setLoading(true);
-    try {
-      await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus });
-      onUpdate(candidateId, newStatus);
-      if (newStatus === 'Shortlisted' && onShortlisted) {
-        onShortlisted(candidateId);
-      }
-    } catch (err) {
-      console.error("Failed to update status:", err);
-      alert("Failed to update status. Please try again.");
-    } finally {
-      setLoading(false);
-      setIsOpen(false);
-    }
-  };
-
-  const currentStyle = STATUS_STYLES[(status || '').toLowerCase()] || { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
-
-  return (
-    <div style={{ position: 'relative' }} ref={dropdownRef}>
-      <button
-        onClick={() => !loading && setIsOpen(!isOpen)}
-        disabled={loading}
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: '6px',
-          padding: '4px 10px', borderRadius: '20px',
-          fontSize: '11.5px', fontWeight: 700,
-          background: currentStyle.bg, color: currentStyle.color,
-          border: 'none', cursor: loading ? 'wait' : 'pointer',
-          whiteSpace: 'nowrap', transition: 'filter 0.1s',
-          opacity: loading ? 0.7 : 1,
-        }}
-        onMouseEnter={e => e.currentTarget.style.filter = 'brightness(0.95)'}
-        onMouseLeave={e => e.currentTarget.style.filter = 'none'}
-      >
-        <span style={{ width: 6, height: 6, borderRadius: '50%', background: currentStyle.dot }} />
-        {loading ? 'Updating...' : (status || 'Select Status')}
-        <ChevronDown size={12} style={{ opacity: 0.5 }} />
-      </button>
-
-      {isOpen && (
-        <div style={{
-          position: 'absolute', top: '100%', left: 0, marginTop: '4px',
-          background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px',
-          boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
-          zIndex: 50, padding: '6px', minWidth: '180px', maxHeight: '300px', overflowY: 'auto'
-        }}>
-          {RECRUITMENT_STAGES.map(stage => {
-            const style = STATUS_STYLES[stage.toLowerCase()] || { dot: '#94a3b8' };
-            const isActive = stage === status;
-            return (
-              <button
-                key={stage}
-                onClick={() => handleUpdate(stage)}
-                style={{
-                  width: '100%', display: 'flex', alignItems: 'center', gap: '8px',
-                  padding: '8px 10px', borderRadius: '8px',
-                  background: isActive ? '#f8fafc' : 'transparent',
-                  border: 'none', cursor: 'pointer', textAlign: 'left',
-                  fontSize: '12px', color: isActive ? '#0f172a' : '#475569',
-                  fontWeight: isActive ? 700 : 500, transition: 'background 0.1s'
-                }}
-                onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
-                onMouseLeave={e => !isActive && (e.currentTarget.style.background = 'transparent')}
-              >
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: style.dot }} />
-                {stage}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -694,47 +570,153 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
 }
 
 function ConversationModal({ candidate, onClose }) {
-  const [platform, setPlatform] = useState(candidate.linkedin ? 'linkedin' : 'email');
-  const [messages, setMessages] = useState([]);
+  const [platform, setPlatform] = useState('email'); // Always default to Email tab
+  const [threads, setThreads] = useState({
+    email: { messages: [], loaded: false, error: '' },
+    linkedin: { messages: [], loaded: false, error: '' }
+  });
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
+  const [localSentMessagesByPlatform, setLocalSentMessagesByPlatform] = useState({
+    email: [],
+    linkedin: []
+  }); // Buffer for messages sent before server syncs them
 
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
   const sendChatReply = useAppStore(state => state.sendChatReply);
-  const { heyreachCampaignId, setHeyreachCampaignId, triggerHeyReachOutreach, updateCandidateField } = useAppStore();
+  const { heyreachCampaignId, setHeyreachCampaignId, triggerHeyReachOutreach } = useAppStore();
   const [isTriggering, setIsTriggering] = useState(false);
   const [hasTriggered, setHasTriggered] = useState(false);
   const messagesEndRef = useRef(null);
-
-  const loadMessages = async () => {
-    setLoading(true);
-    const res = await fetchChatHistory(0, candidate.id, platform);
-    if (res.success) {
-      setMessages(res.messages || []);
-    } else {
-      setMessages([]);
-    }
-    setLoading(false);
-  };
+  const threadsRef = useRef(threads);
+  const requestSeqRef = useRef({ email: 0, linkedin: 0 });
+  const candidateIdRef = useRef(candidate.id);
 
   useEffect(() => {
-    loadMessages();
-  }, [candidate.id, platform]);
+    threadsRef.current = threads;
+  }, [threads]);
 
+  useEffect(() => {
+    candidateIdRef.current = candidate.id;
+  }, [candidate.id]);
+
+  const activeThread = threads[platform] || { messages: [], loaded: false, error: '' };
+  const messages = activeThread.messages || [];
+  const localSentMessages = localSentMessagesByPlatform[platform] || [];
+  const conversationAccent = platform === 'linkedin' ? '#0077b5' : '#f97316';
+  const hasAnyVisibleMessages = messages.length > 0 || localSentMessages.length > 0;
+
+  const loadMessages = useCallback(async ({ showLoader = false, silent = false, targetPlatform = platform } = {}) => {
+    const cachedThread = threadsRef.current[targetPlatform];
+    const candidateId = candidate.id;
+    const requestSeq = ++requestSeqRef.current[targetPlatform];
+    const shouldBlock = showLoader && !cachedThread?.loaded;
+
+    if (targetPlatform === platform) {
+      if (shouldBlock) setLoading(true);
+      else if (!silent) setRefreshing(true);
+    }
+
+    const res = await fetchChatHistory(0, candidateId, targetPlatform);
+    if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) {
+      return;
+    }
+
+    if (res.success) {
+      setThreads(prev => ({
+        ...prev,
+        [targetPlatform]: {
+          messages: res.messages || [],
+          loaded: true,
+          error: ''
+        }
+      }));
+    } else {
+      setThreads(prev => ({
+        ...prev,
+        [targetPlatform]: {
+          ...prev[targetPlatform],
+          loaded: true,
+          error: res.error || `Failed to fetch ${targetPlatform} chat history`
+        }
+      }));
+    }
+    if (targetPlatform === platform) {
+      setLoading(false);
+      if (!silent) setRefreshing(false);
+    }
+  }, [candidate.id, fetchChatHistory, platform]);
+
+  useEffect(() => {
+    const nextThreads = {
+      email: { messages: [], loaded: false, error: '' },
+      linkedin: { messages: [], loaded: false, error: '' }
+    };
+    threadsRef.current = nextThreads;
+    requestSeqRef.current = { email: 0, linkedin: 0 };
+    setThreads(nextThreads);
+    setLocalSentMessagesByPlatform({ email: [], linkedin: [] });
+    setLoading(true);
+    setRefreshing(false);
+    setReplyText('');
+    setHasTriggered(false);
+  }, [candidate.id]);
+
+  useEffect(() => {
+    setReplyText('');
+    loadMessages({ showLoader: true, targetPlatform: platform });
+  }, [candidate.id, platform, loadMessages]);
+
+  // Auto-poll every 5s for new replies
+  useEffect(() => {
+    const interval = setInterval(() => loadMessages({ silent: true, targetPlatform: platform }), 5000);
+    return () => clearInterval(interval);
+  }, [candidate.id, platform, loadMessages]);
+
+  // Scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, localSentMessages]);
 
   const handleSend = async () => {
-    if (!replyText.trim()) return;
+    const text = replyText.trim();
+    if (!text) return;
+    const activePlatform = platform;
+    const pendingId = `${activePlatform}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // Add to local buffer instantly
+    const optimisticMsg = {
+      type: 'SENT',
+      email_body: text,
+      time: new Date().toISOString(),
+      sentAt: Date.now(), // Local timestamp for clearing logic
+      sender_name: 'You',
+      _pendingClientId: pendingId,
+      _pending: true
+    };
+    setLocalSentMessagesByPlatform(prev => ({
+      ...prev,
+      [activePlatform]: [...(prev[activePlatform] || []), optimisticMsg]
+    }));
+    setReplyText('');
     setSending(true);
-    const res = await sendChatReply(0, candidate.id, replyText, platform);
+    
+    // Instant scroll to the bottom to show the optimistic message
+    setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 50);
+
+    const res = await sendChatReply(0, candidate.id, text, activePlatform);
     if (res.success) {
-      setReplyText('');
-      await loadMessages();
+      setTimeout(() => loadMessages({ silent: true, targetPlatform: activePlatform }), 3000);
     } else {
-      alert(res.error || 'Failed to send reply');
+      setLocalSentMessagesByPlatform(prev => ({
+        ...prev,
+        [activePlatform]: (prev[activePlatform] || []).filter(m => m._pendingClientId !== pendingId)
+      }));
+      toast.error(res.error || 'Failed to send reply');
     }
     setSending(false);
   };
@@ -768,18 +750,49 @@ function ConversationModal({ candidate, onClose }) {
               <MessageSquare size={14} /> Conversations
             </div>
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{
+              padding: '7px 12px',
+              borderRadius: '999px',
+              background: refreshing ? '#eff6ff' : '#fff',
+              border: `1px solid ${refreshing ? '#bfdbfe' : '#e2e8f0'}`,
+              color: refreshing ? '#2563eb' : '#64748b',
+              fontSize: '11px',
+              fontWeight: 700,
+              transition: 'all 0.2s ease'
+            }}>
+              {loading && !activeThread.loaded
+                ? 'Loading thread...'
+                : refreshing
+                  ? 'Syncing latest replies...'
+                  : activeThread.error && !hasAnyVisibleMessages
+                    ? 'Unable to refresh'
+                    : `${messages.length} message${messages.length === 1 ? '' : 's'}`}
+            </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', borderRadius: '50%', color: '#64748b' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = 'none'}>
             <X size={20} />
           </button>
+          </div>
         </div>
 
-        <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', padding: '0 20px', background: '#fff' }}>
+        <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', padding: '10px 20px 0', background: '#fff', gap: '10px' }}>
           <button
             onClick={() => setPlatform('linkedin')}
             style={{
-              padding: '14px 20px', background: 'none', border: 'none', borderBottom: platform === 'linkedin' ? '2px solid #0077b5' : '2px solid transparent',
-              color: platform === 'linkedin' ? '#0077b5' : '#64748b', fontWeight: platform === 'linkedin' ? 700 : 500,
-              fontSize: '13.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', transition: 'all 0.2s'
+              padding: '12px 18px',
+              background: platform === 'linkedin' ? '#eff6ff' : 'transparent',
+              border: 'none',
+              borderBottom: platform === 'linkedin' ? '2px solid #0077b5' : '2px solid transparent',
+              color: platform === 'linkedin' ? '#0077b5' : '#64748b',
+              fontWeight: platform === 'linkedin' ? 700 : 500,
+              fontSize: '13.5px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              transition: 'all 0.2s ease',
+              borderTopLeftRadius: '12px',
+              borderTopRightRadius: '12px'
             }}
           >
             <Linkedin size={16} /> LinkedIn
@@ -787,9 +800,20 @@ function ConversationModal({ candidate, onClose }) {
           <button
             onClick={() => setPlatform('email')}
             style={{
-              padding: '14px 20px', background: 'none', border: 'none', borderBottom: platform === 'email' ? '2px solid #f97316' : '2px solid transparent',
-              color: platform === 'email' ? '#f97316' : '#64748b', fontWeight: platform === 'email' ? 700 : 500,
-              fontSize: '13.5px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', transition: 'all 0.2s'
+              padding: '12px 18px',
+              background: platform === 'email' ? '#fff7ed' : 'transparent',
+              border: 'none',
+              borderBottom: platform === 'email' ? '2px solid #f97316' : '2px solid transparent',
+              color: platform === 'email' ? '#f97316' : '#64748b',
+              fontWeight: platform === 'email' ? 700 : 500,
+              fontSize: '13.5px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              transition: 'all 0.2s ease',
+              borderTopLeftRadius: '12px',
+              borderTopRightRadius: '12px'
             }}
           >
             <Mail size={16} /> Email
@@ -798,14 +822,68 @@ function ConversationModal({ candidate, onClose }) {
 
         <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#f8fafc' }}>
-            <div style={{ flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {loading ? (
-                <div style={{ textAlign: 'center', padding: '40px', color: '#94a3b8', fontSize: '14px' }}>Loading conversations...</div>
+            <div style={{ position: 'relative', flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {loading && !activeThread.loaded ? (
+                <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', flex: 1, gap: '16px' }}>
+                  {Array.from({ length: 4 }).map((_, idx) => {
+                    const isIncoming = idx % 2 === 0;
+                    return (
+                      <div key={`conversation-skeleton-${idx}`} style={{ display: 'flex', flexDirection: 'column', alignItems: isIncoming ? 'flex-start' : 'flex-end', gap: '6px' }}>
+                        <div style={{ width: 90, height: 10, borderRadius: 999, background: '#e2e8f0', opacity: 0.75 }} />
+                        <div style={{
+                          width: `${isIncoming ? 54 : 46}%`,
+                          minWidth: '190px',
+                          maxWidth: '78%',
+                          height: idx === 1 ? 64 : 52,
+                          borderRadius: isIncoming ? '8px 18px 18px 18px' : '18px 8px 18px 18px',
+                          background: 'linear-gradient(90deg,#f1f5f9 20%,#e2e8f0 50%,#f1f5f9 80%)',
+                          backgroundSize: '200% 100%',
+                          animation: 'shimmer 1.2s linear infinite'
+                        }} />
+                      </div>
+                    );
+                  })}
+                </div>
               ) : messages.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '40px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
-                  <div style={{ color: '#94a3b8', fontSize: '14px' }}>No messages found on {platform === 'linkedin' ? 'LinkedIn' : 'Email'}.</div>
+                  <div style={{
+                    width: 64,
+                    height: 64,
+                    borderRadius: '20px',
+                    background: platform === 'linkedin' ? '#eff6ff' : '#fff7ed',
+                    color: conversationAccent,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}>
+                    {platform === 'linkedin' ? <Linkedin size={28} /> : <Mail size={28} />}
+                  </div>
+                  <div style={{ color: '#64748b', fontSize: '14px', fontWeight: 600 }}>
+                    {activeThread.error ? `Unable to load ${platform === 'linkedin' ? 'LinkedIn' : 'email'} messages` : 'No messages yet'}
+                  </div>
+                  <div style={{ color: '#94a3b8', fontSize: '13px', maxWidth: '320px', lineHeight: 1.6 }}>
+                    {activeThread.error
+                      ? 'The last refresh did not complete. You can switch tabs or try again in a moment.'
+                      : 'Type a message below to start the conversation.'}
+                  </div>
+                  {activeThread.error && (
+                    <button
+                      onClick={() => loadMessages({ showLoader: true, targetPlatform: platform })}
+                      style={{
+                        padding: '10px 14px',
+                        borderRadius: '10px',
+                        border: '1px solid #e2e8f0',
+                        background: '#fff',
+                        color: '#0f172a',
+                        fontWeight: 700,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Retry
+                    </button>
+                  )}
 
-                  {platform === 'linkedin' && !hasTriggered && candidate.li_status !== 'in_campaign' && (
+                  {platform === 'linkedin' && !hasTriggered && (candidate.li_status !== 'in_campaign' && candidate.li_status !== 'message_sent' && candidate.li_status !== 'replied' && candidate.li_status !== 'connection_accepted') && (
                     candidate.status?.toLowerCase() === 'shortlisted' ? (
                       <div style={{
                         background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '20px',
@@ -823,7 +901,7 @@ function ConversationModal({ candidate, onClose }) {
                             <span style={{ fontSize: '11px', fontWeight: 600, color: '#64748b' }}>Campaign ID:</span>
                             <input
                               type="text"
-                              value={heyreachCampaignId}
+                              value={candidate.heyreach_campaign_id || heyreachCampaignId}
                               onChange={(e) => setHeyreachCampaignId(e.target.value)}
                               style={{
                                 border: 'none', background: 'transparent', fontSize: '13px',
@@ -833,18 +911,26 @@ function ConversationModal({ candidate, onClose }) {
                           </div>
                           <button
                             onClick={async () => {
-                              if (!heyreachCampaignId) return alert('Please enter a Campaign ID');
+                              if (!heyreachCampaignId) {
+                                toast.error('Please enter a Campaign ID');
+                                return;
+                              }
+                              const campaignId = parseInt(heyreachCampaignId, 10);
+                              if (isNaN(campaignId) || campaignId <= 0) {
+                                toast.error('Enter a valid Campaign ID');
+                                return;
+                              }
                               setIsTriggering(true);
-                              const res = await triggerHeyReachOutreach({
-                                candidate_ids: [candidate.id],
-                                role_id: 0, // Talent Pool context
-                                campaign_id: parseInt(heyreachCampaignId),
-                                sender_account_id: 113572 // Default
-                              });
+                                const res = await triggerHeyReachOutreach({
+                                  candidate_ids: [candidate.id],
+                                  role_id: 0,
+                                  campaign_id: campaignId,
+                                  sender_account_id: 113572 // Default
+                                });
                               if (res.success) {
                                 toast.success('Outreach triggered successfully!');
                                 setHasTriggered(true);
-                                setTimeout(loadMessages, 3000);
+                                setTimeout(() => loadMessages({ targetPlatform: 'linkedin' }), 3000);
                               } else {
                                 toast.error(res.error || 'Failed to trigger outreach');
                               }
@@ -875,36 +961,75 @@ function ConversationModal({ candidate, onClose }) {
                   )}
                 </div>
               ) : (
-                messages.map((msg, i) => {
-                  const isCandidate = msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
-                  const senderName = isCandidate ? `${candidate.first_name}` : 'You';
-                  const time = msg.time || msg.created_at || msg.timestamp;
-                  const body = msg.email_body || msg.message || msg.text || '';
-
-                  return (
-                    <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end' }}>
-                      <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
-                        {senderName} &bull; {formatTime(time)}
-                      </div>
-                      <div style={{
-                        maxWidth: '85%',
-                        padding: '12px 16px',
-                        borderRadius: '16px',
-                        background: isCandidate ? '#fff' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
-                        color: isCandidate ? '#0f172a' : '#fff',
-                        fontSize: '13.5px',
-                        lineHeight: '1.5',
-                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                        border: isCandidate ? '1px solid #e2e8f0' : 'none',
-                        borderBottomLeftRadius: isCandidate ? '4px' : '16px',
-                        borderBottomRightRadius: isCandidate ? '16px' : '4px',
-                        whiteSpace: 'pre-wrap'
-                      }}>
-                        <div dangerouslySetInnerHTML={{ __html: body }} style={{ maxWidth: '100%', overflowWrap: 'break-word', wordWrap: 'break-word' }} />
-                      </div>
-                    </div>
+                (() => {
+                  const serverMsgs = messages || [];
+                  const pendingToShow = localSentMessages.filter(lm => 
+                    !serverMsgs.some(sm => {
+                      const sText = (sm.email_body || sm.message || sm.text || "").replace(/<[^>]+>/g, '').trim();
+                      const lText = (lm.email_body || "").replace(/<[^>]+>/g, '').trim();
+                      return sText.includes(lText.substring(0, 20)) || lText.includes(sText.substring(0, 20));
+                    })
                   );
-                })
+
+                  return [...serverMsgs, ...pendingToShow]
+                    .sort((a, b) => {
+                      const timeA = new Date(a.time || a.created_at || a.timestamp).getTime();
+                      const timeB = new Date(b.time || b.created_at || b.timestamp).getTime();
+                      return (isNaN(timeA) ? 0 : timeA) - (isNaN(timeB) ? 0 : timeB);
+                    })
+                    .map((msg, idx) => {
+                      const isCandidate = msg.type === 'REPLY' || msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
+                      const senderName = isCandidate ? `${candidate.first_name}` : 'You';
+                      const time = msg.time || msg.created_at || msg.timestamp;
+                      const body = msg.email_body || msg.message || msg.text || '';
+                      const isPending = msg._pending;
+
+                      return (
+                        <div key={idx} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end', animation: 'msgFadeIn 0.24s ease', transform: refreshing ? 'translateY(1px)' : 'translateY(0)', transition: 'transform 0.2s ease' }}>
+                          <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
+                            {senderName}{time ? ` • ${formatTime(time)}` : ''}
+                          </div>
+                          <div style={{
+                            maxWidth: '80%',
+                            padding: '10px 15px',
+                            borderRadius: isCandidate ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
+                            background: isCandidate ? '#fff' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
+                            color: isCandidate ? '#0f172a' : '#fff',
+                            fontSize: '14px',
+                            lineHeight: '1.5',
+                            boxShadow: isCandidate ? '0 1px 4px rgba(0,0,0,0.07)' : '0 2px 8px rgba(249,115,22,0.25)',
+                            border: isCandidate ? '1px solid #e2e8f0' : 'none',
+                            opacity: isPending ? 0.65 : 1,
+                            transform: refreshing ? 'scale(0.995)' : 'scale(1)',
+                            transition: 'opacity 0.3s ease, transform 0.2s ease',
+                            whiteSpace: 'pre-wrap'
+                          }}>
+                            {isPending
+                              ? <span>{body}</span>
+                              : <div dangerouslySetInnerHTML={{ __html: body }} style={{ overflowWrap: 'break-word' }} />}
+                          </div>
+                          {isPending && <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '2px', paddingRight: '4px' }}>Sending...</div>}
+                        </div>
+                      );
+                    });
+                })()
+              )}
+              {refreshing && hasAnyVisibleMessages && (
+                <div style={{
+                  position: 'sticky',
+                  top: 0,
+                  alignSelf: 'center',
+                  padding: '6px 12px',
+                  borderRadius: '999px',
+                  background: '#fff',
+                  border: '1px solid #e2e8f0',
+                  color: '#64748b',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  boxShadow: '0 10px 20px -14px rgba(15,23,42,0.35)'
+                }}>
+                  Checking for new replies...
+                </div>
               )}
               <div ref={messagesEndRef} />
             </div>
@@ -1013,13 +1138,19 @@ export default function TalentPool() {
   const [selectedCandidateForChat, setSelectedCandidateForChat] = useState(null);
   const [shortlistCard, setShortlistCard] = useState(null);
   const [shortlistingId, setShortlistingId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [showAddToListModal, setShowAddToListModal] = useState(false);
   const [contactInfo, setContactInfo] = useState(readPersistedContactInfo); // { [candidateId]: { email, phone, enriching } }
   const analytics = useAppStore(state => state.analytics);
   const fetchAnalytics = useAppStore(state => state.fetchAnalytics);
   const shortlistAndOutreach = useAppStore(state => state.shortlistAndOutreach);
   const updateCandidateField = useAppStore(state => state.updateCandidateField);
+  const prefetchCallLists = useAppStore(state => state.fetchCallLists);
+  const prefetchCallStats = useAppStore(state => state.fetchCallStats);
+  const prefetchCalls = useAppStore(state => state.fetchCalls);
   const { heyreachCampaignId } = useAppStore();
   const didInitRef = useRef(false);
+  const talentPoolRequestSeqRef = useRef(0);
 
   // Poll Clay/DB updates aggressively for enriching records so contact data appears quickly.
   useEffect(() => {
@@ -1146,6 +1277,30 @@ export default function TalentPool() {
       // setShortlistCard({ name: 'Candidate', email: '', phone: '', linkedin: '', email_outreach: 'error', linkedin_outreach: 'error' }); // Removed as per instruction, toast handles error
     }
   };
+  const updateFieldAndMaybeShortlist = async (candidateId, data) => {
+    const res = await updateCandidateField(candidateId, data);
+    if (!res.success) return res;
+
+    const field = Object.keys(data)[0];
+    const value = data[field];
+    const isValuable = value && !['na', 'n/a', 'none', ''].includes(value.toLowerCase());
+
+    if (isValuable && (field === 'email' || field === 'phone')) {
+      const candidate = candidates.find(c => c.id === candidateId);
+      if (candidate && (candidate.status === 'To be started' || !candidate.status)) {
+        try {
+          await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: 'Shortlisted' });
+          setCandidates(prev => prev.map(c => c.id === candidateId ? { ...c, status: 'Shortlisted' } : c));
+          toast.success(`Candidate automatically shortlisted`);
+          fetchAnalytics();
+        } catch (err) {
+          console.error('Auto-shortlist failed:', err);
+        }
+      }
+    }
+    return res;
+  };
+
   const debounceRef = useRef(null);
 
   const mergeContactInfoFromRows = useCallback((rows = []) => {
@@ -1183,7 +1338,14 @@ export default function TalentPool() {
     fetchAnalytics();
   }, [fetchAnalytics]);
 
+  useEffect(() => {
+    prefetchCallLists();
+    prefetchCallStats();
+    prefetchCalls({ due_filter: 'today', status: 'pending' }, { updateState: false });
+  }, [prefetchCallLists, prefetchCallStats, prefetchCalls]);
+
   const fetchCandidates = useCallback(async (pg = 1) => {
+    let requestId = 0;
     try {
       const params = new URLSearchParams();
       params.set('page', pg);
@@ -1211,24 +1373,18 @@ export default function TalentPool() {
       params.set('sort_dir', sortDir);
 
       const paramsString = params.toString();
-      const currentCache = useAppStore.getState().talentPoolCache;
-
-      const isInstantHit = currentCache?.lastParamsString === paramsString && currentCache?.data;
-
-      if (!isInstantHit) {
-        setLoading(true);
-      } else {
-        // Optimistically render from cache instantly
-        const d = currentCache.data;
-        setCandidates(d.candidates);
-        setTotal(d.total);
-        setTotalPages(d.total_pages);
-        setStatusCounts(d.status_counts || {});
-        setIsSemanticSearch(d.is_semantic_search || false);
-        mergeContactInfoFromRows(d.candidates);
-      }
+      requestId = ++talentPoolRequestSeqRef.current;
+      setLoading(true);
+      setCandidates([]);
+      setTotal(0);
+      setTotalPages(1);
+      setStatusCounts({});
 
       const res = await useAppStore.getState().fetchTalentPool(paramsString);
+
+      if (requestId !== talentPoolRequestSeqRef.current) {
+        return;
+      }
 
       if (res.success && res.data) {
         setCandidates(res.data.candidates);
@@ -1241,7 +1397,9 @@ export default function TalentPool() {
     } catch (e) {
       console.error('Failed to fetch talent pool:', e);
     } finally {
-      setLoading(false);
+      if (requestId === talentPoolRequestSeqRef.current) {
+        setLoading(false);
+      }
     }
   }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, mergeContactInfoFromRows]);
 
@@ -1288,8 +1446,8 @@ export default function TalentPool() {
   // Status tabs: All + each status
   const statusTabs = ['', ...Object.keys(statusCounts)];
 
-  // Columns
   const cols = [
+    { key: 'selection', label: '', w: 40 },
     { key: 'first_name', label: 'First Name', w: 100 },
     { key: 'last_name', label: 'Last Name', w: 100 },
     { key: 'title', label: 'Title', w: 160, sortKey: 'title' },
@@ -1307,6 +1465,23 @@ export default function TalentPool() {
     { key: 'notes', label: 'Notes', w: 200 },
     { key: 'match_score', label: 'Match Score', w: 110, hidden: !isSemanticSearch },
   ];
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === candidates.length && candidates.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(candidates.map(c => c.id)));
+    }
+  };
+
+  const toggleSelectOne = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const handleSort = (sortKey) => {
     if (!sortKey) return;
@@ -1461,21 +1636,27 @@ export default function TalentPool() {
               <tr style={{ background: '#fff', borderBottom: '1.5px solid #f1f5f9', position: 'sticky', top: 0, zIndex: 10 }}>
                 {cols.filter(c => !c.hidden).map((col, index) => (
                   <th key={col.key}
-                    onClick={() => handleSort(col.sortKey)}
+                    onClick={() => col.key === 'selection' ? toggleSelectAll() : handleSort(col.sortKey)}
                     style={{
                       padding: '11px 14px', textAlign: 'left',
                       fontSize: 11, fontWeight: 700, color: '#94a3b8',
                       textTransform: 'uppercase', letterSpacing: '0.06em',
-                      minWidth: col.w, cursor: col.sortKey ? 'pointer' : 'default',
+                      minWidth: col.w, cursor: (col.sortKey || col.key === 'selection') ? 'pointer' : 'default',
                       whiteSpace: 'nowrap', userSelect: 'none',
                       borderBottom: '1.5px solid #f1f5f9',
                       borderRight: '1.5px solid #f1f5f9',
                       borderLeft: index === 0 ? '1.5px solid #f1f5f9' : 'none'
                     }}
                   >
-                    {col.label}
-                    {col.sortKey && sortBy === col.sortKey && (
-                      <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>
+                    {col.key === 'selection' ? (
+                      <input type="checkbox" checked={selectedIds.size === candidates.length && candidates.length > 0} readOnly style={{ cursor: 'pointer' }} />
+                    ) : (
+                      <>
+                        {col.label}
+                        {col.sortKey && sortBy === col.sortKey && (
+                          <span style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>
+                        )}
+                      </>
                     )}
                   </th>
                 ))}
@@ -1511,11 +1692,15 @@ export default function TalentPool() {
 
               {candidates.map((c, idx) => (
                 <tr key={c.id || idx}
-                  style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', cursor: 'default' }}
-                  onMouseEnter={e => e.currentTarget.style.background = '#fafafa'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  onClick={() => toggleSelectOne(c.id)}
+                  style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', cursor: 'pointer', background: selectedIds.has(c.id) ? '#fff7ed' : 'transparent' }}
+                  onMouseEnter={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = '#fafafa'; }}
+                  onMouseLeave={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = 'transparent'; }}
                 >
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
+                  <td style={{ padding: '13px 14px', textAlign: 'center', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9' }}>
+                    <input type="checkbox" checked={selectedIds.has(c.id)} readOnly style={{ cursor: 'pointer' }} />
+                  </td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.last_name || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', borderRight: '1px solid #f1f5f9' }}>{c.title || c.headline || ''}</td>
                   <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
@@ -1555,7 +1740,7 @@ export default function TalentPool() {
                         id={c.id}
                         field="email"
                         value={emailVal}
-                        onUpdate={updateCandidateField}
+                        onUpdate={updateFieldAndMaybeShortlist}
                         placeholder="NA"
                       />
                     );
@@ -1580,7 +1765,7 @@ export default function TalentPool() {
                         id={c.id}
                         field="phone"
                         value={phoneVal}
-                        onUpdate={updateCandidateField}
+                        onUpdate={updateFieldAndMaybeShortlist}
                         placeholder="NA"
                       />
                     );
@@ -1700,8 +1885,58 @@ export default function TalentPool() {
         </div>
       </div>
 
+      {showAddToListModal && (
+        <AddToListModal
+          selectedCount={selectedIds.size}
+          onClose={() => setShowAddToListModal(false)}
+          onSuccess={() => {
+            setSelectedIds(new Set());
+            setShowAddToListModal(false);
+          }}
+          candidateIds={Array.from(selectedIds)}
+        />
+      )}
+
+      {selectedIds.size > 0 && (
+        <div style={{
+          position: 'fixed', bottom: 30, left: '50%', transform: 'translateX(-50%)',
+          background: '#0f172a', color: '#fff', padding: '12px 24px', borderRadius: '16px',
+          display: 'flex', alignItems: 'center', gap: 20, boxShadow: '0 20px 25px -5px rgba(0,0,0,0.3)',
+          zIndex: 1000, border: '1px solid rgba(255,255,255,0.1)', animation: 'slideUp 0.3s ease-out'
+        }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>{selectedIds.size} candidates selected</span>
+          <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.2)' }} />
+          <button
+            onClick={() => setShowAddToListModal(true)}
+            style={{
+              padding: '8px 16px', background: '#f97316', color: '#fff', border: 'none',
+              borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = '#ea580c'}
+            onMouseLeave={e => e.currentTarget.style.background = '#f97316'}
+          >
+            <Phone size={14} /> Add to Call List
+          </button>
+          <button
+            onClick={() => setSelectedIds(new Set())}
+            style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
       <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes slideUp {
+          from { transform: translate(-50%, 100%); opacity: 0; }
+          to { transform: translate(-50%, 0); opacity: 1; }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        @keyframes msgFadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
       `}</style>
@@ -1728,6 +1963,121 @@ export default function TalentPool() {
           Triggering outreach...
         </div>
       )}
+    </div>
+  );
+}
+
+function AddToListModal({ selectedCount, onClose, onSuccess, candidateIds }) {
+  const { callLists, fetchCallLists, createCallList, addCandidatesToCallList } = useAppStore();
+  const [loading, setLoading] = useState(false);
+  const [newListName, setNewListName] = useState('');
+  const [selectedListId, setSelectedListId] = useState('');
+  const [mode, setMode] = useState('select'); // 'select' or 'create'
+
+  useEffect(() => {
+    fetchCallLists();
+  }, [fetchCallLists]);
+
+  const handleAction = async () => {
+    setLoading(true);
+    try {
+      let listId = selectedListId;
+      if (mode === 'create') {
+        if (!newListName.trim()) return;
+        const res = await createCallList(newListName);
+        if (res.success) listId = res.data.id;
+        else throw new Error(res.error);
+      }
+
+      if (!listId) return;
+      const res = await addCandidatesToCallList(candidateIds, listId);
+      if (res.success) {
+        toast.success(`Added ${selectedCount} candidates to call list`);
+        onSuccess();
+      } else {
+        toast.error(res.error);
+      }
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+      <div style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '440px', padding: '32px', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
+        <h3 style={{ fontSize: '20px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Add to Call List</h3>
+        <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '24px' }}>Choose a list to add {selectedCount} candidates to.</p>
+
+        <div style={{ display: 'flex', gap: 8, marginBottom: 20, padding: 4, background: '#f8fafc', borderRadius: 12 }}>
+          <button
+            onClick={() => setMode('select')}
+            style={{
+              flex: 1, padding: '8px', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700,
+              background: mode === 'select' ? '#fff' : 'transparent',
+              color: mode === 'select' ? '#0f172a' : '#64748b',
+              boxShadow: mode === 'select' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+              cursor: 'pointer'
+            }}
+          >Existing List</button>
+          <button
+            onClick={() => setMode('create')}
+            style={{
+              flex: 1, padding: '8px', border: 'none', borderRadius: 8, fontSize: 13, fontWeight: 700,
+              background: mode === 'create' ? '#fff' : 'transparent',
+              color: mode === 'create' ? '#0f172a' : '#64748b',
+              boxShadow: mode === 'create' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+              cursor: 'pointer'
+            }}
+          >+ New List</button>
+        </div>
+
+        {mode === 'select' ? (
+          <select
+            value={selectedListId}
+            onChange={e => setSelectedListId(e.target.value)}
+            style={{
+              width: '100%', padding: '12px 16px', borderRadius: 12, border: '1.5px solid #e2e8f0',
+              fontSize: 14, outline: 'none', marginBottom: 24, background: '#fff'
+            }}
+          >
+            <option value="">Select a list...</option>
+            {callLists.map(l => (
+              <option key={l.id} value={l.id}>{l.name} ({l.candidate_count} candidates)</option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            placeholder="List name (e.g. Frontend Devs Today)"
+            value={newListName}
+            onChange={e => setNewListName(e.target.value)}
+            style={{
+              width: '100%', padding: '12px 16px', borderRadius: 12, border: '1.5px solid #e2e8f0',
+              fontSize: 14, outline: 'none', marginBottom: 24, boxSizing: 'border-box'
+            }}
+          />
+        )}
+
+        <div style={{ display: 'flex', gap: 12 }}>
+          <button
+            onClick={onClose}
+            style={{ flex: 1, padding: '14px', background: '#f1f5f9', color: '#475569', border: 'none', borderRadius: 12, fontWeight: 700, cursor: 'pointer' }}
+          >Cancel</button>
+          <button
+            onClick={handleAction}
+            disabled={loading || (mode === 'select' && !selectedListId) || (mode === 'create' && !newListName.trim())}
+            style={{
+              flex: 1, padding: '14px', background: '#f97316', color: '#fff', border: 'none', borderRadius: 12,
+              fontWeight: 700, cursor: (loading || (mode === 'select' && !selectedListId) || (mode === 'create' && !newListName.trim())) ? 'not-allowed' : 'pointer',
+              opacity: (loading || (mode === 'select' && !selectedListId) || (mode === 'create' && !newListName.trim())) ? 0.6 : 1
+            }}
+          >
+            {loading ? 'Adding...' : 'Add Candidates'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

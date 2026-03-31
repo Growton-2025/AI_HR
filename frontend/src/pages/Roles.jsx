@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw } from 'lucide-react'
 import { toast } from 'sonner'
+import StatusDropdown from '../components/StatusDropdown'
 
 function Roles() {
     const {
@@ -170,6 +171,12 @@ function Roles() {
             return
         }
 
+        const campaignId = parseInt(heyreachCampaignId, 10)
+        if (isNaN(campaignId) || campaignId <= 0) {
+            toast.error('Enter a valid HeyReach campaign ID')
+            return
+        }
+
         setIsSendingLI(true)
         try {
             const validCandidates = viewingRole.candidates.filter(c => c && c.id && c.linkedin)
@@ -186,7 +193,7 @@ function Roles() {
                 candidate_ids: candidateIds,
                 role_id: roleId,
                 role_name: viewingRole.name,
-                campaign_id: parseInt(heyreachCampaignId),
+                campaign_id: campaignId,
                 sender_account_id: 113572 // From user snippet
             })
 
@@ -613,6 +620,7 @@ function Roles() {
                                     <th style={{ minWidth: '120px', width: '120px' }}>Details</th>
                                     <th style={{ minWidth: '70px', width: '70px' }}>Priority</th>
                                     <th style={{ minWidth: '140px', maxWidth: '160px' }}>Feedback</th>
+                                    <th style={{ minWidth: '150px' }}>Status</th>
                                     <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Delivery</div></th>
                                     <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Hub</div></th>
                                     <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Delivery</div></th>
@@ -676,6 +684,24 @@ function Roles() {
                                             <td>{getPriorityBadge(candidate.priority)}</td>
                                             <td title={feedback} style={{ fontSize: "13px", color: "#64748b", whiteSpace: "normal", lineHeight: "1.4" }}>
                                                 {truncatedFeedback || "—"}
+                                            </td>
+
+                                            {/* Candidate Status */}
+                                            <td>
+                                                <StatusDropdown
+                                                    status={candidate.status}
+                                                    candidateId={candidate.id}
+                                                    onUpdate={(id, newStatus) => {
+                                                        useAppStore.setState(state => ({
+                                                            viewingRole: {
+                                                                ...state.viewingRole,
+                                                                candidates: state.viewingRole.candidates.map(c =>
+                                                                    c.id === id ? { ...c, status: newStatus } : c
+                                                                )
+                                                            }
+                                                        }))
+                                                    }}
+                                                />
                                             </td>
 
                                             {/* Email Delivery */}

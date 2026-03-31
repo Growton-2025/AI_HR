@@ -139,6 +139,11 @@ async def browse_candidates(
             "total_experience_years": round(float(exp_val), 1) if exp_val else 0,
             "avg_tenure_years": round(float(stability_val), 1) if stability_val else 0,
             "status": status_val,
+            "li_status": p.get("li_status") or "",
+            "heyreach_campaign_id": p.get("heyreach_campaign_id") or "",
+            "email_campaign_id": p.get("email_campaign_id") or "",
+            "message_sent_count": p.get("message_sent_count") or 0,
+            "li_sent_count": p.get("li_sent_count") or 0,
             "headline": p.get("headline") or "",
             "match_score": round(score * 100, 1) if score is not None else None,
         })

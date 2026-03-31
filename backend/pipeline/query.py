@@ -222,7 +222,21 @@ def load_all_profiles_from_db():
         return []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, name, linkedin, location, headline, about, total_experience_years, max_people_managed, avg_years_in_company, raw_fields->>'services', raw_fields->>'extracted_industry', embedding, created_by, raw_fields, email, phone, response, notes FROM candidates")
+        # Fetch candidates with their Talent Pool (NULL role_id) outreach status
+        # Use DISTINCT ON to get the most recent outreach record for each candidate.
+        cur.execute("""
+            SELECT DISTINCT ON (c.id)
+                c.id, c.name, c.linkedin, c.location, c.headline, c.about, 
+                c.total_experience_years, c.max_people_managed, c.avg_years_in_company, 
+                c.raw_fields->>'services', c.raw_fields->>'extracted_industry', 
+                c.embedding, c.created_by, c.raw_fields, c.email, COALESCE(c.mobile_phone, c.phone),
+                c.response, c.notes, c.status, 
+                co.heyreach_campaign_id, co.li_status, co.campaign_id, co.status as email_outreach_status,
+                co.li_sent_count, co.message_sent_count
+            FROM candidates c
+            LEFT JOIN candidate_outreach co ON c.id = co.candidate_id AND co.recruitment_role_id IS NULL
+            ORDER BY c.id, co.updated_at DESC
+        """)
         candidates_raw = cur.fetchall()
 
         cur.execute("""
@@ -290,8 +304,16 @@ def load_all_profiles_from_db():
                 "created_by": cand[12] or "System",
                 "email": cand[14] or "",
                 "phone": cand[15] or "",
+                "mobile_phone": cand[15] or "",
                 "response": cand[16] or "",
                 "notes": cand[17] or "",
+                "status": cand[18] or "To be started",
+                "heyreach_campaign_id": cand[19],
+                "li_status": cand[20],
+                "email_campaign_id": cand[21],
+                "email_outreach_status": cand[22],
+                "li_sent_count": cand[23] or 0,
+                "message_sent_count": cand[24] or 0,
                 "roles": roles_by_candidate.get(candidate_id, [])
             })
         
@@ -317,6 +339,15 @@ def initialize_cache():
         logger.info(f"Cache initialized with {len(PROFILES_BY_ID)} profiles and {len(ALL_COMPANY_NAMES)} companies.")
     except Exception as e:
         logger.error(f"Failed to initialize cache: {e}")
+
+def update_profile_cache(candidate_id: int, data: Dict[str, Any]):
+    """Update a specific profile in the global cache"""
+    global PROFILES_BY_ID
+    if candidate_id in PROFILES_BY_ID:
+        PROFILES_BY_ID[candidate_id].update(data)
+        logger.info(f"Updated cache for candidate {candidate_id}: {data}")
+    else:
+        logger.warning(f"Attempted to update cache for non-existent candidate {candidate_id}")
 
 # --- Logic Functions ---
 

@@ -1,11 +1,111 @@
 import requests
 import os
+import re
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
 
 class HeyReachBot:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("HEYREACH_API_KEY")
         self.push_url = "https://api.heyreach.io/api/public/campaign/AddLeadsToCampaign"
+
+    @staticmethod
+    def _normalize_linkedin_url(profile_url: Optional[str]) -> str:
+        if not profile_url:
+            return ""
+
+        raw = str(profile_url).strip()
+        if not raw:
+            return ""
+
+        if not raw.startswith("http"):
+            raw = f"https://{raw.lstrip('/')}"
+
+        parsed = urlparse(raw)
+        path = re.sub(r'/+$', '', (parsed.path or '').strip().lower())
+        return path
+
+    def _conversation_matches_profile(self, conversation: Dict, profile_url: str) -> bool:
+        target = self._normalize_linkedin_url(profile_url)
+        if not target:
+            return False
+
+        candidate_urls = []
+        linked_profile = conversation.get('linkedInUserProfile') or {}
+        corr_profile = conversation.get('correspondentProfile') or {}
+        participants = conversation.get('participants') or []
+
+        candidate_urls.extend([
+            linked_profile.get('profileUrl'),
+            linked_profile.get('profile_url'),
+            corr_profile.get('profileUrl'),
+            corr_profile.get('profile_url'),
+            conversation.get('leadProfileUrl'),
+            conversation.get('profileUrl'),
+        ])
+
+        for participant in participants:
+            candidate_urls.extend([
+                participant.get('profileUrl'),
+                participant.get('profile_url'),
+                participant.get('linkedinProfileUrl'),
+                participant.get('linkedInProfileUrl'),
+            ])
+
+        normalized_candidates = [
+            self._normalize_linkedin_url(candidate_url)
+            for candidate_url in candidate_urls
+            if candidate_url
+        ]
+
+        return any(
+            candidate == target or target in candidate or candidate in target
+            for candidate in normalized_candidates
+            if candidate
+        )
+
+    def _find_conversation(
+        self,
+        profile_url: str,
+        campaign_id: Optional[int] = None,
+        conversation_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        headers = {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "accept": "application/json"
+        }
+        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
+
+        payloads = [
+            {"offset": 0, "limit": 100}
+        ]
+
+        seen_conversation_ids = set()
+
+        for payload in payloads:
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=10)
+                res.raise_for_status()
+                items = res.json().get('items', [])
+            except Exception as e:
+                print(f"⚠️ HeyReach conversation lookup failed for payload {payload}: {e}")
+                continue
+
+            for conversation in items:
+                conv_id = conversation.get('id')
+                if conv_id in seen_conversation_ids:
+                    continue
+                seen_conversation_ids.add(conv_id)
+
+                if conversation_id and str(conv_id) == str(conversation_id):
+                    return conversation
+
+                if self._conversation_matches_profile(conversation, profile_url):
+                    return conversation
+
+        return None
+
     def push_lead(self, campaign_id: int, account_id: int, first_name: str, last_name: str, profile_url: str):
         """
         Push a single lead to a HeyReach campaign.
@@ -183,7 +283,7 @@ class HeyReachBot:
             return None
 
 
-    def get_lead_activity(self, profile_url: str):
+    def get_lead_activity(self, profile_url: str, campaign_id: Optional[int] = None):
         """
         Fetch detailed activity for sync: Sent messages, Replies, Timestamps, and ConversationID.
         """
@@ -193,28 +293,13 @@ class HeyReachBot:
             "accept": "application/json"
         }
         
-        # 1. Get conversation to find IDs and meta
-        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-        payload = {
-            "filters": {"leadProfileUrl": profile_url},
-            "limit": 1
-        }
-        
         try:
-            print(f"DEBUG: HeyReach GetConversationsV2 for {profile_url}")
-            res = requests.post(url, headers=headers, json=payload, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            items = data.get('items', [])
-            print(f"DEBUG: HeyReach found {len(items)} conversations")
-            
-            if not items:
+            conv = self._find_conversation(profile_url, campaign_id=campaign_id)
+            if not conv:
                 print(f"DEBUG: No HeyReach conversation found for {profile_url}")
                 return None
-                
-            conv = items[0]
+
             conv_id = conv.get('id')
-            # Extract accountId from conversation object
             account_id = conv.get('linkedInAccountId') or conv.get('linkedInAccount', {}).get('id')
             
             if not account_id:
@@ -279,7 +364,12 @@ class HeyReachBot:
             return None
 
 
-    def get_li_chat_history(self, profile_url: str) -> List[Dict]:
+    def get_li_chat_history(
+        self,
+        profile_url: str,
+        campaign_id: Optional[int] = None,
+        conversation_id: Optional[str] = None
+    ) -> List[Dict]:
         """
         Fetch conversation history for a LinkedIn profile.
         """
@@ -288,24 +378,19 @@ class HeyReachBot:
             "Content-Type": "application/json",
             "accept": "application/json"
         }
-        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-        payload = {
-            "filters": {"leadProfileUrl": profile_url},
-            "limit": 1
-        }
         
         try:
-            res = requests.post(url, headers=headers, json=payload, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            items = data.get('items', [])
-            
-            if not items:
+            conversation = self._find_conversation(
+                profile_url,
+                campaign_id=campaign_id,
+                conversation_id=conversation_id
+            )
+
+            if not conversation:
                 return []
-                
-            # Get the conversation ID and account ID
-            conversation_id = items[0].get('id')
-            account_id = items[0].get('linkedInAccountId') or items[0].get('linkedInAccount', {}).get('id')
+
+            conversation_id = conversation.get('id')
+            account_id = conversation.get('linkedInAccountId') or conversation.get('linkedInAccount', {}).get('id')
             
             if not conversation_id or not account_id:
                 return []
@@ -372,7 +457,14 @@ class HeyReachBot:
             print(f"❌ Error fetching LI chat history: {e}")
             return []
 
-    def send_li_message(self, profile_url: str, message: str, conversation_id: Optional[str] = None, account_id: Optional[int] = None) -> bool:
+    def send_li_message(
+        self,
+        profile_url: str,
+        message: str,
+        conversation_id: Optional[str] = None,
+        account_id: Optional[int] = None,
+        campaign_id: Optional[int] = None
+    ) -> bool:
         """
         Send a LinkedIn message to a profile via the PublicInbox/SendMessage endpoint.
         """
@@ -387,26 +479,20 @@ class HeyReachBot:
         
         # 1. If conversation_id or account_id not provided, find them
         if not final_conv_id or not final_acc_id:
-            url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-            payload = {
-                "filters": {"leadProfileUrl": profile_url},
-                "limit": 1
-            }
-            
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=10)
-                res.raise_for_status()
-                items = res.json().get('items', [])
-                if not items:
+                conversation = self._find_conversation(
+                    profile_url,
+                    campaign_id=campaign_id,
+                    conversation_id=conversation_id
+                )
+                if not conversation:
                     print(f"❌ No LinkedIn conversation found for profile: {profile_url}")
                     return False
-                
-                conv = items[0]
+
                 if not final_conv_id:
-                    final_conv_id = conv.get('id')
+                    final_conv_id = conversation.get('id')
                 if not final_acc_id:
-                    # Get accountId from the conversation object
-                    final_acc_id = conv.get('linkedInAccountId') or conv.get('linkedInAccount', {}).get('id')
+                    final_acc_id = conversation.get('linkedInAccountId') or conversation.get('linkedInAccount', {}).get('id')
             except Exception as e:
                 print(f"❌ Failed to lookup conversation for message: {e}")
                 return False

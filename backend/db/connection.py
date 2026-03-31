@@ -60,7 +60,7 @@ def _initialize_pool():
             _connection_pool = None
             raise
 
-def get_db_connection(max_retries=3, retry_delay=1):
+def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgvector=True):
     """
     Get a database connection from the pool with automatic retry logic.
     
@@ -92,25 +92,26 @@ def get_db_connection(max_retries=3, retry_delay=1):
             if conn is None:
                 raise Exception("Pool returned None connection")
             
-            # Test the connection
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-            except Exception as test_error:
-                # Connection is bad, discard it and get a new one
-                logger.warning(f"Connection test failed: {test_error}, discarding connection")
+            if validate:
+                # Test the connection only when callers need the extra safety.
                 try:
-                    _connection_pool.putconn(conn, close=True)
-                except:
-                    pass
-                raise test_error
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                except Exception as test_error:
+                    # Connection is bad, discard it and get a new one
+                    logger.warning(f"Connection test failed: {test_error}, discarding connection")
+                    try:
+                        _connection_pool.putconn(conn, close=True)
+                    except:
+                        pass
+                    raise test_error
             
-            # Register vector extension
-            try:
-                register_vector(conn)
-            except Exception as reg_error:
-                logger.warning(f"Failed to register vector extension: {reg_error}")
+            if register_pgvector:
+                try:
+                    register_vector(conn)
+                except Exception as reg_error:
+                    logger.warning(f"Failed to register vector extension: {reg_error}")
             
             # Connection is good
             if attempt > 0:
@@ -180,13 +181,20 @@ def close_all_connections():
 class DatabaseConnection:
     """Context manager for database connections that automatically returns them to the pool."""
     
-    def __init__(self, max_retries=3, retry_delay=1):
+    def __init__(self, max_retries=3, retry_delay=1, validate=True, register_pgvector=True):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.validate = validate
+        self.register_pgvector = register_pgvector
         self.conn = None
     
     def __enter__(self):
-        self.conn = get_db_connection(self.max_retries, self.retry_delay)
+        self.conn = get_db_connection(
+            self.max_retries,
+            self.retry_delay,
+            validate=self.validate,
+            register_pgvector=self.register_pgvector,
+        )
         return self.conn
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -196,7 +204,7 @@ class DatabaseConnection:
             return_db_connection(self.conn, close=close_conn)
         return False
 
-def get_db_connection_context(max_retries=3, retry_delay=1):
+def get_db_connection_context(max_retries=3, retry_delay=1, validate=True, register_pgvector=True):
     """
     Get a database connection context manager.
     
@@ -206,7 +214,7 @@ def get_db_connection_context(max_retries=3, retry_delay=1):
                 # use connection
                 pass
     """
-    return DatabaseConnection(max_retries, retry_delay)
+    return DatabaseConnection(max_retries, retry_delay, validate=validate, register_pgvector=register_pgvector)
 
 def drop_all_tables(cur, conn):
     """

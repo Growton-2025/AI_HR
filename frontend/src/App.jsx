@@ -10,6 +10,7 @@ import Login from './pages/Login'
 import UserManagement from './pages/UserManagement'
 import TalentPool from './pages/TalentPool'
 import Dashboard from './pages/Dashboard'
+import Calls from './pages/Calls'
 
 // Set axios header immediately on module load (before any component renders)
 const initToken = localStorage.getItem('token')
@@ -65,7 +66,7 @@ function App() {
         return null // don't render until profile and role are fetched
     }
 
-    const isFullBleed = ['/', '/dashboard', '/talent-pool', '/screening'].includes(location.pathname)
+    const isFullBleed = ['/', '/dashboard', '/talent-pool', '/screening', '/calls'].includes(location.pathname)
 
     return (
         <div className="app-layout">
@@ -96,7 +97,7 @@ function App() {
                             <Route path="/talent-pool" element={<TalentPool />} />
                             <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
                             <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
-                            <Route path="/calls" element={<ComingSoon title="Call Management" description="Schedule and manage candidate interviews" />} />
+                            <Route path="/calls" element={<Calls />} />
                             <Route path="/admin/users" element={<UserManagement />} />
                         </Routes>
                     </div>
@@ -110,7 +111,7 @@ function App() {
                         <Route path="/talent-pool" element={<TalentPool />} />
                         <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
                         <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
-                        <Route path="/calls" element={<ComingSoon title="Call Management" description="Schedule and manage candidate interviews" />} />
+                        <Route path="/calls" element={<Calls />} />
                         <Route path="/admin/users" element={<UserManagement />} />
                     </Routes>
                 )}
