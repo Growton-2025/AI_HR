@@ -570,7 +570,11 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
 }
 
 function ConversationModal({ candidate, onClose }) {
-  const [platform, setPlatform] = useState('email'); // Always default to Email tab
+  // Auto-select LinkedIn tab if candidate has an active LinkedIn response
+  const hasLiActivity = ['replied', 'message_sent', 'connection_accepted', 'in_campaign'].includes(candidate?.li_status);
+  const hasLiResponse = Boolean(candidate?.li_response_text);
+  const defaultPlatform = (hasLiResponse || candidate?.li_status === 'replied') ? 'linkedin' : 'email';
+  const [platform, setPlatform] = useState(defaultPlatform);
   const [threads, setThreads] = useState({
     email: { messages: [], loaded: false, error: '' },
     linkedin: { messages: [], loaded: false, error: '' }
@@ -593,6 +597,8 @@ function ConversationModal({ candidate, onClose }) {
   const threadsRef = useRef(threads);
   const requestSeqRef = useRef({ email: 0, linkedin: 0 });
   const candidateIdRef = useRef(candidate.id);
+  const lastSyncTimeRef = useRef(Date.now());
+
 
   useEffect(() => {
     threadsRef.current = threads;
@@ -612,11 +618,15 @@ function ConversationModal({ candidate, onClose }) {
     const cachedThread = threadsRef.current[targetPlatform];
     const candidateId = candidate.id;
     const requestSeq = ++requestSeqRef.current[targetPlatform];
-    const shouldBlock = showLoader && !cachedThread?.loaded;
+    // Always block (show skeleton) on initial load for this platform
+    const shouldBlock = showLoader || !cachedThread?.loaded;
 
     if (targetPlatform === platform) {
-      if (shouldBlock) setLoading(true);
-      else if (!silent) setRefreshing(true);
+      if (!cachedThread?.loaded) {
+        setLoading(true);
+      } else if (!silent) {
+        setRefreshing(true);
+      }
     }
 
     const res = await fetchChatHistory(0, candidateId, targetPlatform);
@@ -625,6 +635,8 @@ function ConversationModal({ candidate, onClose }) {
     }
 
     if (res.success) {
+      // Small artificial delay to ensure smooth transition from skeleton to content
+      await new Promise(r => setTimeout(r, 200));
       setThreads(prev => ({
         ...prev,
         [targetPlatform]: {
@@ -666,7 +678,11 @@ function ConversationModal({ candidate, onClose }) {
 
   useEffect(() => {
     setReplyText('');
-    loadMessages({ showLoader: true, targetPlatform: platform });
+    const cached = threadsRef.current[platform];
+    if (!cached || !cached.loaded) {
+      setLoading(true);
+    }
+    loadMessages({ targetPlatform: platform });
   }, [candidate.id, platform, loadMessages]);
 
   // Auto-poll every 5s for new replies
@@ -702,7 +718,7 @@ function ConversationModal({ candidate, onClose }) {
     }));
     setReplyText('');
     setSending(true);
-    
+
     // Instant scroll to the bottom to show the optimistic message
     setTimeout(() => {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -718,367 +734,369 @@ function ConversationModal({ candidate, onClose }) {
       }));
       toast.error(res.error || 'Failed to send reply');
     }
+
     setSending(false);
   };
 
+  const buildMessageList = () => {
+    const serverMsgs = activeThread.messages || [];
+    const localMsgs = localSentMessagesByPlatform[platform] || [];
+
+    // Filter out duplicates from server
+    const uniqueServerMsgs = [];
+    const serverMsgsSeen = new Set();
+    serverMsgs.forEach(msg => {
+      const msgKey = `${msg.type}-${(msg.email_body || '').trim().toLowerCase()}-${msg.time}`;
+      if (!serverMsgsSeen.has(msgKey)) {
+        uniqueServerMsgs.push(msg);
+        serverMsgsSeen.add(msgKey);
+      }
+    });
+
+    // Match local against server
+    const pendingToShow = localMsgs.filter(lm => {
+      const match = uniqueServerMsgs.some(sm => {
+        if (sm.type !== 'SENT') return false;
+        const sBody = (sm.email_body || '').trim().toLowerCase();
+        const lBody = (lm.email_body || '').trim().toLowerCase();
+        // Match if one includes the other, but only for first 50 chars to avoid false hits on generic "hi"
+        return sBody === lBody || sBody.includes(lBody) || lBody.includes(sBody);
+      });
+      // Also expire local messages after 60s if they haven't synced, to prevent ghosting
+      const age = (Date.now() - (lm.sentAt || 0)) / 1000;
+      return !match && age < 60;
+    });
+
+    const combined = [...uniqueServerMsgs, ...pendingToShow];
+    return combined.sort((a, b) => {
+      const getT = (m) => new Date(m.time || m.created_at || m.timestamp || 0).getTime();
+      return getT(a) - getT(b);
+    });
+  };
+
+  const displayMessages = buildMessageList();
+
   const formatTime = (timeStr) => {
     if (!timeStr) return '';
-    const d = new Date(timeStr);
-    return isNaN(d.getTime()) ? timeStr : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString();
+    try {
+      const d = new Date(timeStr);
+      if (isNaN(d.getTime())) return timeStr;
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString([], { month: '2-digit', day: '2-digit' });
+    } catch {
+      return timeStr;
+    }
   };
 
   return (
     <div style={{
       position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      background: 'rgba(15, 23, 42, 0.4)', backdropFilter: 'blur(4px)',
+      background: 'rgba(15, 23, 42, 0.4)', backdropFilter: 'blur(8px)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      zIndex: 9999, padding: '20px'
+      zIndex: 9999, padding: '20px', animation: 'fadeIn 0.2s ease-out'
     }} onClick={onClose}>
+       <style>{`
+         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+         @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+         @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+         .hide-scrollbar::-webkit-scrollbar { display: none; }
+         .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+         @keyframes spin-anim { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+         .spin-anim { animation: spin-anim 0.8s linear infinite; will-change: transform; }
+         .message-bubble { will-change: transform, opacity; }
+       `}</style>
       <div
         onClick={e => e.stopPropagation()}
         style={{
-          background: '#fff', width: '100%', maxWidth: '600px', height: '80vh',
-          borderRadius: '20px', display: 'flex', flexDirection: 'column',
-          boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1)',
-          overflow: 'hidden'
+          background: '#fff', width: '100%', maxWidth: '750px', height: '85vh',
+          borderRadius: '28px', display: 'flex', flexDirection: 'column',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+          overflow: 'hidden', animation: 'slideUp 0.3s ease-out'
         }}
       >
-        <div style={{ padding: '20px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f8fafc' }}>
+        {/* Header */}
+        <div style={{ padding: '24px 32px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#fff' }}>
           <div>
-            <div style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a' }}>{candidate.first_name} {candidate.last_name || ''}</div>
-            <div style={{ fontSize: '13px', color: '#64748b', display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
-              <MessageSquare size={14} /> Conversations
-            </div>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <div style={{
-              padding: '7px 12px',
-              borderRadius: '999px',
-              background: refreshing ? '#eff6ff' : '#fff',
-              border: `1px solid ${refreshing ? '#bfdbfe' : '#e2e8f0'}`,
-              color: refreshing ? '#2563eb' : '#64748b',
-              fontSize: '11px',
-              fontWeight: 700,
-              transition: 'all 0.2s ease'
-            }}>
-              {loading && !activeThread.loaded
-                ? 'Loading thread...'
-                : refreshing
-                  ? 'Syncing latest replies...'
-                  : activeThread.error && !hasAnyVisibleMessages
-                    ? 'Unable to refresh'
-                    : `${messages.length} message${messages.length === 1 ? '' : 's'}`}
-            </div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', borderRadius: '50%', color: '#64748b' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = 'none'}>
-            <X size={20} />
-          </button>
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', padding: '10px 20px 0', background: '#fff', gap: '10px' }}>
-          <button
-            onClick={() => setPlatform('linkedin')}
-            style={{
-              padding: '12px 18px',
-              background: platform === 'linkedin' ? '#eff6ff' : 'transparent',
-              border: 'none',
-              borderBottom: platform === 'linkedin' ? '2px solid #0077b5' : '2px solid transparent',
-              color: platform === 'linkedin' ? '#0077b5' : '#64748b',
-              fontWeight: platform === 'linkedin' ? 700 : 500,
-              fontSize: '13.5px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              transition: 'all 0.2s ease',
-              borderTopLeftRadius: '12px',
-              borderTopRightRadius: '12px'
-            }}
-          >
-            <Linkedin size={16} /> LinkedIn
-          </button>
-          <button
-            onClick={() => setPlatform('email')}
-            style={{
-              padding: '12px 18px',
-              background: platform === 'email' ? '#fff7ed' : 'transparent',
-              border: 'none',
-              borderBottom: platform === 'email' ? '2px solid #f97316' : '2px solid transparent',
-              color: platform === 'email' ? '#f97316' : '#64748b',
-              fontWeight: platform === 'email' ? 700 : 500,
-              fontSize: '13.5px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              transition: 'all 0.2s ease',
-              borderTopLeftRadius: '12px',
-              borderTopRightRadius: '12px'
-            }}
-          >
-            <Mail size={16} /> Email
-          </button>
-        </div>
-
-        <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#f8fafc' }}>
-            <div style={{ position: 'relative', flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {loading && !activeThread.loaded ? (
-                <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', flex: 1, gap: '16px' }}>
-                  {Array.from({ length: 4 }).map((_, idx) => {
-                    const isIncoming = idx % 2 === 0;
-                    return (
-                      <div key={`conversation-skeleton-${idx}`} style={{ display: 'flex', flexDirection: 'column', alignItems: isIncoming ? 'flex-start' : 'flex-end', gap: '6px' }}>
-                        <div style={{ width: 90, height: 10, borderRadius: 999, background: '#e2e8f0', opacity: 0.75 }} />
-                        <div style={{
-                          width: `${isIncoming ? 54 : 46}%`,
-                          minWidth: '190px',
-                          maxWidth: '78%',
-                          height: idx === 1 ? 64 : 52,
-                          borderRadius: isIncoming ? '8px 18px 18px 18px' : '18px 8px 18px 18px',
-                          background: 'linear-gradient(90deg,#f1f5f9 20%,#e2e8f0 50%,#f1f5f9 80%)',
-                          backgroundSize: '200% 100%',
-                          animation: 'shimmer 1.2s linear infinite'
-                        }} />
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : messages.length === 0 ? (
-                <div style={{ textAlign: 'center', padding: '40px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
-                  <div style={{
-                    width: 64,
-                    height: 64,
-                    borderRadius: '20px',
-                    background: platform === 'linkedin' ? '#eff6ff' : '#fff7ed',
-                    color: conversationAccent,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    {platform === 'linkedin' ? <Linkedin size={28} /> : <Mail size={28} />}
-                  </div>
-                  <div style={{ color: '#64748b', fontSize: '14px', fontWeight: 600 }}>
-                    {activeThread.error ? `Unable to load ${platform === 'linkedin' ? 'LinkedIn' : 'email'} messages` : 'No messages yet'}
-                  </div>
-                  <div style={{ color: '#94a3b8', fontSize: '13px', maxWidth: '320px', lineHeight: 1.6 }}>
-                    {activeThread.error
-                      ? 'The last refresh did not complete. You can switch tabs or try again in a moment.'
-                      : 'Type a message below to start the conversation.'}
-                  </div>
-                  {activeThread.error && (
-                    <button
-                      onClick={() => loadMessages({ showLoader: true, targetPlatform: platform })}
-                      style={{
-                        padding: '10px 14px',
-                        borderRadius: '10px',
-                        border: '1px solid #e2e8f0',
-                        background: '#fff',
-                        color: '#0f172a',
-                        fontWeight: 700,
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Retry
-                    </button>
-                  )}
-
-                  {platform === 'linkedin' && !hasTriggered && (candidate.li_status !== 'in_campaign' && candidate.li_status !== 'message_sent' && candidate.li_status !== 'replied' && candidate.li_status !== 'connection_accepted') && (
-                    candidate.status?.toLowerCase() === 'shortlisted' ? (
-                      <div style={{
-                        background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '20px',
-                        width: '100%', maxWidth: '340px', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05)',
-                        display: 'flex', flexDirection: 'column', gap: '12px'
-                      }}>
-                        <div style={{ fontSize: '12px', fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', textAlign: 'left' }}>
-                          Start HeyReach Outreach
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <div style={{
-                            flex: 1, display: 'flex', alignItems: 'center', gap: '6px',
-                            background: '#f8fafc', padding: '6px 10px', borderRadius: '8px', border: '1px solid #e2e8f0'
-                          }}>
-                            <span style={{ fontSize: '11px', fontWeight: 600, color: '#64748b' }}>Campaign ID:</span>
-                            <input
-                              type="text"
-                              value={candidate.heyreach_campaign_id || heyreachCampaignId}
-                              onChange={(e) => setHeyreachCampaignId(e.target.value)}
-                              style={{
-                                border: 'none', background: 'transparent', fontSize: '13px',
-                                fontWeight: 'bold', color: '#0369a1', width: '70px', outline: 'none'
-                              }}
-                            />
-                          </div>
-                          <button
-                            onClick={async () => {
-                              if (!heyreachCampaignId) {
-                                toast.error('Please enter a Campaign ID');
-                                return;
-                              }
-                              const campaignId = parseInt(heyreachCampaignId, 10);
-                              if (isNaN(campaignId) || campaignId <= 0) {
-                                toast.error('Enter a valid Campaign ID');
-                                return;
-                              }
-                              setIsTriggering(true);
-                                const res = await triggerHeyReachOutreach({
-                                  candidate_ids: [candidate.id],
-                                  role_id: 0,
-                                  campaign_id: campaignId,
-                                  sender_account_id: 113572 // Default
-                                });
-                              if (res.success) {
-                                toast.success('Outreach triggered successfully!');
-                                setHasTriggered(true);
-                                setTimeout(() => loadMessages({ targetPlatform: 'linkedin' }), 3000);
-                              } else {
-                                toast.error(res.error || 'Failed to trigger outreach');
-                              }
-                              setIsTriggering(false);
-                            }}
-                            disabled={isTriggering}
-                            style={{
-                              background: '#0a66c2', color: '#fff', border: 'none',
-                              borderRadius: '8px', padding: '8px 16px', fontSize: '13px',
-                              fontWeight: 600, cursor: 'pointer', opacity: isTriggering ? 0.7 : 1
-                            }}
-                          >
-                            {isTriggering ? 'Triggering...' : 'Start'}
-                          </button>
-                        </div>
-                        <p style={{ fontSize: '11px', color: '#94a3b8', margin: 0, textAlign: 'left' }}>
-                          Candidate will be pushed to HeyReach campaign.
-                        </p>
-                      </div>
-                    ) : (
-                      <div style={{
-                        fontSize: '12px', color: '#64748b', background: '#f1f5f9',
-                        padding: '10px 16px', borderRadius: '10px', border: '1px solid #e2e8f0'
-                      }}>
-                        LinkedIn outreach can only be started for <b>Shortlisted</b> candidates.
-                      </div>
-                    )
-                  )}
-                </div>
-              ) : (
-                (() => {
-                  const serverMsgs = messages || [];
-                  const pendingToShow = localSentMessages.filter(lm => 
-                    !serverMsgs.some(sm => {
-                      const sText = (sm.email_body || sm.message || sm.text || "").replace(/<[^>]+>/g, '').trim();
-                      const lText = (lm.email_body || "").replace(/<[^>]+>/g, '').trim();
-                      return sText.includes(lText.substring(0, 20)) || lText.includes(sText.substring(0, 20));
-                    })
-                  );
-
-                  return [...serverMsgs, ...pendingToShow]
-                    .sort((a, b) => {
-                      const timeA = new Date(a.time || a.created_at || a.timestamp).getTime();
-                      const timeB = new Date(b.time || b.created_at || b.timestamp).getTime();
-                      return (isNaN(timeA) ? 0 : timeA) - (isNaN(timeB) ? 0 : timeB);
-                    })
-                    .map((msg, idx) => {
-                      const isCandidate = msg.type === 'REPLY' || msg.is_reply || msg.type === 'INBOX' || msg.direction === 'inbound';
-                      const senderName = isCandidate ? `${candidate.first_name}` : 'You';
-                      const time = msg.time || msg.created_at || msg.timestamp;
-                      const body = msg.email_body || msg.message || msg.text || '';
-                      const isPending = msg._pending;
-
-                      return (
-                        <div key={idx} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end', animation: 'msgFadeIn 0.24s ease', transform: refreshing ? 'translateY(1px)' : 'translateY(0)', transition: 'transform 0.2s ease' }}>
-                          <div style={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px', padding: '0 4px', fontWeight: 600 }}>
-                            {senderName}{time ? ` • ${formatTime(time)}` : ''}
-                          </div>
-                          <div style={{
-                            maxWidth: '80%',
-                            padding: '10px 15px',
-                            borderRadius: isCandidate ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
-                            background: isCandidate ? '#fff' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
-                            color: isCandidate ? '#0f172a' : '#fff',
-                            fontSize: '14px',
-                            lineHeight: '1.5',
-                            boxShadow: isCandidate ? '0 1px 4px rgba(0,0,0,0.07)' : '0 2px 8px rgba(249,115,22,0.25)',
-                            border: isCandidate ? '1px solid #e2e8f0' : 'none',
-                            opacity: isPending ? 0.65 : 1,
-                            transform: refreshing ? 'scale(0.995)' : 'scale(1)',
-                            transition: 'opacity 0.3s ease, transform 0.2s ease',
-                            whiteSpace: 'pre-wrap'
-                          }}>
-                            {isPending
-                              ? <span>{body}</span>
-                              : <div dangerouslySetInnerHTML={{ __html: body }} style={{ overflowWrap: 'break-word' }} />}
-                          </div>
-                          {isPending && <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '2px', paddingRight: '4px' }}>Sending...</div>}
-                        </div>
-                      );
-                    });
-                })()
-              )}
-              {refreshing && hasAnyVisibleMessages && (
-                <div style={{
-                  position: 'sticky',
-                  top: 0,
-                  alignSelf: 'center',
-                  padding: '6px 12px',
-                  borderRadius: '999px',
-                  background: '#fff',
-                  border: '1px solid #e2e8f0',
-                  color: '#64748b',
-                  fontSize: '11px',
-                  fontWeight: 700,
-                  boxShadow: '0 10px 20px -14px rgba(15,23,42,0.35)'
-                }}>
-                  Checking for new replies...
-                </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-
-            <div style={{ padding: '16px 20px', background: '#fff', borderTop: '1px solid #e2e8f0' }}>
-              <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-end', background: '#f8fafc', padding: '8px 12px', borderRadius: '16px', border: '1px solid #e2e8f0' }}>
-                <textarea
-                  value={replyText}
-                  onChange={(e) => setReplyText(e.target.value)}
-                  placeholder={`Reply via ${platform === 'linkedin' ? 'LinkedIn' : 'Email'}...`}
-                  rows={1}
-                  style={{
-                    flex: 1, border: 'none', background: 'transparent', outline: 'none',
-                    resize: 'none', fontSize: '14px', color: '#0f172a', padding: '8px 4px',
-                    minHeight: '38px', maxHeight: '120px', fontFamily: 'inherit'
-                  }}
-                  onInput={(e) => {
-                    e.target.style.height = 'auto';
-                    e.target.style.height = (e.target.scrollHeight) + 'px';
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSend();
-                    }
-                  }}
-                />
-                <button
-                  onClick={handleSend}
-                  disabled={sending || !replyText.trim()}
-                  style={{
-                    width: '38px', height: '38px', borderRadius: '50%',
-                    background: sending || !replyText.trim() ? '#e2e8f0' : (platform === 'linkedin' ? '#0077b5' : '#f97316'),
-                    color: sending || !replyText.trim() ? '#94a3b8' : '#fff',
-                    border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    cursor: sending || !replyText.trim() ? 'not-allowed' : 'pointer',
-                    transition: 'all 0.2s', padding: 0, flexShrink: 0, marginBottom: '2px'
-                  }}
-                >
-                  <Send size={18} style={{ marginLeft: '2px' }} />
-                </button>
+            <div style={{ fontSize: '20px', fontWeight: 800, color: '#0f172a', letterSpacing: '-0.02em', display: 'flex', alignItems: 'center', gap: '10px' }}>
+              {candidate.first_name} {candidate.last_name || ''}
+              <div style={{ px: '8px', py: '2px', background: '#f1f5f9', borderRadius: '6px', fontSize: '11px', fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                ID: {candidate.id}
               </div>
             </div>
+            <div style={{ fontSize: '13px', color: '#64748b', display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px' }}>
+              <MessageSquare size={14} />
+              <span>Real-time Sync Active</span>
+              {refreshing && (
+                <span style={{ fontSize: '11px', color: conversationAccent, fontWeight: 700, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                   <div style={{ width: 4, height: 4, borderRadius: '50%', background: conversationAccent, animation: 'pulse 1s infinite' }} />
+                   UPDATING
+                </span>
+              )}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+            <button 
+              onClick={() => loadMessages({ silent: false })}
+              style={{
+                background: '#fff', border: '1.5px solid #e2e8f0', cursor: 'pointer', padding: '8px 14px', 
+                borderRadius: '12px', color: '#64748b', fontSize: '12px', fontWeight: 600,
+                display: 'flex', alignItems: 'center', gap: '6px', transition: 'all 0.2s'
+              }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = '#94a3b8'}
+              onMouseLeave={e => e.currentTarget.style.borderColor = '#e2e8f0'}
+            >
+              <RefreshCw size={14} className={refreshing ? 'spin-anim' : ''} />
+              Manual Sync
+            </button>
+            <button onClick={onClose} style={{ background: '#f1f5f9', border: 'none', cursor: 'pointer', padding: '10px', borderRadius: '12px', color: '#64748b', transition: 'all 0.2s' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = '#f1f5f9'}>
+              <X size={20} />
+            </button>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div style={{ display: 'flex', padding: '0 32px', borderBottom: '1px solid #f1f5f9', background: '#fff', gap: '24px' }}>
+          {[
+            { id: 'linkedin', label: 'LinkedIn', icon: Linkedin, color: '#0077b5' },
+            { id: 'email', label: 'Email', icon: Mail, color: '#f97316' }
+          ].map(t => (
+            <button
+              key={t.id}
+              onClick={() => setPlatform(t.id)}
+              style={{
+                padding: '16px 4px',
+                background: 'transparent',
+                border: 'none',
+                borderBottom: platform === t.id ? `3px solid ${t.color}` : '3px solid transparent',
+                color: platform === t.id ? '#0f172a' : '#64748b',
+                fontWeight: platform === t.id ? 700 : 500,
+                fontSize: '14px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                transition: 'all 0.2s ease',
+                position: 'relative'
+              }}
+            >
+              <t.icon size={18} color={platform === t.id ? t.color : '#94a3b8'} strokeWidth={platform === t.id ? 2.5 : 2} />
+              {t.label}
+              {t.id === 'linkedin' && hasLiResponse && platform !== 'linkedin' && (
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', position: 'absolute', top: 12, right: -6, border: '2px solid #fff' }} />
+              )}
+            </button>
+          ))}
+        </div>
+
+         {/* Messages */}
+         <div className="hide-scrollbar" style={{ flex: 1, overflowY: 'auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '8px', background: '#f8fafc', containment: 'layout style paint' }}>
+           {loading ? (
+             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+               {[1, 2, 3].map(i => (
+                 <div key={i} style={{ width: i % 2 === 0 ? '55%' : '65%', height: '72px', borderRadius: '18px', background: 'linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%)', backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite', alignSelf: i % 2 === 0 ? 'flex-end' : 'flex-start' }} />
+               ))}
+             </div>
+           ) : displayMessages.length === 0 ? (
+             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', gap: '16px' }}>
+               <div style={{ width: 64, height: 64, borderRadius: '20px', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e2e8f0' }}>
+                 <MessageSquare size={32} opacity={0.5} />
+               </div>
+               <div style={{ textAlign: 'center' }}>
+                 <div style={{ fontWeight: 600, color: '#64748b' }}>No messages yet</div>
+                 <div style={{ fontSize: '13px' }}>Start the conversation below</div>
+               </div>
+               {platform === 'linkedin' && !heyreachCampaignId && (
+                 <button
+                   onClick={async () => {
+                     setIsTriggering(true);
+                     const res = await triggerHeyReachOutreach([candidate.id]);
+                     setIsTriggering(false);
+                     if (res.success) {
+                       setHasTriggered(true);
+                       loadMessages({ silent: true });
+                     }
+                   }}
+                   disabled={isTriggering || hasTriggered}
+                   style={{
+                     marginTop: '12px', padding: '10px 20px', background: '#0077b5', color: '#fff',
+                     border: 'none', borderRadius: '12px', fontWeight: 600, fontSize: '13px', cursor: 'pointer',
+                     display: 'flex', alignItems: 'center', gap: '8px'
+                   }}
+                 >
+                   {isTriggering ? 'Starting...' : hasTriggered ? 'Campaign Started' : 'Start LinkedIn Outreach'}
+                 </button>
+               )}
+             </div>
+           ) : (
+             <>
+               {displayMessages.map((msg, idx) => {
+                 // Determine if message is from candidate (incoming) or from us (outgoing)
+                 // Priority: direction field > type field > fallback
+                 let isCandidate = false;
+                 if (msg.direction === 'inbound') {
+                   isCandidate = true;
+                 } else if (msg.direction === 'outbound') {
+                   isCandidate = false;
+                 } else if (msg.type === 'REPLY' || msg.type === 'INBOX') {
+                   isCandidate = true;
+                 } else if (msg.type === 'SENT') {
+                   isCandidate = false;
+                 } else {
+                   // Default based on is_reply flag
+                   isCandidate = Boolean(msg.is_reply);
+                 }
+                 
+                 const nextMsg = displayMessages[idx + 1];
+                 let nextIsCandidate = false;
+                 if (nextMsg) {
+                   if (nextMsg.direction === 'inbound') {
+                     nextIsCandidate = true;
+                   } else if (nextMsg.direction === 'outbound') {
+                     nextIsCandidate = false;
+                   } else if (nextMsg.type === 'REPLY' || nextMsg.type === 'INBOX') {
+                     nextIsCandidate = true;
+                   } else if (nextMsg.type === 'SENT') {
+                     nextIsCandidate = false;
+                   } else {
+                     nextIsCandidate = Boolean(nextMsg.is_reply);
+                   }
+                 }
+                 
+                 const isConsecutive = nextMsg && isCandidate === nextIsCandidate;
+                 
+                 const rawBody = msg.email_body || msg.message || msg.text || '';
+                 const cleanBody = rawBody.replace(/<[^>]+>/g, '')
+                   .replace(/&nbsp;/g, ' ')
+                   .replace(/&amp;/g, '&')
+                   .replace(/&quot;/g, '"')
+                   .replace(/&apos;/g, "'")
+                   .trim();
+
+                 return (
+                   <div key={msg.id || idx} className="message-bubble" style={{
+                     display: 'flex',
+                     flexDirection: 'column',
+                     alignItems: isCandidate ? 'flex-start' : 'flex-end',
+                     gap: '4px',
+                     maxWidth: '85%',
+                     alignSelf: isCandidate ? 'flex-start' : 'flex-end',
+                     opacity: msg._pending ? 0.7 : 1,
+                     marginBottom: isConsecutive ? '4px' : '16px'
+                   }}>
+                     <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', flexDirection: isCandidate ? 'row' : 'row-reverse' }}>
+                       <div style={{
+                         width: 28, height: 28, borderRadius: '10px',
+                         visibility: isConsecutive ? 'hidden' : 'visible',
+                         background: isCandidate ? '#fff' : conversationAccent,
+                         display: 'flex', alignItems: 'center', justifyContent: 'center',
+                         fontSize: '12px', fontWeight: 700, color: isCandidate ? conversationAccent : '#fff',
+                         border: isCandidate ? `1.5px solid ${conversationAccent}20` : 'none',
+                         boxShadow: '0 2px 4px rgba(0,0,0,0.05)',
+                         flexShrink: 0
+                       }}>
+                         {isCandidate ? (candidate.first_name?.[0] || 'C') : 'You'}
+                       </div>
+                       <div style={{
+                         padding: '12px 18px',
+                         borderRadius: isCandidate ? '18px 18px 18px 4px' : '18px 18px 4px 18px',
+                         background: isCandidate ? '#fff' : conversationAccent,
+                         color: isCandidate ? '#334155' : '#fff',
+                         fontSize: '14.5px',
+                         lineHeight: '1.5',
+                         boxShadow: isCandidate ? '0 4px 6px -1px rgba(0,0,0,0.05)' : `0 10px 15px -3px ${conversationAccent}15`,
+                         border: isCandidate ? '1px solid #f1f5f9' : 'none',
+                         whiteSpace: 'pre-wrap',
+                         wordBreak: 'break-word',
+                         position: 'relative'
+                       }}>
+                         {cleanBody}
+                         {msg._pending && (
+                           <div style={{ 
+                             position: 'absolute', right: -24, bottom: 4, 
+                             display: 'flex', gap: '2px', opacity: 0.5 
+                           }}>
+                             {[0, 1, 2].map(i => (
+                               <div key={i} style={{ 
+                                 width: 4, height: 4, borderRadius: '50%', background: '#64748b', 
+                                 animation: 'pulse 1s infinite', animationDelay: `${i * 0.2}s` 
+                               }} />
+                             ))}
+                           </div>
+                         )}
+                       </div>
+                     </div>
+                     <div style={{ fontSize: '10px', color: '#94a3b8', margin: isCandidate ? '0 42px' : '0 12px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                       {msg._pending ? 'Sending' : formatTime(msg.time)}
+                     </div>
+                   </div>
+                 );
+               })}
+               <div ref={messagesEndRef} />
+             </>
+           )}
+         </div>
+
+        {/* Reply Area */}
+        <div style={{ padding: '24px 32px', background: '#fff', borderTop: '1px solid #f1f5f9' }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '12px', background: '#f8fafc',
+            padding: '8px 8px 8px 16px', borderRadius: '20px', border: '1.5px solid #e2e8f0',
+            transition: 'border-color 0.2s', focusWithin: { borderColor: conversationAccent }
+          }}>
+            <textarea
+              value={replyText}
+              onChange={e => setReplyText(e.target.value)}
+              placeholder={`Reply via ${platform === 'linkedin' ? 'LinkedIn' : 'Email'}...`}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
+              rows={1}
+              style={{
+                flex: 1, background: 'none', border: 'none', outline: 'none',
+                resize: 'none', padding: '8px 0', fontSize: '14px', color: '#0f172a',
+                fontFamily: 'inherit', maxHeight: '120px'
+              }}
+            />
+            <button
+              onClick={handleSend}
+              disabled={sending || !replyText.trim()}
+              style={{
+                width: 40, height: 40, borderRadius: '16px',
+                background: replyText.trim() ? conversationAccent : '#e2e8f0',
+                color: '#fff', border: 'none', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                transition: 'all 0.2s', transform: sending ? 'scale(0.9)' : 'none'
+              }}
+            >
+              {sending ? (
+                <div style={{ width: 18, height: 18, border: '2px solid #fff', borderTop: '2px solid transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+              ) : (
+                <Send size={18} />
+              )}
+            </button>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px', padding: '0 4px' }}>
+            <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+              Press <b>Enter</b> to send, <b>Shift + Enter</b> for new line
+            </span>
+            {platform === 'email' && (
+              <span style={{ fontSize: '11px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <Mail size={12} /> Sending from: <b>Recruitment Team</b>
+              </span>
+            )}
           </div>
         </div>
       </div>
+      <style>{`
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes pulse { 0% { transform: scale(0.95); opacity: 0.5; } 50% { transform: scale(1.05); opacity: 1; } 100% { transform: scale(0.95); opacity: 0.5; } }
+      `}</style>
     </div>
   );
 }
+
 
 
 export default function TalentPool() {
@@ -1143,6 +1161,7 @@ export default function TalentPool() {
   const [contactInfo, setContactInfo] = useState(readPersistedContactInfo); // { [candidateId]: { email, phone, enriching } }
   const analytics = useAppStore(state => state.analytics);
   const fetchAnalytics = useAppStore(state => state.fetchAnalytics);
+  const syncOutreachResponses = useAppStore(state => state.syncOutreachResponses);
   const shortlistAndOutreach = useAppStore(state => state.shortlistAndOutreach);
   const updateCandidateField = useAppStore(state => state.updateCandidateField);
   const prefetchCallLists = useAppStore(state => state.fetchCallLists);
@@ -1393,6 +1412,14 @@ export default function TalentPool() {
         setStatusCounts(res.data.status_counts || {});
         setIsSemanticSearch(res.data.is_semantic_search || false);
         mergeContactInfoFromRows(res.data.candidates);
+
+        // Prewarm LinkedIn chat cache for candidates with active LinkedIn outreach
+        const prewarmIds = res.data.candidates
+          .filter(c => ['replied', 'message_sent', 'connection_accepted', 'in_campaign'].includes(c.li_status))
+          .map(c => c.id);
+        if (prewarmIds.length > 0) {
+          useAppStore.getState().prewarmLinkedInCache(prewarmIds).catch(console.error);
+        }
       }
     } catch (e) {
       console.error('Failed to fetch talent pool:', e);
@@ -1421,6 +1448,36 @@ export default function TalentPool() {
   }, [fetchCandidates]);
 
   useEffect(() => { fetchCandidates(page); }, [page]);
+
+  // Store fetchCandidates and page in refs to avoid dependency cycles in the sync interval
+  const fetchRef = useRef(fetchCandidates);
+  const pageRef = useRef(page);
+  useEffect(() => {
+    fetchRef.current = fetchCandidates;
+    pageRef.current = page;
+  }, [fetchCandidates, page]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncTalentPoolReplies = async () => {
+      const res = await syncOutreachResponses(0);
+      const updatedCount = Number(res?.data?.updated_count || 0);
+      if (!cancelled && res?.success && updatedCount > 0) {
+        // Fetch candidates for the current page only if there were updates
+        fetchRef.current(pageRef.current);
+      }
+    };
+
+    // Run once initially, then stagger
+    syncTalentPoolReplies();
+    const interval = setInterval(syncTalentPoolReplies, 15000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [syncOutreachResponses]);
 
   const setFilter = (key, val) => setFilters(f => ({ ...f, [key]: val }));
 
@@ -1781,13 +1838,51 @@ export default function TalentPool() {
                     />
                   </td>
                   <td
-                    onClick={() => setSelectedCandidateForChat(c)}
+                    onClick={(e) => { e.stopPropagation(); setSelectedCandidateForChat(c); }}
                     style={{
-                      padding: '13px 14px', fontSize: 12, color: '#2563eb', borderRight: '1px solid #f1f5f9',
-                      cursor: 'pointer', textDecoration: c.response ? 'underline' : 'none'
+                      padding: '13px 14px', borderRight: '1px solid #f1f5f9',
+                      cursor: 'pointer'
                     }}
                   >
-                    {c.response || 'View Chat'}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {/* Email response preview */}
+                      <div style={{
+                        fontSize: 12, color: c.response ? '#2563eb' : '#94a3b8',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 130,
+                        textDecoration: c.response ? 'underline' : 'none'
+                      }}>
+                        {c.response || 'View Chat'}
+                      </div>
+                      {/* LinkedIn response badge */}
+                      {c.li_status && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <Linkedin size={11} color={c.li_status === 'replied' ? '#0077b5' : '#94a3b8'} />
+                          <span style={{
+                            fontSize: 10, fontWeight: 700,
+                            color: c.li_status === 'replied' ? '#0077b5'
+                              : c.li_status === 'message_sent' ? '#7c3aed'
+                                : c.li_status === 'connection_accepted' ? '#15803d'
+                                  : '#64748b',
+                            textTransform: 'uppercase', letterSpacing: '0.03em'
+                          }}>
+                            {c.li_status === 'replied' ? 'LI Replied ✓'
+                              : c.li_status === 'message_sent' ? 'LI Msg Sent'
+                                : c.li_status === 'connection_accepted' ? 'LI Connected'
+                                  : c.li_status === 'in_campaign' ? 'LI In Campaign'
+                                    : c.li_status === 'connection_sent' ? 'LI Req Sent'
+                                      : c.li_status}
+                          </span>
+                        </div>
+                      )}
+                      {c.li_response_text && (
+                        <div style={{
+                          fontSize: 11, color: '#475569', fontStyle: 'italic',
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 130
+                        }}>
+                          "{c.li_response_text}"
+                        </div>
+                      )}
+                    </div>
                   </td>
                   <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
                     <EditableNotes candidateId={c.id} initialNotes={c.notes} />
