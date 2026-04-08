@@ -614,52 +614,54 @@ function ConversationModal({ candidate, onClose }) {
   const conversationAccent = platform === 'linkedin' ? '#0077b5' : '#f97316';
   const hasAnyVisibleMessages = messages.length > 0 || localSentMessages.length > 0;
 
-  const loadMessages = useCallback(async ({ showLoader = false, silent = false, targetPlatform = platform } = {}) => {
-    const cachedThread = threadsRef.current[targetPlatform];
-    const candidateId = candidate.id;
-    const requestSeq = ++requestSeqRef.current[targetPlatform];
-    // Always block (show skeleton) on initial load for this platform
-    const shouldBlock = showLoader || !cachedThread?.loaded;
+   const loadMessages = useCallback(async ({ showLoader = false, silent = false, targetPlatform = platform } = {}) => {
+     const cachedThread = threadsRef.current[targetPlatform];
+     const candidateId = candidate.id;
+     const requestSeq = ++requestSeqRef.current[targetPlatform];
+     // Always block (show skeleton) on initial load for this platform
+     const shouldBlock = showLoader || !cachedThread?.loaded;
 
-    if (targetPlatform === platform) {
-      if (!cachedThread?.loaded) {
-        setLoading(true);
-      } else if (!silent) {
-        setRefreshing(true);
-      }
-    }
+     if (targetPlatform === platform) {
+       if (!cachedThread?.loaded) {
+         setLoading(true);
+       } else if (!silent) {
+         setRefreshing(true);
+       }
+     }
 
-    const res = await fetchChatHistory(0, candidateId, targetPlatform);
-    if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) {
-      return;
-    }
+     const res = await fetchChatHistory(0, candidateId, targetPlatform);
+     if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) {
+       return;
+     }
 
-    if (res.success) {
-      // Small artificial delay to ensure smooth transition from skeleton to content
-      await new Promise(r => setTimeout(r, 200));
-      setThreads(prev => ({
-        ...prev,
-        [targetPlatform]: {
-          messages: res.messages || [],
-          loaded: true,
-          error: ''
-        }
-      }));
-    } else {
-      setThreads(prev => ({
-        ...prev,
-        [targetPlatform]: {
-          ...prev[targetPlatform],
-          loaded: true,
-          error: res.error || `Failed to fetch ${targetPlatform} chat history`
-        }
-      }));
-    }
-    if (targetPlatform === platform) {
-      setLoading(false);
-      if (!silent) setRefreshing(false);
-    }
-  }, [candidate.id, fetchChatHistory, platform]);
+     if (res.success) {
+       // Only add delay on initial load (not on refresh) for smooth transition from skeleton to content
+       if (!cachedThread?.loaded) {
+         await new Promise(r => setTimeout(r, 150));
+       }
+       setThreads(prev => ({
+         ...prev,
+         [targetPlatform]: {
+           messages: res.messages || [],
+           loaded: true,
+           error: ''
+         }
+       }));
+     } else {
+       setThreads(prev => ({
+         ...prev,
+         [targetPlatform]: {
+           ...prev[targetPlatform],
+           loaded: true,
+           error: res.error || `Failed to fetch ${targetPlatform} chat history`
+         }
+       }));
+     }
+     if (targetPlatform === platform) {
+       setLoading(false);
+       if (!silent) setRefreshing(false);
+     }
+   }, [candidate.id, fetchChatHistory, platform]);
 
   useEffect(() => {
     const nextThreads = {
@@ -833,20 +835,22 @@ function ConversationModal({ candidate, onClose }) {
               )}
             </div>
           </div>
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            <button 
-              onClick={() => loadMessages({ silent: false })}
-              style={{
-                background: '#fff', border: '1.5px solid #e2e8f0', cursor: 'pointer', padding: '8px 14px', 
-                borderRadius: '12px', color: '#64748b', fontSize: '12px', fontWeight: 600,
-                display: 'flex', alignItems: 'center', gap: '6px', transition: 'all 0.2s'
-              }}
-              onMouseEnter={e => e.currentTarget.style.borderColor = '#94a3b8'}
-              onMouseLeave={e => e.currentTarget.style.borderColor = '#e2e8f0'}
-            >
-              <RefreshCw size={14} className={refreshing ? 'spin-anim' : ''} />
-              Manual Sync
-            </button>
+           <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+             <button 
+               onClick={() => loadMessages({ silent: false })}
+               disabled={refreshing}
+               style={{
+                 background: '#fff', border: '1.5px solid #e2e8f0', cursor: refreshing ? 'wait' : 'pointer', padding: '8px 14px', 
+                 borderRadius: '12px', color: refreshing ? '#94a3b8' : '#64748b', fontSize: '12px', fontWeight: 600,
+                 display: 'flex', alignItems: 'center', gap: '6px', transition: 'all 0.2s',
+                 opacity: refreshing ? 0.6 : 1
+               }}
+               onMouseEnter={e => !refreshing && (e.currentTarget.style.borderColor = '#94a3b8')}
+               onMouseLeave={e => !refreshing && (e.currentTarget.style.borderColor = '#e2e8f0')}
+             >
+               <RefreshCw size={14} className={refreshing ? 'spin-anim' : ''} style={{ transition: 'transform 0.2s' }} />
+               {refreshing ? 'Syncing...' : 'Manual Sync'}
+             </button>
             <button onClick={onClose} style={{ background: '#f1f5f9', border: 'none', cursor: 'pointer', padding: '10px', borderRadius: '12px', color: '#64748b', transition: 'all 0.2s' }} onMouseEnter={e => e.currentTarget.style.background = '#e2e8f0'} onMouseLeave={e => e.currentTarget.style.background = '#f1f5f9'}>
               <X size={20} />
             </button>
