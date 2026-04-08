@@ -31,12 +31,12 @@ def _get_session():
 
 
 class HeyReachBot:
-     def __init__(self, api_key: Optional[str] = None):
-         self.api_key = api_key or os.getenv("HEYREACH_API_KEY")
-         self.push_url = "https://api.heyreach.io/api/public/campaign/AddLeadsToCampaign"
-         self._session = _get_session()
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("HEYREACH_API_KEY")
+        self.push_url = "https://api.heyreach.io/api/public/campaign/AddLeadsToCampaign"
+        self._session = _get_session()
 
-     @staticmethod
+    @staticmethod
     def _normalize_linkedin_url(profile_url: Optional[str]) -> str:
         if not profile_url:
             return ""
@@ -126,11 +126,16 @@ class HeyReachBot:
 
         try:
             print(f"DEBUG: HeyReach lookup for {profile_url} (campaign: {campaign_id})")
-            res = self._get_session().post(url, headers=headers, json=payload, timeout=8)
-            res.raise_for_status()
-            items = res.json().get("items", [])
+            res = self._session.post(url, headers=headers, json=payload, timeout=8)
 
-            if campaign_id:
+            items = []
+            if res.status_code == 200:
+                items = res.json().get("items", [])
+            else:
+                print(f"DEBUG API ERROR ({res.status_code}): {res.text}")
+                # Don't raise_for_status yet, let it try the fallback or return empty
+
+            if campaign_id and items:
                 has_match = any(
                     self._conversation_matches_profile(c, profile_url) for c in items
                 )
@@ -140,9 +145,15 @@ class HeyReachBot:
                         f"DEBUG: No matching conversation in campaign {campaign_id}, trying global lookup."
                     )
                     payload["filters"].pop("campaignId")
-                    res = self._get_session().post(url, headers=headers, json=payload, timeout=8)
-                    res.raise_for_status()
-                    items = res.json().get("items", [])
+                    res = self._session.post(
+                        url, headers=headers, json=payload, timeout=8
+                    )
+                    if res.status_code == 200:
+                        items = res.json().get("items", [])
+                    else:
+                        print(
+                            f"DEBUG API ERROR ({res.status_code}) on fallback: {res.text}"
+                        )
 
             for conversation in items:
                 conv_id = conversation.get("id")
@@ -160,7 +171,7 @@ class HeyReachBot:
                     f"DEBUG: Filtered lookup returned nothing for {profile_url}, trying 20 most recent."
                 )
                 fallback_payload = {"offset": 0, "limit": 20}
-                res = self._get_session().post(
+                res = self._session.post(
                     url, headers=headers, json=fallback_payload, timeout=8
                 )
                 if res.status_code == 200:
@@ -208,7 +219,7 @@ class HeyReachBot:
         }
 
         try:
-            response = self._get_session().post(self.push_url, headers=headers, json=payload)
+            response = self._session.post(self.push_url, headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -229,7 +240,7 @@ class HeyReachBot:
         url = "https://api.heyreach.io/api/public/campaign/GetAll"
         payload = {"offset": 0, "limit": 50, "keyword": name}
         try:
-            response = self._get_session().post(url, headers=headers, json=payload, timeout=8)
+            response = self._session.post(url, headers=headers, json=payload, timeout=8)
             response.raise_for_status()
             data = response.json()
             items = data.get("items", [])
@@ -260,7 +271,7 @@ class HeyReachBot:
         url = "https://api.heyreach.io/api/public/campaign/GetLeadsFromCampaign"
         payload = {"campaignId": campaign_id, "limit": 100}
         try:
-            response = self._get_session().post(url, headers=headers, json=payload, timeout=8)
+            response = self._session.post(url, headers=headers, json=payload, timeout=8)
             response.raise_for_status()
             data = response.json()
             return data.get("items") if isinstance(data, dict) else data
@@ -293,7 +304,9 @@ class HeyReachBot:
             }
 
             try:
-                response = self._get_session().post(url, headers=headers, json=payload, timeout=8)
+                response = self._session.post(
+                    url, headers=headers, json=payload, timeout=8
+                )
                 response.raise_for_status()
                 data = response.json()
                 items = data.get("items") if isinstance(data, dict) else data
@@ -336,7 +349,7 @@ class HeyReachBot:
                                 "filters": {"leadProfileUrl": profile_url},
                                 "limit": 1,
                             }
-                            conv_res = self._get_session().post(
+                            conv_res = self._session.post(
                                 conv_url, headers=headers, json=conv_payload, timeout=8
                             )
                             if conv_res.status_code == 200:
@@ -387,9 +400,9 @@ class HeyReachBot:
                 print(f"DEBUG: Could not find accountId in conversation {conv_id}")
                 return None
 
-             # 2. Get full messages history via GetChatroom
-             msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{account_id}/{conv_id}"
-             msg_res = self._session.get(msg_url, headers=headers, timeout=8)
+            # 2. Get full messages history via GetChatroom
+            msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{account_id}/{conv_id}"
+            msg_res = self._session.get(msg_url, headers=headers, timeout=8)
             msg_res.raise_for_status()
 
             # GetChatroom response usually contains a 'messages' array or similar
@@ -492,9 +505,9 @@ class HeyReachBot:
             if not conversation_id or not account_id:
                 return []
 
-             # Now fetch messages for this conversation via GetChatroom
-             msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{account_id}/{conversation_id}"
-             msg_res = self._session.get(msg_url, headers=headers, timeout=8)
+            # Now fetch messages for this conversation via GetChatroom
+            msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{account_id}/{conversation_id}"
+            msg_res = self._session.get(msg_url, headers=headers, timeout=8)
             msg_res.raise_for_status()
             msg_data = msg_res.json()
 
@@ -656,7 +669,7 @@ class HeyReachBot:
             print(
                 f"DEBUG: Sending HeyReach message to {final_conv_id} via account {final_acc_id}"
             )
-            send_res = self._get_session().post(
+            send_res = self._session.post(
                 send_url, headers=headers, json=send_payload, timeout=8
             )
 
