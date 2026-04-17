@@ -31,11 +31,24 @@ async def warm_profiles_backend():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
-    await warm_calls_backend()
-    await warm_profiles_backend()
+    
+    # Run warmup tasks in the background so they don't block the application 
+    # from starting and responding to health checks.
+    # We use a try-except here to catch any immediate setup errors.
+    try:
+        # Schedule warmup in the background
+        asyncio.create_task(warm_calls_backend())
+        asyncio.create_task(warm_profiles_backend())
+    except Exception as e:
+        print(f"CRITICAL: Background warmup task scheduling failed: {e}")
+        
     yield
-    from backend.db.connection import close_all_connections
-    close_all_connections()
+    
+    try:
+        from backend.db.connection import close_all_connections
+        close_all_connections()
+    except:
+        pass
 
 async def load_data_async():
     await asyncio.sleep(0.5) # Wait for the app to be fully up
