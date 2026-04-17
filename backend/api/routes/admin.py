@@ -78,6 +78,20 @@ async def update_permissions(user_id: int, permissions: dict):
     finally:
         return_db_connection(conn)
 
+@router.post("/warm-all")
+async def warm_all_data(current_user: schemas.User = Depends(deps.get_current_user)):
+    """Trigger background warming of all core data (Profiles, Chats, Calls)"""
+    from backend.pipeline import query
+    from backend.api.routes import calls
+    import asyncio
+    
+    # Run bulk initialization in threads so we don't block the API response
+    asyncio.create_task(asyncio.to_thread(query.initialize_cache))
+    asyncio.create_task(asyncio.to_thread(calls.bulk_load_calls_cache))
+    
+    return {"status": "warming", "message": "Global cache warming triggered"}
+
+
 @router.delete("/recruiters/{user_id}", dependencies=[Depends(check_admin)])
 async def delete_recruiter(user_id: int):
     conn = get_db_connection()

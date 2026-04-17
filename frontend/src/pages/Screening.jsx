@@ -1,8 +1,31 @@
-import { useState } from 'react'
+import { startTransition, useMemo, useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import SearchResults from '../components/SearchResults'
 import RoleAssignment from '../components/RoleAssignment'
-import { Search, SearchCode, X, Cpu, Database, Check, Loader2, SearchX, AlertCircle, Activity } from 'lucide-react'
+import { Search, SearchCode, X, Cpu, Database, Check, Loader2, SearchX, AlertCircle, Activity, Sparkles, RotateCcw } from 'lucide-react'
+
+function buildRetrySuggestions(query) {
+    const trimmedQuery = (query || '').trim()
+    if (!trimmedQuery) {
+        return []
+    }
+
+    const suggestions = []
+    const companyMatch = trimmedQuery.match(/\b(?:working|worked|currently working|currently at|from|at|in)\s+([a-z0-9&.' -]+)$/i)
+    const companyHint = companyMatch?.[1]?.trim().replace(/[.,]+$/, '')
+
+    if (companyHint && companyHint.length >= 3) {
+        suggestions.push(`People from ${companyHint}`)
+        suggestions.push(`Candidates with experience at ${companyHint}`)
+        suggestions.push(`${companyHint} sales candidates`)
+    } else {
+        suggestions.push(trimmedQuery.replace(/\b(senior|lead|principal|staff|director)\b/gi, '').replace(/\s+/g, ' ').trim())
+        suggestions.push(`${trimmedQuery} in India`)
+        suggestions.push(`Candidates similar to ${trimmedQuery}`)
+    }
+
+    return [...new Set(suggestions.map(suggestion => suggestion.trim()).filter(suggestion => suggestion && suggestion.toLowerCase() !== trimmedQuery.toLowerCase()))].slice(0, 3)
+}
 
 function Screening() {
     const {
@@ -13,6 +36,8 @@ function Screening() {
         statusMessage,
         searchResults,
         usage,
+        searchOutcome,
+        lastSearchError,
         searchCandidatesStream,
         stopSearch,
         clearSearch,
@@ -22,29 +47,39 @@ function Screening() {
     } = useAppStore()
 
     const [inputQuery, setInputQuery] = useState(searchQuery)
-    const [showHistory, setShowHistory] = useState(false)
+    const selectedCount = Object.keys(selectedCandidates).length
 
-    const handleSearch = () => {
-        if (inputQuery.trim()) {
-            setSearchQuery(inputQuery)
-
-            searchCandidatesStream(inputQuery)
-            setShowHistory(false)
+    const handleSearch = (queryOverride) => {
+        const nextQuery = typeof queryOverride === 'string'
+            ? queryOverride.trim()
+            : inputQuery.trim()
+        if (!nextQuery) {
+            return
         }
+
+        if (nextQuery !== inputQuery) {
+            setInputQuery(nextQuery)
+        }
+
+        setSearchQuery(nextQuery)
+        startTransition(() => {
+            searchCandidatesStream(nextQuery)
+        })
     }
 
     const handleClear = () => {
         setInputQuery('')
-        clearSearch()
+        startTransition(() => {
+            clearSearch()
+        })
     }
 
     const handleKeyDown = (e) => {
-        if (e.key === 'Enter') {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault()
             handleSearch()
         }
     }
-
-    const selectedCount = Object.keys(selectedCandidates).length
 
     const suggestions = [
         "Sales Manager in London with SaaS experience",
@@ -52,6 +87,22 @@ function Screening() {
         "Marketing Director in New York",
         "Product Manager for Fintech"
     ]
+
+    const retrySuggestions = useMemo(() => buildRetrySuggestions(searchQuery || inputQuery), [inputQuery, searchQuery])
+    const hasResults = searchResults.length > 0
+    const hasSettledSearch = hasResults || ['empty', 'error', 'cancelled'].includes(searchOutcome)
+    const shouldShowStage = isSearching || !hasResults
+    const steps = [
+        { label: "Analyzing Requirements", icon: Search },
+        { label: "Scanning Candidate Database", icon: Database },
+        { label: "Evaluating Matches with AI", icon: Cpu },
+        { label: "Finalizing Results", icon: Check }
+    ]
+
+    let currentStepIndex = 0
+    if (searchProgress > 25) currentStepIndex = 1
+    if (searchProgress > 50) currentStepIndex = 2
+    if (searchProgress > 85) currentStepIndex = 3
 
     // Step 3: Role Assignment
     if (screenStep === 3) {
@@ -62,70 +113,6 @@ function Screening() {
         )
     }
 
-    // Step 2: Generating/Loading
-    if (isSearching) {
-        const steps = [
-            { label: "Analyzing Requirements", icon: Search },
-            { label: "Scanning Candidate Database", icon: Database },
-            { label: "Evaluating Matches with AI", icon: Cpu },
-            { label: "Finalizing Results", icon: Check }
-        ]
-
-        let currentStepIndex = 0
-        if (searchProgress > 25) currentStepIndex = 1
-        if (searchProgress > 50) currentStepIndex = 2
-        if (searchProgress > 85) currentStepIndex = 3
-
-        return (
-            <div style={{ width: '100%', position: 'relative', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <div className="loader-container">
-                    {/* Pulsing Brain */}
-                    <div className="ai-brain-pulse">
-                        <Activity size={40} />
-                    </div>
-
-                    <h2 style={{ fontSize: '24px', fontWeight: '700', color: '#1e293b', marginBottom: '8px' }}>
-                        AI Talent Scout
-                    </h2>
-                    <p style={{ color: '#64748b', marginBottom: '40px' }}>
-                        Finding the perfect match for your role...
-                    </p>
-
-                    {/* Steps */}
-                    <div className="loading-steps">
-                        {steps.map((step, index) => {
-                            const Icon = step.icon
-                            let statusClass = ''
-                            if (index < currentStepIndex) statusClass = 'completed'
-                            else if (index === currentStepIndex) statusClass = 'active'
-
-                            return (
-                                <div key={index} className={`step-item ${statusClass}`}>
-                                    <div className="step-icon">
-                                        {index < currentStepIndex ? <Check size={14} /> : <Icon size={14} />}
-                                    </div>
-                                    <div style={{ flex: 1, fontSize: '14px', fontWeight: index === currentStepIndex ? '600' : '500' }}>
-                                        {step.label}
-                                    </div>
-                                    {index === currentStepIndex && <Loader2 size={16} className="animate-spin" style={{ color: '#7c3aed' }} />}
-                                </div>
-                            )
-                        })}
-                    </div>
-
-                    <button
-                        className="btn btn-secondary"
-                        onClick={stopSearch}
-                        style={{ marginTop: '40px', fontSize: '13px', padding: '8px 16px' }}
-                    >
-                        Cancel Screening
-                    </button>
-                </div>
-            </div>
-        )
-    }
-
-    // Step 1: Search Interface + Results
     return (
         <div style={{ width: '100%', position: 'relative', minHeight: '100vh', padding: '40px 40px 40px' }}>
             <h2 className="screen-header">Candidate Screening</h2>
@@ -141,8 +128,6 @@ function Screening() {
                         value={inputQuery}
                         onChange={(e) => setInputQuery(e.target.value)}
                         onKeyDown={handleKeyDown}
-                        onFocus={() => setShowHistory(true)}
-                        onBlur={() => setTimeout(() => setShowHistory(false), 200)}
                     />
                     {inputQuery && (
                         <button
@@ -178,20 +163,186 @@ function Screening() {
                         <button className="btn btn-secondary" onClick={handleClear}>
                             Clear
                         </button>
-                         <button
+                        <button
                             className="btn btn-primary"
                             onClick={handleSearch}
                             disabled={!inputQuery.trim()}
                         >
-                            <SearchCode size={16} /> Screen Candidates
+                            {isSearching ? <Loader2 size={16} className="animate-spin" /> : <SearchCode size={16} />}
+                            {isSearching ? 'Screening...' : 'Screen Candidates'}
                         </button>
                     </div>
                 </div>
             </div>
 
-            {/* Show results if available */}
-            {searchResults.length > 0 && (
-                <>
+            {shouldShowStage && (
+                <div className="screening-stage-shell">
+                    {isSearching && (
+                        <div className="screening-stage-card screening-stage-loading">
+                            <div className="loader-container" style={{ minHeight: 'auto' }}>
+                                <div className="ai-brain-pulse">
+                                    <Activity size={40} />
+                                </div>
+
+                                <h2 style={{ fontSize: '24px', fontWeight: '700', color: '#1e293b', marginBottom: '8px' }}>
+                                    AI Talent Scout
+                                </h2>
+                                <p style={{ color: '#64748b', marginBottom: '16px', textAlign: 'center', maxWidth: '520px' }}>
+                                    Finding the strongest match for your role without freezing the screen.
+                                </p>
+
+                                <div className="screening-status-chip">
+                                    <Sparkles size={14} />
+                                    <span>{statusMessage || 'Screening candidates...'}</span>
+                                </div>
+
+                                <div className="screening-progress-track">
+                                    <div
+                                        className="screening-progress-fill"
+                                        style={{ width: `${Math.max(searchProgress, 8)}%` }}
+                                    />
+                                </div>
+
+                                <div className="loading-steps" style={{ marginTop: '8px' }}>
+                                    {steps.map((step, index) => {
+                                        const Icon = step.icon
+                                        let statusClass = ''
+                                        if (index < currentStepIndex) statusClass = 'completed'
+                                        else if (index === currentStepIndex) statusClass = 'active'
+
+                                        return (
+                                            <div key={index} className={`step-item ${statusClass}`}>
+                                                <div className="step-icon">
+                                                    {index < currentStepIndex ? <Check size={14} /> : <Icon size={14} />}
+                                                </div>
+                                                <div style={{ flex: 1, fontSize: '14px', fontWeight: index === currentStepIndex ? '600' : '500' }}>
+                                                    {step.label}
+                                                </div>
+                                                {index === currentStepIndex && <Loader2 size={16} className="animate-spin" style={{ color: '#7c3aed' }} />}
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={stopSearch}
+                                    style={{ marginTop: '28px', fontSize: '13px', padding: '8px 16px' }}
+                                >
+                                    Cancel Screening
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {!isSearching && !hasSettledSearch && (
+                        <div className="screening-stage-card screening-stage-idle">
+                            <div className="screening-idle-header">
+                                <div className="screening-idle-badge">
+                                    <Sparkles size={14} />
+                                    <span>Fast natural-language search</span>
+                                </div>
+                                <h3>Search by company, title, geography, product focus, or experience</h3>
+                                <p>
+                                    Screening works best when you write the request the way you would brief a recruiter.
+                                    The page will keep the search box visible and transition results in underneath it.
+                                </p>
+                            </div>
+                            <div className="screening-idle-grid">
+                                {suggestions.map((suggestion) => (
+                                    <button
+                                        key={suggestion}
+                                        type="button"
+                                        className="screening-idle-chip"
+                                        onClick={() => setInputQuery(suggestion)}
+                                    >
+                                        {suggestion}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {!isSearching && searchOutcome === 'empty' && (
+                        <div className="screening-stage-card screening-stage-empty">
+                            <div className="screening-empty-icon">
+                                <SearchX size={28} />
+                            </div>
+
+                            <h3>No close matches yet</h3>
+                            <p>
+                                I couldn&apos;t find a strong match for <strong>{searchQuery}</strong>.
+                                Try a broader phrase, or rerun one of these relaxed searches.
+                            </p>
+
+                            {retrySuggestions.length > 0 && (
+                                <div className="screening-empty-actions">
+                                    {retrySuggestions.map((suggestion) => (
+                                        <button
+                                            key={suggestion}
+                                            type="button"
+                                            className="screening-suggestion-button"
+                                            onClick={() => handleSearch(suggestion)}
+                                        >
+                                            {suggestion}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+
+                            <div className="screening-empty-footer">
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={handleClear}
+                                >
+                                    Clear Screening
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {!isSearching && searchOutcome === 'error' && (
+                        <div className="screening-stage-card screening-stage-error">
+                            <div className="screening-empty-icon error">
+                                <AlertCircle size={28} />
+                            </div>
+                            <h3>Screening hit a snag</h3>
+                            <p>{lastSearchError || statusMessage || 'The search could not be completed right now.'}</p>
+                            <div className="screening-empty-actions">
+                                <button
+                                    type="button"
+                                    className="screening-suggestion-button"
+                                    onClick={() => handleSearch(searchQuery || inputQuery)}
+                                >
+                                    <RotateCcw size={14} />
+                                    Retry Search
+                                </button>
+                                <button
+                                    type="button"
+                                    className="screening-suggestion-button"
+                                    onClick={handleClear}
+                                >
+                                    Start Fresh
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {!isSearching && searchOutcome === 'cancelled' && (
+                        <div className="screening-stage-card screening-stage-cancelled">
+                            <div className="screening-idle-badge">
+                                <AlertCircle size={14} />
+                                <span>Screening stopped</span>
+                            </div>
+                            <h3>Your previous search was cancelled</h3>
+                            <p>Update the query and run it again whenever you&apos;re ready.</p>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {hasResults && !isSearching && (
+                <div className="screening-results-panel">
                     <div className="result-banner">
                         <div className="result-banner-content">
                             <div className="result-banner-title">{searchResults.length} Candidates Found</div>
@@ -226,66 +377,6 @@ function Screening() {
                             <span style={{ color: '#94a3b8', fontSize: '14px' }}>Select candidates from the list above</span>
                         )}
                     </div>
-                </>
-            )}
-
-            {/* Status message when no results */}
-            {/* Professional No Results State */}
-            {!isSearching && searchResults.length === 0 && statusMessage && (
-                <div style={{
-                    marginTop: '32px',
-                    padding: '40px',
-                    background: '#fff5f5', /* Red-50 */
-                    border: '1px solid #fed7d7', /* Red-200 */
-                    borderRadius: '16px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    textAlign: 'center',
-                    boxShadow: '0 4px 6px -1px rgba(229, 62, 62, 0.05)'
-                }}>
-                    <div style={{
-                        width: '64px',
-                        height: '64px',
-                        background: '#fff',
-                        borderRadius: '50%',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        marginBottom: '16px',
-                        boxShadow: '0 2px 4px rgba(0,0,0,0.05)',
-                        border: '1px solid #fed7d7'
-                    }}>
-                        <SearchX size={32} color="#e53e3e" />
-                    </div>
-
-                    <h3 style={{ fontSize: '18px', fontWeight: '700', color: '#c53030', marginBottom: '8px' }}>
-                        No Matches Found
-                    </h3>
-
-                    <p style={{ color: '#718096', maxWidth: '400px', marginBottom: '24px', lineHeight: '1.6' }}>
-                        We couldn't find any candidates matching "<strong>{searchQuery}</strong>".
-                        The criteria might be too specific.
-                    </p>
-
-                    <div style={{ textAlign: 'left', background: 'white', padding: '20px', borderRadius: '12px', border: '1px solid #edf2f7', width: '100%', maxWidth: '450px' }}>
-                        <div style={{ fontSize: '12px', fontWeight: '600', color: '#718096', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.5px' }}>
-                            Suggestions
-                        </div>
-                        <ul style={{ margin: 0, paddingLeft: '20px', color: '#4a5568', fontSize: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                            <li>Try using broader terms (e.g., "Developer" instead of "Senior Python Developer")</li>
-                            <li>Check for spelling errors in your query</li>
-                            <li>Remove specific location or experience constraints</li>
-                        </ul>
-                    </div>
-
-                    <button
-                        className="btn btn-secondary"
-                        onClick={handleClear}
-                        style={{ marginTop: '24px' }}
-                    >
-                        Clear Screening & Try Again
-                    </button>
                 </div>
             )}
         </div>

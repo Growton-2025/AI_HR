@@ -1,0 +1,71 @@
+import os
+import requests
+import tempfile
+import threading
+from typing import Optional
+from openai import OpenAI
+from backend.db.connection import get_db_connection
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def process_call_audio(call_id: int, recording_url: str):
+    """
+    Background worker to transcribe and summarize call audio.
+    """
+    if not recording_url:
+        return
+
+    # Run in a separate thread to avoid blocking the webhook response
+    thread = threading.Thread(target=_process_audio_task, args=(call_id, recording_url))
+    thread.start()
+
+def _process_audio_task(call_id: int, recording_url: str):
+    try:
+        # 1. Download the audio to a temporary file
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp_path = tmp.name
+            response = requests.get(recording_url, timeout=60)
+            if response.status_code != 200:
+                print(f"ERROR: Failed to download audio from {recording_url}")
+                return
+            tmp.write(response.content)
+
+        # 2. Transcribe using Whisper
+        print(f"DEBUG: Transcribing call {call_id}...")
+        with open(tmp_path, "rb") as audio_file:
+            transcript_res = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file
+            )
+        transcript_text = transcript_res.text
+
+        # 3. Summarize using GPT-4o
+        print(f"DEBUG: Summarizing call {call_id}...")
+        summary_res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert HR assistant. Summarize the following recruitment call transcript concisely, highlighting key candidate points and the next steps."},
+                {"role": "user", "content": transcript_text}
+            ]
+        )
+        summary_text = summary_res.choices[0].message.content
+
+        # 4. Update Database
+        conn = get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE calls SET transcript = %s, summary = %s WHERE id = %s",
+                        (transcript_text, summary_text, call_id)
+                    )
+                    conn.commit()
+                print(f"DEBUG: Successfully processed AI content for call {call_id}")
+            finally:
+                conn.close()
+
+        # 5. Cleanup
+        os.unlink(tmp_path)
+
+    except Exception as e:
+        print(f"ERROR: AI Processing failed for call {call_id}: {e}")

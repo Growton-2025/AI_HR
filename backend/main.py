@@ -12,11 +12,27 @@ from contextlib import asynccontextmanager
 import asyncio
 from backend.pipeline import query
 
+async def warm_calls_backend():
+    # Prime the DB-backed calls routes once so the first real page load
+    # does not spend 10s+ initializing the pool and schema.
+    try:
+        await asyncio.to_thread(calls.warm_call_caches)
+    except Exception as e:
+        print(f"CALLS WARMUP FAILED: {e}")
+
+async def warm_profiles_backend():
+    # Warm the in-memory candidate cache before serving requests so analytics,
+    # dashboard cards, and Talent Pool do not come up empty after a cold start.
+    try:
+        await asyncio.to_thread(query.initialize_cache)
+    except Exception as e:
+        print(f"PROFILE WARMUP FAILED: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # DONT let startup block! Let it yield immediately so Azure is happy.
     print("Backend is starting up...")
-    asyncio.create_task(load_data_async())
+    await warm_calls_backend()
+    await warm_profiles_backend()
     yield
     from backend.db.connection import close_all_connections
     close_all_connections()
@@ -25,11 +41,9 @@ async def load_data_async():
     await asyncio.sleep(0.5) # Wait for the app to be fully up
     print("Starting background data loading...")
     try:
-        # Run initialization in parallel
-        await asyncio.gather(
-            asyncio.to_thread(calls.ensure_calls_schema_ready),
-            asyncio.to_thread(query.initialize_cache)
-        )
+        await asyncio.to_thread(calls.ensure_calls_schema_ready)
+        await asyncio.to_thread(calls.bulk_load_calls_cache)
+        await asyncio.to_thread(query.initialize_cache)
         print("Background data loading complete.")
     except Exception as e:
         print(f"DATABASE CONNECTION FAILED on startup: {e}")
@@ -55,11 +69,11 @@ def read_root():
     return {"message": "Growton AI Backend is running"}
 
 @app.get("/api/health")
-def health_check():
+async def health_check():
     return {"status": "ok"}
 
 @app.get("/api/ping")
-def ping_check():
+async def ping_check():
     return {"message": "pong"}
 
 @app.get("/api/debug_db")

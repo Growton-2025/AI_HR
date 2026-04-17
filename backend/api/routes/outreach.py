@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import threading
 import time
+import asyncio
 from datetime import datetime, timedelta, timezone as tz_module
 from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,25 +19,74 @@ router = APIRouter()
 # In-memory LinkedIn chat cache
 # Structure: {candidate_id: {messages, ts, refreshing}}
 # Messages are cached per candidate to avoid redundant API calls
-_li_chat_cache: Dict[int, Dict] = {}  # {candidate_id: {messages, ts, refreshing}}
+_li_chat_cache: Dict[int, Dict] = {}
 _li_chat_lock = threading.Lock()
-_LI_CACHE_TTL = 300  # 5 minutes - increased from 60s for better performance
-_LI_CACHE_STALE_THRESHOLD = 120  # 2 minutes - trigger background refresh after this
+_LI_CACHE_TTL = 300
+_LI_CACHE_STALE_THRESHOLD = 45
+
+# In-memory Email chat cache
+_email_chat_cache: Dict[int, Dict] = {}
+_email_chat_lock = threading.Lock()
+_EMAIL_CACHE_TTL = 3600        # 1 hour for emails (last longer than LI)
+_EMAIL_CACHE_STALE_THRESHOLD = 300 # 5 minutes threshold for bg refresh
 
 
-def _refresh_li_cache(
+
+def _update_outreach_identifiers(candidate_id: int, conv_id: str, acc_id: int):
+    """Update identifiers in database if they changed."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        fields = []
+        params = []
+        if conv_id:
+            fields.append("li_conversation_id = %s")
+            params.append(str(conv_id))
+        if acc_id:
+            fields.append("li_account_id = %s")
+            params.append(str(acc_id))
+        
+        if fields:
+            params.append(candidate_id)
+            cur.execute(f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s", tuple(params))
+            conn.commit()
+            print(f"DEBUG: Auto-corrected identifiers for cand {candidate_id}")
+        cur.close()
+    except Exception as e:
+        print(f"WARNING: ID update failed: {e}")
+    finally:
+        return_db_connection(conn)
+
+def _sync_li_messages(
     candidate_id: int,
     profile_url: str,
     campaign_id: Optional[int],
     conversation_id: Optional[str],
-):
-    """Background thread: fetch fresh messages and update cache."""
+    account_id: Optional[int] = None,
+) -> List[Dict]:
+    """
+    Core logic to fetch fresh messages from HeyReach and update the cache.
+    Returns the refreshed message list.
+    """
     bot = HeyReachBot()
     messages = []
     try:
-        messages = bot.get_li_chat_history(
-            profile_url, campaign_id=campaign_id, conversation_id=conversation_id
+        res_data = bot.get_li_chat_history(
+            profile_url,
+            campaign_id=campaign_id,
+            conversation_id=conversation_id,
+            account_id=account_id,
         )
+        messages = res_data.get("messages", [])
+        new_conv_id = res_data.get("conversation_id")
+        new_acc_id = res_data.get("account_id")
+
+        # Persistent Auto-Correction: If IDs recovered/changed, save to DB
+        if (new_conv_id and new_conv_id != conversation_id) or (new_acc_id and str(new_acc_id) != str(account_id)):
+             _update_outreach_identifiers(candidate_id, new_conv_id, new_acc_id)
+
         # Clean messages before caching
         if messages:
             for msg in messages:
@@ -43,23 +94,120 @@ def _refresh_li_cache(
                 if raw_body:
                     msg["email_body"] = _clean_email_body(raw_body)
     except Exception as e:
-        print(
-            f"WARNING: Background LI cache refresh failed for cand {candidate_id}: {e}"
-        )
-    finally:
-        with _li_chat_lock:
-            # We store the monotonic timestamp for TTL and the count for verification
-            _li_chat_cache[candidate_id] = {
-                "messages": messages or [],
-                "ts": time.monotonic(),
-                "refreshing": False,
-                "db_updated_at": datetime.now(
-                    tz_module.utc
-                ),  # Track when this was fetched
-            }
-        print(
-            f"DEBUG: LI cache refreshed for cand {candidate_id}: {len(messages or [])} msgs"
-        )
+        print(f"WARNING: HeyReach sync failed for cand {candidate_id}: {e}")
+    
+    with _li_chat_lock:
+        # Persistent Cache Protection: If the new fetch is empty, keep old messages
+        final_messages = messages
+        if not final_messages and candidate_id in _li_chat_cache:
+            old_messages = _li_chat_cache[candidate_id].get("messages", [])
+            if old_messages:
+                print(f"DEBUG: Preserving {len(old_messages)} existing messages for cand {candidate_id} after empty/failed sync.")
+                final_messages = old_messages
+
+        _li_chat_cache[candidate_id] = {
+            "messages": final_messages or [],
+            "ts": time.monotonic(),
+            "refreshing": False,
+            "db_updated_at": datetime.now(tz_module.utc),
+        }
+
+        # ── PERSISTENT DB CACHE ──────────────────────────────────────────────
+        # Save the fetched history to DB so it lives across restarts
+        if final_messages:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE candidate_outreach 
+                        SET li_chat_history_cache = %s,
+                            li_chat_history_updated_at = %s
+                        WHERE candidate_id = %s
+                    """,
+                        (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id),
+                    )
+                    conn.commit()
+                    cur.close()
+                    return_db_connection(conn)
+                except Exception as db_err:
+                    print(f"WARNING: Failed to persist LI cache to DB: {db_err}")
+                    if conn:
+                        return_db_connection(conn, close=True)
+
+    print(f"DEBUG: LI cache refreshed for cand {candidate_id}: {len(final_messages or [])} msgs")
+    return final_messages or []
+
+def _refresh_li_cache_task(
+    candidate_id: int,
+    profile_url: str,
+    campaign_id: Optional[int],
+    conversation_id: Optional[str],
+    account_id: Optional[int] = None,
+):
+    """Background task wrapper."""
+    # No longer skipping background sync due to strict filter
+    _sync_li_messages(candidate_id, profile_url, campaign_id, conversation_id, account_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _sync_email_messages(candidate_id: int, email: str, campaign_id: str) -> List[Dict]:
+    """Fetch fresh emails from Smartlead and update DB/memory cache."""
+    bot = get_smartlead_bot()
+    messages = []
+    try:
+        messages = bot.get_chat_history(email, campaign_id)
+        if messages and isinstance(messages, list):
+            for msg in messages:
+                raw_body = msg.get("email_body", "")
+                if raw_body:
+                    msg["email_body"] = _clean_email_body(raw_body)
+    except Exception as e:
+        print(f"WARNING: Smartlead sync failed for cand {candidate_id}: {e}")
+
+    with _email_chat_lock:
+        final_messages = messages
+        # If fetch failed/empty, preserve old cache if possible
+        if not final_messages and candidate_id in _email_chat_cache:
+            final_messages = _email_chat_cache[candidate_id].get("messages", [])
+
+        _email_chat_cache[candidate_id] = {
+            "messages": final_messages or [],
+            "ts": time.monotonic(),
+            "refreshing": False,
+            "db_updated_at": datetime.now(tz_module.utc),
+        }
+
+        # Persist to DB
+        if final_messages:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE candidate_outreach 
+                        SET email_chat_history_cache = %s,
+                            email_chat_history_updated_at = %s
+                        WHERE candidate_id = %s AND (campaign_id = %s OR %s IS NULL)
+                    """,
+                        (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id, campaign_id, campaign_id),
+                    )
+                    conn.commit()
+                    cur.close()
+                    return_db_connection(conn)
+                except Exception as db_err:
+                    print(f"WARNING: Failed to persist Email cache to DB: {db_err}")
+                    return_db_connection(conn, close=True)
+
+    return final_messages or []
+
+
+def _refresh_email_cache_task(candidate_id: int, email: str, campaign_id: str):
+    _sync_email_messages(candidate_id, email, campaign_id)
 
 
 def _prewarm_single(candidate_id: int):
@@ -78,7 +226,7 @@ def _prewarm_single(candidate_id: int):
         profile_url = cand_row[0]
         cur.execute(
             """
-            SELECT heyreach_campaign_id, li_conversation_id
+            SELECT heyreach_campaign_id, li_conversation_id, li_account_id
             FROM candidate_outreach
             WHERE candidate_id = %s
             ORDER BY updated_at DESC LIMIT 1
@@ -90,6 +238,7 @@ def _prewarm_single(candidate_id: int):
         return_db_connection(conn)
         campaign_id = int(row[0]) if row and row[0] else None
         conv_id = row[1] if row and len(row) > 1 else None
+        acc_id = int(row[2]) if row and len(row) > 2 and row[2] else None
 
         # Only pre-warm if not already cached / refreshing
         with _li_chat_lock:
@@ -103,7 +252,7 @@ def _prewarm_single(candidate_id: int):
             if cached and cached.get("refreshing", False):
                 return  # Already refreshing
 
-        _refresh_li_cache(candidate_id, profile_url, campaign_id, conv_id)
+        _sync_li_messages(candidate_id, profile_url, campaign_id, conv_id, acc_id)
     except Exception as e:
         print(f"WARNING: prewarm failed for cand {candidate_id}: {e}")
         if conn:
@@ -114,6 +263,51 @@ def _prewarm_single(candidate_id: int):
 
 
 # --- Request/Response Models ---
+
+
+# ── Startup & Bulk Warming ────────────────────────────────────────────────────
+
+def bulk_load_chat_caches(rows: List[tuple]):
+    """
+    Populates in-memory caches from DB rows.
+    Row structure must include: candidate_id, li_cache, email_cache
+    """
+    li_count = 0
+    email_count = 0
+    now = time.monotonic()
+    
+    with _li_chat_lock:
+        with _email_chat_lock:
+            for row in rows:
+                cid, li_cache, email_cache = row
+                if li_cache:
+                    if isinstance(li_cache, str): li_cache = json.loads(li_cache)
+                    _li_chat_cache[cid] = {
+                        "messages": li_cache,
+                        "ts": now - (_LI_CACHE_TTL / 2),
+                        "refreshing": False
+                    }
+                    li_count += 1
+                if email_cache:
+                    if isinstance(email_cache, str): email_cache = json.loads(email_cache)
+                    _email_chat_cache[cid] = {
+                        "messages": email_cache,
+                        "ts": now - (_EMAIL_CACHE_TTL / 2),
+                        "refreshing": False
+                    }
+                    email_count += 1
+                    
+    print(f"DEBUG: Bulk-warmed {li_count} LI chats and {email_count} Email chats into memory.")
+
+def _startup_prewarm():
+    """Run once at startup to warm the LI cache for known active candidates."""
+    # This will now be handled by bulk_load_chat_caches called from query.py
+    pass
+
+
+_startup_thread = threading.Thread(target=_startup_prewarm, daemon=True)
+_startup_thread.start()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class OutreachTriggerRequest(BaseModel):
@@ -751,6 +945,7 @@ async def prewarm_linkedin_cache(
 async def get_linkedin_chat_history(
     role_id: int,
     candidate_id: int,
+    force: bool = False,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured LinkedIn chat history for a candidate.
@@ -770,7 +965,8 @@ async def get_linkedin_chat_history(
         if role_id == 0:
             cur.execute(
                 """
-                SELECT updated_at, heyreach_campaign_id, li_conversation_id
+                SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
+                       li_chat_history_cache
                 FROM candidate_outreach
                 WHERE candidate_id = %s
                 ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
@@ -781,7 +977,8 @@ async def get_linkedin_chat_history(
             role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
             cur.execute(
                 f"""
-                SELECT updated_at, heyreach_campaign_id, li_conversation_id
+                SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
+                       li_chat_history_cache
                 FROM candidate_outreach
                 WHERE candidate_id = %s AND {role_where}
                 ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
@@ -789,10 +986,12 @@ async def get_linkedin_chat_history(
                 (candidate_id, *role_params),
             )
 
+
         outreach_row = cur.fetchone()
         print(f"DEBUG: Outreach record for cand {candidate_id}: {outreach_row}")
         cur.close()
         return_db_connection(conn)
+        conn = None  # Mark as returned so the except block doesn't double-return
 
         if not cand_row or not cand_row[0]:
             return {"messages": []}
@@ -804,102 +1003,134 @@ async def get_linkedin_chat_history(
         li_conversation_id = (
             outreach_row[2] if outreach_row and len(outreach_row) > 2 else None
         )
+        initial_li_text = (
+            outreach_row[3] if outreach_row and len(outreach_row) > 3 else None
+        )
+        initial_li_at = (
+            outreach_row[4] if outreach_row and len(outreach_row) > 4 else None
+        )
+        li_account_id = (
+            outreach_row[5] if outreach_row and len(outreach_row) > 5 else None
+        )
+        li_response_text = (
+            outreach_row[6] if outreach_row and len(outreach_row) > 6 else None
+        )
+        response_received_at = (
+            outreach_row[7] if outreach_row and len(outreach_row) > 7 else None
+        )
+        # Index 8: li_chat_history_cache — fetched in same query, no extra DB call needed
+        li_chat_history_cache_raw = (
+            outreach_row[8] if outreach_row and len(outreach_row) > 8 else None
+        )
+        li_account_id_int = int(li_account_id) if li_account_id else None
         campaign_id_int = int(heyreach_campaign_id) if heyreach_campaign_id else None
 
-         # ---------------------------------------------------------------
-         # Cache logic - optimized for performance
-         # ---------------------------------------------------------------
-         # Strategy: Return cached data ASAP, refresh in background if needed
-         # Two-tier cache: Fresh (< 2min) returns immediately, Stale (2-5min) returns + background refresh
-         db_updated_at = outreach_row[0] if outreach_row else None
+        # ---------------------------------------------------------------
+        # Cache logic - optimized for performance
+        # ---------------------------------------------------------------
+        # Strategy: Return cached data ASAP, refresh in background if needed
+        db_updated_at = outreach_row[0] if outreach_row else None
 
-         with _li_chat_lock:
-             cached = _li_chat_cache.get(candidate_id)
-             cache_ts = cached.get("ts", 0) if cached else 0
-             cache_age = time.monotonic() - cache_ts
+        with _li_chat_lock:
+            cached = _li_chat_cache.get(candidate_id)
+            cache_ts = cached.get("ts", 0) if cached else 0
+            cache_age = time.monotonic() - cache_ts
+            is_stale = cache_age > _LI_CACHE_STALE_THRESHOLD
+            already_refreshing = cached and cached.get("refreshing", False)
 
-             # Two-tier strategy:
-             # is_very_stale: cache > 5min old, needs synchronous fetch
-             # is_stale: cache 2-5min old, return cached + trigger background refresh
-             is_very_stale = cache_age > _LI_CACHE_TTL
-             is_stale = cache_age > _LI_CACHE_STALE_THRESHOLD
-             already_refreshing = cached and cached.get("refreshing", False)
+            if force:
+                is_stale = True
+                already_refreshing = False
 
-        if already_refreshing:
-            # For polling UI: If we are already refreshing, return what we have (stale or empty)
-            # DO NOT wait in a loop, it makes the frontend feel sluggish/stuck.
-            print(
-                f"DEBUG: LI cache is currently refreshing for cand {candidate_id}. Serving current state."
+        # Common junk/placeholder values that should never be shown as real messages
+        _JUNK_LI_INITIALS = {"linkedin", "hi", "hii", "hello", "test", "hey", "helo", "helo", "msg", "message"}
+
+        def _prepend_initial(msgs):
+            """Helper: prepend initial_li_text if not already in the list.
+            Guards against junk test data being shown as a real sent message.
+            """
+            if not initial_li_text:
+                return msgs
+            clean = initial_li_text.strip()
+            # No more strict junk guard - if a message exists, show it.
+            if not clean:
+                return msgs
+            already = any(
+                (m.get("email_body") or "").strip() == clean
+                for m in (msgs or [])
             )
-            return {"messages": cached["messages"] if cached else [], "syncing": True}
+            if already:
+                return msgs
+            entry = {
+                "type": "SENT",
+                "email_body": clean,
+                "time": initial_li_at.isoformat() if initial_li_at else None,
+                "sender_name": "You",
+            }
+            return [entry] + (msgs or [])
 
-         if cached and not is_very_stale and not is_stale:
-             # Fresh cache (< 2min) — return immediately, no refresh needed
-             print(
-                 f"DEBUG: LI cache HIT (age {cache_age:.0f}s) for cand {candidate_id}: {len(cached['messages'])} msgs"
-             )
-             return {"messages": cached["messages"]}
 
-         if cached and is_stale and not is_very_stale:
-             # Stale cache (2-5min) but HAS data — return immediately, trigger background refresh
-             print(
-                 f"DEBUG: LI cache STALE (age {cache_age:.0f}s) for cand {candidate_id}, refreshing in background"
-             )
-             with _li_chat_lock:
-                 _li_chat_cache[candidate_id]["refreshing"] = True
+        # ── Always-instant strategy ─────────────────────────────────────────
+        # Return cached data immediately. Kick off a background refresh if
+        # stale. The frontend handles freshness via SWR parallel fetching.
 
-             t = threading.Thread(
-                 target=_refresh_li_cache,
-                 args=(candidate_id, profile_url, campaign_id_int, li_conversation_id),
-                 daemon=True,
-             )
-             t.start()
-             return {"messages": cached["messages"], "syncing": True}
+        if not already_refreshing and (is_stale or not cached):
+            # ── INSTANT DB CACHE RESTORE ─────────────────────────────────────
+            # li_chat_history_cache is already in outreach_row[8] — zero extra DB calls.
+            # Restore to memory cache so the response is instant on first load.
+            if not cached and li_chat_history_cache_raw:
+                try:
+                    messages_from_db = li_chat_history_cache_raw
+                    if isinstance(messages_from_db, str):
+                        messages_from_db = json.loads(messages_from_db)
+                    if messages_from_db:
+                        print(f"DEBUG: Instantly restored {len(messages_from_db)} msgs from DB cache for cand {candidate_id}")
+                        with _li_chat_lock:
+                            _li_chat_cache[candidate_id] = {
+                                "messages": messages_from_db,
+                                # Mark semi-stale so background refresh still runs
+                                "ts": time.monotonic() - (_LI_CACHE_TTL / 2),
+                                "refreshing": False
+                            }
+                            cached = _li_chat_cache[candidate_id]
+                except Exception as e:
+                    print(f"WARNING: DB cache restore parse failed: {e}")
 
-         # No cache or very stale — perform synchronous fetch and prime the cache
-         print(f"DEBUG: LI cache MISS/VERY_STALE for cand {candidate_id}, fetching live...")
-         with _li_chat_lock:
-             # Prevent other requests from fetching simultaneously
-             if candidate_id not in _li_chat_cache:
-                 _li_chat_cache[candidate_id] = {
-                     "messages": [],
-                     "ts": 0,
-                     "refreshing": True,
-                 }
-             else:
-                 _li_chat_cache[candidate_id]["refreshing"] = True
-
-         bot = HeyReachBot()
-         messages = []
-         try:
-             messages = bot.get_li_chat_history(
-                 profile_url,
-                 campaign_id=campaign_id_int,
-                 conversation_id=li_conversation_id,
-             )
-             messages = messages or []
-
-             # Clean messages before returning/caching
-             for msg in messages:
-                 raw_body = msg.get("email_body", "")
-                 if raw_body:
-                     msg["email_body"] = _clean_email_body(raw_body)
-         except Exception as e:
-             print(
-                 f"ERROR: Sync LinkedIn chat fetch failed for cand {candidate_id}: {e}"
-             )
-        finally:
+            # Kick off background refresh (always, if stale or first load)
             with _li_chat_lock:
-                _li_chat_cache[candidate_id] = {
-                    "messages": messages,
-                    "ts": time.monotonic(),
-                    "refreshing": False,
-                }
+                if candidate_id not in _li_chat_cache:
+                    _li_chat_cache[candidate_id] = {"messages": [], "ts": 0, "refreshing": True}
+                else:
+                    _li_chat_cache[candidate_id]["refreshing"] = True
 
-        print(
-            f"DEBUG: HeyReach returned {len(messages)} messages for candidate {candidate_id}"
-        )
-        return {"messages": messages}
+            t = threading.Thread(
+                target=_refresh_li_cache_task,
+                args=(candidate_id, profile_url, campaign_id_int, li_conversation_id, li_account_id_int),
+                daemon=True,
+            )
+            t.start()
+            print(f"DEBUG: Background HeyReach refresh started for cand {candidate_id} (cached={cached is not None}, stale={is_stale})")
+
+        current_messages = cached["messages"] if cached else []
+        final_msgs = _prepend_initial(current_messages)
+        
+        # ── OPTIMISTIC FALLBACK ──────────────────────────────────────────────
+        # If the history is STILL empty, but we possess a reply in our DB,
+        # synthesize a virtual message so the user sees the content immediately.
+        if not final_msgs and li_response_text:
+            print(f"DEBUG: Using optimistic fallback for candidate {candidate_id}")
+            final_msgs = [{
+                "type": "RECEIVED",
+                "email_body": li_response_text,
+                "time": response_received_at.isoformat() if response_received_at else None,
+                "sender_name": "Candidate"
+            }]
+
+        return {
+            "messages": final_msgs,
+            "syncing": not cached or is_stale or (cached and cached.get("refreshing")),
+        }
+
 
     except Exception as e:
         if conn:
@@ -962,14 +1193,16 @@ async def get_chat_history(
     try:
         cur = conn.cursor()
         role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
-        # Use ORDER BY + LIMIT 1 to get the most recent outreach row with a campaign_id if possible
+        # Strictly prioritize rows that have a Smartlead campaign_id (Email campaign)
+        # to prevent LinkedIn records from leaking into the Email history view.
         cur.execute(
             f"""
-            SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at
+            SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at,
+                   co.email_chat_history_cache, co.email_chat_history_updated_at
             FROM candidate_outreach co
             JOIN candidates c ON c.id = co.candidate_id
             WHERE co.candidate_id = %s AND {role_where}
-            ORDER BY co.campaign_id DESC NULLS LAST, co.updated_at DESC
+            ORDER BY (co.campaign_id IS NOT NULL) DESC, co.updated_at DESC
             LIMIT 1
         """,
             (candidate_id, *role_params),
@@ -983,67 +1216,85 @@ async def get_chat_history(
                 status_code=404, detail="Candidate outreach record not found"
             )
 
-        email, campaign_id, initial_msg_text, initial_msg_at = row
+        email, campaign_id, initial_msg_text, initial_msg_at, db_cache, db_updated_at = row
         print(f"DEBUG: Email chat — email={email}, campaign_id={campaign_id}")
 
+        # ── Always-instant strategy for Email ──
+        with _email_chat_lock:
+            cached = _email_chat_cache.get(candidate_id)
+            cache_ts = cached.get("ts", 0) if cached else 0
+            cache_age = time.monotonic() - cache_ts
+            is_stale = cache_age > _EMAIL_CACHE_STALE_THRESHOLD
+            already_refreshing = cached and cached.get("refreshing", False)
+
+        # ── Guard: junk initial messages or platform crosstalk
+        # If we don't have a campaign_id, this record might be a LinkedIn-only record.
+        # We should NOT show the initial_message (email col) if there's no email campaign.
+        _JUNK_EMAIL_INITIALS = {"hii", "hi", "hey", "hello", "test", "linkedin", "msg", "message", "helo", "hello!", "hi!"}
         if not campaign_id:
-            # No campaign yet — return initial message if stored
-            if initial_msg_text:
-                return {
-                    "messages": [
-                        {
-                            "type": "SENT",
-                            "email_body": initial_msg_text,
-                            "time": initial_msg_at.isoformat()
-                            if initial_msg_at
-                            else None,
-                            "sender_name": "You",
-                        }
-                    ]
-                }
-            return {"messages": []}
-
-        bot = get_smartlead_bot()
-        print(f"DEBUG: Fetching Email history for {email} (campaign_id: {campaign_id})")
-        messages = bot.get_chat_history(email, campaign_id)
-        print(f"DEBUG: Found {len(messages) if messages else 0} Emails")
-
-        # Prepend the initial outreach message if Smartlead hasn't stored it yet
+            initial_msg_text = None
+        
         if initial_msg_text:
-            initial_entry = {
+            _clean_init = initial_msg_text.strip()
+            if len(_clean_init) < 12 or _clean_init.lower() in _JUNK_EMAIL_INITIALS:
+                initial_msg_text = None
+
+        def _prepend_initial_email(msgs):
+            if not initial_msg_text: return msgs
+            clean_init = initial_msg_text.strip()
+            # Already handled earlier
+            entry = {
                 "type": "SENT",
-                "email_body": initial_msg_text,
+                "email_body": clean_init,
                 "time": initial_msg_at.isoformat() if initial_msg_at else None,
                 "sender_name": "You",
             }
-            if not messages:
-                messages = [initial_entry]
-            else:
-                # Only prepend if no message with same text already exists (avoid duplicates)
-                already_present = any(
-                    (m.get("email_body") or "").strip() == initial_msg_text.strip()
-                    for m in messages
+            if not msgs: return [entry]
+            if any((m.get("email_body") or "").strip() == clean_init for m in msgs):
+                return msgs
+            return [entry] + msgs
+
+        if not already_refreshing and (is_stale or not cached):
+            # Try instant restore from DB cache column
+            if not cached and db_cache:
+                try:
+                    msgs_from_db = db_cache
+                    if isinstance(msgs_from_db, str): msgs_from_db = json.loads(msgs_from_db)
+                    if msgs_from_db:
+                        print(f"DEBUG: Instantly restored {len(msgs_from_db)} email msgs from DB cache for cand {candidate_id}")
+                        with _email_chat_lock:
+                            _email_chat_cache[candidate_id] = {
+                                "messages": msgs_from_db,
+                                "ts": time.monotonic() - (_EMAIL_CACHE_TTL / 2),
+                                "refreshing": False
+                            }
+                            cached = _email_chat_cache[candidate_id]
+                except Exception as e:
+                    print(f"WARNING: Email DB cache restore failed: {e}")
+
+            # Kick off background refresh if we have a campaign
+            if campaign_id:
+                with _email_chat_lock:
+                    if candidate_id not in _email_chat_cache:
+                        _email_chat_cache[candidate_id] = {"messages": [], "ts": 0, "refreshing": True}
+                    else:
+                        _email_chat_cache[candidate_id]["refreshing"] = True
+
+                t = threading.Thread(
+                    target=_refresh_email_cache_task,
+                    args=(candidate_id, email, campaign_id),
+                    daemon=True
                 )
-                if not already_present:
-                    messages = [initial_entry] + messages
+                t.start()
+                print(f"DEBUG: Background Smartlead refresh started for cand {candidate_id}")
 
-        if messages and isinstance(messages, list):
-            for msg in messages:
-                raw_body = msg.get("email_body", "")
-                if raw_body:
-                    cleaned_text = _clean_email_body(raw_body)
-                    # For emails containing raw HTML entities (like <email@domain.com>) fix them so the frontend
-                    # strips them cleanly without rendering literal "&lt;".
-                    cleaned_text = (
-                        cleaned_text.replace("&lt;", "<")
-                        .replace("&gt;", ">")
-                        .replace("&nbsp;", " ")
-                        .replace("&amp;", "&")
-                        .replace("&quot;", '"')
-                    )
-                    msg["email_body"] = cleaned_text
-
-        return {"messages": messages or []}
+        # Return whatever we have in cache (or empty) + syncing flag
+        current_messages = cached["messages"] if cached else []
+        final_msgs = _prepend_initial_email(current_messages)
+        return {
+            "messages": final_msgs,
+            "syncing": not cached or is_stale or (cached and cached.get("refreshing")),
+        }
     except HTTPException:
         if conn:
             return_db_connection(conn)
@@ -1052,7 +1303,7 @@ async def get_chat_history(
         if conn:
             return_db_connection(conn)
         raise HTTPException(
-            status_code=500, detail=f"Failed to fetch chat history: {e}"
+            status_code=500, detail=f"Failed to fetch Email chat history: {e}"
         )
 
 
@@ -1147,6 +1398,33 @@ async def send_linkedin_chat_reply(
         )
 
         if success:
+            # Record initial message if first time (optional but keeps patterns consistent)
+            try:
+                conn3 = get_db_connection()
+                if conn3:
+                    with conn3.cursor() as cur3:
+                        role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+                        cur3.execute(
+                            f"""
+                            UPDATE candidate_outreach
+                            SET initial_li_message = %s,
+                                initial_li_message_at = NOW(),
+                                updated_at = NOW()
+                            WHERE candidate_id = %s AND {role_where}
+                              AND initial_li_message IS NULL
+                            """,
+                            (request.message, candidate_id, *role_params)
+                        )
+                        conn3.commit()
+                        return_db_connection(conn3)
+            except:
+                pass
+
+            with _li_chat_lock:
+                if candidate_id in _li_chat_cache:
+                    _li_chat_cache[candidate_id]["ts"] = (
+                        0  # Invalidate cache so next fetch is fresh
+                    )
             return {"success": True}
         else:
             raise HTTPException(
@@ -1348,7 +1626,7 @@ def sync_responses(
         # Fetch both Smartlead and HeyReach identifiers
         cur.execute(
             f"""
-            SELECT co.candidate_id, c.email, co.campaign_id, c.linkedin, co.heyreach_campaign_id
+            SELECT co.candidate_id, c.email, co.campaign_id, c.linkedin, co.heyreach_campaign_id, co.li_conversation_id, co.li_account_id
             FROM candidate_outreach co
             JOIN candidates c ON c.id = co.candidate_id
             WHERE {role_where}
@@ -1375,7 +1653,7 @@ def sync_responses(
 
     print(f"Syncing responses for {len(candidates_data)} candidates...")
 
-    for c_id, email, sl_campaign_id, linkedin, hr_campaign_id in candidates_data:
+    for c_id, email, sl_campaign_id, linkedin, hr_campaign_id, li_conv_id, li_acc_id in candidates_data:
         update_data = {"candidate_id": c_id, "role_id": role_id}
         has_update = False
 
@@ -1398,23 +1676,68 @@ def sync_responses(
 
         # 2. Sync HeyReach (LinkedIn)
         if linkedin:
+            # Synchronize responses for everyone
             try:
-                print(f"DEBUG: Starting HeyReach sync for {linkedin}")
-                activity = hr_bot.get_lead_activity(
-                    linkedin,
-                    campaign_id=int(hr_campaign_id) if hr_campaign_id else None,
-                )
+                activity = None
+                if hr_campaign_id:
+                    # Batch fetch for campaign to avoid rate limiting
+                    hr_camp_int = int(hr_campaign_id)
+                    if hr_camp_int not in hr_campaign_cache:
+                        print(
+                            f"DEBUG: Fetching all activities for HeyReach campaign {hr_camp_int}"
+                        )
+                        hr_campaign_cache[hr_camp_int] = hr_bot.get_campaign_activities(
+                            hr_camp_int
+                        )
+
+                    norm_li = hr_bot._normalize_linkedin_url(linkedin)
+                    if norm_li in hr_campaign_cache[hr_camp_int]:
+                        activity = hr_campaign_cache[hr_camp_int][norm_li]
+
+                # Fallback to single fetch if not in cache or no campaign_id
+                if not activity:
+                    print(f"DEBUG: Starting HeyReach single sync for {linkedin}")
+                    import time
+
+                    time.sleep(0.5)  # small sleep just for single fetches
+                    activity = hr_bot.get_lead_activity(
+                        linkedin,
+                        campaign_id=int(hr_campaign_id) if hr_campaign_id else None,
+                        conversation_id=li_conv_id,
+                        account_id=int(li_acc_id) if li_acc_id else None,
+                    )
+                    
+                    # Update IDs if recovered
+                    if activity and (activity.get("conversation_id") != li_conv_id or str(activity.get("account_id")) != str(li_acc_id)):
+                        li_conv_id = activity.get("conversation_id")
+                        li_acc_id = activity.get("account_id")
+
                 if activity:
+                    # ── NORMALIZE ACTIVITY KEYS ─────────────────────────────
+                    # Handle keys from both get_campaign_activities and get_lead_activity
+                    is_replied = activity.get("is_replied") or (activity.get("li_status") == "replied")
+                    reply_text = activity.get("reply_text") or activity.get("li_response_text")
+                    last_action_at = activity.get("last_sent_at") or activity.get("li_last_action_at")
+                    sent_count = activity.get("sent_count") or 0
+                    recov_conv_id = activity.get("conversation_id") or activity.get("li_conversation_id") or li_conv_id
+                    recov_acc_id = activity.get("account_id") or activity.get("li_account_id") or li_acc_id
+
                     print(f"DEBUG: HeyReach activity found for {linkedin}: {activity}")
                     update_data["li_status"] = (
-                        "replied" if activity["is_replied"] else "message_sent"
+                        "replied" if is_replied else "message_sent"
                     )
-                    update_data["li_sent_count"] = activity["sent_count"]
-                    update_data["li_last_action_at"] = activity["last_sent_at"]
-                    update_data["li_response_text"] = activity["reply_text"]
-                    update_data["li_response_received_at"] = activity["reply_at"]
-                    update_data["li_conversation_id"] = activity["conversation_id"]
+                    update_data["li_sent_count"] = sent_count
+                    update_data["li_last_action_at"] = last_action_at
+                    update_data["li_response_text"] = reply_text
+                    update_data["li_response_received_at"] = activity.get("reply_at")  # reply_at is only in get_lead_activity
+                    update_data["li_conversation_id"] = recov_conv_id
+                    update_data["li_account_id"] = recov_acc_id
                     has_update = True
+
+                    # Invalidate chat cache if activity was found
+                    with _li_chat_lock:
+                        if c_id in _li_chat_cache:
+                            _li_chat_cache[c_id]["ts"] = 0
             except Exception as e:
                 print(f"Error syncing HeyReach for {linkedin}: {e}")
 
@@ -1439,15 +1762,19 @@ def sync_responses(
                         fields.append("response_received_at = %(response_received_at)s")
                         fields.append("response_text = %(response_text)s")
 
-                    if "li_status" in upd:
-                        fields.append("li_status = %(li_status)s")
-                        fields.append("li_response_text = %(li_response_text)s")
-                        fields.append("li_last_action_at = %(li_last_action_at)s")
-                        fields.append("li_sent_count = %(li_sent_count)s")
-                        fields.append(
-                            "li_response_received_at = %(li_response_received_at)s"
-                        )
-                        fields.append("li_conversation_id = %(li_conversation_id)s")
+                        if "li_status" in upd:
+                            fields.append("li_status = %(li_status)s")
+                            fields.append("li_response_text = %(li_response_text)s")
+                            fields.append("li_last_action_at = %(li_last_action_at)s")
+                            fields.append("li_sent_count = %(li_sent_count)s")
+                            fields.append("li_response_received_at = %(li_response_received_at)s")
+                            
+                            # Use values from the upd dictionary to avoid outer-scope variable leaks
+                            if "li_conversation_id" in upd:
+                                fields.append("li_conversation_id = %(li_conversation_id)s")
+                            
+                            if "li_account_id" in upd:
+                                fields.append("li_account_id = %(li_account_id)s")
 
                     if role_id == 0:
                         role_where_update = "recruitment_role_id IS NULL"
@@ -1469,6 +1796,7 @@ def sync_responses(
         # Keep the in-memory talent pool cache in sync so browse results reflect fresh outreach data.
         try:
             from backend.pipeline.query import update_profile_cache
+            from backend.api.routes.browse import _invalidate_browse_cache
 
             for upd in updates:
                 cache_payload = {}
@@ -1482,6 +1810,10 @@ def sync_responses(
                     cache_payload["li_sent_count"] = upd.get("li_sent_count") or 0
                 if cache_payload:
                     update_profile_cache(upd["candidate_id"], cache_payload)
+
+            # Invalidate browse result cache so next request reflects updated data
+            if updates:
+                _invalidate_browse_cache()
         except Exception as cache_e:
             print(f"Warning: could not update in-memory outreach cache: {cache_e}")
 
@@ -1677,16 +2009,22 @@ async def heyreach_webhook(request: Dict):
         new_response = None
 
         event_lower = event.lower()
-        if "reply" in event_lower or "message" in event_lower:
+
+        # Check if it's explicitly a reply
+        if "reply" in event_lower or "replied" in event_lower:
             new_status = "replied"
             # Extract message
             recent = request.get("recent_messages", [])
             if recent and isinstance(recent, list):
                 last_msg = recent[-1]
-                if last_msg.get("is_reply"):
+                # Trust is_reply flag if it exists, otherwise assume the latest is the reply
+                if last_msg.get("is_reply", True):
                     new_response = last_msg.get("message", "")
             else:
                 new_response = request.get("messageText") or request.get("message")
+
+        elif "message" in event_lower and "sent" in event_lower:
+            new_status = "message_sent"
 
         elif "connection" in event_lower:
             if "accepted" in event_lower:
@@ -1699,27 +2037,44 @@ async def heyreach_webhook(request: Dict):
             if "message" in action.lower() or "send" in action.lower():
                 new_status = "message_sent"
 
+        # Extract Identifiers from webhook for future direct sync optimization
+        conv_id = request.get("conversation_id") or request.get("conversationId")
+        acc_id = request.get("accountId") or request.get("linkedInAccountId")
+
+        # Invalidate in-memory chat cache immediately so UI refresh shows the reply NOW.
+        with _li_chat_lock:
+            if candidate_id in _li_chat_cache:
+                _li_chat_cache[candidate_id]["ts"] = 0
+                print(f"DEBUG: Webhook invalidated LI chat cache for cand {candidate_id} due to event: {event}")
+
         if new_status:
             # Update candidate_outreach
             # Since we don't have role_id in webhook, we update all entries for this candidate
-            # Or we could try to find the active campaign
-            update_sql = """
-                UPDATE candidate_outreach
-                SET li_status = %s,
-                    li_last_action_at = NOW(),
-                    updated_at = NOW()
-            """
+            fields = [
+                "li_status = %s",
+                "li_last_action_at = NOW()",
+                "updated_at = NOW()"
+            ]
             params = [new_status]
 
             if new_response:
-                update_sql += ", li_response_text = %s"
+                fields.append("li_response_text = %s")
                 params.append(new_response)
+            
+            if conv_id:
+                fields.append("li_conversation_id = %s")
+                params.append(str(conv_id))
+            
+            if acc_id:
+                fields.append("li_account_id = %s")
+                params.append(str(acc_id))
 
-            update_sql += " WHERE candidate_id = %s"
+            update_sql = f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s"
             params.append(candidate_id)
 
             cur.execute(update_sql, tuple(params))
             conn.commit()
+
 
         cur.close()
         return_db_connection(conn)

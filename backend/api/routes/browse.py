@@ -2,8 +2,22 @@ from fastapi import APIRouter, Query, HTTPException
 from typing import Optional, List
 from pydantic import BaseModel
 from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID
+import time
+import hashlib
+import json
 
 router = APIRouter()
+
+# ── Server-side browse result cache ───────────────────────────────────────────────
+# Caches filtered + paginated results so repeated requests return instantly
+_browse_cache: dict = {}  # key: param_hash → {result, ts}
+_BROWSE_CACHE_TTL = 20   # seconds
+
+def _invalidate_browse_cache():
+    """Called when outreach data changes so stale data isn't served."""
+    global _browse_cache
+    _browse_cache.clear()
+# ──────────────────────────────────────────────────────────────
 
 class StatusUpdate(BaseModel):
     status: str
@@ -32,7 +46,7 @@ INDUSTRY_KEYWORDS = [
 async def browse_candidates(
     # Pagination
     page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=5, le=100),
+    page_size: int = Query(25, ge=5, le=5000),
     # Search
     q: Optional[str] = None,
     # Filters
@@ -42,6 +56,7 @@ async def browse_candidates(
     location_type: Optional[str] = None,   # On-site | Remote | Hybrid
     product_service: Optional[str] = None,
     status: Optional[str] = None,          # shortlisted | rejected | etc.
+    created_by: Optional[str] = None,
     min_exp: Optional[float] = None,
     max_exp: Optional[float] = None,
     min_avg_tenure: Optional[float] = None, # stability
@@ -50,6 +65,22 @@ async def browse_candidates(
     sort_dir: Optional[str] = "asc",
 ):
     """Browse all candidates with filtering, search, and pagination"""
+
+    # ── Cache key from all params ───────────────────────────────────
+    cache_key_src = json.dumps({
+        "page": page, "page_size": page_size, "q": q, "title": title,
+        "company": company, "city": city, "location_type": location_type,
+        "product_service": product_service, "status": status, "created_by": created_by,
+        "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
+        "sort_by": sort_by, "sort_dir": sort_dir,
+    }, sort_keys=True)
+    cache_key = hashlib.md5(cache_key_src.encode()).hexdigest()
+
+    # Serve from cache if fresh
+    cached = _browse_cache.get(cache_key)
+    if cached and (time.monotonic() - cached["ts"]) < _BROWSE_CACHE_TTL:
+        return cached["result"]
+
     all_profiles = list(PROFILES_BY_ID.values())
 
     # --- Semantic Search for Expertise ---
@@ -84,6 +115,7 @@ async def browse_candidates(
         exp_val = p.get("total_experience_years") or 0
         stability_val = p.get("avg_years_in_company") or 0
         status_val = p.get("status") or ""
+        created_by_val = p.get("created_by") or ""
         name_val = p.get("name") or ""
         title_val = primary_role.get("title") or p.get("headline") or ""
         company_val = primary_role.get("company") or ""
@@ -109,6 +141,8 @@ async def browse_candidates(
         if not matches_filter(company, company_val, "company"):
             continue
         if not matches_filter(city, city_val, "city"):
+            continue
+        if not matches_filter(created_by, created_by_val, "created_by"):
             continue
         if not matches_filter(location_type, loc_val):
             continue
@@ -139,7 +173,9 @@ async def browse_candidates(
             "total_experience_years": round(float(exp_val), 1) if exp_val else 0,
             "avg_tenure_years": round(float(stability_val), 1) if stability_val else 0,
             "status": status_val,
+            "created_by": created_by_val,
             "li_status": p.get("li_status") or "",
+            "li_response_text": p.get("li_response_text") or "",
             "heyreach_campaign_id": p.get("heyreach_campaign_id") or "",
             "email_campaign_id": p.get("email_campaign_id") or "",
             "message_sent_count": p.get("message_sent_count") or 0,
@@ -193,7 +229,7 @@ async def browse_candidates(
     offset = (page - 1) * page_size
     page_results = results[offset: offset + page_size]
 
-    return {
+    result = {
         "candidates": page_results,
         "total": total,
         "page": page,
@@ -202,6 +238,9 @@ async def browse_candidates(
         "status_counts": status_counts,
         "is_semantic_search": bool(semantic_scores),
     }
+    # Store in cache
+    _browse_cache[cache_key] = {"result": result, "ts": time.monotonic()}
+    return result
 
 
 @router.get("/candidates/browse/meta")
@@ -209,12 +248,13 @@ async def browse_metadata():
     """Return unique filter values (for dropdowns)"""
     all_profiles = list(PROFILES_BY_ID.values())
 
-    companies, cities, titles, products, locations, statuses = set(), set(), set(), set(), set(), set()
+    companies, cities, titles, products, locations, statuses, recruiters = set(), set(), set(), set(), set(), set(), set()
     for p in all_profiles:
         primary_role = (p.get("roles") or [{}])[0]
         if c := primary_role.get("company"): companies.add(c)
         if ci := (p.get("location") or "").split(",")[0].strip(): cities.add(ci)
         if t := (primary_role.get("title") or p.get("headline") or ""): titles.add(t)
+        if recruiter := (p.get("created_by") or "").strip(): recruiters.add(recruiter)
         
         # Combine local services and company product/service
         if cp := (primary_role.get("company_details") or {}).get("product_service"): products.add(cp)
@@ -244,6 +284,7 @@ async def browse_metadata():
         "products": sorted(products)[:100],
         "location_types": sorted(locations),
         "statuses": sorted(statuses),
+        "recruiters": sorted(recruiters),
     }
 
 @router.post("/candidates/{candidate_id}/status")

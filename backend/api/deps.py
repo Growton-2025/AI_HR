@@ -1,4 +1,5 @@
-
+import threading
+import time
 from typing import Generator, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -10,6 +11,26 @@ from backend.api import schemas
 from backend.db.connection import get_db_connection, return_db_connection
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
+_USER_CACHE_TTL_SECONDS = 60
+_user_cache: dict[str, tuple[float, schemas.User]] = {}
+_user_cache_lock = threading.Lock()
+
+
+def _get_cached_user(username: str) -> Optional[schemas.User]:
+    with _user_cache_lock:
+        cached = _user_cache.get(username)
+        if not cached:
+            return None
+        cached_at, user = cached
+        if time.time() - cached_at > _USER_CACHE_TTL_SECONDS:
+            _user_cache.pop(username, None)
+            return None
+        return user
+
+
+def _set_cached_user(username: str, user: schemas.User) -> None:
+    with _user_cache_lock:
+        _user_cache[username] = (time.time(), user)
 
 def get_db():
     conn = get_db_connection()
@@ -42,9 +63,13 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> sch
         token_data = schemas.TokenData(username=username)
     except (JWTError, ValidationError):
         raise credentials_exception
+
+    cached_user = _get_cached_user(token_data.username)
+    if cached_user is not None:
+        return cached_user
     
     # Return user from token data
-    conn = get_db_connection()
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise credentials_exception
     
@@ -54,7 +79,7 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> sch
             user = cur.fetchone()
             if not user:
                 raise credentials_exception
-            return schemas.User(
+            resolved_user = schemas.User(
                 id=user[0], 
                 username=user[2], 
                 email=user[2], 
@@ -62,6 +87,7 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> sch
                 role=user[3], 
                 permissions=user[4] or {}
             )
+            _set_cached_user(token_data.username, resolved_user)
+            return resolved_user
     finally:
         return_db_connection(conn)
-

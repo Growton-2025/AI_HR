@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { Search, Briefcase, Activity, MessageSquareMore, Phone, BarChart2, MoreHorizontal, LogOut, Users } from 'lucide-react'
+import { Search, Briefcase, Activity, MessageSquareMore, Phone, BarChart2, MoreHorizontal, LogOut, Users, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 
 const MIN_WIDTH = 56
 const MAX_WIDTH = 420
@@ -10,7 +10,7 @@ const ICON_THRESHOLD = 160
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
     const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
-    const { user, sidebarWidth, setSidebarWidth } = useAppStore()
+    const { user, sidebarWidth, setSidebarWidth, isSidebarCollapsed, toggleSidebar } = useAppStore()
     const role = user?.role
     const permissions = user?.permissions || {}
     const isDragging = useRef(false)
@@ -69,18 +69,34 @@ function Sidebar() {
     return (
         <aside className="app-sidebar" style={{ width: sidebarWidth, display: 'flex', flexDirection: 'column' }}>
 
-            {/* ── Logo ── */}
+            {/* ── Logo & Toggle ── */}
             <div style={{
                 padding: isIconOnly ? '16px 0' : '20px 20px',
                 borderBottom: '1px solid rgba(255,255,255,0.06)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                display: 'flex', alignItems: 'center', justifyContent: isIconOnly ? 'center' : 'space-between', flexShrink: 0,
             }}>
                 <img
                     src="https://cdn.prod.website-files.com/65e41b0d7632a225ef3abc4e/693509bb8da9f3b5e10554be_LOGO.svg"
                     alt="Growton"
-                    style={{ filter: 'brightness(0) invert(1)', width: isIconOnly ? '26px' : 'clamp(70px,55%,130px)', height: 'auto', objectFit: 'contain', flexShrink: 0 }}
+                    style={{ filter: 'brightness(0) invert(1)', width: isIconOnly ? '26px' : '90px', height: 'auto', objectFit: 'contain', flexShrink: 0 }}
                 />
+                {!isIconOnly && (
+                    <button onClick={toggleSidebar} style={{ background: 'none', border: 'none', color: '#52525b', cursor: 'pointer', padding: '4px' }}>
+                        <PanelLeftClose size={18} />
+                    </button>
+                )}
             </div>
+
+            {isIconOnly && (
+                <button onClick={toggleSidebar} style={{ 
+                    position: 'absolute', top: '70px', right: '-12px', background: '#f97316', 
+                    borderRadius: '50%', width: '24px', height: '24px', display: 'flex', 
+                    alignItems: 'center', justifyContent: 'center', border: 'none', color: '#fff',
+                    cursor: 'pointer', zIndex: 10001, boxShadow: '0 2px 8px rgba(249,115,22,0.4)' 
+                }}>
+                    <PanelLeftOpen size={14} />
+                </button>
+            )}
 
             {/* ── Top Section (nav) ── */}
             <div style={{ flex: '0 0 auto' }}>

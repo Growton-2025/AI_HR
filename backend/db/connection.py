@@ -7,6 +7,7 @@ import logging
 from dotenv import load_dotenv
 import time
 from functools import wraps
+import threading
 
 load_dotenv()
 
@@ -21,7 +22,7 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 
 # Connection pool (initialized on first use)
 _connection_pool = None
-_pool_lock = None
+_pool_lock = threading.Lock()
 
 def get_db_connection_params():
     """Returns a dictionary of DB connection parameters."""
@@ -32,26 +33,29 @@ def get_db_connection_params():
         "host": DB_HOST,
         "port": DB_PORT,
         "sslmode": "require",
-        "connect_timeout": 10,
+        "connect_timeout": 15,
         "keepalives": 1,
-        "keepalives_idle": 30,
+        "keepalives_idle": 20,
         "keepalives_interval": 10,
         "keepalives_count": 5
     }
 
 def _initialize_pool():
     """Initialize the connection pool if not already initialized."""
-    global _connection_pool, _pool_lock
-    
-    if _connection_pool is None:
-        import threading
-        _pool_lock = threading.Lock()
-        
+    global _connection_pool
+
+    if _connection_pool is not None:
+        return
+
+    with _pool_lock:
+        if _connection_pool is not None:
+            return
+
         try:
             logger.info("Initializing database connection pool...")
             _connection_pool = pool.ThreadedConnectionPool(
-                minconn=2,
-                maxconn=20,
+                minconn=1,
+                maxconn=30,
                 **get_db_connection_params()
             )
             logger.info("Database connection pool initialized successfully")
@@ -92,20 +96,32 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
             if conn is None:
                 raise Exception("Pool returned None connection")
             
+            if conn.closed:
+                raise psycopg2.InterfaceError("Pool returned a closed connection")
+
             if validate:
-                # Test the connection only when callers need the extra safety.
+                # Azure PostgreSQL may kill idle SSL sockets after long inactivity.
+                # Only pay for a round-trip validation when the caller explicitly asks for it.
                 try:
                     with conn.cursor() as cur:
                         cur.execute("SELECT 1")
                         cur.fetchone()
-                except Exception as test_error:
-                    # Connection is bad, discard it and get a new one
-                    logger.warning(f"Connection test failed: {test_error}, discarding connection")
+                except (psycopg2.OperationalError, psycopg2.InterfaceError, Exception) as test_error:
+                    logger.warning(
+                        f"Stale/dead connection detected (Azure idle timeout?), discarding and retrying: {test_error}"
+                    )
                     try:
+                        # Very important: use putconn with close=True for the pool to track the removal
                         _connection_pool.putconn(conn, close=True)
-                    except:
-                        pass
-                    raise test_error
+                    except Exception as p_err:
+                        # If putconn fails (e.g. unkeyed), just close it manually as a last resort
+                        logger.debug(f"Discarding untracked/unkeyed dead connection: {p_err}")
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                    raise test_error  # retry loop will get a fresh connection
+
             
             if register_pgvector:
                 try:
@@ -165,7 +181,18 @@ def return_db_connection(conn, close=False):
         try:
             _connection_pool.putconn(conn, close=close)
         except Exception as e:
-            logger.error(f"Error returning connection to pool: {e}")
+            # "unkeyed connection" means the pool is no longer tracking this specific object
+            # This can happen if it was already closed or discarded during validation.
+            # We catch it to prevent crashing the request.
+            if "unkeyed" in str(e).lower():
+                logger.debug(f"Connection already unkeyed from pool, ensuring closed: {e}")
+                try:
+                    if not conn.closed:
+                        conn.close()
+                except:
+                    pass
+            else:
+                logger.error(f"Error returning connection to pool: {e}")
 
 def close_all_connections():
     """Close all connections in the pool. Call this on application shutdown."""

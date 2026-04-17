@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { startTransition, useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore, API_BASE } from '../store/useAppStore';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -70,6 +70,32 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—'
         {loading && ' ...'}
       </span>
     </td>
+  );
+}
+
+function TableSkeleton({ rows = 10 }) {
+  return (
+    <>
+      {Array.from({ length: rows }).map((_, i) => (
+        <tr key={i} style={{ borderBottom: '1px solid #f1f5f9' }}>
+          <td style={{ padding: '16px 20px' }}>
+            <div className="shimmer skeleton-row" style={{ width: '100%', borderRadius: '4px' }} />
+          </td>
+          <td style={{ padding: '16px 20px' }}>
+            <div className="shimmer skeleton-row" style={{ width: '80%', borderRadius: '4px' }} />
+          </td>
+          <td style={{ padding: '16px 20px' }}>
+            <div className="shimmer skeleton-row" style={{ width: '60%', borderRadius: '4px' }} />
+          </td>
+          <td style={{ padding: '16px 20px' }}>
+            <div className="shimmer skeleton-row" style={{ width: '70%', borderRadius: '4px' }} />
+          </td>
+          <td style={{ padding: '16px 20px' }}>
+            <div className="shimmer skeleton-row" style={{ width: '90%', borderRadius: '4px' }} />
+          </td>
+        </tr>
+      ))}
+    </>
   );
 }
 
@@ -477,6 +503,176 @@ const DEFAULT_PAGE_SIZE = 25;
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 const CONTACT_INFO_STORAGE_KEY = 'talent-pool-contact-info-v1';
 
+function normalizeTalentPoolText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function splitTalentPoolFilterValues(values = [], inputValue = '') {
+  return [...(values || []), inputValue]
+    .flatMap((value) => String(value || '').split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function matchesTalentPoolFilters(filterValues, targetValue) {
+  if (!filterValues.length) return true;
+  const normalizedTarget = normalizeTalentPoolText(targetValue);
+  if (!normalizedTarget) return false;
+  return filterValues.some((value) => normalizedTarget.includes(normalizeTalentPoolText(value)));
+}
+
+function buildTalentPoolParamsString({
+  page = 1,
+  pageSize = 25,
+  globalSearch = '',
+  filters = {},
+  activeStatusTab = '',
+  sortBy = 'name',
+  sortDir = 'asc',
+}) {
+  const params = new URLSearchParams();
+  params.set('page', page);
+  params.set('page_size', pageSize || 25);
+
+  if (globalSearch) params.set('q', globalSearch);
+
+  const titleSearch = splitTalentPoolFilterValues(filters?.title, filters?.titleInput).join(',');
+  if (titleSearch) params.set('title', titleSearch);
+
+  const companySearch = splitTalentPoolFilterValues(filters?.company, filters?.companyInput).join(',');
+  if (companySearch) params.set('company', companySearch);
+
+  const citySearch = splitTalentPoolFilterValues(filters?.city, filters?.cityInput).join(',');
+  if (citySearch) params.set('city', citySearch);
+
+  const productSearch = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput).join(',');
+  if (productSearch) params.set('product_service', productSearch);
+
+  if (activeStatusTab) params.set('status', activeStatusTab);
+  else if (filters?.status) params.set('status', filters.status);
+
+  if (filters?.min_exp !== undefined && filters?.min_exp !== '') params.set('min_exp', filters.min_exp);
+  if (filters?.max_exp !== undefined && filters?.max_exp !== '') params.set('max_exp', filters.max_exp);
+  if (filters?.created_by) params.set('created_by', filters.created_by);
+
+  params.set('sort_by', sortBy);
+  params.set('sort_dir', sortDir);
+
+  return params.toString();
+}
+
+function buildLocalTalentPoolView(rows = [], {
+  globalSearch = '',
+  filters = {},
+  activeStatusTab = '',
+  sortBy = 'name',
+  sortDir = 'asc',
+  page = 1,
+  pageSize = 25,
+}) {
+  const titleFilters = splitTalentPoolFilterValues(filters?.title, filters?.titleInput);
+  const companyFilters = splitTalentPoolFilterValues(filters?.company, filters?.companyInput);
+  const cityFilters = splitTalentPoolFilterValues(filters?.city, filters?.cityInput);
+  const productFilters = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput);
+  const recruiterFilters = splitTalentPoolFilterValues([], filters?.created_by);
+  const normalizedSearch = normalizeTalentPoolText(globalSearch);
+  const effectiveStatus = activeStatusTab || filters?.status || '';
+  const normalizedStatus = normalizeTalentPoolText(effectiveStatus);
+  const minExp = Number(filters?.min_exp ?? 0);
+  const maxExp = Number(filters?.max_exp ?? 40);
+
+  const filteredRows = rows.filter((row) => {
+    const title = row?.title || row?.headline || '';
+    const company = row?.company || '';
+    const city = row?.city || '';
+    const product = row?.product_service || '';
+    const recruiter = row?.created_by || '';
+    const status = row?.status || 'To be started';
+    const totalExperience = Number(row?.total_experience_years || 0);
+
+    if (normalizedSearch) {
+      const searchable = [
+        row?.name,
+        row?.first_name,
+        row?.last_name,
+        title,
+        company,
+        city,
+        product,
+        recruiter,
+        row?.email,
+        row?.phone,
+        row?.mobile_phone,
+        status,
+      ].map(normalizeTalentPoolText).join(' ');
+
+      if (!searchable.includes(normalizedSearch)) return false;
+    }
+
+    if (!matchesTalentPoolFilters(titleFilters, title)) return false;
+    if (!matchesTalentPoolFilters(companyFilters, company)) return false;
+    if (!matchesTalentPoolFilters(cityFilters, city)) return false;
+    if (!matchesTalentPoolFilters(recruiterFilters, recruiter)) return false;
+    if (productFilters.length && !matchesTalentPoolFilters(productFilters, product)) return false;
+    if (totalExperience < minExp || totalExperience > maxExp) return false;
+
+    return true;
+  });
+
+  const statusCounts = {};
+  for (const row of filteredRows) {
+    const status = (row?.status || 'To be started').trim();
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+  }
+
+  let finalRows = filteredRows;
+  if (normalizedStatus) {
+    finalRows = filteredRows.filter((row) => normalizeTalentPoolText(row?.status || 'To be started') === normalizedStatus);
+  }
+
+  const getSortValue = (row) => {
+    switch (sortBy) {
+      case 'title':
+        return row?.title || row?.headline || '';
+      case 'company':
+        return row?.company || '';
+      case 'city':
+        return row?.city || '';
+      case 'exp':
+        return Number(row?.total_experience_years || 0);
+      case 'tenure':
+        return Number(row?.avg_tenure_years || 0);
+      case 'name':
+      default:
+        return row?.name || `${row?.first_name || ''} ${row?.last_name || ''}`.trim();
+    }
+  };
+
+  finalRows = [...finalRows].sort((a, b) => {
+    const left = getSortValue(a);
+    const right = getSortValue(b);
+
+    if (typeof left === 'number' || typeof right === 'number') {
+      return sortDir === 'desc' ? Number(right) - Number(left) : Number(left) - Number(right);
+    }
+
+    const result = String(left).localeCompare(String(right), undefined, { sensitivity: 'base' });
+    return sortDir === 'desc' ? -result : result;
+  });
+
+  const total = finalRows.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const start = (safePage - 1) * pageSize;
+
+  return {
+    candidates: finalRows.slice(start, start + pageSize),
+    total,
+    totalPages,
+    statusCounts,
+  };
+}
+
 const readPersistedContactInfo = () => {
   if (typeof window === 'undefined') return {};
   try {
@@ -569,129 +765,209 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
   );
 }
 
+// ─── Module-level SWR Chat Cache ─────────────────────────────────────────────
+// Survives modal open/close so second open is always instant.
+// Structure: { [candidateId]: { email: { messages, ts }, linkedin: { messages, ts } } }
+const _chatCache = {};
+const CHAT_CACHE_TTL_MS = 30_000; // 30 seconds — same as backend cache TTL
+
+function _getCached(candidateId, platform) {
+  const entry = _chatCache[candidateId]?.[platform];
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CHAT_CACHE_TTL_MS) return null; // expired
+  return entry.messages;
+}
+
+function _setCached(candidateId, platform, messages) {
+  if (!_chatCache[candidateId]) _chatCache[candidateId] = {};
+  _chatCache[candidateId][platform] = { messages, ts: Date.now() };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function ConversationModal({ candidate, onClose }) {
   // Auto-select LinkedIn tab if candidate has an active LinkedIn response
-  const hasLiActivity = ['replied', 'message_sent', 'connection_accepted', 'in_campaign'].includes(candidate?.li_status);
   const hasLiResponse = Boolean(candidate?.li_response_text);
   const defaultPlatform = (hasLiResponse || candidate?.li_status === 'replied') ? 'linkedin' : 'email';
   const [platform, setPlatform] = useState(defaultPlatform);
-  const [threads, setThreads] = useState({
-    email: { messages: [], loaded: false, error: '' },
-    linkedin: { messages: [], loaded: false, error: '' }
-  });
-  const [loading, setLoading] = useState(true);
+
+  // ── SWR Thread State ───────────────────────────────────────────────────────
+  // Seed from module-level cache for instant render on re-open
+  const seedThread = (p) => {
+    const cached = _getCached(candidate.id, p);
+    return cached ? { messages: cached, loaded: true, error: '' } : { messages: [], loaded: false, error: '' };
+  };
+  const [threads, setThreads] = useState(() => ({
+    email: seedThread('email'),
+    linkedin: seedThread('linkedin'),
+  }));
+  // loading = active tab has no messages yet; refreshing = manual sync in progress
+  const [loading, setLoading] = useState(!_getCached(candidate.id, defaultPlatform));
   const [refreshing, setRefreshing] = useState(false);
+  const [liSyncing, setLiSyncing] = useState(false);
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
-  const [localSentMessagesByPlatform, setLocalSentMessagesByPlatform] = useState({
-    email: [],
-    linkedin: []
-  }); // Buffer for messages sent before server syncs them
+  const [localSentMessagesByPlatform, setLocalSentMessagesByPlatform] = useState({ email: [], linkedin: [] });
 
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
   const sendChatReply = useAppStore(state => state.sendChatReply);
-  const { heyreachCampaignId, setHeyreachCampaignId, triggerHeyReachOutreach } = useAppStore();
+  const { heyreachCampaignId, triggerHeyReachOutreach } = useAppStore();
   const [isTriggering, setIsTriggering] = useState(false);
   const [hasTriggered, setHasTriggered] = useState(false);
   const messagesEndRef = useRef(null);
   const threadsRef = useRef(threads);
   const requestSeqRef = useRef({ email: 0, linkedin: 0 });
   const candidateIdRef = useRef(candidate.id);
-  const lastSyncTimeRef = useRef(Date.now());
 
-
-  useEffect(() => {
-    threadsRef.current = threads;
-  }, [threads]);
-
-  useEffect(() => {
-    candidateIdRef.current = candidate.id;
-  }, [candidate.id]);
+  useEffect(() => { threadsRef.current = threads; }, [threads]);
+  useEffect(() => { candidateIdRef.current = candidate.id; }, [candidate.id]);
 
   const activeThread = threads[platform] || { messages: [], loaded: false, error: '' };
   const messages = activeThread.messages || [];
   const localSentMessages = localSentMessagesByPlatform[platform] || [];
   const conversationAccent = platform === 'linkedin' ? '#0077b5' : '#f97316';
-  const hasAnyVisibleMessages = messages.length > 0 || localSentMessages.length > 0;
 
-   const loadMessages = useCallback(async ({ showLoader = false, silent = false, targetPlatform = platform } = {}) => {
-     const cachedThread = threadsRef.current[targetPlatform];
-     const candidateId = candidate.id;
-     const requestSeq = ++requestSeqRef.current[targetPlatform];
-     // Always block (show skeleton) on initial load for this platform
-     const shouldBlock = showLoader || !cachedThread?.loaded;
+  // ── Core fetch function ────────────────────────────────────────────────────
+  const loadMessages = useCallback(async ({
+    silent = false,
+    targetPlatform = platform,
+    force = false
+  } = {}) => {
+    const candidateId = candidate.id;
+    const requestSeq = ++requestSeqRef.current[targetPlatform];
+    const isActiveTab = targetPlatform === platform;
 
-     if (targetPlatform === platform) {
-       if (!cachedThread?.loaded) {
-         setLoading(true);
-       } else if (!silent) {
-         setRefreshing(true);
-       }
-     }
+    // Show loader only on active tab when no messages cached
+    if (isActiveTab && !silent && !threadsRef.current[targetPlatform]?.loaded) {
+      setLoading(true);
+    } else if (isActiveTab && !silent) {
+      setRefreshing(true);
+    }
 
-     const res = await fetchChatHistory(0, candidateId, targetPlatform);
-     if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) {
-       return;
-     }
+    const res = await fetchChatHistory(0, candidateId, targetPlatform, force);
 
-     if (res.success) {
-       // Only add delay on initial load (not on refresh) for smooth transition from skeleton to content
-       if (!cachedThread?.loaded) {
-         await new Promise(r => setTimeout(r, 150));
-       }
-       setThreads(prev => ({
-         ...prev,
-         [targetPlatform]: {
-           messages: res.messages || [],
-           loaded: true,
-           error: ''
-         }
-       }));
-     } else {
-       setThreads(prev => ({
-         ...prev,
-         [targetPlatform]: {
-           ...prev[targetPlatform],
-           loaded: true,
-           error: res.error || `Failed to fetch ${targetPlatform} chat history`
-         }
-       }));
-     }
-     if (targetPlatform === platform) {
-       setLoading(false);
-       if (!silent) setRefreshing(false);
-     }
-   }, [candidate.id, fetchChatHistory, platform]);
+    // Discard stale responses (candidate changed or newer request fired)
+    if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) return;
 
+    if (res.success) {
+      const msgs = res.messages || [];
+      _setCached(candidateId, targetPlatform, msgs); // persist in module cache
+      setThreads(prev => ({
+        ...prev,
+        [targetPlatform]: { messages: msgs, loaded: true, error: '' }
+      }));
+      if (targetPlatform === 'linkedin') setLiSyncing(Boolean(res.syncing));
+    } else {
+      setThreads(prev => ({
+        ...prev,
+        [targetPlatform]: { ...prev[targetPlatform], loaded: true, error: res.error || 'Failed to load' }
+      }));
+    }
+
+    if (isActiveTab) {
+      setLoading(false);
+      if (!silent) setRefreshing(false);
+    }
+  }, [candidate.id, fetchChatHistory, platform]);
+
+  // ── On candidate change: reset state (but preserve module cache) ───────────
   useEffect(() => {
     const nextThreads = {
-      email: { messages: [], loaded: false, error: '' },
-      linkedin: { messages: [], loaded: false, error: '' }
+      email: seedThread('email'),
+      linkedin: seedThread('linkedin'),
     };
     threadsRef.current = nextThreads;
     requestSeqRef.current = { email: 0, linkedin: 0 };
     setThreads(nextThreads);
     setLocalSentMessagesByPlatform({ email: [], linkedin: [] });
-    setLoading(true);
+    setLoading(!_getCached(candidate.id, defaultPlatform));
     setRefreshing(false);
     setReplyText('');
     setHasTriggered(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candidate.id]);
 
+  // ── On modal open: fetch BOTH tabs in parallel (SWR) ──────────────────────
+  useEffect(() => {
+    const candidateId = candidate.id;
+    requestSeqRef.current = { email: 0, linkedin: 0 };
+
+    // Fetch both platforms simultaneously — don't wait for active tab first
+    Promise.all([
+      fetchChatHistory(0, candidateId, 'email', false),
+      fetchChatHistory(0, candidateId, 'linkedin', false),
+    ]).then(([emailRes, liRes]) => {
+      if (candidateIdRef.current !== candidateId) return;
+
+      setThreads(prev => {
+        const next = { ...prev };
+        if (emailRes.success) {
+          const msgs = emailRes.messages || [];
+          _setCached(candidateId, 'email', msgs);
+          next.email = { messages: msgs, loaded: true, error: '' };
+        } else {
+          next.email = { ...prev.email, loaded: true, error: emailRes.error || 'Failed' };
+        }
+        if (liRes.success) {
+          const msgs = liRes.messages || [];
+          _setCached(candidateId, 'linkedin', msgs);
+          next.linkedin = { messages: msgs, loaded: true, error: '' };
+        } else {
+          next.linkedin = { ...prev.linkedin, loaded: true, error: liRes.error || 'Failed' };
+        }
+        return next;
+      });
+      if (liRes.success) setLiSyncing(Boolean(liRes.syncing));
+      setLoading(false);
+      setRefreshing(false);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidate.id]);
+
+  // ── Tab switch: if already loaded just show, else fetch ────────────────────
   useEffect(() => {
     setReplyText('');
     const cached = threadsRef.current[platform];
-    if (!cached || !cached.loaded) {
+    if (!cached?.loaded) {
       setLoading(true);
+      loadMessages({ targetPlatform: platform });
+    } else {
+      setLoading(false);
     }
-    loadMessages({ targetPlatform: platform });
-  }, [candidate.id, platform, loadMessages]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform]);
 
-  // Auto-poll every 5s for new replies
+  // ── Intelligent Fast Poll — if LinkedIn is syncing, poll every 2s ─────────────────
   useEffect(() => {
-    const interval = setInterval(() => loadMessages({ silent: true, targetPlatform: platform }), 5000);
+    if (platform !== 'linkedin' || !liSyncing) return;
+    
+    // Fast poll while syncing
+    const interval = setInterval(() => {
+      const cid = candidateIdRef.current;
+      fetchChatHistory(0, cid, 'linkedin', false).then(res => {
+        if (res.success && candidateIdRef.current === cid) {
+          const msgs = res.messages || [];
+          _setCached(cid, 'linkedin', msgs);
+          setThreads(prev => ({ ...prev, linkedin: { messages: msgs, loaded: true, error: '' } }));
+          setLiSyncing(Boolean(res.syncing));
+        }
+      });
+    }, 2000);
+    
     return () => clearInterval(interval);
-  }, [candidate.id, platform, loadMessages]);
+  }, [candidate.id, platform, liSyncing, fetchChatHistory]);
+
+  // ── Standard background poll — keep both tabs fresh ──────────────────────────
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const cid = candidateIdRef.current;
+      // Poll both platforms silently every 30s for general freshness
+      Promise.all([
+        fetchChatHistory(0, cid, 'email', false),
+        fetchChatHistory(0, cid, 'linkedin', false),
+      ]); 
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [candidate.id, fetchChatHistory]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -833,11 +1109,17 @@ function ConversationModal({ candidate, onClose }) {
                    UPDATING
                 </span>
               )}
+              {!refreshing && platform === 'linkedin' && liSyncing && (
+                <span style={{ fontSize: '11px', color: '#0077b5', fontWeight: 600, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '5px', opacity: 0.8 }}>
+                   <div style={{ width: 5, height: 5, borderRadius: '50%', background: '#0077b5', animation: 'pulse 1.4s ease-in-out infinite' }} />
+                   Fetching latest…
+                </span>
+              )}
             </div>
           </div>
            <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
              <button 
-               onClick={() => loadMessages({ silent: false })}
+               onClick={() => loadMessages({ silent: false, force: true })}
                disabled={refreshing}
                style={{
                  background: '#fff', border: '1.5px solid #e2e8f0', cursor: refreshing ? 'wait' : 'pointer', padding: '8px 14px', 
@@ -894,20 +1176,24 @@ function ConversationModal({ candidate, onClose }) {
          {/* Messages */}
          <div className="hide-scrollbar" style={{ flex: 1, overflowY: 'auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '8px', background: '#f8fafc', containment: 'layout style paint' }}>
            {loading ? (
-             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', animation: 'fadeIn 0.3s ease-out' }}>
                {[1, 2, 3].map(i => (
                  <div key={i} style={{ width: i % 2 === 0 ? '55%' : '65%', height: '72px', borderRadius: '18px', background: 'linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%)', backgroundSize: '200% 100%', animation: 'shimmer 1.5s infinite', alignSelf: i % 2 === 0 ? 'flex-end' : 'flex-start' }} />
                ))}
              </div>
            ) : displayMessages.length === 0 ? (
-             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', gap: '16px' }}>
-               <div style={{ width: 64, height: 64, borderRadius: '20px', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e2e8f0' }}>
-                 <MessageSquare size={32} opacity={0.5} />
+             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', gap: '16px', animation: 'fadeIn 0.4s ease-out' }}>
+               <div style={{ width: 64, height: 64, borderRadius: '20px', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05)' }}>
+                 <MessageSquare size={32} opacity={0.5} color={conversationAccent} />
                </div>
-               <div style={{ textAlign: 'center' }}>
-                 <div style={{ fontWeight: 600, color: '#64748b' }}>No messages yet</div>
-                 <div style={{ fontSize: '13px' }}>Start the conversation below</div>
-               </div>
+                <div style={{ textAlign: 'center', animation: 'slideUp 0.4s ease-out 0.1s backwards' }}>
+                  <div style={{ fontWeight: 600, color: '#475569', fontSize: '15px' }}>
+                    {platform === 'linkedin' && liSyncing ? 'Loading latest messages...' : 'No messages yet'}
+                  </div>
+                  <div style={{ fontSize: '13px', marginTop: '4px' }}>
+                    {platform === 'linkedin' && liSyncing ? 'This usually takes a few seconds' : 'Start the conversation below'}
+                  </div>
+                </div>
                {platform === 'linkedin' && !heyreachCampaignId && (
                  <button
                    onClick={async () => {
@@ -968,12 +1254,15 @@ function ConversationModal({ candidate, onClose }) {
                  const isConsecutive = nextMsg && isCandidate === nextIsCandidate;
                  
                  const rawBody = msg.email_body || msg.message || msg.text || '';
-                 const cleanBody = rawBody.replace(/<[^>]+>/g, '')
+                 const cleanBody = rawBody
+                   .replace(/<(br|div|p)(\s*\/?)>/gi, '\n') // Convert block tags to freshlines before stripping
+                   .replace(/<[^>]+>/g, '')
                    .replace(/&nbsp;/g, ' ')
                    .replace(/&amp;/g, '&')
                    .replace(/&quot;/g, '"')
                    .replace(/&apos;/g, "'")
-                   .trim();
+                   .trim()
+                   .replace(/\n\s*\n/g, '\n\n'); // Max 2 consecutive newlines
 
                  return (
                    <div key={msg.id || idx} className="message-bubble" style={{
@@ -1136,26 +1425,57 @@ export default function TalentPool() {
     );
   }
 
-  const [candidates, setCandidates] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(1);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  // --- Store Sync (Persistent State) ---
+  const candidates = useAppStore(state => state.tpCandidates);
+  const total = useAppStore(state => state.tpTotal);
+  const totalPages = useAppStore(state => state.tpTotalPages);
+  const statusCounts = useAppStore(state => state.tpStatusCounts);
+  const filters = useAppStore(state => state.tpFilters);
+  const activeStatusTab = useAppStore(state => state.tpActiveStatusTab);
+  const sortBy = useAppStore(state => state.tpSortBy);
+  const sortDir = useAppStore(state => state.tpSortDir);
+  const page = useAppStore(state => state.tpPage);
+  const pageSize = useAppStore(state => state.tpPageSize);
+  const globalSearch = useAppStore(state => state.tpGlobalSearch);
+  
+  const setFilters = useAppStore(state => state.setTpFilters);
+  const setActiveStatusTab = useAppStore(state => state.setTpActiveStatusTab);
+  const setTpPagination = useAppStore(state => state.setTpPagination);
+  const setTpSort = useAppStore(state => state.setTpSort);
+  const setGlobalSearch = useAppStore(state => state.setTpGlobalSearch);
+  const fetchTalentPool = useAppStore(state => state.fetchTalentPool);
+  const fetchTalentPoolIndex = useAppStore(state => state.fetchTalentPoolIndex);
+  const talentPoolCache = useAppStore(state => state.talentPoolCache);
+  const talentPoolIndex = useAppStore(state => state.talentPoolIndex);
+  const updateTpCandidate = useAppStore(state => state.updateTpCandidate);
+
+  const setPage = (nextPage) => {
+    const currentPage = useAppStore.getState().tpPage;
+    const currentPageSize = useAppStore.getState().tpPageSize;
+    const resolvedPage = typeof nextPage === 'function' ? nextPage(currentPage) : nextPage;
+    setTpPagination(resolvedPage, currentPageSize);
+  };
+  const setSortBy = (sb) => setTpSort(sb, useAppStore.getState().tpSortDir);
+  const setSortDir = (nextSortDir) => {
+    const currentSortBy = useAppStore.getState().tpSortBy;
+    const currentSortDir = useAppStore.getState().tpSortDir;
+    const resolvedSortDir = typeof nextSortDir === 'function' ? nextSortDir(currentSortDir) : nextSortDir;
+    setTpSort(currentSortBy, resolvedSortDir);
+  };
+
   const [loading, setLoading] = useState(false);
-  const [statusCounts, setStatusCounts] = useState({});
-  const [meta, setMeta] = useState({ companies: [], cities: [], products: [], statuses: [] });
-  const [globalSearch, setGlobalSearch] = useState('');
-  const [filters, setFilters] = useState({
-    title: [], titleInput: '',
-    company: [], companyInput: '',
-    city: [], cityInput: '',
-    product_service: [], productInput: '',
-    status: '', created_by: '',
-    min_exp: 0, max_exp: 40,
+  const [isFilterCollapsed, setIsFilterCollapsed] = useState(() => {
+    return localStorage.getItem('tp-filter-collapsed') === 'true';
   });
-  const [activeStatusTab, setActiveStatusTab] = useState('');
-  const [sortBy, setSortBy] = useState('name');
-  const [sortDir, setSortDir] = useState('asc');
+
+  const toggleFilterSidebar = () => {
+    setIsFilterCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem('tp-filter-collapsed', String(next));
+      return next;
+    });
+  };
+  const [meta, setMeta] = useState({ companies: [], cities: [], products: [], statuses: [] });
   const [isSemanticSearch, setIsSemanticSearch] = useState(false);
   const [selectedCandidateForChat, setSelectedCandidateForChat] = useState(null);
   const [shortlistCard, setShortlistCard] = useState(null);
@@ -1168,12 +1488,13 @@ export default function TalentPool() {
   const syncOutreachResponses = useAppStore(state => state.syncOutreachResponses);
   const shortlistAndOutreach = useAppStore(state => state.shortlistAndOutreach);
   const updateCandidateField = useAppStore(state => state.updateCandidateField);
-  const prefetchCallLists = useAppStore(state => state.fetchCallLists);
-  const prefetchCallStats = useAppStore(state => state.fetchCallStats);
-  const prefetchCalls = useAppStore(state => state.fetchCalls);
   const { heyreachCampaignId } = useAppStore();
   const didInitRef = useRef(false);
   const talentPoolRequestSeqRef = useRef(0);
+  const visibleCandidatesRef = useRef(candidates);
+  const canUseInstantLocalFilteringRef = useRef(false);
+
+  const [isRevalidating, setIsRevalidating] = useState(false);
 
   // Poll Clay/DB updates aggressively for enriching records so contact data appears quickly.
   useEffect(() => {
@@ -1253,11 +1574,14 @@ export default function TalentPool() {
     // Preserve any existing contact details immediately to avoid flicker while enrichment runs.
     setContactInfo(prev => {
       const current = prev[candidateId] || {};
-      const row = candidates.find(c => c.id === candidateId) || {};
+      const row = visibleCandidatesRef.current.find(c => c.id === candidateId)
+        || talentPoolIndex?.rows?.find(c => c.id === candidateId)
+        || candidates.find(c => c.id === candidateId)
+        || {};
       const next = {
         email: current.email || row.email || '',
-        phone: current.phone || row.phone || '',
-        enriching: !(current.email || current.phone || row.email || row.phone)
+        phone: current.phone || row.phone || row.mobile_phone || '',
+        enriching: !(current.email || current.phone || row.email || row.phone || row.mobile_phone)
       };
       return { ...prev, [candidateId]: next };
     });
@@ -1309,11 +1633,13 @@ export default function TalentPool() {
     const isValuable = value && !['na', 'n/a', 'none', ''].includes(value.toLowerCase());
 
     if (isValuable && (field === 'email' || field === 'phone')) {
-      const candidate = candidates.find(c => c.id === candidateId);
+      const candidate = visibleCandidatesRef.current.find(c => c.id === candidateId)
+        || talentPoolIndex?.rows?.find(c => c.id === candidateId)
+        || candidates.find(c => c.id === candidateId);
       if (candidate && (candidate.status === 'To be started' || !candidate.status)) {
         try {
           await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: 'Shortlisted' });
-          setCandidates(prev => prev.map(c => c.id === candidateId ? { ...c, status: 'Shortlisted' } : c));
+          updateTpCandidate(candidateId, { status: 'Shortlisted' });
           toast.success(`Candidate automatically shortlisted`);
           fetchAnalytics();
         } catch (err) {
@@ -1359,80 +1685,109 @@ export default function TalentPool() {
   useEffect(() => {
     axios.get(`${API_BASE}/candidates/browse/meta`).then(r => setMeta(r.data)).catch(() => { });
     fetchAnalytics();
-  }, [fetchAnalytics]);
+    void fetchTalentPoolIndex();
+  }, [fetchAnalytics, fetchTalentPoolIndex]);
 
-  useEffect(() => {
-    prefetchCallLists();
-    prefetchCallStats();
-    prefetchCalls({ due_filter: 'today', status: 'pending' }, { updateState: false });
-  }, [prefetchCallLists, prefetchCallStats, prefetchCalls]);
+  const hasSemanticProductFilter = splitTalentPoolFilterValues(
+    filters?.product_service,
+    filters?.productInput,
+  ).length > 0;
+  const canUseInstantLocalFiltering = Boolean(
+    !hasSemanticProductFilter &&
+    Array.isArray(talentPoolIndex?.rows) &&
+    talentPoolIndex.rows.length > 0
+  );
+  const localTalentPoolView = canUseInstantLocalFiltering
+    ? buildLocalTalentPoolView(talentPoolIndex.rows, {
+      globalSearch,
+      filters,
+      activeStatusTab,
+      sortBy,
+      sortDir,
+      page,
+      pageSize,
+    })
+    : null;
+  const displayedCandidates = localTalentPoolView?.candidates || candidates;
+  const displayedTotal = localTalentPoolView?.total ?? total;
+  const displayedTotalPages = localTalentPoolView?.totalPages ?? totalPages;
+  const displayedStatusCounts = localTalentPoolView?.statusCounts || statusCounts;
+  const allVisibleSelected = displayedCandidates.length > 0 && displayedCandidates.every((candidate) => selectedIds.has(candidate.id));
 
   const fetchCandidates = useCallback(async (pg = 1) => {
     let requestId = 0;
     try {
-      const params = new URLSearchParams();
-      params.set('page', pg);
-      params.set('page_size', pageSize);
-      if (globalSearch) params.set('q', globalSearch);
-
-      const titleSearch = [...(filters.title || []), filters.titleInput].filter(Boolean).join(',');
-      if (titleSearch) params.set('title', titleSearch);
-
-      const companySearch = [...(filters.company || []), filters.companyInput].filter(Boolean).join(',');
-      if (companySearch) params.set('company', companySearch);
-
-      const citySearch = [...(filters.city || []), filters.cityInput].filter(Boolean).join(',');
-      if (citySearch) params.set('city', citySearch);
-
-      const productSearch = [...(filters.product_service || []), filters.productInput].filter(Boolean).join(',');
-      if (productSearch) params.set('product_service', productSearch);
-
-      if (activeStatusTab) params.set('status', activeStatusTab);
-      else if (filters.status) params.set('status', filters.status);
-      if (filters.min_exp !== undefined && filters.min_exp !== '') params.set('min_exp', filters.min_exp);
-      if (filters.max_exp !== undefined && filters.max_exp !== '') params.set('max_exp', filters.max_exp);
-      if (filters.created_by) params.set('created_by', filters.created_by);
-      params.set('sort_by', sortBy);
-      params.set('sort_dir', sortDir);
-
-      const paramsString = params.toString();
       requestId = ++talentPoolRequestSeqRef.current;
-      setLoading(true);
-      setCandidates([]);
-      setTotal(0);
-      setTotalPages(1);
-      setStatusCounts({});
+      const paramsString = buildTalentPoolParamsString({
+        page: pg,
+        pageSize,
+        globalSearch,
+        filters,
+        activeStatusTab,
+        sortBy,
+        sortDir,
+      });
 
-      const res = await useAppStore.getState().fetchTalentPool(paramsString);
+      const cache = useAppStore.getState().talentPoolCache || talentPoolCache;
+      const cachedData = cache.lastParamsString === paramsString ? cache.data : null;
+      const hasData = visibleCandidatesRef.current.length > 0;
+
+      if (!cachedData && !hasData) {
+        setLoading(true);
+      } else {
+        setIsRevalidating(true);
+      }
+
+      const res = await fetchTalentPool(paramsString);
 
       if (requestId !== talentPoolRequestSeqRef.current) {
         return;
       }
 
       if (res.success && res.data) {
-        setCandidates(res.data.candidates);
-        setTotal(res.data.total);
-        setTotalPages(res.data.total_pages);
-        setStatusCounts(res.data.status_counts || {});
         setIsSemanticSearch(res.data.is_semantic_search || false);
         mergeContactInfoFromRows(res.data.candidates);
-
-        // Prewarm LinkedIn chat cache for candidates with active LinkedIn outreach
-        const prewarmIds = res.data.candidates
-          .filter(c => ['replied', 'message_sent', 'connection_accepted', 'in_campaign'].includes(c.li_status))
-          .map(c => c.id);
-        if (prewarmIds.length > 0) {
-          useAppStore.getState().prewarmLinkedInCache(prewarmIds).catch(console.error);
-        }
       }
     } catch (e) {
       console.error('Failed to fetch talent pool:', e);
     } finally {
       if (requestId === talentPoolRequestSeqRef.current) {
         setLoading(false);
+        setIsRevalidating(false);
       }
     }
-  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, mergeContactInfoFromRows]);
+  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, mergeContactInfoFromRows, fetchTalentPool, talentPoolCache]);
+
+  useEffect(() => {
+    visibleCandidatesRef.current = displayedCandidates;
+    canUseInstantLocalFilteringRef.current = canUseInstantLocalFiltering;
+  }, [displayedCandidates, canUseInstantLocalFiltering]);
+
+  useEffect(() => {
+    if (canUseInstantLocalFiltering) {
+      setIsSemanticSearch(false);
+      setLoading(false);
+      setIsRevalidating(false);
+    }
+  }, [canUseInstantLocalFiltering]);
+
+  useEffect(() => {
+    if (page > displayedTotalPages) {
+      setPage(displayedTotalPages);
+    }
+  }, [page, displayedTotalPages]);
+
+  // Aggressive Pre-warming for LinkedIn Cache
+  useEffect(() => {
+    if (displayedCandidates.length > 0) {
+      const prewarmIds = displayedCandidates
+        .filter(c => ['replied', 'message_sent', 'connection_accepted', 'in_campaign'].includes(c.li_status))
+        .map(c => c.id);
+      if (prewarmIds.length > 0) {
+        useAppStore.getState().prewarmLinkedInCache(prewarmIds).catch(console.error);
+      }
+    }
+  }, [displayedCandidates]);
 
   // Debounced refetch
   useEffect(() => {
@@ -1441,17 +1796,27 @@ export default function TalentPool() {
       return;
     }
     clearTimeout(debounceRef.current);
+    if (canUseInstantLocalFiltering) {
+      if (page !== 1) {
+        setPage(1);
+      }
+      return () => clearTimeout(debounceRef.current);
+    }
     debounceRef.current = setTimeout(() => {
       if (page !== 1) {
         setPage(1);
         return;
       }
       fetchCandidates(1);
-    }, 350);
+    }, 120);
     return () => clearTimeout(debounceRef.current);
-  }, [fetchCandidates]);
+  }, [fetchCandidates, canUseInstantLocalFiltering]);
 
-  useEffect(() => { fetchCandidates(page); }, [page]);
+  useEffect(() => {
+    if (!canUseInstantLocalFiltering) {
+      fetchCandidates(page);
+    }
+  }, [page, canUseInstantLocalFiltering, fetchCandidates]);
 
   // Store fetchCandidates and page in refs to avoid dependency cycles in the sync interval
   const fetchRef = useRef(fetchCandidates);
@@ -1468,8 +1833,11 @@ export default function TalentPool() {
       const res = await syncOutreachResponses(0);
       const updatedCount = Number(res?.data?.updated_count || 0);
       if (!cancelled && res?.success && updatedCount > 0) {
-        // Fetch candidates for the current page only if there were updates
-        fetchRef.current(pageRef.current);
+        if (canUseInstantLocalFilteringRef.current) {
+          await fetchTalentPoolIndex({ force: true });
+        } else {
+          fetchRef.current(pageRef.current);
+        }
       }
     };
 
@@ -1481,31 +1849,32 @@ export default function TalentPool() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [syncOutreachResponses]);
+  }, [syncOutreachResponses, fetchTalentPoolIndex]);
 
-  const setFilter = (key, val) => setFilters(f => ({ ...f, [key]: val }));
 
+  const setFilter = (key, val) => setFilters(prev => ({ ...prev, [key]: val }));
   const clearFilters = () => {
-    setFilters({
-      title: [], titleInput: '',
-      company: [], companyInput: '',
-      city: [], cityInput: '',
-      product_service: [], productInput: '',
-      status: '', created_by: '',
-      min_exp: 0, max_exp: 40
+    startTransition(() => {
+      setFilters(() => ({
+        title: [], titleInput: '',
+        company: [], companyInput: '',
+        city: [], cityInput: '',
+        product_service: [], productInput: '',
+        status: '', created_by: '',
+        min_exp: 0, max_exp: 40,
+      }));
+      setGlobalSearch('');
+      setActiveStatusTab('');
     });
-    setGlobalSearch('');
-    setActiveStatusTab('');
-    setPage(1);
+    setTpPagination(1, pageSize);
   };
-
-  const hasFilters = globalSearch ||
-    filters.title || filters.company || filters.city || filters.product_service || filters.status ||
-    filters.min_exp !== 0 || filters.max_exp !== 40 ||
-    activeStatusTab;
-
-  // Status tabs: All + each status
-  const statusTabs = ['', ...Object.keys(statusCounts)];
+  const hasFilters = filters && Object.keys(filters).some(key => {
+    if (key.toLowerCase().includes('input')) return false;
+    const v = filters[key];
+    if (key === 'min_exp') return v > 0;
+    if (key === 'max_exp') return v < 40;
+    return Array.isArray(v) ? v.length > 0 : !!v;
+  });
 
   const cols = [
     { key: 'selection', label: '', w: 40 },
@@ -1528,11 +1897,15 @@ export default function TalentPool() {
   ];
 
   const toggleSelectAll = () => {
-    if (selectedIds.size === candidates.length && candidates.length > 0) {
-      setSelectedIds(new Set());
-    } else {
-      setSelectedIds(new Set(candidates.map(c => c.id)));
-    }
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        displayedCandidates.forEach(candidate => next.delete(candidate.id));
+      } else {
+        displayedCandidates.forEach(candidate => next.add(candidate.id));
+      }
+      return next;
+    });
   };
 
   const toggleSelectOne = (id) => {
@@ -1555,10 +1928,21 @@ export default function TalentPool() {
 
       {/* ── Left Filter Sidebar ── */}
       <aside style={{
-        width: 200, minWidth: 200, padding: '20px 16px',
-        background: '#fff', borderRight: '1.5px solid #f1f5f9',
-        overflowY: 'auto', flexShrink: 0,
-        display: 'flex', flexDirection: 'column', gap: 0,
+        width: isFilterCollapsed ? 0 : 200, 
+        minWidth: isFilterCollapsed ? 0 : 200, 
+        padding: isFilterCollapsed ? 0 : '20px 16px',
+        background: '#fff', 
+        borderRight: isFilterCollapsed ? 'none' : '1.5px solid #f1f5f9',
+        overflowX: 'hidden',
+        overflowY: 'auto', 
+        flexShrink: 0,
+        display: 'flex', 
+        flexDirection: 'column', 
+        gap: 0,
+        transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+        position: 'relative',
+        opacity: isFilterCollapsed ? 0 : 1,
+        visibility: isFilterCollapsed ? 'hidden' : 'visible'
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 800, fontSize: 14, color: '#0f172a' }}>
@@ -1571,34 +1955,52 @@ export default function TalentPool() {
           )}
         </div>
 
-        <TagFilterInput label="Title" values={filters.title} inputValue={filters.titleInput} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} />
-        <TagFilterInput label="Current Company" values={filters.company} inputValue={filters.companyInput} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} />
-        <TagFilterInput label="City" values={filters.city} inputValue={filters.cityInput} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} />
+        <TagFilterInput label="Title" values={filters?.title || []} inputValue={filters?.titleInput || ''} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} />
+        <TagFilterInput label="Current Company" values={filters?.company || []} inputValue={filters?.companyInput || ''} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} />
+        <TagFilterInput label="City" values={filters?.city || []} inputValue={filters?.cityInput || ''} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} />
 
-        <TagFilterInput label="Expertise / Product" values={filters.product_service} inputValue={filters.productInput} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} />
+        <TagFilterInput label="Expertise / Product" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} />
 
-        {role === 'admin' && (
+        {filters?.created_by !== undefined && (
           <SelectFilter
             label="Recruiter"
-            value={filters.created_by || ''}
+            value={filters?.created_by || ''}
             onChange={v => setFilter('created_by', v)}
             options={meta.recruiters || []}
             placeholder="All Recruiters"
           />
         )}
 
-        <SelectFilter label="Status" value={filters.status} onChange={v => setFilter('status', v)} options={meta.statuses} placeholder="All Statuses" />
+        <SelectFilter label="Status" value={filters?.status || ''} onChange={v => setFilter('status', v)} options={meta.statuses || []} placeholder="All Statuses" />
 
         <RangeSlider
           label="Total Experience"
           min={0}
           max={40}
-          minValue={filters.min_exp}
-          maxValue={filters.max_exp}
+          minValue={filters?.min_exp ?? 0}
+          maxValue={filters?.max_exp ?? 40}
           onChange={(min, max) => {
-            setFilters(prev => ({ ...prev, min_exp: min, max_exp: max }));
+            setFilter('min_exp', min);
+            setFilter('max_exp', max);
           }}
         />
+
+        <div style={{ marginTop: 'auto', paddingTop: '20px' }}>
+          <button
+            onClick={clearFilters}
+            style={{
+              width: '100%', padding: '10px', borderRadius: '10px',
+              background: '#fff', border: '1.5px solid #f1f5f9',
+              color: '#d33', fontSize: '12px', fontWeight: 700,
+              cursor: 'pointer', transition: 'all 0.2s',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#fff1f1'; e.currentTarget.style.borderColor = '#fee2e2'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = '#f1f5f9'; }}
+          >
+            <RefreshCw size={14} /> Reset All Filters
+          </button>
+        </div>
 
       </aside>
 
@@ -1606,7 +2008,46 @@ export default function TalentPool() {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f8fafc' }}>
 
         {/* Top bar */}
-        <div style={{ padding: '14px 20px', background: '#fff', borderBottom: '1.5px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ 
+          padding: '14px 20px', 
+          background: '#fff', 
+          borderBottom: '1.5px solid #f1f5f9', 
+          display: 'flex', 
+          alignItems: 'center', 
+          gap: 12,
+          position: 'relative'
+        }}>
+          {/* Sidebar Toggle Button */}
+          <button
+            onClick={toggleFilterSidebar}
+            title={isFilterCollapsed ? "Show Filters" : "Hide Filters"}
+            style={{
+              background: isFilterCollapsed ? '#f97316' : '#fff',
+              border: '1.5px solid #e2e8f0',
+              borderRadius: '8px',
+              width: '32px',
+              height: '32px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'pointer',
+              color: isFilterCollapsed ? '#fff' : '#64748b',
+              transition: 'all 0.2s',
+              marginRight: '8px',
+              boxShadow: isFilterCollapsed ? '0 4px 6px -1px rgba(249, 115, 22, 0.2)' : 'none'
+            }}
+            onMouseEnter={e => {
+              if (!isFilterCollapsed) e.currentTarget.style.borderColor = '#f97316';
+              e.currentTarget.style.transform = 'scale(1.05)';
+            }}
+            onMouseLeave={e => {
+              if (!isFilterCollapsed) e.currentTarget.style.borderColor = '#e2e8f0';
+              e.currentTarget.style.transform = 'scale(1)';
+            }}
+          >
+            {isFilterCollapsed ? <Filter size={16} /> : <ChevronLeft size={18} />}
+          </button>
+
           {/* Global search */}
           <div style={{ position: 'relative', flex: 1, maxWidth: 380 }}>
             <Search size={15} color="#94a3b8" style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)' }} />
@@ -1616,7 +2057,7 @@ export default function TalentPool() {
               onChange={e => setGlobalSearch(e.target.value)}
               placeholder="Global search across all columns..."
               style={{
-                width: '100%', padding: '9px 12px 9px 34px',
+                width: '100%', padding: '9px 34px 9px 34px',
                 background: '#f8fafc', border: '1.5px solid #e2e8f0',
                 borderRadius: 10, color: '#0f172a', fontSize: 13,
                 outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box',
@@ -1625,16 +2066,45 @@ export default function TalentPool() {
               onFocus={e => { e.target.style.borderColor = '#f97316'; e.target.style.background = '#fff'; }}
               onBlur={e => { e.target.style.borderColor = '#e2e8f0'; e.target.style.background = '#f8fafc'; }}
             />
+            {globalSearch && (
+              <X 
+                size={14} 
+                color="#94a3b8" 
+                style={{ position: 'absolute', right: 11, top: '50%', transform: 'translateY(-50%)', cursor: 'pointer' }}
+                onClick={() => setGlobalSearch('')}
+              />
+            )}
           </div>
 
           <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
             {/* Total count */}
-            <span style={{ fontSize: 13, color: '#94a3b8', fontWeight: 500 }}>
-              {loading ? '...' : `${total.toLocaleString()} candidates`}
-            </span>
-            <button onClick={() => fetchCandidates(page)}
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+              <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 700 }}>
+                {loading && !displayedCandidates.length ? '...' : `${displayedTotal.toLocaleString()} candidates`}
+              </span>
+              {isRevalidating && (
+                <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <RefreshCw size={10} className="revalidating" /> Syncing updates
+                </span>
+              )}
+            </div>
+            <button onClick={async () => {
+              if (canUseInstantLocalFiltering) {
+                setIsRevalidating(true);
+                try {
+                  const result = await fetchTalentPoolIndex({ force: true });
+                  if (!result?.success) {
+                    toast.error(result?.error || 'Failed to refresh candidates');
+                  }
+                } finally {
+                  setIsRevalidating(false);
+                }
+                return;
+              }
+              await fetchCandidates(page);
+            }}
               style={{ width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', color: '#64748b' }}>
-              <RefreshCw size={14} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+              <RefreshCw size={14} style={{ animation: loading || isRevalidating ? 'spin 1s linear infinite' : 'none' }} />
             </button>
           </div>
         </div>
@@ -1643,12 +2113,17 @@ export default function TalentPool() {
         <div style={{ padding: '12px 20px', background: '#fff', borderBottom: '1.5px solid #f1f5f9', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none' }}>
           {['', ...RECRUITMENT_STAGES].map(tab => {
             const isActive = activeStatusTab === tab;
-            const count = tab === '' ? total : (statusCounts[tab] || 0);
+            const count = tab === '' ? (displayedTotal || 0) : (displayedStatusCounts?.[tab] || 0);
             const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
 
             return (
               <button key={tab || 'all'}
-                onClick={() => { setActiveStatusTab(tab); setPage(1); }}
+                onClick={() => {
+                  startTransition(() => {
+                    setActiveStatusTab(tab);
+                  });
+                  setPage(1);
+                }}
                 style={{
                   padding: '6px 14px', borderRadius: '30px', border: isActive ? '1.5px solid #f97316' : '1.5px solid #e2e8f0',
                   background: isActive ? '#fff7ed' : '#f8fafc', cursor: 'pointer', fontSize: 12, fontWeight: 700,
@@ -1671,7 +2146,7 @@ export default function TalentPool() {
                 }}
               >
                 {tab === '' ? (
-                  <span style={{ color: isActive ? '#f97316' : '#0f172a' }}>All ({total})</span>
+                  <span style={{ color: isActive ? '#f97316' : '#0f172a' }}>All ({displayedTotal})</span>
                 ) : (
                   <>
                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: style.dot || '#94a3b8' }} />
@@ -1710,7 +2185,7 @@ export default function TalentPool() {
                     }}
                   >
                     {col.key === 'selection' ? (
-                      <input type="checkbox" checked={selectedIds.size === candidates.length && candidates.length > 0} readOnly style={{ cursor: 'pointer' }} />
+                      <input type="checkbox" checked={allVisibleSelected} readOnly style={{ cursor: 'pointer' }} />
                     ) : (
                       <>
                         {col.label}
@@ -1724,7 +2199,7 @@ export default function TalentPool() {
               </tr>
             </thead>
             <tbody>
-              {loading && candidates.length === 0 && (
+              {loading && displayedCandidates.length === 0 && (
                 Array.from({ length: 10 }).map((_, i) => (
                   <tr key={i} style={{ borderBottom: '1px solid #f8fafc' }}>
                     {cols.filter(c => !c.hidden).map((c, j) => (
@@ -1736,7 +2211,7 @@ export default function TalentPool() {
                 ))
               )}
 
-              {!loading && candidates.length === 0 && (
+              {!loading && displayedCandidates.length === 0 && (
                 <tr>
                   <td colSpan={cols.filter(c => !c.hidden).length} style={{ padding: '80px 20px', textAlign: 'center' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
@@ -1751,7 +2226,7 @@ export default function TalentPool() {
                 </tr>
               )}
 
-              {candidates.map((c, idx) => (
+              {displayedCandidates.map((c, idx) => (
                 <tr key={c.id || idx}
                   onClick={() => toggleSelectOne(c.id)}
                   style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', cursor: 'pointer', background: selectedIds.has(c.id) ? '#fff7ed' : 'transparent' }}
@@ -1836,7 +2311,7 @@ export default function TalentPool() {
                       status={c.status}
                       candidateId={c.id}
                       onUpdate={(id, newStatus) => {
-                        setCandidates(prev => prev.map(cand => cand.id === id ? { ...cand, status: newStatus } : cand));
+                        updateTpCandidate(id, { status: newStatus });
                       }}
                       onShortlisted={handleShortlisted}
                     />
@@ -1917,8 +2392,7 @@ export default function TalentPool() {
               <select
                 value={pageSize}
                 onChange={e => {
-                  setPageSize(Number(e.target.value));
-                  setPage(1);
+                  setTpPagination(1, Number(e.target.value));
                 }}
                 style={{
                   padding: '4px 8px', borderRadius: '6px', border: '1.5px solid #e2e8f0',
@@ -1930,7 +2404,7 @@ export default function TalentPool() {
               </select>
             </div>
             <span style={{ fontSize: 13, color: '#94a3b8' }}>
-              Showing {Math.min((page - 1) * pageSize + 1, total)}–{Math.min(page * pageSize, total)} of <strong style={{ color: '#0f172a' }}>{total.toLocaleString()}</strong> candidates
+              Showing {displayedTotal === 0 ? 0 : Math.min((page - 1) * pageSize + 1, displayedTotal)}–{Math.min(page * pageSize, displayedTotal)} of <strong style={{ color: '#0f172a' }}>{displayedTotal.toLocaleString()}</strong> candidates
             </span>
           </div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -1944,10 +2418,10 @@ export default function TalentPool() {
               const pages = [];
               const range = 2; // Number of pages to show around current page
 
-              for (let i = 1; i <= totalPages; i++) {
+              for (let i = 1; i <= displayedTotalPages; i++) {
                 if (
                   i === 1 ||
-                  i === totalPages ||
+                  i === displayedTotalPages ||
                   (i >= page - range && i <= page + range)
                 ) {
                   pages.push(
@@ -1976,8 +2450,8 @@ export default function TalentPool() {
               return pages;
             })()}
 
-            <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages}
-              style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 7, cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.4 : 1 }}>
+            <button onClick={() => setPage(p => Math.min(displayedTotalPages, p + 1))} disabled={page === displayedTotalPages}
+              style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 7, cursor: page === displayedTotalPages ? 'not-allowed' : 'pointer', opacity: page === displayedTotalPages ? 0.4 : 1 }}>
               <ChevronRight size={14} color="#64748b" />
             </button>
           </div>
@@ -2074,7 +2548,7 @@ function AddToListModal({ selectedCount, onClose, onSuccess, candidateIds }) {
   const [mode, setMode] = useState('select'); // 'select' or 'create'
 
   useEffect(() => {
-    fetchCallLists();
+    fetchCallLists({ force: true });
   }, [fetchCallLists]);
 
   const handleAction = async () => {
@@ -2083,7 +2557,7 @@ function AddToListModal({ selectedCount, onClose, onSuccess, candidateIds }) {
       let listId = selectedListId;
       if (mode === 'create') {
         if (!newListName.trim()) return;
-        const res = await createCallList(newListName);
+        const res = await createCallList(newListName.trim());
         if (res.success) listId = res.data.id;
         else throw new Error(res.error);
       }
@@ -2091,7 +2565,11 @@ function AddToListModal({ selectedCount, onClose, onSuccess, candidateIds }) {
       if (!listId) return;
       const res = await addCandidatesToCallList(candidateIds, listId);
       if (res.success) {
-        toast.success(`Added ${selectedCount} candidates to call list`);
+        toast.success(
+          res.optimistic
+            ? `Syncing ${selectedCount} candidate${selectedCount === 1 ? '' : 's'} to call list`
+            : `Added ${selectedCount} candidate${selectedCount === 1 ? '' : 's'} to call list`
+        );
         onSuccess();
       } else {
         toast.error(res.error);

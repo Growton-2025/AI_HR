@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
-import { Users, Activity, MessageSquareMore, TrendingUp, Globe, BarChart2, Layers, Award } from 'lucide-react';
+import { Users, Activity, MessageSquareMore, TrendingUp, Globe, BarChart2, Layers, Award, PhoneCall } from 'lucide-react';
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer
 } from 'recharts';
@@ -14,7 +14,7 @@ const getEntryColor = (name, index, palette) => {
   return palette[index % palette.length];
 };
 
-const DashboardCard = ({ title, value, subtext, icon: Icon, color }) => (
+const DashboardCard = ({ title, value, subtext, icon: Icon, color, loading }) => (
   <div
     style={{
       background: '#fff',
@@ -24,25 +24,28 @@ const DashboardCard = ({ title, value, subtext, icon: Icon, color }) => (
       border: '1.5px solid #f1f5f9',
       display: 'flex', flexDirection: 'column', gap: '12px',
       transition: 'transform 0.2s, box-shadow 0.2s',
-    }}
-    onMouseEnter={e => {
-      e.currentTarget.style.transform = 'translateY(-4px)';
-      e.currentTarget.style.boxShadow = '0 20px 25px -5px rgba(0,0,0,0.05)';
-    }}
-    onMouseLeave={e => {
-      e.currentTarget.style.transform = 'none';
-      e.currentTarget.style.boxShadow = '0 4px 6px -1px rgba(0,0,0,0.02)';
+      position: 'relative',
+      overflow: 'hidden'
     }}
   >
+    {loading && <div className="shimmer" style={{ position: 'absolute', inset: 0, opacity: 0.1, zIndex: 1 }} />}
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-      <div style={{ width: '48px', height: '48px', borderRadius: '14px', background: `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <Icon size={24} color={color} />
+      <div style={{ width: '48px', height: '48px', borderRadius: '14px', background: loading ? '#f1f5f9' : `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {!loading && <Icon size={24} color={color} />}
       </div>
     </div>
     <div>
-      <div style={{ fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px' }}>{value}</div>
-      <div style={{ fontSize: '14px', fontWeight: 700, color: '#64748b', marginTop: '2px' }}>{title}</div>
-      {subtext && <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>{subtext}</div>}
+      <div style={{ 
+        fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px',
+        width: loading ? '100px' : 'auto', height: loading ? '32px' : 'auto',
+        background: loading ? '#f1f5f9' : 'transparent', borderRadius: '8px'
+      }}>{!loading && value}</div>
+      <div style={{ 
+        fontSize: '14px', fontWeight: 700, color: '#64748b', marginTop: '4px',
+        width: loading ? '140px' : 'auto', height: loading ? '14px' : 'auto',
+        background: loading ? '#f1f5f9' : 'transparent', borderRadius: '4px'
+      }}>{!loading && title}</div>
+      {!loading && subtext && <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>{subtext}</div>}
     </div>
   </div>
 );
@@ -91,10 +94,22 @@ const CustomTooltip = ({ active, payload }) => {
 const CHART_MODES = ['Geography', 'Industry', 'Segment'];
 
 const Dashboard = () => {
-  const { user, analytics, fetchAnalytics } = useAppStore();
+  const { user, analytics, fetchAnalytics, callStats, fetchCallStats } = useAppStore();
   const [activeMode, setActiveMode] = useState(0);
+  const [isRevalidating, setIsRevalidating] = useState(false);
+  const hasLoadedRef = useRef(false);
 
-  useEffect(() => { fetchAnalytics(); }, [fetchAnalytics]);
+  useEffect(() => {
+    const run = async () => {
+      if (hasLoadedRef.current) {
+        setIsRevalidating(true);
+      }
+      await Promise.allSettled([fetchAnalytics(), fetchCallStats()]);
+      hasLoadedRef.current = true;
+      setIsRevalidating(false);
+    };
+    run();
+  }, [fetchAnalytics, fetchCallStats]);
 
   const isAdmin = user?.role === 'admin';
 
@@ -107,10 +122,13 @@ const Dashboard = () => {
       inConv = (analytics.personal.pipeline_health['In Conversation'] || 0) + (analytics.personal.pipeline_health['Client Interviewing'] || 0);
   }
 
+  const totalCalls = (callStats?.due_today || 0) + (callStats?.upcoming || 0) + (callStats?.completed || 0);
+
   const metricCards = [
     { title: 'Total Sourced', value: displayMetrics.total_sourced?.toLocaleString(), subtext: 'Leads in talent pool', icon: Users, color: '#f97316' },
     { title: 'Shortlisted', value: displayMetrics.shortlisted?.toLocaleString(), subtext: 'Approved leads', icon: Activity, color: '#22c55e' },
-    { title: 'In Conversation', value: inConv?.toLocaleString(), subtext: 'Active outreach & follow-ups', icon: MessageSquareMore, color: '#3b82f6' }
+    { title: 'Call Operations', value: totalCalls.toLocaleString(), subtext: `${callStats?.due_today || 0} Ongoing · ${callStats?.upcoming || 0} Upcoming · ${callStats?.completed || 0} Completed`, icon: PhoneCall, color: '#3b82f6' },
+    { title: 'Active Hub', value: ((displayMetrics.email_campaigns_active || 0) + (displayMetrics.linkedin_campaigns_active || 0)).toLocaleString(), subtext: `${displayMetrics.email_campaigns_active || 0} via Email · ${displayMetrics.linkedin_campaigns_active || 0} via LinkedIn`, icon: TrendingUp, color: '#ec4899' }
   ];
 
   const distributions = analytics?.distributions || { geo: [], industry: [], segment: [], functional: [] };
@@ -137,10 +155,19 @@ const Dashboard = () => {
       </div>
 
       {/* Metric Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '20px', marginBottom: '36px' }}>
-        {metricCards.map(m => (
-          <DashboardCard key={m.title} {...m} />
-        ))}
+      <div style={{ 
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', 
+        gap: '20px', marginBottom: '36px',
+        opacity: isRevalidating ? 0.7 : 1,
+        transition: 'opacity 0.2s'
+      }}>
+        {(!analytics && !isRevalidating) ? (
+          [1,2,3].map(i => <DashboardCard key={i} loading />)
+        ) : (
+          metricCards.map(m => (
+            <DashboardCard key={m.title} {...m} />
+          ))
+        )}
       </div>
 
       {/* Dynamic Charts */}

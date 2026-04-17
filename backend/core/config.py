@@ -5,7 +5,7 @@ class Settings:
     PROJECT_NAME: str = "AI HR Platform"
     SECRET_KEY: str = "your-secret-key-keep-it-secret"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30 days
     
     # DB Settings (defaults)
     DB_USER: str = os.getenv("DB_USER", "postgres")

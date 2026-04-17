@@ -330,6 +330,8 @@ def initialize_cache():
     global PROFILES_BY_ID, ALL_COMPANY_NAMES, _PROFILES_CACHE
     try:
         profiles = load_all_profiles_from_db()
+        PROFILES_BY_ID.clear()
+        ALL_COMPANY_NAMES.clear()
         PROFILES_BY_ID.update({p['id']: p for p in profiles})
         _PROFILES_CACHE = profiles
         
@@ -348,6 +350,24 @@ def update_profile_cache(candidate_id: int, data: Dict[str, Any]):
         logger.info(f"Updated cache for candidate {candidate_id}: {data}")
     else:
         logger.warning(f"Attempted to update cache for non-existent candidate {candidate_id}")
+
+
+def build_candidate_pool(candidate_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    Build a lightweight search pool from the in-memory cache.
+    We drop embeddings here because the screening API serializes these profiles.
+    """
+    if candidate_ids is None:
+        source_profiles = PROFILES_BY_ID.values()
+    else:
+        source_profiles = [PROFILES_BY_ID[pid] for pid in candidate_ids if pid in PROFILES_BY_ID]
+
+    pool = []
+    for profile in source_profiles:
+        profile_copy = dict(profile)
+        profile_copy.pop("embedding", None)
+        pool.append(profile_copy)
+    return pool
 
 # --- Logic Functions ---
 
@@ -793,9 +813,16 @@ async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria
 
         checks = [
             check_company_presence,
-            check_location_presence, check_geography_experience,
+            check_industry_presence,
+            check_functional_presence,
+            check_customer_segments,
+            check_location_presence,
+            check_geography_experience,
+            check_company_details,
+            check_company_culture_presence,
             check_excluded_geography_presence,
-            check_tenure_in_latest_role, check_avg_tenure_in_last_n_roles
+            check_tenure_in_latest_role,
+            check_avg_tenure_in_last_n_roles
         ]
         
         for check in checks:
@@ -956,10 +983,14 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
         get_values_from_criteria(criteria.get("required_industries")) +
         get_values_from_criteria(criteria.get("required_functions")) +
         get_values_from_criteria(criteria.get("required_segments")) +
-        get_values_from_criteria(criteria.get("required_geographies"))
-    )
+        get_values_from_criteria(criteria.get("required_geographies")) +
+        get_values_from_criteria(criteria.get("required_locations")) +
+        get_values_from_criteria(criteria.get("required_company_details")) +
+        get_values_from_criteria(criteria.get("required_culture_type"))
+    ).strip()
     
     initial_candidate_pool = []
+    used_vector_shortlist = False
     
     if search_query_text:
         try:
@@ -968,31 +999,30 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
             
             conn = get_db_connection()
             if conn:
-                with conn.cursor() as cur:
-                   # Use pgvector cosine distance <=>
-                   cur.execute("SELECT id FROM candidates ORDER BY embedding <=> %s::vector LIMIT 500", (query_embedding,))
-                   ids = [row[0] for row in cur.fetchall()]
-                conn.close()
-                # Fetch full objects from cache
-                # Initialize candidates without the numpy ndarray embedding
-                cached_profiles = [PROFILES_BY_ID[pid] for pid in ids if pid in PROFILES_BY_ID]
-                
-                # Strip numpy arrays
-                initial_candidate_pool = []
-                for p in cached_profiles:
-                    cand_dict = dict(p)
-                    cand_dict.pop('embedding', None)
-                    initial_candidate_pool.append(cand_dict)
-                    
+                try:
+                    with conn.cursor() as cur:
+                       # Use pgvector cosine distance <=>
+                       cur.execute("SELECT id FROM candidates ORDER BY embedding <=> %s::vector LIMIT 500", (query_embedding,))
+                       ids = [row[0] for row in cur.fetchall()]
+                finally:
+                    return_db_connection(conn)
+                initial_candidate_pool = build_candidate_pool(ids)
+                used_vector_shortlist = True
                 logger.info(f"Vector search returned {len(initial_candidate_pool)} candidates.")
+            else:
+                initial_candidate_pool = build_candidate_pool()
         except Exception as e:
             logger.error(f"Vector search failed: {e}. Falling back to full scan.")
-            initial_candidate_pool = list(PROFILES_BY_ID.values())
+            initial_candidate_pool = build_candidate_pool()
     else:
-        initial_candidate_pool = list(PROFILES_BY_ID.values())
+        initial_candidate_pool = build_candidate_pool()
     
     # 4. Filter Candidates
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
+
+    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < len(PROFILES_BY_ID):
+        logger.info("Vector shortlist returned no matches after filtering. Retrying against full cache.")
+        final_candidates = await filter_candidates_by_criteria(build_candidate_pool(), criteria)
     
     if not final_candidates:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}

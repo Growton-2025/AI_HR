@@ -76,7 +76,6 @@ function App() {
                 style={{
                     marginLeft: sidebarWidth,
                     width: `calc(100% - ${sidebarWidth}px)`,
-                    transition: 'none',
                     padding: isFullBleed ? 0 : undefined,
                     minHeight: '100vh',
                     boxSizing: 'border-box',

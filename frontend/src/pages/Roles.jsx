@@ -404,18 +404,36 @@ function Roles() {
 
     const handleSendReply = async () => {
         if (!replyMessage.trim() || isSendingReply) return
+
+        const messageText = replyMessage.trim()
+        setReplyMessage('') // Clear immediately for better UX
+
+        // Add optimistic message to chat instantly
+        const optimisticMsg = {
+            type: 'SENT',
+            email_body: messageText,
+            time: new Date().toISOString(),
+            sender_name: 'You',
+            _pending: true
+        }
+        setChatMessages(prev => [...prev, optimisticMsg])
+
         setIsSendingReply(true)
         try {
-            const res = await sendChatReply(viewingRole.id, chattingWith.id, replyMessage, chatPlatform)
+            const res = await sendChatReply(viewingRole.id, chattingWith.id, messageText, chatPlatform)
             if (res.success) {
-                toast.success('Reply sent!')
-                setReplyMessage('')
-                // Refresh chat
-                handleOpenChat(chattingWith, chatPlatform)
+                toast.success('Reply sent!', { duration: 2000 })
+                // Refresh chat after a short delay to get server-confirmed messages
+                setTimeout(() => handleOpenChat(chattingWith, chatPlatform), 2000)
             } else {
+                // Remove the optimistic message on failure
+                setChatMessages(prev => prev.filter(m => m._pending !== true))
+                setReplyMessage(messageText) // Restore message on error
                 toast.error(res.error || 'Failed to send reply')
             }
         } catch (error) {
+            setChatMessages(prev => prev.filter(m => m._pending !== true))
+            setReplyMessage(messageText)
             toast.error('Failed to send reply')
         } finally {
             setIsSendingReply(false)
@@ -803,39 +821,62 @@ function Roles() {
 
                 {/* Chat Modal */}
                 {chattingWith && (
-                    <div className="modal-overlay" onClick={() => setChattingWith(null)}>
-                        <div className="modal-content" style={{ maxWidth: '700px', display: 'flex', flexDirection: 'column', maxHeight: '90vh' }} onClick={e => e.stopPropagation()}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                    <div className="modal-overlay" onClick={() => setChattingWith(null)} style={{ animation: 'fadeIn 0.2s ease-out' }}>
+                        <div className="modal-content" style={{
+                            maxWidth: '680px',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            maxHeight: '88vh',
+                            animation: 'slideUpModal 0.25s cubic-bezier(0.16, 1, 0.3, 1)',
+                            padding: 0,
+                            overflow: 'hidden'
+                        }} onClick={e => e.stopPropagation()}>
+                            {/* Header */}
+                            <div style={{
+                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                padding: '20px 24px', borderBottom: '1px solid #e2e8f0',
+                                background: chatPlatform === 'linkedin' ? '#f0f9ff' : '#f8f5ff'
+                            }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                    {chatPlatform === 'email' ? <Mail size={24} style={{ color: '#7c3aed' }} /> : <Linkedin size={24} style={{ color: '#0284c7' }} />}
-                                    <h3 className="modal-title" style={{ margin: 0 }}>
-                                        {chatPlatform === 'email' ? 'Email Hub' : 'LinkedIn Hub'} with {chattingWith.name}
-                                    </h3>
+                                    {chatPlatform === 'email'
+                                        ? <div style={{ width: 38, height: 38, borderRadius: 10, background: '#ede9fe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Mail size={20} style={{ color: '#7c3aed' }} /></div>
+                                        : <div style={{ width: 38, height: 38, borderRadius: 10, background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Linkedin size={20} style={{ color: '#0284c7' }} /></div>}
+                                    <div>
+                                        <div style={{ fontWeight: 700, fontSize: 16, color: '#0f172a' }}>
+                                            {chatPlatform === 'email' ? 'Email Hub' : 'LinkedIn Hub'} · {chattingWith.name}
+                                        </div>
+                                        <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
+                                            {chatPlatform === 'email' ? 'Smartlead conversation' : 'HeyReach conversation'}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div style={{ display: 'flex', gap: '8px' }}>
+                                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                                     <button
                                         className="icon-btn"
                                         onClick={() => handleOpenChat(chattingWith, chatPlatform)}
                                         disabled={isFetchingChat}
                                         title="Refresh conversation"
+                                        style={{ width: 34, height: 34, borderRadius: 8 }}
                                     >
-                                        <RefreshCcw size={16} className={isFetchingChat ? 'animate-spin' : ''} />
+                                        <RefreshCcw size={15} className={isFetchingChat ? 'animate-spin' : ''} />
                                     </button>
-                                    <button className="icon-btn" onClick={() => setChattingWith(null)}><Plus size={16} style={{ transform: 'rotate(45deg)' }} /></button>
+                                    <button className="icon-btn" onClick={() => setChattingWith(null)} style={{ width: 34, height: 34, borderRadius: 8 }}>
+                                        <Plus size={16} style={{ transform: 'rotate(45deg)' }} />
+                                    </button>
                                 </div>
                             </div>
 
+                            {/* Message area */}
                             <div className="chat-area" style={{
                                 flex: 1,
                                 overflowY: 'auto',
-                                padding: '16px',
+                                padding: '16px 20px',
                                 background: '#f8fafc',
-                                borderRadius: '12px',
-                                border: '1px solid #e2e8f0',
                                 display: 'flex',
                                 flexDirection: 'column',
-                                gap: '12px',
-                                minHeight: '300px'
+                                gap: '10px',
+                                minHeight: '280px',
+                                maxHeight: '420px'
                             }}>
                                 {isFetchingChat ? (
                                     <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', flex: 1 }}>
@@ -848,6 +889,7 @@ function Roles() {
                                         const type = (msg.type || '').toUpperCase();
                                         const isIncoming = ['INBOX', 'REPLY', 'REPLIED', 'LEAD', 'INCOMING'].includes(type);
                                         const isOutgoing = !isIncoming;
+                                        const isPending = Boolean(msg._pending);
 
                                         let body = msg.email_body || msg.text || msg.message || msg.content || msg.html_body || msg.body || '';
 
@@ -871,42 +913,85 @@ function Roles() {
                                             <div key={i} style={{
                                                 alignSelf: isOutgoing ? 'flex-end' : 'flex-start',
                                                 maxWidth: '85%',
-                                                padding: '12px 16px',
-                                                borderRadius: isOutgoing ? '16px 16px 2px 16px' : '16px 16px 16px 2px',
-                                                background: isOutgoing ? '#7c3aed' : '#ffffff',
-                                                color: isOutgoing ? 'white' : '#1e293b',
-                                                boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                                                border: isOutgoing ? 'none' : '1px solid #e2e8f0'
+                                                display: 'flex',
+                                                flexDirection: 'column',
+                                                alignItems: isOutgoing ? 'flex-end' : 'flex-start',
+                                                animation: isPending ? 'none' : 'fadeIn 0.2s ease-out'
                                             }}>
-                                                <div style={{ fontSize: '11px', opacity: 0.7, marginBottom: '4px', fontWeight: 600 }}>
-                                                    {isOutgoing ? 'Me' : (msg.sender_name || chattingWith.name)} • {msg.time ? new Date(msg.time).toLocaleString() : ''}
+                                                <div style={{
+                                                    padding: '12px 16px',
+                                                    borderRadius: isOutgoing ? '16px 16px 2px 16px' : '16px 16px 16px 2px',
+                                                    background: isOutgoing ? (chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed') : '#ffffff',
+                                                    color: isOutgoing ? 'white' : '#1e293b',
+                                                    boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+                                                    border: isOutgoing ? 'none' : '1px solid #e2e8f0',
+                                                    opacity: isPending ? 0.65 : 1,
+                                                    transition: 'opacity 0.3s ease'
+                                                }}>
+                                                    <div style={{ fontSize: '11px', opacity: 0.7, marginBottom: '4px', fontWeight: 600 }}>
+                                                        {isOutgoing ? 'Me' : (msg.sender_name || chattingWith.name)} • {msg.time ? new Date(msg.time).toLocaleString() : ''}
+                                                    </div>
+                                                    {isPending
+                                                        ? <div style={{ fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{body}</div>
+                                                        : <div style={{ fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: body }} />}
                                                 </div>
-                                                <div style={{ fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: body }} />
+                                                {isPending && (
+                                                    <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '3px', padding: '0 4px' }}>
+                                                        Sending...
+                                                    </div>
+                                                )}
                                             </div>
                                         );
                                     })
                                 )}
                                 <div ref={chatEndRef} />
                             </div>
-
-                            <div style={{ marginTop: '20px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                <textarea
-                                    className="input-field"
-                                    placeholder="Write your reply..."
-                                    style={{ width: '100%', minHeight: '80px', resize: 'vertical', padding: '12px' }}
-                                    value={replyMessage}
-                                    onChange={(e) => setReplyMessage(e.target.value)}
-                                />
-                                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
-                                    <button className="btn btn-secondary" onClick={() => setChattingWith(null)}>Cancel</button>
+                            {/* Reply box */}
+                            <div style={{ padding: '16px 20px 20px', borderTop: '1px solid #e2e8f0', background: '#fff' }}>
+                                <div style={{
+                                    display: 'flex', gap: '10px', alignItems: 'flex-end',
+                                    background: '#f8fafc', border: '1.5px solid #e2e8f0',
+                                    borderRadius: '14px', padding: '8px 12px',
+                                    transition: 'border-color 0.2s',
+                                }}
+                                    onFocusCapture={e => e.currentTarget.style.borderColor = chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed'}
+                                    onBlurCapture={e => e.currentTarget.style.borderColor = '#e2e8f0'}
+                                >
+                                    <textarea
+                                        className="input-field"
+                                        placeholder={`Reply via ${chatPlatform === 'linkedin' ? 'LinkedIn (HeyReach)' : 'Email (Smartlead)'}…`}
+                                        style={{
+                                            flex: 1, minHeight: '44px', maxHeight: '120px',
+                                            resize: 'none', border: 'none', background: 'transparent',
+                                            outline: 'none', padding: '4px 0',
+                                            fontSize: '14px', fontFamily: 'inherit', color: '#0f172a'
+                                        }}
+                                        value={replyMessage}
+                                        onChange={(e) => setReplyMessage(e.target.value)}
+                                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendReply(); }}}
+                                        onInput={(e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; }}
+                                    />
                                     <button
-                                        className="btn btn-primary"
                                         onClick={handleSendReply}
                                         disabled={!replyMessage.trim() || isSendingReply}
-                                        style={{ minWidth: '120px' }}
+                                        style={{
+                                            width: 40, height: 40, borderRadius: '50%', border: 'none',
+                                            flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                            background: !replyMessage.trim() || isSendingReply ? '#e2e8f0'
+                                                : chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed',
+                                            color: !replyMessage.trim() || isSendingReply ? '#94a3b8' : '#fff',
+                                            cursor: !replyMessage.trim() || isSendingReply ? 'not-allowed' : 'pointer',
+                                            transition: 'all 0.2s ease',
+                                            transform: isSendingReply ? 'scale(0.9)' : 'scale(1)',
+                                        }}
                                     >
-                                        {isSendingReply ? <Loader2 size={16} className="animate-spin" /> : <><Send size={16} style={{ marginRight: '8px' }} /> Send Reply</>}
+                                        {isSendingReply
+                                            ? <Loader2 size={16} className="animate-spin" />
+                                            : <Send size={16} />}
                                     </button>
+                                </div>
+                                <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 6, paddingLeft: 4 }}>
+                                    Press Enter to send · Shift+Enter for new line
                                 </div>
                             </div>
                         </div>

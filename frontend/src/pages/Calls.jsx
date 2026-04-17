@@ -5,7 +5,7 @@ import {
   Search, RefreshCw, MoreHorizontal, User, 
   Trash2, X, ChevronLeft, Send, MessageSquare, 
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
-  ListHeart, Layers, PhoneIncoming
+  ClipboardList, Layers, PhoneIncoming
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
@@ -54,7 +54,7 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
     stateRef.current = { messages, loaded };
   }, [messages, loaded]);
 
-  const loadMessages = useCallback(async ({ showLoader = false, silent = false } = {}) => {
+  const loadMessages = useCallback(async ({ showLoader = false, silent = false, force = false } = {}) => {
     const requestSeq = ++requestSeqRef.current;
     const hasCachedMessages = stateRef.current.messages.length > 0 || stateRef.current.loaded;
     const shouldBlock = showLoader && !hasCachedMessages;
@@ -65,7 +65,7 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
       setRefreshing(true);
     }
 
-    const res = await fetchChatHistory(0, candidateId, platform);
+    const res = await fetchChatHistory(0, candidateId, platform, force);
     if (requestSeqRef.current !== requestSeq) return;
 
     if (res.success) {
@@ -289,22 +289,68 @@ export default function Calls() {
     callLists, fetchCallLists,
     callsLastQueryKey,
     callStats, fetchCallStats,
-    updateCall, deleteCall, deleteCallList
+    updateCall, deleteCall, deleteCallList, createCallList, clearCallsState
   } = useAppStore();
 
   const [activeTab, setActiveTab] = useState('today');
   const [loading, setLoading] = useState(false);
+  const [isRevalidating, setIsRevalidating] = useState(false);
   const [selectedList, setSelectedList] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
+  const [expandedCallId, setExpandedCallId] = useState(null);
+  
+  // List Creation State
+  const [isCreatingList, setIsCreatingList] = useState(false);
+  const [newListName, setNewListName] = useState('');
+  const [isSubmittingList, setIsSubmittingList] = useState(false);
+  const [fetchNotice, setFetchNotice] = useState('');
+  const retryTimerRef = useRef(null);
+  const callsRef = useRef(calls);
+  const callListsRef = useRef(callLists);
+
+  useEffect(() => {
+    callsRef.current = calls;
+  }, [calls]);
+
+  useEffect(() => {
+    callListsRef.current = callLists;
+  }, [callLists]);
+
+  useEffect(() => () => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+    }
+  }, []);
 
   const fetchData = useCallback(async () => {
-    setLoading(true);
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+
+    const hasCache = activeTab === 'lists' && !selectedList
+      ? callListsRef.current.length > 0
+      : callsRef.current && callsRef.current.length > 0;
+    if (!hasCache) setLoading(true);
+    else setIsRevalidating(true);
+
+    void fetchCallStats().then(res => {
+      if (!res?.success) {
+        console.error('Failed to refresh call stats:', res?.error);
+      }
+    });
+
     try {
-      const statsPromise = fetchCallStats();
       if (activeTab === 'lists' && !selectedList) {
-        const [listsRes, statsRes] = await Promise.all([fetchCallLists(), statsPromise]);
-        if (!listsRes?.success || !statsRes?.success) throw new Error('Failed to fetch call data');
+        const listsRes = await fetchCallLists();
+        if (!listsRes?.success) {
+          setFetchNotice(hasCache ? 'Server is slow. Showing the last available call lists.' : 'Server is slow. Trying again shortly.');
+          retryTimerRef.current = setTimeout(() => {
+            fetchData();
+          }, 2000);
+          return;
+        }
       } else {
         const params = {};
         if (activeTab === 'today') params.due_filter = 'today';
@@ -318,13 +364,25 @@ export default function Calls() {
           params.status = 'pending';
         }
 
-        const [callsRes, statsRes] = await Promise.all([fetchCalls(params), statsPromise]);
-        if (!callsRes?.success || !statsRes?.success) throw new Error('Failed to fetch call data');
+        const callsRes = await fetchCalls(params);
+        if (!callsRes?.success) {
+          setFetchNotice(hasCache ? 'Server is slow. Showing the last available call tasks.' : 'Server is slow. Trying again shortly.');
+          retryTimerRef.current = setTimeout(() => {
+            fetchData();
+          }, 2000);
+          return;
+        }
       }
+      setFetchNotice('');
     } catch (e) {
-      toast.error('Failed to fetch data');
+      console.error('fetchData detailed error:', e);
+      setFetchNotice(hasCache ? 'Server is slow. Showing the last available call data.' : 'Server is slow. Trying again shortly.');
+      retryTimerRef.current = setTimeout(() => {
+        fetchData();
+      }, 2000);
     } finally {
       setLoading(false);
+      setIsRevalidating(false);
     }
   }, [activeTab, selectedList, fetchCalls, fetchCallLists, fetchCallStats]);
 
@@ -347,7 +405,7 @@ export default function Calls() {
     if (!window.confirm('Remove this candidate from the call list?')) return;
     const res = await deleteCall(callId);
     if (res.success) toast.success('Removed from list');
-    else toast.error('Failed to remove');
+    else toast.error(res.error || 'Failed to remove');
   };
 
   const handleDeleteList = async (listId, name) => {
@@ -357,7 +415,25 @@ export default function Calls() {
       if (selectedList?.id === listId) setSelectedList(null);
       toast.success('List deleted');
     }
-    else toast.error('Failed to delete list');
+    else toast.error(res.error || 'Failed to delete list');
+  };
+
+  const handleCreateList = async () => {
+    if (!newListName.trim()) {
+      setIsCreatingList(false);
+      return;
+    }
+    setIsSubmittingList(true);
+    const res = await createCallList(newListName.trim());
+    setIsSubmittingList(false);
+    
+    if (res.success) {
+      toast.success('List created');
+      setNewListName('');
+      setIsCreatingList(false);
+    } else {
+      toast.error(res.error || 'Failed to create list');
+    }
   };
 
   const filteredCalls = (calls || []).filter(c => 
@@ -365,7 +441,7 @@ export default function Calls() {
     (c.candidate_title || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
   const currentCallsQueryKey = selectedList
-    ? `list_id=${selectedList.id}`
+    ? `list_id=${selectedList.id}&status=pending`
     : activeTab === 'today'
       ? 'due_filter=today&status=pending'
       : activeTab === 'upcoming'
@@ -378,9 +454,21 @@ export default function Calls() {
 
   return (
     <div style={{ padding: '32px', background: '#f8fafc', minHeight: '100vh', fontFamily: '"Inter", sans-serif' }}>
-      <header style={{ marginBottom: '32px' }}>
-        <h1 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Tasks Dashboard</h1>
-        <p style={{ color: '#64748b', fontSize: '15px' }}>Track your calling progress and lists</p>
+      <header style={{ marginBottom: '32px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <h1 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Tasks Dashboard</h1>
+          <p style={{ color: '#64748b', fontSize: '15px' }}>Track your calling progress and lists</p>
+          {fetchNotice && (
+            <div style={{ marginTop: '12px', padding: '10px 14px', borderRadius: '12px', background: '#fff7ed', color: '#c2410c', fontSize: '13px', fontWeight: 600, border: '1px solid #fdba74' }}>
+              {fetchNotice}
+            </div>
+          )}
+        </div>
+        {isRevalidating && (
+          <div style={{ padding: '8px 16px', borderRadius: '12px', background: '#eff6ff', color: '#2563eb', fontSize: '12px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <RefreshCw size={14} className="revalidating" /> Updating...
+          </div>
+        )}
       </header>
 
       {/* Stats Cards */}
@@ -403,7 +491,7 @@ export default function Calls() {
         {TABS.map(tab => (
           <button
             key={tab.id}
-            onClick={() => { setActiveTab(tab.id); setSelectedList(null); }}
+            onClick={() => { clearCallsState(); setActiveTab(tab.id); setSelectedList(null); }}
             style={{
               padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #2563eb' : '2px solid transparent',
               color: activeTab === tab.id ? '#2563eb' : '#64748b', fontSize: '14px', fontWeight: 600,
@@ -432,10 +520,70 @@ export default function Calls() {
                   <div style={{ width: '35%', height: 12, borderRadius: 8, background: '#f1f5f9' }} />
                 </div>
               ))}
+              
+              {/* Create List Card */}
+              <div 
+                style={{ 
+                  padding: '24px', borderRadius: '20px', 
+                  border: isCreatingList ? '2px solid #3b82f6' : '1px dashed #cbd5e1', 
+                  background: isCreatingList ? '#fff' : '#f8fafc',
+                  cursor: isCreatingList ? 'default' : 'pointer',
+                  transition: 'all 0.2s ease',
+                  display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
+                  minHeight: '160px',
+                  boxShadow: isCreatingList ? '0 10px 15px -3px rgba(0, 0, 0, 0.05)' : 'none'
+                }}
+                onClick={() => !isCreatingList && setIsCreatingList(true)}
+                onMouseEnter={e => !isCreatingList && (e.currentTarget.style.borderColor = '#94a3b8')}
+                onMouseLeave={e => !isCreatingList && (e.currentTarget.style.borderColor = '#cbd5e1')}
+              >
+                {!isCreatingList ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
+                    <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: '#fff', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <List size={20} color="#64748b" />
+                    </div>
+                    <span style={{ fontSize: '15px', fontWeight: 600, color: '#64748b' }}>Create New List</span>
+                  </div>
+                ) : (
+                  <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    <input
+                      autoFocus
+                      type="text"
+                      placeholder="e.g. Frontend Q1 Hires"
+                      value={newListName}
+                      onChange={e => setNewListName(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && handleCreateList()}
+                      disabled={isSubmittingList}
+                      style={{
+                        width: '100%', padding: '10px 14px', borderRadius: '10px',
+                        border: '1px solid #e2e8f0', fontSize: '14px', outline: 'none',
+                        boxSizing: 'border-box'
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); handleCreateList(); }}
+                        disabled={isSubmittingList}
+                        style={{ flex: 1, padding: '8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '8px', fontSize: '13px', fontWeight: 600, cursor: isSubmittingList ? 'wait' : 'pointer' }}
+                      >
+                        {isSubmittingList ? 'Saving...' : 'Save List'}
+                      </button>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); setIsCreatingList(false); setNewListName(''); }}
+                        disabled={isSubmittingList}
+                        style={{ padding: '8px 12px', background: '#f1f5f9', color: '#64748b', border: 'none', borderRadius: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {callLists.map(list => (
                 <div 
                   key={list.id} 
-                  onClick={() => setSelectedList(list)}
+                  onClick={() => { clearCallsState(); setSelectedList(list); }}
                   style={{ 
                     padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', cursor: 'pointer',
                     transition: 'all 0.2s'
@@ -462,7 +610,7 @@ export default function Calls() {
                   <h3 style={{ fontSize: '16px', fontWeight: 700, color: '#0f172a', marginBottom: '4px' }}>{list.name}</h3>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                     <User size={12} color="#94a3b8" />
-                    <span style={{ fontSize: '13px', color: '#64748b' }}>{list.candidate_count} Candidates</span>
+                    <span style={{ fontSize: '13px', color: '#64748b' }}>{list.candidate_count} Pending</span>
                   </div>
                 </div>
               ))}
@@ -476,7 +624,7 @@ export default function Calls() {
             <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px' }}>
               {selectedList && (
                 <button 
-                  onClick={() => setSelectedList(null)}
+                  onClick={() => { clearCallsState(); setSelectedList(null); }}
                   style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', display: 'flex', alignItems: 'center', gap: '4px', padding: '4px' }}
                 >
                   <ChevronLeft size={20} />
@@ -523,8 +671,8 @@ export default function Calls() {
               {!showCallsLoading && (
                 <>
               {(filteredCalls || []).map(call => (
+                <React.Fragment key={call.id}>
                 <div 
-                  key={call.id}
                   style={{ 
                     padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', 
                     alignItems: 'center', gap: '16px'
@@ -549,9 +697,31 @@ export default function Calls() {
                           : `Due: ${formatLocalDate(call.due_date)}`
                         }
                       </div>
+                      {call.status === 'completed' && (
+                        <>
+                          <div style={{ color: '#2563eb', fontWeight: 600 }}>
+                            {call.duration ? `${Math.floor(call.duration / 60)}m ${call.duration % 60}s` : '0s'}
+                          </div>
+                          <div style={{ color: '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
+                            {call.outcome || 'No Outcome'}
+                          </div>
+                        </>
+                      )}
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: '8px' }}>
+                    {call.status === 'completed' && (
+                      <button
+                        onClick={() => setExpandedCallId(expandedCallId === call.id ? null : call.id)}
+                        style={{
+                          padding: '8px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
+                          background: '#fff', color: '#2563eb', border: '1.5px solid #dbeafe', cursor: 'pointer',
+                          display: 'flex', alignItems: 'center', gap: '6px'
+                        }}
+                      >
+                        {expandedCallId === call.id ? 'Hide Details' : 'View Insights'}
+                      </button>
+                    )}
                     <button 
                       onClick={() => handleDeleteCall(call.id)}
                       style={{ padding: '8px', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', borderRadius: '8px' }}
@@ -573,12 +743,49 @@ export default function Calls() {
                       }}
                     >
                       <PhoneCall size={16} /> 
-                      {call.status === 'completed' ? 'Completed' : 'Dial Now'}
                     </button>
                   </div>
                 </div>
-              ))}
-              {(filteredCalls || []).length === 0 && (
+
+                {/* Expanded Details Section */}
+                {expandedCallId === call.id && (
+                  <div style={{ 
+                    padding: '24px', background: '#f8fafc', borderRadius: '16px', margin: '0 0 20px 56px',
+                    border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
+                  }}>
+                    {call.recording_url ? (
+                      <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Call Recording</h4>
+                        <audio controls src={call.recording_url} style={{ width: '100%' }} />
+                      </div>
+                    ) : (
+                      <div style={{ padding: '16px', borderRadius: '12px', background: '#fff', border: '1px solid #e2e8f0', color: '#64748b', fontSize: '13px' }}>
+                        Recording not available for this call.
+                      </div>
+                    )}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+                      <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>AI Summary</h4>
+                        <div style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
+                          {call.summary || (call.recording_url ? 'Processing summary...' : 'No summary available.')}
+                        </div>
+                      </div>
+                      <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Full Transcript</h4>
+                        <div style={{ 
+                          fontSize: '13px', color: '#64748b', lineHeight: '1.6', height: '200px', overflowY: 'auto', 
+                          paddingRight: '12px', whiteSpace: 'pre-wrap' 
+                        }}>
+                          {call.transcript || (call.recording_url ? 'Transcribing call...' : 'No transcript available.')}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </React.Fragment>
+            ))}
+              {(filteredCalls || []).length === 0 && !loading && (
                 <div style={{ padding: '60px', textAlign: 'center', color: '#94a3b8' }}>No candidates matching your query.</div>
               )}
                 </>
@@ -608,12 +815,25 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [followupTitle, setFollowupTitle] = useState(call.task_title || '');
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [saving, setSaving] = useState(false);
-  const { updateCall } = useAppStore();
+  const { updateCall, initiateCall } = useAppStore();
 
   useEffect(() => {
     if (callState === 'connecting') {
-      const timer = setTimeout(() => setCallState('active'), 2000);
-      return () => clearTimeout(timer);
+      const triggerCall = async () => {
+        try {
+          const res = await initiateCall(call.id);
+          if (res.success) {
+            setCallState('active');
+          } else {
+            toast.error(res.error || 'Failed to start call');
+            onClose();
+          }
+        } catch (e) {
+          toast.error('Connection error');
+          onClose();
+        }
+      };
+      triggerCall();
     }
   }, [callState]);
 
@@ -789,6 +1009,16 @@ function CallingModal({ call, onClose, onRefresh }) {
                       {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </div>
+
+                  {['Left Voicemail', 'No Answer'].includes(outcome) && !createFollowup && (
+                    <div style={{ padding: '12px', background: '#eff6ff', color: '#1e40af', borderRadius: '12px', fontSize: '13px', marginBottom: '24px', border: '1px solid #bfdbfe', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <Calendar size={16} style={{ marginTop: '2px', flexShrink: 0 }} />
+                      <div>
+                        <strong style={{ display: 'block', marginBottom: '4px' }}>Automated Call Sequence</strong>
+                        Because the call went unanswered, the next step in the Call 1 → Day 2 → Day 4 → Day 7 sequence will be scheduled automatically when you save.
+                      </div>
+                    </div>
+                  )}
 
                   <div style={{ marginBottom: '24px' }}>
                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Notes & Next Steps</label>

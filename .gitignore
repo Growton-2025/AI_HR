@@ -114,6 +114,7 @@ query_db.py
 verify_glitch_fix.py
 logs/
 scratch/
+*.bak
 test_batch.py
 test_convs.py
 test_heyreach.py
