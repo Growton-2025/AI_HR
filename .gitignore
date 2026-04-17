@@ -94,3 +94,33 @@ frontend/dist/
 # Project Environment
 .env
 frontend/.env
+
+# Temporary and Scratch Files
+*.log
+*.db
+ai_hr.db
+backend/data.db
+backend/uvicorn_output.log
+uvicorn_output.log
+ngrok.log
+chat_check_output.json
+backend_log_new.txt
+frontend_log_new.txt
+debug_*.py
+test_*.py
+force_fetch.py
+get_cand_info.py
+query_db.py
+verify_glitch_fix.py
+logs/
+scratch/
+test_batch.py
+test_convs.py
+test_heyreach.py
+test_heyreach_bot.py
+test_hr.py
+test_hr2.py
+test_perf.py
+test_speed.py
+test_speed2.py
+test_sync.py
