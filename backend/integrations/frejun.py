@@ -8,10 +8,10 @@ logger = logging.getLogger(__name__)
 class FreJunManager:
     def __init__(self):
         self.base_url = "https://api.frejun.com/api/v2"
-        self.client_id = os.getenv("FREJUN_CLIENT_ID")
-        self.client_secret = os.getenv("FREJUN_CLIENT_SECRET")
-        self.user_email = os.getenv("FREJUN_USER_EMAIL")
-        self.virtual_number = os.getenv("FREJUN_VIRTUAL_NUMBER")
+        self.client_id = (os.getenv("FREJUN_CLIENT_ID") or "").strip()
+        self.client_secret = (os.getenv("FREJUN_CLIENT_SECRET") or "").strip()
+        self.user_email = (os.getenv("FREJUN_USER_EMAIL") or "").strip()
+        self.virtual_number = (os.getenv("FREJUN_VIRTUAL_NUMBER") or "").strip()
         self._token = None
 
     def get_access_token(self) -> Optional[str]:
@@ -74,27 +74,21 @@ class FreJunManager:
         
         try:
             logger.info(f"Initiating FreJun call to {candidate_phone} via {virtual_number}")
+            logger.debug(f"DEBUG: FreJun Params: {params}")
+            logger.debug(f"DEBUG: FreJun Payload: {payload}")
+            
             response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
             
             if response.status_code in [200, 201]:
                 return {"success": True, "data": response.json()}
-            elif response.status_code == 401:
-                return {
-                    "success": False, 
-                    "error": "FreJun authentication failed. The token may be expired or invalid.", 
-                    "status_code": 401,
-                    "raw_response": response.text
-                }
-            elif response.status_code == 403:
-                return {
-                    "success": False, 
-                    "error": "FreJun access forbidden. Check if your API key has permissions for this action.", 
-                    "status_code": 403,
-                    "raw_response": response.text
-                }
             else:
-                logger.error(f"FreJun call failed: {response.status_code} - {response.text}")
-                return {"success": False, "error": response.text, "status_code": response.status_code}
+                logger.error(f"FreJun call failed with status {response.status_code}: {response.text}")
+                return {
+                    "success": False, 
+                    "error": f"FreJun Error ({response.status_code}): {response.text}",
+                    "status_code": response.status_code,
+                    "raw_response": response.text
+                }
                 
         except requests.exceptions.Timeout:
             return {"success": False, "error": "FreJun API request timed out"}

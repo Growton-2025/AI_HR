@@ -814,7 +814,15 @@ def initiate_call(
     result = frejun.initiate_call(candidate_phone=phone, recruiter_email=email)
 
     if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "FreJun initiation failed"))
+        # Log the specific error for server-side debugging
+        import logging
+        logging.error(f"FreJun initiation failed: {result.get('error')}")
+        
+        # Raise HTTP exception with the specific message from FreJun
+        raise HTTPException(
+            status_code=result.get("status_code", 500), 
+            detail=result.get("error", "FreJun initiation failed")
+        )
 
     return {"success": True, "message": "Call initiated", "frejun_data": result.get("data")}
 
