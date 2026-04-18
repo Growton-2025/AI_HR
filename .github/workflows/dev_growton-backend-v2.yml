@@ -8,6 +8,11 @@ on:
   push:
     branches:
       - dev
+    paths:
+      - 'backend/**'
+      - 'requirements.txt'
+      - 'startup.sh'
+      - '.github/workflows/dev_growton-backend-v2.yml'
   workflow_dispatch:
 
 jobs:
@@ -32,7 +37,10 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
                 
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+      # App Service/Oryx turns this uploaded source artifact into the runtime package
+      # used at startup. This app depends on the resulting oryx-manifest.toml,
+      # output.tar.zst, and antenv layout, so we deploy only the downloaded artifact
+      # directory explicitly in the deploy job below.
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -59,7 +67,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+          path: backend-artifact
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -67,10 +76,13 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_7ED39A8FB036492EA6D22A14F028AF86 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_108A9CA4A8DC4786AAA41FB14BF0CD92 }}
 
+      # Deploy the downloaded backend artifact directory explicitly so the supported
+      # App Service/Oryx deployment path stays deterministic across runs.
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
           app-name: 'growton-backend-v2'
           slot-name: 'Production'
-          
+          package: backend-artifact
+

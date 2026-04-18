@@ -6,7 +6,9 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from backend.api import schemas, deps
-from backend.db.connection import get_db_connection, return_db_connection
+from backend.db.connection import (
+    get_db_connection_context,
+)
 from backend.services.frejun_calls import transcript_preview
 from backend.pipeline.query import (
     process_query_main,
@@ -32,7 +34,7 @@ async def get_candidates(limit: int = 100, offset: int = 0):
     all_profiles = list(PROFILES_BY_ID.values())
     total = len(all_profiles)
     paginated = all_profiles[offset:offset + limit]
-    
+
     # Return simplified version for listing
     simplified = []
     for p in paginated:
@@ -48,7 +50,7 @@ async def get_candidates(limit: int = 100, offset: int = 0):
             "current_title": primary_role.get("title"),
             "current_company": primary_role.get("company")
         })
-    
+
     return {
         "candidates": simplified,
         "total": total,
@@ -79,10 +81,10 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
     """
     session_id = request.session_id or hashlib.sha256(os.urandom(32)).hexdigest()
     tracker = TokenCostTracker()
-    
+
     results = []
     status_messages = []
-    
+
     try:
         async for item in process_query_main(request.query, session_id, tracker):
             if isinstance(item, str):
@@ -99,7 +101,7 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
                         results.append(profile)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
     return {
         "candidates": results,
         "total": len(results),
@@ -114,10 +116,10 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
 @router.post("/export")
 async def export_candidates(candidate_ids: List[int]):
     """Export selected candidates to Excel (returns base64)"""
-    
+
     selected = {cid: PROFILES_BY_ID[cid] for cid in candidate_ids if cid in PROFILES_BY_ID}
     excel_bytes = profiles_to_excel(selected)
-    
+
     return {
         "filename": f"candidates_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         "content": base64.b64encode(excel_bytes).decode('utf-8'),
@@ -134,20 +136,20 @@ async def websocket_search(websocket: WebSocket):
     Sends progress updates and candidates as they're processed
     """
     await websocket.accept()
-    
+
     try:
         while True:
             # Receive search query
             data = await websocket.receive_json()
             query = data.get("query", "")
             session_id = data.get("session_id", hashlib.sha256(os.urandom(32)).hexdigest())
-            
+
             if not query:
                 await websocket.send_json({"type": "error", "message": "Query is required"})
                 continue
-            
+
             tracker = TokenCostTracker()
-            
+
             try:
                 # Use the pipeline generator
                 async for item in process_query_main(query, session_id, tracker):
@@ -157,16 +159,16 @@ async def websocket_search(websocket: WebSocket):
                             "type": "status",
                             "message": item
                         })
-                    
+
                     elif isinstance(item, dict):
                         msg_type = item.get("type")
-                        
+
                         if msg_type == "progress_start":
                             await websocket.send_json({
                                 "type": "progress_start",
                                 "total": item.get("total", 0)
                             })
-                        
+
                         elif msg_type == "profile_chunk":
                             await websocket.send_json({
                                 "type": "candidate",
@@ -174,7 +176,7 @@ async def websocket_search(websocket: WebSocket):
                                 "current": item.get("current"),
                                 "total": item.get("total")
                             })
-                        
+
                         elif msg_type == "complete":
                             await websocket.send_json({
                                 "type": "complete",
@@ -186,7 +188,7 @@ async def websocket_search(websocket: WebSocket):
                                 }
                             })
                             break
-            
+
             except Exception as e:
                 # Log error but don't crash loop unless critical
                 print(f"Error during search: {e}")
@@ -199,7 +201,7 @@ async def websocket_search(websocket: WebSocket):
                 except Exception:
                     # Client likely disconnected
                     break
-                    
+
     except (WebSocketDisconnect, RuntimeError):
         # RuntimeError is raised by Starlette if we try to send after close
         print("WebSocket client disconnected")
@@ -211,27 +213,27 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
     """Update candidate fields manually"""
 
     # 1. Update Database
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    
     try:
-        cur = conn.cursor()
-        for field, value in data.items():
-            # Basic whitelist for security
-            if field not in ['email', 'mobile_phone', 'linkedin', 'notes', 'name', 'first_name', 'last_name']:
-                continue
-            
-            # Map frontend names to DB column names if different
-            db_field = 'mobile_phone' if field == 'phone' else field
-            
-            cur.execute(f"UPDATE candidates SET {db_field} = %s, updated_at = NOW() WHERE id = %s", (value, candidate_id))
-        
-        conn.commit()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                for field, value in data.items():
+                    # Basic whitelist for security
+                    if field not in ['email', 'mobile_phone', 'linkedin', 'notes', 'name', 'first_name', 'last_name']:
+                        continue
+
+                    # Map frontend names to DB column names if different
+                    db_field = 'mobile_phone' if field == 'phone' else field
+
+                    cur.execute(
+                        f"UPDATE candidates SET {db_field} = %s, updated_at = NOW() WHERE id = %s",
+                        (value, candidate_id),
+                    )
+                conn.commit()
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn: return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Database update failed: {e}")
 
     # 2. Update Cache
@@ -256,46 +258,43 @@ async def get_candidate_activity(
     ensure_calls_schema_ready()
     owner = get_call_list_owner(current_user)
 
-    conn = get_db_connection(validate=True, register_pgvector=False)
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cur = None
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                c.id,
-                COALESCE(c.completed_at, c.updated_at, c.created_at) AS occurred_at,
-                c.status,
-                c.outcome,
-                c.duration,
-                c.recording_url,
-                c.summary,
-                c.transcript,
-                c.notes,
-                c.frejun_virtual_number,
-                cand.mobile_phone,
-                c.frejun_link,
-                c.frejun_summary_url
-            FROM calls c
-            JOIN call_lists cl ON c.list_id = cl.id
-            JOIN candidates cand ON c.candidate_id = cand.id
-            WHERE c.candidate_id = %s
-              AND LOWER(COALESCE(cl.created_by, '')) = %s
-              AND c.status = 'completed'
-            ORDER BY COALESCE(c.completed_at, c.updated_at, c.created_at) DESC, c.id DESC
-            """,
-            (candidate_id, owner),
-        )
-        rows = cur.fetchall()
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        COALESCE(c.completed_at, c.updated_at, c.created_at) AS occurred_at,
+                        c.status,
+                        c.outcome,
+                        c.duration,
+                        c.recording_url,
+                        c.summary,
+                        c.transcript,
+                        c.notes,
+                        c.frejun_virtual_number,
+                        cand.mobile_phone,
+                        c.frejun_link,
+                        c.frejun_summary_url
+                    FROM calls c
+                    JOIN call_lists cl ON c.list_id = cl.id
+                    JOIN candidates cand ON c.candidate_id = cand.id
+                    WHERE c.candidate_id = %s
+                      AND LOWER(COALESCE(cl.created_by, '')) = %s
+                      AND c.status = 'completed'
+                    ORDER BY COALESCE(c.completed_at, c.updated_at, c.created_at) DESC, c.id DESC
+                    """,
+                    (candidate_id, owner),
+                )
+                rows = cur.fetchall()
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        if cur:
-            cur.close()
-        return_db_connection(conn)
 
     items = []
     for row in rows:

@@ -9,7 +9,9 @@ from typing import List, Optional, Dict
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from backend.api import schemas, deps
-from backend.db.connection import get_db_connection, return_db_connection
+from backend.db.connection import (
+    get_db_connection_context,
+)
 from backend.integrations.smartlead import SmartleadBot
 from backend.integrations.heyreach import HeyReachBot
 
@@ -34,30 +36,30 @@ _EMAIL_CACHE_STALE_THRESHOLD = 300 # 5 minutes threshold for bg refresh
 
 def _update_outreach_identifiers(candidate_id: int, conv_id: str, acc_id: int):
     """Update identifiers in database if they changed."""
-    conn = get_db_connection()
-    if not conn:
-        return
     try:
-        cur = conn.cursor()
-        fields = []
-        params = []
-        if conv_id:
-            fields.append("li_conversation_id = %s")
-            params.append(str(conv_id))
-        if acc_id:
-            fields.append("li_account_id = %s")
-            params.append(str(acc_id))
-        
-        if fields:
-            params.append(candidate_id)
-            cur.execute(f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s", tuple(params))
-            conn.commit()
-            print(f"DEBUG: Auto-corrected identifiers for cand {candidate_id}")
-        cur.close()
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                fields = []
+                params = []
+                if conv_id:
+                    fields.append("li_conversation_id = %s")
+                    params.append(str(conv_id))
+                if acc_id:
+                    fields.append("li_account_id = %s")
+                    params.append(str(acc_id))
+
+                if fields:
+                    params.append(candidate_id)
+                    cur.execute(
+                        f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s",
+                        tuple(params),
+                    )
+                    conn.commit()
+                    print(f"DEBUG: Auto-corrected identifiers for cand {candidate_id}")
     except Exception as e:
         print(f"WARNING: ID update failed: {e}")
-    finally:
-        return_db_connection(conn)
 
 def _sync_li_messages(
     candidate_id: int,
@@ -95,7 +97,7 @@ def _sync_li_messages(
                     msg["email_body"] = _clean_email_body(raw_body)
     except Exception as e:
         print(f"WARNING: HeyReach sync failed for cand {candidate_id}: {e}")
-    
+
     with _li_chat_lock:
         # Persistent Cache Protection: If the new fetch is empty, keep old messages
         final_messages = messages
@@ -115,26 +117,23 @@ def _sync_li_messages(
         # ── PERSISTENT DB CACHE ──────────────────────────────────────────────
         # Save the fetched history to DB so it lives across restarts
         if final_messages:
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE candidate_outreach 
-                        SET li_chat_history_cache = %s,
-                            li_chat_history_updated_at = %s
-                        WHERE candidate_id = %s
-                    """,
-                        (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id),
-                    )
-                    conn.commit()
-                    cur.close()
-                    return_db_connection(conn)
-                except Exception as db_err:
-                    print(f"WARNING: Failed to persist LI cache to DB: {db_err}")
-                    if conn:
-                        return_db_connection(conn, close=True)
+            try:
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                    if not conn:
+                        raise RuntimeError("Database connection failed while persisting LinkedIn cache")
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE candidate_outreach
+                            SET li_chat_history_cache = %s,
+                                li_chat_history_updated_at = %s
+                            WHERE candidate_id = %s
+                        """,
+                            (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id),
+                        )
+                        conn.commit()
+            except Exception as db_err:
+                print(f"WARNING: Failed to persist LI cache to DB: {db_err}")
 
     print(f"DEBUG: LI cache refreshed for cand {candidate_id}: {len(final_messages or [])} msgs")
     return final_messages or []
@@ -183,25 +182,29 @@ def _sync_email_messages(candidate_id: int, email: str, campaign_id: str) -> Lis
 
         # Persist to DB
         if final_messages:
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE candidate_outreach 
-                        SET email_chat_history_cache = %s,
-                            email_chat_history_updated_at = %s
-                        WHERE candidate_id = %s AND (campaign_id = %s OR %s IS NULL)
-                    """,
-                        (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id, campaign_id, campaign_id),
-                    )
-                    conn.commit()
-                    cur.close()
-                    return_db_connection(conn)
-                except Exception as db_err:
-                    print(f"WARNING: Failed to persist Email cache to DB: {db_err}")
-                    return_db_connection(conn, close=True)
+            try:
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                    if not conn:
+                        raise RuntimeError("Database connection failed while persisting email cache")
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE candidate_outreach
+                            SET email_chat_history_cache = %s,
+                                email_chat_history_updated_at = %s
+                            WHERE candidate_id = %s AND (campaign_id = %s OR %s IS NULL)
+                        """,
+                            (
+                                json.dumps(final_messages),
+                                datetime.now(tz_module.utc),
+                                candidate_id,
+                                campaign_id,
+                                campaign_id,
+                            ),
+                        )
+                        conn.commit()
+            except Exception as db_err:
+                print(f"WARNING: Failed to persist Email cache to DB: {db_err}")
 
     return final_messages or []
 
@@ -212,30 +215,26 @@ def _refresh_email_cache_task(candidate_id: int, email: str, campaign_id: str):
 
 def _prewarm_single(candidate_id: int):
     """Fetch outreach info from DB and pre-warm LinkedIn chat cache for one candidate."""
-    conn = get_db_connection()
-    if not conn:
-        return
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
-        cand_row = cur.fetchone()
-        if not cand_row or not cand_row[0]:
-            cur.close()
-            return_db_connection(conn)
-            return
-        profile_url = cand_row[0]
-        cur.execute(
-            """
-            SELECT heyreach_campaign_id, li_conversation_id, li_account_id
-            FROM candidate_outreach
-            WHERE candidate_id = %s
-            ORDER BY updated_at DESC LIMIT 1
-        """,
-            (candidate_id,),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
+                cand_row = cur.fetchone()
+                if not cand_row or not cand_row[0]:
+                    return
+                profile_url = cand_row[0]
+                cur.execute(
+                    """
+                    SELECT heyreach_campaign_id, li_conversation_id, li_account_id
+                    FROM candidate_outreach
+                    WHERE candidate_id = %s
+                    ORDER BY updated_at DESC LIMIT 1
+                """,
+                    (candidate_id,),
+                )
+                row = cur.fetchone()
         campaign_id = int(row[0]) if row and row[0] else None
         conv_id = row[1] if row and len(row) > 1 else None
         acc_id = int(row[2]) if row and len(row) > 2 and row[2] else None
@@ -255,11 +254,6 @@ def _prewarm_single(candidate_id: int):
         _sync_li_messages(candidate_id, profile_url, campaign_id, conv_id, acc_id)
     except Exception as e:
         print(f"WARNING: prewarm failed for cand {candidate_id}: {e}")
-        if conn:
-            try:
-                return_db_connection(conn)
-            except Exception:
-                pass
 
 
 # --- Request/Response Models ---
@@ -275,7 +269,7 @@ def bulk_load_chat_caches(rows: List[tuple]):
     li_count = 0
     email_count = 0
     now = time.monotonic()
-    
+
     with _li_chat_lock:
         with _email_chat_lock:
             for row in rows:
@@ -296,7 +290,7 @@ def bulk_load_chat_caches(rows: List[tuple]):
                         "refreshing": False
                     }
                     email_count += 1
-                    
+
     print(f"DEBUG: Bulk-warmed {li_count} LI chats and {email_count} Email chats into memory.")
 
 def _startup_prewarm():
@@ -386,40 +380,37 @@ def _role_filter_sql(role_id: int, column: str = "recruitment_role_id"):
 
 def get_candidate_details(candidate_ids: List[int]):
     """Fetch candidate email and name from database"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, name, email, first_name, last_name
-            FROM candidates
-            WHERE id = ANY(%s) AND email IS NOT NULL
-        """,
-            (candidate_ids,),
-        )
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
 
-        candidates = []
-        for row in cur.fetchall():
-            candidates.append(
-                {
-                    "id": row[0],
-                    "name": row[1],
-                    "email": row[2],
-                    "first_name": row[3] or row[1].split()[0],
-                    "last_name": row[4] or "",
-                }
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, email, first_name, last_name
+                    FROM candidates
+                    WHERE id = ANY(%s) AND email IS NOT NULL
+                """,
+                    (candidate_ids,),
+                )
 
-        cur.close()
-        cur.close()
-        return_db_connection(conn)
-        return candidates
+                candidates = []
+                for row in cur.fetchall():
+                    candidates.append(
+                        {
+                            "id": row[0],
+                            "name": row[1],
+                            "email": row[2],
+                            "first_name": row[3] or row[1].split()[0],
+                            "last_name": row[4] or "",
+                        }
+                    )
+
+            return candidates
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {e}")
 
 
@@ -494,37 +485,31 @@ async def trigger_outreach(
     bot.start_campaign()
 
     # 7. Record in database
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            for candidate in candidates:
-                cur.execute(
-                    """
-                    INSERT INTO candidate_outreach 
-                    (candidate_id, recruitment_role_id, campaign_id, campaign_name, status, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, 'in_campaign', NOW(), NOW())
-                    ON CONFLICT (candidate_id, recruitment_role_id) 
-                    DO UPDATE SET 
-                        campaign_id = EXCLUDED.campaign_id,
-                        campaign_name = EXCLUDED.campaign_name,
-                        status = 'in_campaign',
-                        updated_at = NOW()
-                """,
-                    (candidate["id"], request.role_id, campaign_id, campaign_name),
-                )
-
-            conn.commit()
-            cur.close()
-            conn.commit()
-            cur.close()
-            return_db_connection(conn)
-        except Exception as e:
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
             if conn:
-                return_db_connection(conn)
-            raise HTTPException(
-                status_code=500, detail=f"Failed to record outreach: {e}"
-            )
+                with conn.cursor() as cur:
+                    for candidate in candidates:
+                        cur.execute(
+                            """
+                            INSERT INTO candidate_outreach
+                            (candidate_id, recruitment_role_id, campaign_id, campaign_name, status, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s, 'in_campaign', NOW(), NOW())
+                            ON CONFLICT (candidate_id, recruitment_role_id)
+                            DO UPDATE SET
+                                campaign_id = EXCLUDED.campaign_id,
+                                campaign_name = EXCLUDED.campaign_name,
+                                status = 'in_campaign',
+                                updated_at = NOW()
+                        """,
+                            (candidate["id"], request.role_id, campaign_id, campaign_name),
+                        )
+
+                conn.commit()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to record outreach: {e}"
+        )
 
     return {
         "success": True,
@@ -547,23 +532,20 @@ async def shortlist_outreach(
     3. Pushes lead to HeyReach LinkedIn campaign
     Returns: { email, phone, linkedin, email_outreach, linkedin_outreach }
     """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     # Step 1: Fetch candidate from DB
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, name, first_name, last_name, email, mobile_phone, linkedin FROM candidates WHERE id = %s",
-            (candidate_id,),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, first_name, last_name, email, mobile_phone, linkedin FROM candidates WHERE id = %s",
+                    (candidate_id,),
+                )
+                row = cur.fetchone()
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"DB fetch failed: {e}")
 
     if not row:
@@ -582,37 +564,35 @@ async def shortlist_outreach(
 
     # Step 1.5: Guardrail - Check if already shortlisted/outreached recently
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur_check:
-            cur_check.execute(
-                """
-                SELECT status, li_status, updated_at
-                FROM candidate_outreach
-                WHERE candidate_id = %s AND recruitment_role_id IS NULL
-            """,
-                (cand_id,),
-            )
-            existing = cur_check.fetchone()
-            if existing:
-                e_stat, l_stat, updated_at = existing
-                print(f"⏩ Skipping outreach for {name} - already triggered earlier.")
-                return {
-                    "success": True,
-                    "candidate_id": cand_id,
-                    "name": name,
-                    "email": email or "",
-                    "phone": mobile_phone or "",
-                    "linkedin": linkedin_url or "",
-                    "email_outreach": "started" if e_stat else "not_started",
-                    "linkedin_outreach": "started" if l_stat else "not_started",
-                    "contact_enriching": False,
-                    "already_processed": True,
-                }
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur_check:
+                    cur_check.execute(
+                        """
+                        SELECT status, li_status, updated_at
+                        FROM candidate_outreach
+                        WHERE candidate_id = %s AND recruitment_role_id IS NULL
+                    """,
+                        (cand_id,),
+                    )
+                    existing = cur_check.fetchone()
+                    if existing:
+                        e_stat, l_stat, updated_at = existing
+                        print(f"⏩ Skipping outreach for {name} - already triggered earlier.")
+                        return {
+                            "success": True,
+                            "candidate_id": cand_id,
+                            "name": name,
+                            "email": email or "",
+                            "phone": mobile_phone or "",
+                            "linkedin": linkedin_url or "",
+                            "email_outreach": "started" if e_stat else "not_started",
+                            "linkedin_outreach": "started" if l_stat else "not_started",
+                            "contact_enriching": False,
+                            "already_processed": True,
+                        }
     except Exception as db_e:
         print(f"Warning: could not check existing outreach: {db_e}")
-    finally:
-        if conn:
-            return_db_connection(conn)
 
     # Step 1b: If email or phone missing from DB, trigger Clay enrichment
     if (not email or not mobile_phone) and linkedin_url:
@@ -628,25 +608,23 @@ async def shortlist_outreach(
 
                 # Insert a dummy record immediately so rapid double-clicks are blocked by Step 1.5
                 try:
-                    conn = get_db_connection()
-                    with conn.cursor() as cur_ins:
-                        cur_ins.execute(
-                            """
-                            INSERT INTO candidate_outreach (candidate_id, recruitment_role_id, created_at, updated_at)
-                            SELECT %s, NULL, NOW(), NOW()
-                            WHERE NOT EXISTS (
-                                SELECT 1 FROM candidate_outreach
-                                WHERE candidate_id = %s AND recruitment_role_id IS NULL
-                            )
-                        """,
-                            (cand_id, cand_id),
-                        )
-                        conn.commit()
+                    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                        if conn:
+                            with conn.cursor() as cur_ins:
+                                cur_ins.execute(
+                                    """
+                                    INSERT INTO candidate_outreach (candidate_id, recruitment_role_id, created_at, updated_at)
+                                    SELECT %s, NULL, NOW(), NOW()
+                                    WHERE NOT EXISTS (
+                                        SELECT 1 FROM candidate_outreach
+                                        WHERE candidate_id = %s AND recruitment_role_id IS NULL
+                                    )
+                                """,
+                                    (cand_id, cand_id),
+                                )
+                                conn.commit()
                 except:
                     pass
-                finally:
-                    if conn:
-                        return_db_connection(conn)
             else:
                 print(f"⚠️ Clay trigger failed for {name}")
         except Exception as clay_e:
@@ -696,43 +674,41 @@ Recruitment Team""",
                 email_outreach = "started"
 
                 # Record in DB as Talent Pool row (NULL recruitment_role_id).
-                conn2 = get_db_connection()
-                if conn2:
-                    try:
-                        with conn2.cursor() as cur2:
-                            cur2.execute(
-                                "SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND recruitment_role_id IS NULL",
-                                (cand_id,),
-                            )
-                            exists = cur2.fetchone() is not None
-                            if exists:
+                try:
+                    with get_db_connection_context(validate=False, register_pgvector=False) as conn2:
+                        if conn2:
+                            with conn2.cursor() as cur2:
                                 cur2.execute(
-                                    """
-                                    UPDATE candidate_outreach
-                                    SET campaign_id = %s,
-                                        campaign_name = %s,
-                                        status = 'in_campaign',
-                                        updated_at = NOW()
-                                    WHERE candidate_id = %s AND recruitment_role_id IS NULL
-                                """,
-                                    (campaign_id, campaign_name, cand_id),
+                                    "SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND recruitment_role_id IS NULL",
+                                    (cand_id,),
                                 )
-                            else:
-                                cur2.execute(
-                                    """
-                                    INSERT INTO candidate_outreach
-                                    (candidate_id, recruitment_role_id, campaign_id, campaign_name, status, created_at, updated_at)
-                                    VALUES (%s, NULL, %s, %s, 'in_campaign', NOW(), NOW())
-                                """,
-                                    (cand_id, campaign_id, campaign_name),
-                                )
-                            conn2.commit()
-                    except Exception as db_e:
-                        print(
-                            f"Warning: could not record email outreach for candidate {cand_id}: {db_e}"
-                        )
-                    finally:
-                        return_db_connection(conn2)
+                                exists = cur2.fetchone() is not None
+                                if exists:
+                                    cur2.execute(
+                                        """
+                                        UPDATE candidate_outreach
+                                        SET campaign_id = %s,
+                                            campaign_name = %s,
+                                            status = 'in_campaign',
+                                            updated_at = NOW()
+                                        WHERE candidate_id = %s AND recruitment_role_id IS NULL
+                                    """,
+                                        (campaign_id, campaign_name, cand_id),
+                                    )
+                                else:
+                                    cur2.execute(
+                                        """
+                                        INSERT INTO candidate_outreach
+                                        (candidate_id, recruitment_role_id, campaign_id, campaign_name, status, created_at, updated_at)
+                                        VALUES (%s, NULL, %s, %s, 'in_campaign', NOW(), NOW())
+                                    """,
+                                        (cand_id, campaign_id, campaign_name),
+                                    )
+                                conn2.commit()
+                except Exception as db_e:
+                    print(
+                        f"Warning: could not record email outreach for candidate {cand_id}: {db_e}"
+                    )
         except Exception as e:
             print(f"Smartlead outreach failed for candidate {cand_id}: {e}")
             email_outreach = "error"
@@ -759,42 +735,41 @@ Recruitment Team""",
                 linkedin_outreach = "started" if result else "error"
 
                 # Record LinkedIn status in DB
-                conn3 = get_db_connection()
-                if conn3 and linkedin_outreach == "started":
+                if linkedin_outreach == "started":
                     try:
-                        with conn3.cursor() as cur3:
-                            cur3.execute(
-                                "SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND recruitment_role_id IS NULL",
-                                (cand_id,),
-                            )
-                            exists = cur3.fetchone() is not None
-                            if exists:
-                                cur3.execute(
-                                    """
-                                    UPDATE candidate_outreach
-                                    SET heyreach_campaign_id = %s,
-                                        li_status = 'in_campaign',
-                                        updated_at = NOW()
-                                    WHERE candidate_id = %s AND recruitment_role_id IS NULL
-                                """,
-                                    (hr_campaign_id, cand_id),
-                                )
-                            else:
-                                cur3.execute(
-                                    """
-                                    INSERT INTO candidate_outreach
-                                    (candidate_id, recruitment_role_id, heyreach_campaign_id, li_status, created_at, updated_at)
-                                    VALUES (%s, NULL, %s, 'in_campaign', NOW(), NOW())
-                                """,
-                                    (cand_id, hr_campaign_id),
-                                )
-                            conn3.commit()
+                        with get_db_connection_context(validate=False, register_pgvector=False) as conn3:
+                            if conn3:
+                                with conn3.cursor() as cur3:
+                                    cur3.execute(
+                                        "SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND recruitment_role_id IS NULL",
+                                        (cand_id,),
+                                    )
+                                    exists = cur3.fetchone() is not None
+                                    if exists:
+                                        cur3.execute(
+                                            """
+                                            UPDATE candidate_outreach
+                                            SET heyreach_campaign_id = %s,
+                                                li_status = 'in_campaign',
+                                                updated_at = NOW()
+                                            WHERE candidate_id = %s AND recruitment_role_id IS NULL
+                                        """,
+                                            (hr_campaign_id, cand_id),
+                                        )
+                                    else:
+                                        cur3.execute(
+                                            """
+                                            INSERT INTO candidate_outreach
+                                            (candidate_id, recruitment_role_id, heyreach_campaign_id, li_status, created_at, updated_at)
+                                            VALUES (%s, NULL, %s, 'in_campaign', NOW(), NOW())
+                                        """,
+                                            (cand_id, hr_campaign_id),
+                                        )
+                                    conn3.commit()
                     except Exception as db_e:
                         print(
                             f"Warning: could not record LinkedIn outreach for candidate {cand_id}: {db_e}"
                         )
-                    finally:
-                        return_db_connection(conn3)
             else:
                 linkedin_outreach = "no_campaign_id"
         except Exception as e:
@@ -838,57 +813,53 @@ async def get_outreach_status(
     """
     Get outreach status for all candidates in a role
     """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
-        cur.execute(
-            f"""
-            SELECT 
-                candidate_id,
-                status,
-                message_sent_count,
-                last_message_sent_at,
-                response_received_at,
-                response_text,
-                li_status,
-                li_last_action_at,
-                li_response_text,
-                li_sent_count,
-                li_response_received_at,
-                li_conversation_id
-            FROM candidate_outreach
-            WHERE {role_where}
-        """,
-            role_params,
-        )
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+                cur.execute(
+                    f"""
+                    SELECT
+                        candidate_id,
+                        status,
+                        message_sent_count,
+                        last_message_sent_at,
+                        response_received_at,
+                        response_text,
+                        li_status,
+                        li_last_action_at,
+                        li_response_text,
+                        li_sent_count,
+                        li_response_received_at,
+                        li_conversation_id
+                    FROM candidate_outreach
+                    WHERE {role_where}
+                """,
+                    role_params,
+                )
 
-        statuses = {}
-        for row in cur.fetchall():
-            statuses[row[0]] = {
-                "candidate_id": row[0],
-                "status": row[1],
-                "message_sent_count": row[2],
-                "last_message_sent_at": row[3],
-                "response_received_at": row[4],
-                "response_text": row[5],
-                "li_status": row[6],
-                "li_last_action_at": row[7],
-                "li_response_text": row[8],
-                "li_sent_count": row[9],
-                "li_response_received_at": row[10],
-                "li_conversation_id": row[11],
-            }
-
-        cur.close()
-        return_db_connection(conn)
+                statuses = {}
+                for row in cur.fetchall():
+                    statuses[row[0]] = {
+                        "candidate_id": row[0],
+                        "status": row[1],
+                        "message_sent_count": row[2],
+                        "last_message_sent_at": row[3],
+                        "response_received_at": row[4],
+                        "response_text": row[5],
+                        "li_status": row[6],
+                        "li_last_action_at": row[7],
+                        "li_response_text": row[8],
+                        "li_sent_count": row[9],
+                        "li_response_received_at": row[10],
+                        "li_conversation_id": row[11],
+                    }
         return statuses
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Failed to fetch status: {e}")
 
 
@@ -953,45 +924,40 @@ async def get_linkedin_chat_history(
     Uses an in-memory cache so the response is instant on repeat opens.
     A background thread always refreshes the cache after serving.
     """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
-        cand_row = cur.fetchone()
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
+                cand_row = cur.fetchone()
 
-        if role_id == 0:
-            cur.execute(
-                """
-                SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
-                       li_chat_history_cache
-                FROM candidate_outreach
-                WHERE candidate_id = %s
-                ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
-            """,
-                (candidate_id,),
-            )
-        else:
-            role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
-            cur.execute(
-                f"""
-                SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
-                       li_chat_history_cache
-                FROM candidate_outreach
-                WHERE candidate_id = %s AND {role_where}
-                ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
-            """,
-                (candidate_id, *role_params),
-            )
+                if role_id == 0:
+                    cur.execute(
+                        """
+                        SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
+                               li_chat_history_cache
+                        FROM candidate_outreach
+                        WHERE candidate_id = %s
+                        ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
+                    """,
+                        (candidate_id,),
+                    )
+                else:
+                    role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+                    cur.execute(
+                        f"""
+                        SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
+                               li_chat_history_cache
+                        FROM candidate_outreach
+                        WHERE candidate_id = %s AND {role_where}
+                        ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
+                    """,
+                        (candidate_id, *role_params),
+                    )
 
-
-        outreach_row = cur.fetchone()
-        print(f"DEBUG: Outreach record for cand {candidate_id}: {outreach_row}")
-        cur.close()
-        return_db_connection(conn)
-        conn = None  # Mark as returned so the except block doesn't double-return
+                outreach_row = cur.fetchone()
+                print(f"DEBUG: Outreach record for cand {candidate_id}: {outreach_row}")
 
         if not cand_row or not cand_row[0]:
             return {"messages": []}
@@ -1113,7 +1079,7 @@ async def get_linkedin_chat_history(
 
         current_messages = cached["messages"] if cached else []
         final_msgs = _prepend_initial(current_messages)
-        
+
         # ── OPTIMISTIC FALLBACK ──────────────────────────────────────────────
         # If the history is STILL empty, but we possess a reply in our DB,
         # synthesize a virtual message so the user sees the content immediately.
@@ -1132,9 +1098,9 @@ async def get_linkedin_chat_history(
         }
 
 
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch LinkedIn chat history: {e}"
         )
@@ -1186,30 +1152,28 @@ async def get_chat_history(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured chat history (Default to Email)"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
-        # Strictly prioritize rows that have a Smartlead campaign_id (Email campaign)
-        # to prevent LinkedIn records from leaking into the Email history view.
-        cur.execute(
-            f"""
-            SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at,
-                   co.email_chat_history_cache, co.email_chat_history_updated_at
-            FROM candidate_outreach co
-            JOIN candidates c ON c.id = co.candidate_id
-            WHERE co.candidate_id = %s AND {role_where}
-            ORDER BY (co.campaign_id IS NOT NULL) DESC, co.updated_at DESC
-            LIMIT 1
-        """,
-            (candidate_id, *role_params),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+
+            with conn.cursor() as cur:
+                role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
+                # Strictly prioritize rows that have a Smartlead campaign_id (Email campaign)
+                # to prevent LinkedIn records from leaking into the Email history view.
+                cur.execute(
+                    f"""
+                    SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at,
+                           co.email_chat_history_cache, co.email_chat_history_updated_at
+                    FROM candidate_outreach co
+                    JOIN candidates c ON c.id = co.candidate_id
+                    WHERE co.candidate_id = %s AND {role_where}
+                    ORDER BY (co.campaign_id IS NOT NULL) DESC, co.updated_at DESC
+                    LIMIT 1
+                """,
+                    (candidate_id, *role_params),
+                )
+                row = cur.fetchone()
 
         if not row:
             raise HTTPException(
@@ -1233,7 +1197,7 @@ async def get_chat_history(
         _JUNK_EMAIL_INITIALS = {"hii", "hi", "hey", "hello", "test", "linkedin", "msg", "message", "helo", "hello!", "hi!"}
         if not campaign_id:
             initial_msg_text = None
-        
+
         if initial_msg_text:
             _clean_init = initial_msg_text.strip()
             if len(_clean_init) < 12 or _clean_init.lower() in _JUNK_EMAIL_INITIALS:
@@ -1296,12 +1260,8 @@ async def get_chat_history(
             "syncing": not cached or is_stale or (cached and cached.get("refreshing")),
         }
     except HTTPException:
-        if conn:
-            return_db_connection(conn)
         raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch Email chat history: {e}"
         )
@@ -1326,16 +1286,13 @@ async def send_linkedin_chat_reply(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Send a LinkedIn message reply"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
-        row = cur.fetchone()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                cur.execute("SELECT linkedin FROM candidates WHERE id = %s", (candidate_id,))
+                row = cur.fetchone()
 
         if not row or not row[0]:
             raise HTTPException(
@@ -1346,9 +1303,8 @@ async def send_linkedin_chat_reply(
 
         conv_id = None
         campaign_id = None
-        conn2 = get_db_connection()
-        if conn2:
-            try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn2:
+            if conn2:
                 with conn2.cursor() as cur2:
                     # If role_id is 0 (Talent Pool), try specific filter, but allow fallback
                     role_where, role_params = _role_filter_sql(
@@ -1383,8 +1339,6 @@ async def send_linkedin_chat_reply(
                     if cached:
                         campaign_id = cached[0]
                         conv_id = cached[1]
-            finally:
-                return_db_connection(conn2)
 
         bot = HeyReachBot()
         print(
@@ -1400,9 +1354,8 @@ async def send_linkedin_chat_reply(
         if success:
             # Record initial message if first time (optional but keeps patterns consistent)
             try:
-                conn3 = get_db_connection()
-                if conn3:
-                    try:
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn3:
+                    if conn3:
                         with conn3.cursor() as cur3:
                             role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
                             cur3.execute(
@@ -1417,8 +1370,6 @@ async def send_linkedin_chat_reply(
                                 (request.message, candidate_id, *role_params)
                             )
                             conn3.commit()
-                    finally:
-                        return_db_connection(conn3)
             except:
                 pass
 
@@ -1432,9 +1383,9 @@ async def send_linkedin_chat_reply(
             raise HTTPException(
                 status_code=500, detail="Failed to send LinkedIn message"
             )
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(
             status_code=500, detail=f"Failed to send LinkedIn reply: {e}"
         )
@@ -1448,25 +1399,22 @@ async def send_chat_reply(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Send a reply to a lead (Default to Email)"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
-        cur.execute(
-            f"""
-            SELECT c.email, co.campaign_id
-            FROM candidate_outreach co
-            JOIN candidates c ON c.id = co.candidate_id
-            WHERE co.candidate_id = %s AND {role_where}
-        """,
-            (candidate_id, *role_params),
-        )
-        row = cur.fetchone()
-        cur.close()
-        return_db_connection(conn)
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
+                cur.execute(
+                    f"""
+                    SELECT c.email, co.campaign_id
+                    FROM candidate_outreach co
+                    JOIN candidates c ON c.id = co.candidate_id
+                    WHERE co.candidate_id = %s AND {role_where}
+                """,
+                    (candidate_id, *role_params),
+                )
+                row = cur.fetchone()
 
         # Default behavior: try Email if campaign_id exists
         if row and row[1]:
@@ -1542,9 +1490,8 @@ async def send_chat_reply(
         bot.start_campaign()
 
         # Record in DB
-        conn2 = get_db_connection()
-        if conn2:
-            try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn2:
+            if conn2:
                 with conn2.cursor() as cur2:
                     role_where, role_params = _role_filter_sql(
                         role_id, "recruitment_role_id"
@@ -1592,8 +1539,6 @@ async def send_chat_reply(
                         )
                     conn2.commit()
                     return {"success": True, "triggered": True}
-            finally:
-                return_db_connection(conn2)
 
         raise HTTPException(
             status_code=400,
@@ -1601,12 +1546,8 @@ async def send_chat_reply(
         )
 
     except HTTPException:
-        if conn:
-            return_db_connection(conn)
         raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Failed to send reply: {e}")
 
 
@@ -1617,31 +1558,30 @@ def sync_responses(
     """
     Sync responses from both Smartlead (Email) and HeyReach (LinkedIn)
     """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     candidates_data = []
     try:
-        cur = conn.cursor()
-        role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
-        # Fetch both Smartlead and HeyReach identifiers
-        cur.execute(
-            f"""
-            SELECT co.candidate_id, c.email, co.campaign_id, c.linkedin, co.heyreach_campaign_id, co.li_conversation_id, co.li_account_id
-            FROM candidate_outreach co
-            JOIN candidates c ON c.id = co.candidate_id
-            WHERE {role_where}
-        """,
-            role_params,
-        )
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
 
-        candidates_data = cur.fetchall()
-        cur.close()
+            with conn.cursor() as cur:
+                role_where, role_params = _role_filter_sql(role_id, "co.recruitment_role_id")
+                # Fetch both Smartlead and HeyReach identifiers
+                cur.execute(
+                    f"""
+                    SELECT co.candidate_id, c.email, co.campaign_id, c.linkedin, co.heyreach_campaign_id, co.li_conversation_id, co.li_account_id
+                    FROM candidate_outreach co
+                    JOIN candidates c ON c.id = co.candidate_id
+                    WHERE {role_where}
+                """,
+                    role_params,
+                )
+
+                candidates_data = cur.fetchall()
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error fetching candidates: {e}")
-    finally:
-        return_db_connection(conn)
 
     if not candidates_data:
         return {"updated_count": 0}
@@ -1708,7 +1648,7 @@ def sync_responses(
                         conversation_id=li_conv_id,
                         account_id=int(li_acc_id) if li_acc_id else None,
                     )
-                    
+
                     # Update IDs if recovered
                     if activity and (activity.get("conversation_id") != li_conv_id or str(activity.get("account_id")) != str(li_acc_id)):
                         li_conv_id = activity.get("conversation_id")
@@ -1749,51 +1689,52 @@ def sync_responses(
     # 3. Update Database
     updated_count = 0
     if updates:
-        conn = get_db_connection()
         try:
-            with conn.cursor() as cur:
-                for upd in updates:
-                    # Build dynamic update statement based on what was fetched
-                    fields = ["updated_at = NOW()"]
-                    params = upd
+            with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                if not conn:
+                    raise RuntimeError("Database connection failed")
 
-                    if "status" in upd:
-                        fields.append("status = %(status)s")
-                        fields.append("message_sent_count = %(message_sent_count)s")
-                        fields.append("last_message_sent_at = %(last_message_sent_at)s")
-                        fields.append("response_received_at = %(response_received_at)s")
-                        fields.append("response_text = %(response_text)s")
+                with conn.cursor() as cur:
+                    for upd in updates:
+                        # Build dynamic update statement based on what was fetched
+                        fields = ["updated_at = NOW()"]
+                        params = upd
 
-                        if "li_status" in upd:
-                            fields.append("li_status = %(li_status)s")
-                            fields.append("li_response_text = %(li_response_text)s")
-                            fields.append("li_last_action_at = %(li_last_action_at)s")
-                            fields.append("li_sent_count = %(li_sent_count)s")
-                            fields.append("li_response_received_at = %(li_response_received_at)s")
-                            
-                            # Use values from the upd dictionary to avoid outer-scope variable leaks
-                            if "li_conversation_id" in upd:
-                                fields.append("li_conversation_id = %(li_conversation_id)s")
-                            
-                            if "li_account_id" in upd:
-                                fields.append("li_account_id = %(li_account_id)s")
+                        if "status" in upd:
+                            fields.append("status = %(status)s")
+                            fields.append("message_sent_count = %(message_sent_count)s")
+                            fields.append("last_message_sent_at = %(last_message_sent_at)s")
+                            fields.append("response_received_at = %(response_received_at)s")
+                            fields.append("response_text = %(response_text)s")
 
-                    if role_id == 0:
-                        role_where_update = "recruitment_role_id IS NULL"
-                    else:
-                        role_where_update = f"recruitment_role_id = {int(role_id)}"
-                    sql = f"""
-                        UPDATE candidate_outreach
-                        SET {", ".join(fields)}
-                        WHERE candidate_id = %(candidate_id)s AND {role_where_update}
-                    """
-                    cur.execute(sql, params)
-                    updated_count += 1
-            conn.commit()
+                            if "li_status" in upd:
+                                fields.append("li_status = %(li_status)s")
+                                fields.append("li_response_text = %(li_response_text)s")
+                                fields.append("li_last_action_at = %(li_last_action_at)s")
+                                fields.append("li_sent_count = %(li_sent_count)s")
+                                fields.append("li_response_received_at = %(li_response_received_at)s")
+
+                                # Use values from the upd dictionary to avoid outer-scope variable leaks
+                                if "li_conversation_id" in upd:
+                                    fields.append("li_conversation_id = %(li_conversation_id)s")
+
+                                if "li_account_id" in upd:
+                                    fields.append("li_account_id = %(li_account_id)s")
+
+                        if role_id == 0:
+                            role_where_update = "recruitment_role_id IS NULL"
+                        else:
+                            role_where_update = f"recruitment_role_id = {int(role_id)}"
+                        sql = f"""
+                            UPDATE candidate_outreach
+                            SET {", ".join(fields)}
+                            WHERE candidate_id = %(candidate_id)s AND {role_where_update}
+                        """
+                        cur.execute(sql, params)
+                        updated_count += 1
+                conn.commit()
         except Exception as e:
             print(f"Error updating database: {e}")
-        finally:
-            return_db_connection(conn)
 
         # Keep the in-memory talent pool cache in sync so browse results reflect fresh outreach data.
         try:
@@ -1831,37 +1772,34 @@ async def trigger_heyreach_outreach(
     Trigger HeyReach LinkedIn sequence for selected candidates
     """
     # 1. Fetch candidate details (need LinkedIn URL)
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, first_name, last_name, name, linkedin
-            FROM candidates
-            WHERE id = ANY(%s) AND linkedin IS NOT NULL
-        """,
-            (request.candidate_ids,),
-        )
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, first_name, last_name, name, linkedin
+                    FROM candidates
+                    WHERE id = ANY(%s) AND linkedin IS NOT NULL
+                """,
+                    (request.candidate_ids,),
+                )
 
-        candidates = []
-        for row in cur.fetchall():
-            candidates.append(
-                {
-                    "id": row[0],
-                    "first_name": row[1] or row[3].split()[0],
-                    "last_name": row[2]
-                    or (row[3].split()[1] if len(row[3].split()) > 1 else ""),
-                    "linkedin": row[4],
-                }
-            )
-        cur.close()
-        return_db_connection(conn)
+                candidates = []
+                for row in cur.fetchall():
+                    candidates.append(
+                        {
+                            "id": row[0],
+                            "first_name": row[1] or row[3].split()[0],
+                            "last_name": row[2]
+                            or (row[3].split()[1] if len(row[3].split()) > 1 else ""),
+                            "linkedin": row[4],
+                        }
+                    )
+    except HTTPException:
+        raise
     except Exception as e:
-        if conn:
-            return_db_connection(conn)
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {e}")
 
     if not candidates:
@@ -1906,46 +1844,43 @@ async def trigger_heyreach_outreach(
             db_role_id = request.role_id if (request.role_id or 0) > 0 else None
 
             # Record in DB
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        INSERT INTO candidate_outreach 
-                        (candidate_id, recruitment_role_id, heyreach_campaign_id, li_status, created_at, updated_at)
-                        VALUES (%s, %s, %s, 'in_campaign', NOW(), NOW())
-                        ON CONFLICT (candidate_id, recruitment_role_id) 
-                        DO UPDATE SET 
-                            heyreach_campaign_id = EXCLUDED.heyreach_campaign_id,
-                            li_status = 'in_campaign',
-                            updated_at = NOW()
+            try:
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                    if not conn:
+                        raise RuntimeError("Database connection failed")
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO candidate_outreach
+                            (candidate_id, recruitment_role_id, heyreach_campaign_id, li_status, created_at, updated_at)
+                            VALUES (%s, %s, %s, 'in_campaign', NOW(), NOW())
+                            ON CONFLICT (candidate_id, recruitment_role_id)
+                            DO UPDATE SET
+                                heyreach_campaign_id = EXCLUDED.heyreach_campaign_id,
+                                li_status = 'in_campaign',
+                                updated_at = NOW()
 
-                    """,
-                        (candidate["id"], db_role_id, str(campaign_id)),
-                    )
-                    conn.commit()
-                    cur.close()
-                    return_db_connection(conn)
-
-                    # Synchronize cache
-                    try:
-                        from backend.pipeline.query import update_profile_cache
-
-                        update_profile_cache(
-                            candidate["id"],
-                            {
-                                "heyreach_campaign_id": str(campaign_id),
-                                "li_status": "in_campaign",
-                            },
+                        """,
+                            (candidate["id"], db_role_id, str(campaign_id)),
                         )
-                    except Exception as cache_e:
-                        print(f"Warning: could not update profile cache: {cache_e}")
+                        conn.commit()
+            except Exception as e:
+                print(f"Error recording HeyReach outreach: {e}")
+                continue
 
-                except Exception as e:
-                    print(f"Error recording HeyReach outreach: {e}")
-                    if conn:
-                        return_db_connection(conn)
+            # Synchronize cache after the DB write succeeds.
+            try:
+                from backend.pipeline.query import update_profile_cache
+
+                update_profile_cache(
+                    candidate["id"],
+                    {
+                        "heyreach_campaign_id": str(campaign_id),
+                        "li_status": "in_campaign",
+                    },
+                )
+            except Exception as cache_e:
+                print(f"Warning: could not update profile cache: {cache_e}")
 
     if success_count == 0:
         raise HTTPException(
@@ -1992,97 +1927,89 @@ async def heyreach_webhook(request: Dict):
         return {"status": "ignored", "reason": "no_profile_url"}
 
     # Find candidate by LinkedIn URL
-    conn = get_db_connection()
-    if not conn:
-        return {"status": "error", "reason": "db_connection_failed"}
-
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM candidates WHERE linkedin = %s", (profile_url,))
-        candidate_row = cur.fetchone()
-        if not candidate_row:
-            cur.close()
-            return_db_connection(conn)
-            return {"status": "ignored", "reason": "candidate_not_found"}
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return {"status": "error", "reason": "db_connection_failed"}
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM candidates WHERE linkedin = %s", (profile_url,))
+                candidate_row = cur.fetchone()
+                if not candidate_row:
+                    return {"status": "ignored", "reason": "candidate_not_found"}
 
-        candidate_id = candidate_row[0]
+                candidate_id = candidate_row[0]
 
-        new_status = None
-        new_response = None
+                new_status = None
+                new_response = None
 
-        event_lower = event.lower()
+                event_lower = event.lower()
 
-        # Check if it's explicitly a reply
-        if "reply" in event_lower or "replied" in event_lower:
-            new_status = "replied"
-            # Extract message
-            recent = request.get("recent_messages", [])
-            if recent and isinstance(recent, list):
-                last_msg = recent[-1]
-                # Trust is_reply flag if it exists, otherwise assume the latest is the reply
-                if last_msg.get("is_reply", True):
-                    new_response = last_msg.get("message", "")
-            else:
-                new_response = request.get("messageText") or request.get("message")
+                # Check if it's explicitly a reply
+                if "reply" in event_lower or "replied" in event_lower:
+                    new_status = "replied"
+                    # Extract message
+                    recent = request.get("recent_messages", [])
+                    if recent and isinstance(recent, list):
+                        last_msg = recent[-1]
+                        # Trust is_reply flag if it exists, otherwise assume the latest is the reply
+                        if last_msg.get("is_reply", True):
+                            new_response = last_msg.get("message", "")
+                    else:
+                        new_response = request.get("messageText") or request.get("message")
 
-        elif "message" in event_lower and "sent" in event_lower:
-            new_status = "message_sent"
+                elif "message" in event_lower and "sent" in event_lower:
+                    new_status = "message_sent"
 
-        elif "connection" in event_lower:
-            if "accepted" in event_lower:
-                new_status = "connection_accepted"
-            else:
-                new_status = "connection_sent"
+                elif "connection" in event_lower:
+                    if "accepted" in event_lower:
+                        new_status = "connection_accepted"
+                    else:
+                        new_status = "connection_sent"
 
-        elif "action" in event_lower:
-            action = request.get("actionType", "")
-            if "message" in action.lower() or "send" in action.lower():
-                new_status = "message_sent"
+                elif "action" in event_lower:
+                    action = request.get("actionType", "")
+                    if "message" in action.lower() or "send" in action.lower():
+                        new_status = "message_sent"
 
-        # Extract Identifiers from webhook for future direct sync optimization
-        conv_id = request.get("conversation_id") or request.get("conversationId")
-        acc_id = request.get("accountId") or request.get("linkedInAccountId")
+                # Extract Identifiers from webhook for future direct sync optimization
+                conv_id = request.get("conversation_id") or request.get("conversationId")
+                acc_id = request.get("accountId") or request.get("linkedInAccountId")
 
-        # Invalidate in-memory chat cache immediately so UI refresh shows the reply NOW.
-        with _li_chat_lock:
-            if candidate_id in _li_chat_cache:
-                _li_chat_cache[candidate_id]["ts"] = 0
-                print(f"DEBUG: Webhook invalidated LI chat cache for cand {candidate_id} due to event: {event}")
+                # Invalidate in-memory chat cache immediately so UI refresh shows the reply NOW.
+                with _li_chat_lock:
+                    if candidate_id in _li_chat_cache:
+                        _li_chat_cache[candidate_id]["ts"] = 0
+                        print(f"DEBUG: Webhook invalidated LI chat cache for cand {candidate_id} due to event: {event}")
 
-        if new_status:
-            # Update candidate_outreach
-            # Since we don't have role_id in webhook, we update all entries for this candidate
-            fields = [
-                "li_status = %s",
-                "li_last_action_at = NOW()",
-                "updated_at = NOW()"
-            ]
-            params = [new_status]
+                if new_status:
+                    # Update candidate_outreach
+                    # Since we don't have role_id in webhook, we update all entries for this candidate
+                    fields = [
+                        "li_status = %s",
+                        "li_last_action_at = NOW()",
+                        "updated_at = NOW()"
+                    ]
+                    params = [new_status]
 
-            if new_response:
-                fields.append("li_response_text = %s")
-                params.append(new_response)
-            
-            if conv_id:
-                fields.append("li_conversation_id = %s")
-                params.append(str(conv_id))
-            
-            if acc_id:
-                fields.append("li_account_id = %s")
-                params.append(str(acc_id))
+                    if new_response:
+                        fields.append("li_response_text = %s")
+                        params.append(new_response)
 
-            update_sql = f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s"
-            params.append(candidate_id)
+                    if conv_id:
+                        fields.append("li_conversation_id = %s")
+                        params.append(str(conv_id))
 
-            cur.execute(update_sql, tuple(params))
-            conn.commit()
+                    if acc_id:
+                        fields.append("li_account_id = %s")
+                        params.append(str(acc_id))
 
+                    update_sql = f"UPDATE candidate_outreach SET {', '.join(fields)} WHERE candidate_id = %s"
+                    params.append(candidate_id)
 
-        cur.close()
-        return_db_connection(conn)
+                    cur.execute(update_sql, tuple(params))
+                    conn.commit()
+
         return {"status": "success"}
     except Exception as e:
         print(f"Webhook error: {e}")
-        if conn:
-            return_db_connection(conn)
         return {"status": "error", "reason": str(e)}

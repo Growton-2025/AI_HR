@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 import logging
 
-from backend.db.connection import get_db_connection, return_db_connection
+from backend.db.connection import get_db_connection_context
 from backend.services.clay import trigger_clay
 
 router = APIRouter()
@@ -17,39 +17,37 @@ def clean_val(val):
 @router.post("/enrich/{candidate_id}")
 async def enrich_candidate(candidate_id: int, background_tasks: BackgroundTasks):
     """Trigger enrichment for a candidate - checks cache first to save money!"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    
-    try:
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
         with conn.cursor() as cur:
             # Fetch candidate info INCLUDING existing email/phone
             cur.execute("""
-                SELECT first_name, last_name, name, linkedin, email, mobile_phone 
+                SELECT first_name, last_name, name, linkedin, email, mobile_phone
                 FROM candidates WHERE id = %s
             """, (candidate_id,))
             row = cur.fetchone()
-            
+
         if not row:
             raise HTTPException(status_code=404, detail="Candidate not found")
-        
+
         first_name = row[0]
         last_name = row[1]
         full_name = row[2]
         linkedin_url = row[3]
         existing_email = row[4]
         existing_phone = row[5]
-        
+
         # If we already have BOTH email and phone, skip Clay!
         if existing_email and existing_phone:
             logger.info(f"💰 CACHE HIT: {full_name} already has email & phone - skipping Clay!")
             return {
-                "status": "cached", 
+                "status": "cached",
                 "message": f"Already enriched: {full_name}",
                 "email": existing_email,
                 "phone": existing_phone
             }
-        
+
         if not first_name or not last_name:
             parts = full_name.split(" ", 1)
             first_name = parts[0]
@@ -57,11 +55,8 @@ async def enrich_candidate(candidate_id: int, background_tasks: BackgroundTasks)
 
         logger.info(f"🔍 No cached data for {full_name} - calling Clay...")
         background_tasks.add_task(trigger_clay, first_name, last_name, linkedin_url)
-        
+
         return {"status": "processing", "message": f"Enrichment started for {first_name} {last_name}"}
-        
-    finally:
-        return_db_connection(conn)
 
 @router.post("/results")
 async def receive_results(request: Request):
@@ -70,7 +65,7 @@ async def receive_results(request: Request):
     Endpoint: /api/results
     """
     data = await request.json()
-    
+
     first = data.get('first_name', 'N/A')
     last = data.get('last_name', 'N/A')
     email = clean_val(data.get('result_email'))
@@ -88,23 +83,20 @@ async def receive_results(request: Request):
 
     # Update DB
     if li_url and li_url != 'N/A':
-        conn = get_db_connection()
-        if conn:
-            try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        UPDATE candidates 
-                        SET email = COALESCE(%s, email), 
+                        UPDATE candidates
+                        SET email = COALESCE(%s, email),
                             mobile_phone = COALESCE(%s, mobile_phone)
                         WHERE linkedin = %s
                     """, (email, phone, li_url))
                     conn.commit()
                     logger.info(f"Updated candidate in DB for LinkedIn: {li_url}")
-            finally:
-                return_db_connection(conn)
 
-            # Update the in-memory cache so frontend polling works
-            from backend.pipeline.query import update_candidate_contact
-            update_candidate_contact(li_url, email, phone)
+        # Update the in-memory cache so frontend polling works
+        from backend.pipeline.query import update_candidate_contact
+        update_candidate_contact(li_url, email, phone)
 
     return {"status": "success"}

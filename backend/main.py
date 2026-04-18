@@ -11,6 +11,7 @@ from backend.api.routes import auth, roles, candidates, stats, outreach, admin, 
 from contextlib import asynccontextmanager
 import asyncio
 from backend.pipeline import query
+from backend.db.connection import get_db_connection_context
 
 async def warm_calls_backend():
     # Prime the DB-backed calls routes once so the first real page load
@@ -28,22 +29,27 @@ async def warm_profiles_backend():
     except Exception as e:
         print(f"PROFILE WARMUP FAILED: {e}")
 
+async def warm_backend_caches():
+    # Sequence cold-start DB work so startup does not stampede the shared pool
+    # with multiple large warmers at the same time.
+    await warm_calls_backend()
+    await warm_profiles_backend()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
-    
-    # Run warmup tasks in the background so they don't block the application 
+
+    # Run warmup tasks in the background so they don't block the application
     # from starting and responding to health checks.
     # We use a try-except here to catch any immediate setup errors.
     try:
-        # Schedule warmup in the background
-        asyncio.create_task(warm_calls_backend())
-        asyncio.create_task(warm_profiles_backend())
+        # Schedule a single warmup task so DB-heavy cold-start work stays sequential.
+        asyncio.create_task(warm_backend_caches())
     except Exception as e:
         print(f"CRITICAL: Background warmup task scheduling failed: {e}")
-        
+
     yield
-    
+
     try:
         from backend.db.connection import close_all_connections
         close_all_connections()
@@ -91,24 +97,26 @@ async def ping_check():
 
 @app.get("/api/debug_db")
 async def debug_db():
-    from backend.db.connection import get_db_connection, return_db_connection
     from backend.pipeline.query import redis_client
-    
+
     results = {"db": "testing...", "redis": "testing..."}
-    
+
     # Test DB
     try:
-        conn = get_db_connection(max_retries=1)
-        if conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                results["db"] = "ok"
-            return_db_connection(conn)
-        else:
-            results["db"] = "failed (no connection)"
+        with get_db_connection_context(
+            max_retries=1,
+            validate=True,
+            register_pgvector=False,
+        ) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    results["db"] = "ok"
+            else:
+                results["db"] = "failed (no connection)"
     except Exception as e:
         results["db"] = f"failed: {str(e)}"
-        
+
     # Test Redis
     try:
         if redis_client:
@@ -118,7 +126,7 @@ async def debug_db():
             results["redis"] = "not initialized"
     except Exception as e:
         results["redis"] = f"failed: {str(e)}"
-        
+
     return results
 
 # Include API Routers
@@ -136,4 +144,4 @@ from backend.api.routes import enrichment
 app.include_router(enrichment.router, prefix="/api", tags=["enrichment"])
 # Also mount at root for Clay callback to /results (Clay calls https://ngrok-url/results)
 app.include_router(enrichment.router, tags=["enrichment-callback"])
- 
+

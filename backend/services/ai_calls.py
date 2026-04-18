@@ -4,7 +4,7 @@ import tempfile
 import threading
 from typing import Optional
 from openai import OpenAI
-from backend.db.connection import get_db_connection, return_db_connection
+from backend.db.connection import get_db_connection_context
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -36,7 +36,7 @@ def _process_audio_task(call_id: int, recording_url: str):
         print(f"DEBUG: Transcribing call {call_id}...")
         with open(tmp_path, "rb") as audio_file:
             transcript_res = client.audio.transcriptions.create(
-                model="whisper-1", 
+                model="whisper-1",
                 file=audio_file
             )
         transcript_text = transcript_res.text
@@ -53,9 +53,8 @@ def _process_audio_task(call_id: int, recording_url: str):
         summary_text = summary_res.choices[0].message.content
 
         # 4. Update Database
-        conn = get_db_connection(validate=True, register_pgvector=False)
-        if conn:
-            try:
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -76,8 +75,6 @@ def _process_audio_task(call_id: int, recording_url: str):
                     refresh_call_caches_async()
                 except Exception as cache_exc:
                     print(f"WARNING: Failed to refresh calls cache after AI processing for {call_id}: {cache_exc}")
-            finally:
-                return_db_connection(conn)
 
     except Exception as e:
         print(f"ERROR: AI Processing failed for call {call_id}: {e}")

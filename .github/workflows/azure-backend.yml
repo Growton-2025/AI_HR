@@ -1,19 +1,12 @@
 name: Deploy Backend to Azure
 
 on:
-  push:
-    branches:
-      - dev
-    paths:
-      - 'backend/**'
-      - 'requirements.txt'
-      - '.github/workflows/azure-backend.yml'
   workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -28,6 +21,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    # Legacy manual fallback only.
+    # This workflow deploys raw source directly, so it must not race the
+    # canonical backend workflow that relies on the supported App Service/Oryx path.
     - name: Deploy to Azure Web App
       uses: azure/webapps-deploy@v3
       with:
