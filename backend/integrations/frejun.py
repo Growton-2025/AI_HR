@@ -1,19 +1,27 @@
+import base64
+import hmac
 import logging
 import os
 import re
 from typing import Any, Dict, Optional
 
 import requests
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+load_dotenv()
 
 class FreJunManager:
     def __init__(self):
         self.base_url = "https://api.frejun.com/api/v2"
         self.create_call_url = "https://api.frejun.com/api/v1/integrations/create-call/"
+        self.calls_url = f"{self.base_url}/integrations/calls/"
+        self.webhooks_url = f"{self.base_url}/integrations/webhooks/"
+        self.create_webhook_url = f"{self.base_url}/integrations/create-webhook/"
         self.client_id = (os.getenv("FREJUN_CLIENT_ID") or "").strip()
         self.client_secret = (os.getenv("FREJUN_CLIENT_SECRET") or "").strip()
         self.api_key = (os.getenv("FREJUN_API_KEY") or self.client_secret).strip()
+        self.access_token = (os.getenv("FREJUN_ACCESS_TOKEN") or "").strip()
         self.user_email = (os.getenv("FREJUN_USER_EMAIL") or "").strip()
         self.virtual_number = (os.getenv("FREJUN_VIRTUAL_NUMBER") or "").strip()
         self._token = None
@@ -72,24 +80,51 @@ class FreJunManager:
             "Content-Type": "application/json",
         }
 
+    def _bearer_headers(self, token: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def _client_credentials_headers(self) -> Dict[str, str]:
+        credentials = f"{self.client_id}:{self.client_secret}".encode("utf-8")
+        encoded = base64.b64encode(credentials).decode("utf-8")
+        return {
+            "Authorization": f"Bearer {encoded}",
+            "Content-Type": "application/json",
+        }
+
     def get_access_token(self) -> Optional[str]:
         """
-        Retrieves a fresh access token using the Client Credentials.
-        NOTE: FreJun documentation typically favors API Key for server-side.
-        If Client Credentials flow is used, it follows standard OAuth2.
+        Returns a pre-configured access token when available.
+
+        FreJun's documented token exchange uses an authorization code flow, so we do
+        not attempt to mint bearer tokens server-side without an explicit token in the
+        environment.
         """
         if self._token:
             return self._token
-            
-        # If the user provided an API Key instead of an OAuth Secret, 
-        # we might just return that. 
-        # But here we handle OAuth token exchange if needed.
-        # For now, we'll try to use the secret directly as a Bearer token 
-        # if it's an API Key, or perform the exchange.
-        
-        # Placeholder for OAuth token exchange logic
-        # For Many providers, Client ID + Secret are exchanged at /oauth/token
-        return self.client_secret # Temporary fallback to using secret as token
+
+        if self.access_token:
+            self._token = self.access_token
+            return self._token
+
+        return None
+
+    def _iter_call_auth_attempts(self):
+        seen = set()
+        access_token = self.get_access_token()
+        if access_token:
+            header = tuple(sorted(self._bearer_headers(access_token).items()))
+            if header not in seen:
+                seen.add(header)
+                yield "bearer", dict(header)
+
+        if self.api_key:
+            header = tuple(sorted(self._api_key_headers().items()))
+            if header not in seen:
+                seen.add(header)
+                yield "api_key", dict(header)
 
     def list_virtual_numbers(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
         email = recruiter_email or self.user_email
@@ -211,7 +246,15 @@ class FreJunManager:
             "source": "default" if selected.get("default_calling_number") else "first_available",
         }
 
-    def initiate_call(self, candidate_phone: str, recruiter_email: Optional[str] = None, candidate_name: Optional[str] = None) -> Dict:
+    def initiate_call(
+        self,
+        candidate_phone: str,
+        recruiter_email: Optional[str] = None,
+        candidate_name: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+    ) -> Dict:
         """
         Initiates a 2-legged call via FreJun.
         Rings the recruiter first, then the candidate.
@@ -251,6 +294,12 @@ class FreJunManager:
             "virtual_number": virtual_number,
             "candidate_name": candidate_name or "Candidate"
         }
+        if candidate_id:
+            payload["candidate_id"] = str(candidate_id)
+        if job_id:
+            payload["job_id"] = str(job_id)
+        if transaction_id:
+            payload["transaction_id"] = str(transaction_id)
         
         try:
             logger.info(f"Initiating FreJun call to {candidate_phone} via {virtual_number}")
@@ -264,7 +313,10 @@ class FreJunManager:
 
             body = self._parse_response_body(response)
             if response.status_code in [200, 201]:
-                return {"success": True, "data": body}
+                response_data = body.get("data") if isinstance(body, dict) else None
+                if not isinstance(response_data, dict):
+                    response_data = {}
+                return {"success": True, "data": body, "call_data": response_data}
             else:
                 message = self._extract_error_message(body, response.text or "FreJun request failed")
                 if response.status_code >= 500 and "contact frejun support" in message.lower():
@@ -298,3 +350,210 @@ class FreJunManager:
         
         # Logic to update database goes here (handled in the route)
         return {"processed": True}
+
+    def get_call_logs(
+        self,
+        recruiter_email: Optional[str] = None,
+        call_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+        candidate_number: Optional[str] = None,
+        candidate_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        email = (recruiter_email or self.user_email or "").strip()
+        params: Dict[str, str] = {}
+        if email:
+            params["email"] = email
+            params["recruiter_email"] = email
+        if call_id:
+            params["call_id"] = str(call_id)
+        if event_id:
+            params["event_id"] = str(event_id)
+        if transaction_id:
+            params["transaction_id"] = str(transaction_id)
+        if candidate_id:
+            params["candidate_id"] = str(candidate_id)
+        normalized_candidate_number = self._normalize_phone(candidate_number)
+        if normalized_candidate_number:
+            params["candidate_number"] = normalized_candidate_number
+
+        attempts = list(self._iter_call_auth_attempts())
+        if not attempts:
+            return {
+                "success": False,
+                "error": (
+                    "FreJun call-log lookup requires authentication. Configure FREJUN_API_KEY "
+                    "or FREJUN_ACCESS_TOKEN."
+                ),
+            }
+
+        last_error = None
+        for auth_mode, headers in attempts:
+            try:
+                response = requests.get(self.calls_url, headers=headers, params=params, timeout=30)
+                body = self._parse_response_body(response)
+                if response.status_code == 200:
+                    payload = body.get("data") if isinstance(body, dict) else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    results = payload.get("results")
+                    if not isinstance(results, list):
+                        results = []
+                    return {
+                        "success": True,
+                        "data": payload,
+                        "results": results,
+                        "auth_mode": auth_mode,
+                    }
+
+                last_error = {
+                    "status_code": response.status_code,
+                    "message": self._extract_error_message(body, response.text or "FreJun request failed"),
+                    "auth_mode": auth_mode,
+                    "raw_response": response.text,
+                }
+
+                if response.status_code not in (401, 403):
+                    break
+            except requests.exceptions.Timeout:
+                last_error = {"message": "FreJun call-log lookup timed out", "auth_mode": auth_mode}
+            except Exception as exc:
+                logger.exception("Error retrieving FreJun call logs")
+                last_error = {"message": str(exc), "auth_mode": auth_mode}
+
+        if last_error is None:
+            last_error = {"message": "FreJun call-log lookup failed"}
+
+        status_code = last_error.get("status_code")
+        detail = last_error.get("message") or "FreJun call-log lookup failed"
+        if last_error.get("auth_mode") == "api_key" and status_code in (401, 403):
+            detail = (
+                f"{detail}. Configure FREJUN_ACCESS_TOKEN if this FreJun endpoint is restricted "
+                "to bearer-token authentication in your account."
+            )
+        return {
+            "success": False,
+            "error": detail,
+            "status_code": status_code,
+            "raw_response": last_error.get("raw_response"),
+        }
+
+    def list_webhooks(self) -> Dict[str, Any]:
+        if not self.client_id or not self.client_secret:
+            return {"success": False, "error": "FreJun client credentials are required to list webhooks"}
+
+        try:
+            response = requests.get(self.webhooks_url, headers=self._client_credentials_headers(), timeout=30)
+            body = self._parse_response_body(response)
+            if response.status_code == 200:
+                data = body.get("data")
+                if not isinstance(data, list):
+                    data = []
+                return {"success": True, "data": data}
+
+            return {
+                "success": False,
+                "error": self._extract_error_message(body, "Failed to list FreJun webhooks"),
+                "status_code": response.status_code,
+                "raw_response": response.text,
+            }
+        except Exception as exc:
+            logger.exception("Error listing FreJun webhooks")
+            return {"success": False, "error": str(exc)}
+
+    def create_webhook(self, event: str, callback_url: str, custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        if not self.client_id or not self.client_secret:
+            return {"success": False, "error": "FreJun client credentials are required to create webhooks"}
+
+        payload: Dict[str, Any] = {
+            "event": event,
+            "callback_url": callback_url,
+        }
+        if custom_headers:
+            payload["custom_headers"] = custom_headers
+
+        try:
+            response = requests.post(
+                self.create_webhook_url,
+                headers=self._client_credentials_headers(),
+                json=payload,
+                timeout=30,
+            )
+            body = self._parse_response_body(response)
+            if response.status_code in (200, 201):
+                return {"success": True, "data": body.get("data") if isinstance(body, dict) else body}
+
+            return {
+                "success": False,
+                "error": self._extract_error_message(body, "Failed to create FreJun webhook"),
+                "status_code": response.status_code,
+                "raw_response": response.text,
+            }
+        except Exception as exc:
+            logger.exception("Error creating FreJun webhook")
+            return {"success": False, "error": str(exc)}
+
+    def ensure_webhooks(self, callback_url: str, events: list[str]) -> Dict[str, Any]:
+        existing = self.list_webhooks()
+        if not existing.get("success"):
+            return existing
+
+        current_hooks = existing.get("data") or []
+        created = []
+        skipped = []
+        for event in events:
+            event_exists = any(
+                hook.get("event") == event and hook.get("callback_url") == callback_url
+                for hook in current_hooks
+            )
+            if event_exists:
+                skipped.append(event)
+                continue
+
+            created_hook = self.create_webhook(event=event, callback_url=callback_url)
+            if not created_hook.get("success"):
+                return {
+                    "success": False,
+                    "error": f"Failed to create webhook for {event}: {created_hook.get('error')}",
+                    "created": created,
+                    "skipped": skipped,
+                }
+            created.append(event)
+
+        return {"success": True, "created": created, "skipped": skipped, "existing": current_hooks}
+
+    def validate_webhook_signature(
+        self,
+        *,
+        method: str,
+        request_uri: str,
+        raw_body: bytes,
+        signature: Optional[str],
+        signature_slim: Optional[str],
+        call_id: Optional[str],
+    ) -> Dict[str, Any]:
+        if not self.client_secret:
+            return {"valid": False, "error": "FreJun client secret missing"}
+
+        method = (method or "POST").upper()
+        body_text = raw_body.decode("utf-8")
+        signature = (signature or "").strip()
+        signature_slim = (signature_slim or "").strip()
+
+        if signature:
+            payload = f"{method}{request_uri}{body_text}".encode("utf-8")
+            expected = base64.b64encode(
+                hmac.new(self.client_secret.encode("utf-8"), payload, "sha256").digest()
+            ).decode("utf-8")
+            if hmac.compare_digest(signature, expected):
+                return {"valid": True, "mode": "frejun-signature"}
+
+        if signature_slim and call_id:
+            payload = f"{method}{request_uri}{call_id}".encode("utf-8")
+            expected = base64.b64encode(
+                hmac.new(self.client_secret.encode("utf-8"), payload, "sha256").digest()
+            ).decode("utf-8")
+            if hmac.compare_digest(signature_slim, expected):
+                return {"valid": True, "mode": "frejun-signature-slim"}
+
+        return {"valid": False, "error": "Invalid FreJun webhook signature"}

@@ -20,6 +20,7 @@ def process_call_audio(call_id: int, recording_url: str):
     thread.start()
 
 def _process_audio_task(call_id: int, recording_url: str):
+    tmp_path = None
     try:
         # 1. Download the audio to a temporary file
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
@@ -56,16 +57,32 @@ def _process_audio_task(call_id: int, recording_url: str):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE calls SET transcript = %s, summary = %s WHERE id = %s",
+                        """
+                        UPDATE calls
+                        SET
+                            transcript = COALESCE(NULLIF(transcript, ''), %s),
+                            summary = COALESCE(NULLIF(summary, ''), %s)
+                        WHERE id = %s
+                        """,
                         (transcript_text, summary_text, call_id)
                     )
                     conn.commit()
                 print(f"DEBUG: Successfully processed AI content for call {call_id}")
+                try:
+                    from backend.api.routes.calls import invalidate_calls_cache, refresh_call_caches_async
+
+                    invalidate_calls_cache()
+                    refresh_call_caches_async()
+                except Exception as cache_exc:
+                    print(f"WARNING: Failed to refresh calls cache after AI processing for {call_id}: {cache_exc}")
             finally:
                 conn.close()
 
-        # 5. Cleanup
-        os.unlink(tmp_path)
-
     except Exception as e:
         print(f"ERROR: AI Processing failed for call {call_id}: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass

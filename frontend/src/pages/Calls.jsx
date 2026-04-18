@@ -23,6 +23,18 @@ const formatLocalDate = (dateString) => {
   });
 };
 
+const formatDateTime = (value) => {
+  if (!value) return 'Unknown';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+};
+
 const TABS = [
   { id: 'today', label: 'Due Today', icon: Clock },
   { id: 'upcoming', label: 'Upcoming', icon: Calendar },
@@ -283,13 +295,179 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   );
 }
 
+function CandidateActivityPanel({ candidateId, candidateName }) {
+  const fetchCandidateActivity = useAppStore(state => state.fetchCandidateActivity);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState('');
+  const itemsRef = useRef([]);
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  const loadActivity = useCallback(async ({ force = false, silent = false } = {}) => {
+    if (!silent) {
+      setRefreshing(true);
+    }
+    if (!itemsRef.current.length) {
+      setLoading(true);
+    }
+
+    const res = await fetchCandidateActivity(candidateId, { force });
+    if (res.success) {
+      setItems(res.data || []);
+      setError('');
+    } else {
+      setError(res.error || 'Failed to load activity');
+    }
+
+    setLoading(false);
+    setRefreshing(false);
+  }, [candidateId, fetchCandidateActivity]);
+
+  useEffect(() => {
+    setItems([]);
+    setError('');
+    setLoading(true);
+    setRefreshing(false);
+    loadActivity({ force: false });
+  }, [candidateId, loadActivity]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '400px', background: '#f8fafc' }}>
+      <div style={{ padding: '18px 24px', borderBottom: '1px solid #e2e8f0', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#0f172a' }}>
+          <div style={{
+            width: '38px',
+            height: '38px',
+            borderRadius: '12px',
+            background: '#eff6ff',
+            color: '#2563eb',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}>
+            <ClipboardList size={18} />
+          </div>
+          <div>
+            <div style={{ fontSize: '13px', fontWeight: 800 }}>Candidate Activity</div>
+            <div style={{ fontSize: '12px', color: '#64748b' }}>{candidateName || 'Candidate'} timeline</div>
+          </div>
+        </div>
+        <button
+          onClick={() => loadActivity({ force: true })}
+          style={{
+            width: '34px',
+            height: '34px',
+            borderRadius: '10px',
+            border: '1px solid #e2e8f0',
+            background: '#fff',
+            color: '#64748b',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          <RefreshCw size={15} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
+        </button>
+      </div>
+
+      <div style={{ flex: 1, padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        {loading ? (
+          Array.from({ length: 2 }).map((_, idx) => (
+            <div
+              key={`activity-skeleton-${idx}`}
+              style={{ padding: '18px', borderRadius: '18px', background: '#fff', border: '1px solid #e2e8f0' }}
+            >
+              <div style={{ width: '40%', height: 14, borderRadius: 999, background: '#e2e8f0', marginBottom: 12 }} />
+              <div style={{ width: '100%', height: 44, borderRadius: 12, background: '#f1f5f9', marginBottom: 12 }} />
+              <div style={{ width: '65%', height: 12, borderRadius: 999, background: '#e2e8f0' }} />
+            </div>
+          ))
+        ) : items.length === 0 ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ maxWidth: '360px', textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>No completed call activity yet</div>
+              <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
+                {error || 'Completed FreJun calls with recordings, summaries, and outcomes will appear here as the activity timeline fills in.'}
+              </div>
+            </div>
+          </div>
+        ) : (
+          items.map(item => (
+            <div key={item.id} style={{ position: 'relative', padding: '18px', borderRadius: '20px', background: '#fff', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', marginBottom: '14px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <div style={{ width: '36px', height: '36px', borderRadius: '12px', background: '#eff6ff', color: '#2563eb', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <PhoneIncoming size={18} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>Completed Call With {candidateName || 'Candidate'}</div>
+                    <div style={{ fontSize: '12px', color: '#64748b' }}>
+                      {item.status || 'completed'}{item.outcome ? ` • ${item.outcome}` : ''}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ fontSize: '12px', color: '#64748b', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                  {formatDateTime(item.occurred_at)}
+                </div>
+              </div>
+
+              {item.recording_url ? (
+                <div style={{ marginBottom: '14px', padding: '14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <audio controls src={item.recording_url} style={{ width: '100%' }} />
+                </div>
+              ) : null}
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 16px', marginBottom: '14px', fontSize: '13px', color: '#475569' }}>
+                <div><strong>From:</strong> {item.from_number || 'N/A'}</div>
+                <div><strong>To:</strong> {item.to_number || 'N/A'}</div>
+                <div><strong>Duration:</strong> {item.duration_seconds ? `${Math.floor(item.duration_seconds / 60)}m ${item.duration_seconds % 60}s` : '0s'}</div>
+              </div>
+
+              {item.summary && (
+                <div style={{ marginBottom: '10px', fontSize: '14px', color: '#334155', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+                  {item.summary}
+                </div>
+              )}
+
+              {item.transcript_preview && (
+                <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
+                  {item.transcript_preview}
+                </div>
+              )}
+
+              {item.source_url && (
+                <div style={{ marginTop: '14px' }}>
+                  <a
+                    href={item.source_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none' }}
+                  >
+                    <ExternalLink size={14} />
+                    Open Source
+                  </a>
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Calls() {
   const { 
     calls, fetchCalls, 
     callLists, fetchCallLists,
     callsLastQueryKey,
     callStats, fetchCallStats,
-    updateCall, deleteCall, deleteCallList, createCallList, clearCallsState
+    updateCall, deleteCall, deleteCallList, createCallList, clearCallsState, syncCallRecording
   } = useAppStore();
 
   const [activeTab, setActiveTab] = useState('today');
@@ -299,6 +477,7 @@ export default function Calls() {
   const [searchQuery, setSearchQuery] = useState('');
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
   const [expandedCallId, setExpandedCallId] = useState(null);
+  const [syncingCallId, setSyncingCallId] = useState(null);
   
   // List Creation State
   const [isCreatingList, setIsCreatingList] = useState(false);
@@ -434,6 +613,24 @@ export default function Calls() {
     } else {
       toast.error(res.error || 'Failed to create list');
     }
+  };
+
+  const handleSyncRecording = async (callId) => {
+    setSyncingCallId(callId);
+    const res = await syncCallRecording(callId);
+    setSyncingCallId(null);
+
+    if (!res.success) {
+      toast.error(res.error || 'Failed to sync recording');
+      return;
+    }
+
+    if (res.data?.recording_url) {
+      toast.success('Recording synced');
+      return;
+    }
+
+    toast('Recording is not ready in FreJun yet');
   };
 
   const filteredCalls = (calls || []).filter(c => 
@@ -753,16 +950,60 @@ export default function Calls() {
                     padding: '24px', background: '#f8fafc', borderRadius: '16px', margin: '0 0 20px 56px',
                     border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
                   }}>
-                    {call.recording_url ? (
-                      <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Call Recording</h4>
+                    <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '12px' }}>
+                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Call Recording</h4>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                          {(call.frejun_link || call.frejun_summary_url) && (
+                            <a
+                              href={call.frejun_link || call.frejun_summary_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                            >
+                              <ExternalLink size={14} />
+                              Open FreJun
+                            </a>
+                          )}
+                          {!call.recording_url && (
+                            <button
+                              onClick={() => handleSyncRecording(call.id)}
+                              disabled={syncingCallId === call.id}
+                              style={{
+                                padding: '8px 12px',
+                                borderRadius: '10px',
+                                border: '1px solid #dbeafe',
+                                background: '#eff6ff',
+                                color: '#1d4ed8',
+                                fontSize: '12px',
+                                fontWeight: 700,
+                                cursor: syncingCallId === call.id ? 'wait' : 'pointer',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '6px'
+                              }}
+                            >
+                              <RefreshCw size={14} style={{ animation: syncingCallId === call.id ? 'spin 1s linear infinite' : 'none' }} />
+                              {syncingCallId === call.id ? 'Syncing...' : 'Sync Recording'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {call.recording_url ? (
                         <audio controls src={call.recording_url} style={{ width: '100%' }} />
-                      </div>
-                    ) : (
-                      <div style={{ padding: '16px', borderRadius: '12px', background: '#fff', border: '1px solid #e2e8f0', color: '#64748b', fontSize: '13px' }}>
-                        Recording not available for this call.
-                      </div>
-                    )}
+                      ) : (
+                        <div style={{ color: '#64748b', fontSize: '13px' }}>
+                          Recording not available for this call yet.
+                        </div>
+                      )}
+                      {(call.recording_source || call.recording_synced_at) && (
+                        <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8' }}>
+                          {call.recording_source ? `Source: ${call.recording_source}` : ''}
+                          {call.recording_source && call.recording_synced_at ? ' • ' : ''}
+                          {call.recording_synced_at ? `Synced ${formatDateTime(call.recording_synced_at)}` : ''}
+                        </div>
+                      )}
+                    </div>
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
                       <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
@@ -1111,6 +1352,11 @@ function CallingModal({ call, onClose, onRefresh }) {
               candidateId={call.candidate_id}
               candidateName={call.candidate_name}
               platform={activeTab}
+            />
+          ) : activeTab === 'tasks' ? (
+            <CandidateActivityPanel
+              candidateId={call.candidate_id}
+              candidateName={call.candidate_name}
             />
           ) : (
             <div style={{ padding: '32px', textAlign: 'center', color: '#94a3b8', background: '#f8fafc', minHeight: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

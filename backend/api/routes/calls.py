@@ -1,14 +1,27 @@
+import json
+import os
 import threading
 import time
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from backend.api import deps, schemas
 from backend.db.connection import get_db_connection, return_db_connection, get_db_connection_context
 from backend.integrations.frejun import FreJunManager
 from backend.services.ai_calls import process_call_audio
+from backend.services.frejun_calls import (
+    coalesce_text,
+    digits_only,
+    extract_payload_details,
+    extract_transcript_text,
+    build_summary_text,
+    humanize_status,
+    normalize_phone,
+    select_best_call_log_result,
+    transcript_preview,
+)
 
 router = APIRouter()
 
@@ -26,6 +39,91 @@ _cache_refreshing = False
 _stats_cache: dict[str, dict] = {}
 _stats_cache_ts: dict[str, float] = {}
 _STATS_TTL = 30 # seconds
+
+CALLS_SELECT_QUERY = """
+    SELECT
+        c.id,
+        c.candidate_id,
+        c.list_id,
+        c.status,
+        c.outcome,
+        c.notes,
+        c.duration,
+        c.due_date,
+        c.created_at,
+        c.task_title,
+        cand.name AS candidate_name,
+        cand.headline AS candidate_title,
+        cand.mobile_phone AS candidate_phone,
+        c.completed_at,
+        c.recording_url,
+        c.transcript,
+        c.summary,
+        cl.created_by,
+        c.frejun_status,
+        c.frejun_call_id,
+        c.frejun_event_id,
+        c.frejun_virtual_number,
+        c.frejun_summary_url,
+        c.frejun_link,
+        c.recording_source,
+        c.recording_synced_at,
+        c.frejun_transaction_id,
+        c.frejun_recruiter_email
+    FROM calls c
+    JOIN call_lists cl ON c.list_id = cl.id
+    JOIN candidates cand ON c.candidate_id = cand.id
+"""
+
+
+def call_row_to_dict(row) -> dict:
+    return {
+        "id": row[0],
+        "candidate_id": row[1],
+        "list_id": row[2],
+        "status": row[3],
+        "outcome": row[4],
+        "notes": row[5],
+        "duration": row[6],
+        "due_date": row[7],
+        "created_at": row[8],
+        "task_title": row[9],
+        "candidate_name": row[10],
+        "candidate_title": row[11],
+        "candidate_company": "",
+        "candidate_phone": row[12],
+        "completed_at": row[13],
+        "recording_url": row[14],
+        "transcript": row[15],
+        "summary": row[16],
+        "created_by": (row[17] or "").strip().lower(),
+        "frejun_status": row[18],
+        "frejun_call_id": row[19],
+        "frejun_event_id": row[20],
+        "frejun_virtual_number": row[21],
+        "frejun_summary_url": row[22],
+        "frejun_link": row[23],
+        "recording_source": row[24],
+        "recording_synced_at": row[25],
+        "frejun_transaction_id": row[26],
+        "frejun_recruiter_email": row[27],
+    }
+
+
+def build_frejun_request_uri(request: Request) -> str:
+    explicit_callback_url = (os.getenv("FREJUN_WEBHOOK_CALLBACK_URL") or "").strip()
+    if explicit_callback_url:
+        return explicit_callback_url
+
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").strip()
+    forwarded_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
+    if forwarded_proto and forwarded_host:
+        path = request.url.path
+        if request.url.query:
+            path = f"{path}?{request.url.query}"
+        return f"{forwarded_proto}://{forwarded_host}{path}"
+
+    return str(request.url)
 
 def invalidate_calls_cache():
     global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
@@ -61,29 +159,9 @@ def bulk_load_calls_cache():
         if not conn: return
         try:
             with conn.cursor() as cur:
-                query = """
-                    SELECT c.id, c.candidate_id, c.list_id, c.status, c.outcome, c.notes, c.duration, c.due_date, c.created_at, c.task_title,
-                           cand.name AS candidate_name, cand.headline AS candidate_title, cand.mobile_phone AS candidate_phone,
-                           c.completed_at, c.recording_url, c.transcript, c.summary, cl.created_by
-                    FROM calls c
-                    JOIN call_lists cl ON c.list_id = cl.id
-                    JOIN candidates cand ON c.candidate_id = cand.id
-                    ORDER BY c.due_date ASC, c.created_at DESC
-                """
-                cur.execute(query)
+                cur.execute(f"{CALLS_SELECT_QUERY} ORDER BY c.due_date ASC, c.created_at DESC")
                 rows = cur.fetchall()
-                data = []
-                for row in rows:
-                    data.append({
-                        "id": row[0], "candidate_id": row[1], "list_id": row[2],
-                        "status": row[3], "outcome": row[4], "notes": row[5],
-                        "duration": row[6], "due_date": row[7], "created_at": row[8],
-                        "task_title": row[9], "candidate_name": row[10],
-                        "candidate_title": row[11], "candidate_company": "",
-                        "candidate_phone": row[12], "completed_at": row[13],
-                        "recording_url": row[14], "transcript": row[15], "summary": row[16],
-                        "created_by": (row[17] or "").strip().lower()
-                    })
+                data = [call_row_to_dict(row) for row in rows]
                 with _calls_lock:
                     _calls_cache = data
                 print(f"DEBUG: Bulk-warmed {len(data)} calls into memory.")
@@ -177,6 +255,191 @@ def get_calls_db_connection():
     return get_db_connection(validate=True, register_pgvector=False)
 
 
+def fetch_call_by_id(cur, call_id: int, owner: Optional[str] = None) -> Optional[dict]:
+    query = f"{CALLS_SELECT_QUERY} WHERE c.id = %s"
+    params: list[Any] = [call_id]
+    if owner:
+        query += " AND LOWER(COALESCE(cl.created_by, '')) = %s"
+        params.append(owner)
+    cur.execute(query, params)
+    row = cur.fetchone()
+    return call_row_to_dict(row) if row else None
+
+
+def find_call_match_for_frejun_payload(cur, payload_details: Dict[str, Any]) -> Optional[dict]:
+    match_specs = [
+        ("frejun_call_id", payload_details.get("call_id")),
+        ("frejun_event_id", payload_details.get("event_id")),
+        ("frejun_transaction_id", payload_details.get("transaction_id")),
+    ]
+
+    for column, value in match_specs:
+        if not value:
+            continue
+        cur.execute(
+            f"""
+            {CALLS_SELECT_QUERY}
+            WHERE c.{column} = %s
+            ORDER BY c.created_at DESC
+            LIMIT 1
+            """,
+            (value,),
+        )
+        row = cur.fetchone()
+        if row:
+            return call_row_to_dict(row)
+
+    candidate_number = payload_details.get("candidate_number")
+    candidate_digits = digits_only(candidate_number)
+    if candidate_digits:
+        last_ten = candidate_digits[-10:]
+        cur.execute(
+            f"""
+            {CALLS_SELECT_QUERY}
+            WHERE regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g') = %s
+               OR RIGHT(regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g'), 10) = %s
+            ORDER BY
+                CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END,
+                c.created_at DESC
+            LIMIT 1
+            """,
+            (candidate_digits, last_ten),
+        )
+        row = cur.fetchone()
+        if row:
+            return call_row_to_dict(row)
+
+    return None
+
+
+def build_call_log_payload(call_log_result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "event": "call.summary",
+        "call_id": call_log_result.get("call_id"),
+        "event_id": call_log_result.get("event_id"),
+        "candidate_number": call_log_result.get("candidate_number"),
+        "candidate_name": call_log_result.get("candidate_name"),
+        "virtual_number": call_log_result.get("virtual_number"),
+        "call_status": call_log_result.get("status"),
+        "duration": call_log_result.get("duration") or call_log_result.get("call_duration"),
+        "recording_url": call_log_result.get("recording_url"),
+        "summary_url": call_log_result.get("summary_url"),
+        "link": call_log_result.get("link"),
+        "transcript": call_log_result.get("call_transcript"),
+        "ai_insights": call_log_result.get("ai_insights"),
+        "call_outcome": call_log_result.get("call_outcome"),
+        "call_notes": call_log_result.get("recruiter_notes"),
+        "call_creator": call_log_result.get("recruiter"),
+        "metadata": {
+            "transaction_id": call_log_result.get("transaction_id"),
+            "candidate_id": call_log_result.get("candidate_id"),
+            "job_id": call_log_result.get("job_id"),
+        },
+    }
+
+
+def persist_frejun_update(
+    cur,
+    *,
+    call_id: int,
+    existing_call: dict,
+    payload_details: Dict[str, Any],
+    recording_source: Optional[str] = None,
+) -> dict:
+    current_duration = int(existing_call.get("duration") or 0)
+    next_duration = current_duration
+    if payload_details.get("duration_seconds") is not None:
+        next_duration = max(current_duration, int(payload_details["duration_seconds"]))
+
+    is_terminal = bool(payload_details.get("is_terminal"))
+    next_status = "completed" if is_terminal else existing_call.get("status")
+    next_outcome = coalesce_text(payload_details.get("outcome"), existing_call.get("outcome"))
+    next_notes = coalesce_text(existing_call.get("notes"), payload_details.get("notes"))
+    next_recording_url = coalesce_text(existing_call.get("recording_url"), payload_details.get("recording_url"))
+    next_transcript = coalesce_text(existing_call.get("transcript"), payload_details.get("transcript_text"))
+    next_summary = coalesce_text(existing_call.get("summary"), payload_details.get("summary_text"))
+    next_frejun_status = coalesce_text(payload_details.get("frejun_status"), existing_call.get("frejun_status"))
+    next_frejun_call_id = coalesce_text(payload_details.get("call_id"), existing_call.get("frejun_call_id"))
+    next_frejun_event_id = coalesce_text(payload_details.get("event_id"), existing_call.get("frejun_event_id"))
+    next_frejun_virtual_number = coalesce_text(payload_details.get("virtual_number"), existing_call.get("frejun_virtual_number"))
+    next_frejun_summary_url = coalesce_text(payload_details.get("summary_url"), existing_call.get("frejun_summary_url"))
+    next_frejun_link = coalesce_text(payload_details.get("link"), existing_call.get("frejun_link"))
+    next_recording_source = coalesce_text(recording_source, payload_details.get("recording_source"), existing_call.get("recording_source"))
+    next_transaction_id = coalesce_text(payload_details.get("transaction_id"), existing_call.get("frejun_transaction_id"))
+    next_recruiter_email = coalesce_text(payload_details.get("recruiter_email"), existing_call.get("frejun_recruiter_email"))
+    should_stamp_recording_sync = bool(
+        next_recording_url
+        and (
+            payload_details.get("recording_url")
+            or payload_details.get("summary_text")
+            or payload_details.get("transcript_text")
+            or recording_source == "frejun_call_logs"
+        )
+    )
+
+    cur.execute(
+        """
+        UPDATE calls
+        SET
+            status = %s,
+            outcome = %s,
+            notes = %s,
+            duration = %s,
+            completed_at = CASE WHEN %s THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+            recording_url = %s,
+            transcript = %s,
+            summary = %s,
+            frejun_status = %s,
+            frejun_call_id = %s,
+            frejun_event_id = %s,
+            frejun_virtual_number = %s,
+            frejun_summary_url = %s,
+            frejun_link = %s,
+            recording_source = %s,
+            recording_synced_at = CASE WHEN %s THEN NOW() ELSE recording_synced_at END,
+            frejun_transaction_id = %s,
+            frejun_recruiter_email = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            next_status,
+            next_outcome,
+            next_notes,
+            next_duration,
+            is_terminal,
+            next_recording_url,
+            next_transcript,
+            next_summary,
+            next_frejun_status,
+            next_frejun_call_id,
+            next_frejun_event_id,
+            next_frejun_virtual_number,
+            next_frejun_summary_url,
+            next_frejun_link,
+            next_recording_source,
+            should_stamp_recording_sync,
+            next_transaction_id,
+            next_recruiter_email,
+            call_id,
+        ),
+    )
+
+    return fetch_call_by_id(cur, call_id)
+
+
+def maybe_process_call_audio(previous_call: dict, updated_call: dict):
+    previous_recording_url = previous_call.get("recording_url")
+    next_recording_url = updated_call.get("recording_url")
+    if not next_recording_url:
+        return
+    if previous_recording_url:
+        return
+    if updated_call.get("transcript") and updated_call.get("summary"):
+        return
+    process_call_audio(updated_call["id"], next_recording_url)
+
+
 class CallListCreate(BaseModel):
     name: str
 
@@ -191,6 +454,10 @@ class CallListResponse(BaseModel):
 class AddCandidatesRequest(BaseModel):
     candidate_ids: List[int]
     list_id: int
+
+
+class CallInitiateRequest(BaseModel):
+    call_id: int
 
 
 class CallUpdate(BaseModel):
@@ -220,6 +487,18 @@ class CallResponse(BaseModel):
     candidate_title: Optional[str]
     candidate_company: Optional[str]
     candidate_phone: Optional[str]
+    completed_at: Optional[datetime] = None
+    recording_url: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+    frejun_status: Optional[str] = None
+    frejun_call_id: Optional[str] = None
+    frejun_event_id: Optional[str] = None
+    frejun_virtual_number: Optional[str] = None
+    frejun_summary_url: Optional[str] = None
+    frejun_link: Optional[str] = None
+    recording_source: Optional[str] = None
+    recording_synced_at: Optional[datetime] = None
 
 
 def ensure_calls_schema_ready(force: bool = False):
@@ -284,6 +563,16 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_url TEXT;")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS transcript TEXT;")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS summary TEXT;")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_status VARCHAR(100);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_call_id VARCHAR(255);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_event_id VARCHAR(255);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_transaction_id VARCHAR(255);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_recruiter_email VARCHAR(255);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_virtual_number VARCHAR(50);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_summary_url TEXT;")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS frejun_link TEXT;")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_source VARCHAR(100);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_synced_at TIMESTAMP;")
             cur.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$
                 BEGIN
@@ -306,6 +595,9 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_status_due_date ON calls(status, due_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_created_at ON calls(created_at DESC);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_call_lists_created_by ON call_lists(created_by);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_frejun_call_id ON calls(frejun_call_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_frejun_event_id ON calls(frejun_event_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_frejun_transaction_id ON calls(frejun_transaction_id);")
             conn.commit()
             _calls_schema_ready = True
         except Exception:
@@ -468,6 +760,7 @@ def get_calls(
     due_filter: Optional[str] = None,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
+    ensure_calls_schema_ready()
     owner = get_call_list_owner(current_user)
 
     # ── HIGH PERFORMANCE IN-MEMORY FILTERING ──
@@ -526,6 +819,7 @@ def get_calls(
 
 @router.patch("/{call_id}")
 def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = Depends(deps.get_current_user)):
+    ensure_calls_schema_ready()
     conn = get_calls_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -557,6 +851,15 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         if request.task_title is not None:
             fields.append("task_title = %s")
             params.append(request.task_title.strip() or None)
+        if request.recording_url is not None:
+            fields.append("recording_url = %s")
+            params.append(request.recording_url.strip() or None)
+        if request.transcript is not None:
+            fields.append("transcript = %s")
+            params.append(request.transcript.strip() or None)
+        if request.summary is not None:
+            fields.append("summary = %s")
+            params.append(request.summary.strip() or None)
 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -774,124 +1077,327 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
 
 @router.post("/initiate")
 def initiate_call(
-    request: dict,
+    request: CallInitiateRequest,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
-    call_id = request.get("call_id")
-    if not call_id:
-        raise HTTPException(status_code=400, detail="call_id is required")
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+    call_id = request.call_id
 
-    phone = None
-    email = None
-    
-    # ── STEP 1: Fetch data and release connection IMMEDIATELY ──
-    with get_db_connection_context() as conn:
+    candidate_name = None
+    candidate_phone = None
+    candidate_id = None
+    recruiter_email = None
+    transaction_id = None
+
+    with get_db_connection_context(validate=True, register_pgvector=False) as conn:
         if not conn:
             raise HTTPException(status_code=500, detail="Database connection failed")
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT cand.mobile_phone, cl.created_by
+                SELECT
+                    c.candidate_id,
+                    cand.name,
+                    cand.mobile_phone,
+                    COALESCE(NULLIF(c.frejun_recruiter_email, ''), NULLIF(%s, ''), NULLIF(cl.created_by, '')),
+                    COALESCE(NULLIF(c.frejun_transaction_id, ''), %s)
                 FROM calls c
                 JOIN candidates cand ON c.candidate_id = cand.id
                 JOIN call_lists cl ON c.list_id = cl.id
                 WHERE c.id = %s
+                  AND LOWER(COALESCE(cl.created_by, '')) = %s
                 """,
-                (call_id,),
+                (
+                    (os.getenv("FREJUN_USER_EMAIL") or current_user.email or "").strip(),
+                    f"call:{call_id}",
+                    call_id,
+                    owner,
+                ),
             )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Call task not found")
-            phone = row[0]
-            import os
-            email = os.getenv("FREJUN_USER_EMAIL") or current_user.email or row[1]
 
-    if not phone:
+            candidate_id = row[0]
+            candidate_name = row[1]
+            candidate_phone = row[2]
+            recruiter_email = (row[3] or "").strip()
+            transaction_id = (row[4] or "").strip() or f"call:{call_id}"
+
+            cur.execute(
+                """
+                UPDATE calls
+                SET
+                    frejun_transaction_id = COALESCE(NULLIF(frejun_transaction_id, ''), %s),
+                    frejun_recruiter_email = COALESCE(NULLIF(frejun_recruiter_email, ''), %s),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (transaction_id, recruiter_email or None, call_id),
+            )
+            conn.commit()
+
+    if not candidate_phone:
         raise HTTPException(status_code=400, detail="Candidate has no phone number")
+    if not recruiter_email:
+        raise HTTPException(status_code=400, detail="Recruiter email missing for FreJun call initiation")
 
-    # ── STEP 2: Call FreJun API while NOT holding a DB connection ──
     frejun = FreJunManager()
-    result = frejun.initiate_call(candidate_phone=phone, recruiter_email=email)
+    result = frejun.initiate_call(
+        candidate_phone=candidate_phone,
+        recruiter_email=recruiter_email,
+        candidate_name=candidate_name,
+        candidate_id=str(candidate_id),
+        transaction_id=transaction_id,
+    )
 
     if not result.get("success"):
-        # Log the specific error for server-side debugging
-        import logging
-        logging.error(f"FreJun initiation failed: {result.get('error')}")
-        
-        # Raise HTTP exception with the specific message from FreJun
         raise HTTPException(
             status_code=result.get("status_code", 500), 
             detail=result.get("error", "FreJun initiation failed")
         )
 
-    return {"success": True, "message": "Call initiated", "frejun_data": result.get("data")}
+    call_data = result.get("call_data") or {}
+    returned_call_id = str(call_data.get("call_id") or "").strip() or None
+    returned_event_id = str(call_data.get("event_id") or "").strip() or None
+    returned_virtual_number = normalize_phone(call_data.get("virtual_number"))
+    raw_status = call_data.get("call_status")
+    if raw_status in (None, ""):
+        raw_status = call_data.get("status")
+    returned_status = str(raw_status).strip().lower().replace(" ", "-") if raw_status not in (None, "") else None
+
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE calls
+            SET
+                frejun_call_id = COALESCE(NULLIF(frejun_call_id, ''), %s),
+                frejun_event_id = COALESCE(NULLIF(frejun_event_id, ''), %s),
+                frejun_transaction_id = COALESCE(NULLIF(frejun_transaction_id, ''), %s),
+                frejun_recruiter_email = COALESCE(NULLIF(frejun_recruiter_email, ''), %s),
+                frejun_virtual_number = COALESCE(NULLIF(frejun_virtual_number, ''), %s),
+                frejun_status = COALESCE(NULLIF(frejun_status, ''), %s),
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                returned_call_id,
+                returned_event_id,
+                transaction_id,
+                recruiter_email,
+                returned_virtual_number,
+                returned_status,
+                call_id,
+            ),
+        )
+        updated_call = fetch_call_by_id(cur, call_id, owner)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+
+    invalidate_calls_cache()
+    refresh_call_caches_async()
+
+    return {
+        "success": True,
+        "message": "Call initiated",
+        "frejun_data": result.get("data"),
+        "call": updated_call,
+    }
+
+
+@router.post("/{call_id}/sync-recording", response_model=CallResponse)
+def sync_call_recording(
+    call_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cur = None
+    call = None
+    try:
+        cur = conn.cursor()
+        call = fetch_call_by_id(cur, call_id, owner)
+    finally:
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+
+    if not call:
+        raise HTTPException(status_code=404, detail="Call task not found")
+    if call.get("recording_url"):
+        return call
+
+    if not (
+        call.get("frejun_call_id")
+        or call.get("frejun_event_id")
+        or call.get("frejun_transaction_id")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="This call is missing FreJun identifiers and cannot be synced yet",
+        )
+
+    recruiter_email = (
+        call.get("frejun_recruiter_email")
+        or (os.getenv("FREJUN_USER_EMAIL") or current_user.email or "").strip()
+    )
+
+    frejun = FreJunManager()
+    lookup = frejun.get_call_logs(
+        recruiter_email=recruiter_email,
+        call_id=call.get("frejun_call_id"),
+        event_id=call.get("frejun_event_id"),
+        transaction_id=call.get("frejun_transaction_id"),
+        candidate_number=call.get("candidate_phone"),
+        candidate_id=str(call.get("candidate_id")),
+    )
+    if not lookup.get("success"):
+        raise HTTPException(
+            status_code=lookup.get("status_code") or 502,
+            detail=lookup.get("error", "FreJun call-log lookup failed"),
+        )
+
+    best_result = select_best_call_log_result(
+        lookup.get("results") or [],
+        frejun_call_id=call.get("frejun_call_id"),
+        frejun_event_id=call.get("frejun_event_id"),
+        frejun_transaction_id=call.get("frejun_transaction_id"),
+        candidate_number=call.get("candidate_phone"),
+    )
+    if not best_result:
+        return call
+
+    payload_details = extract_payload_details(build_call_log_payload(best_result))
+
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cur = None
+    updated_call = None
+    try:
+        cur = conn.cursor()
+        existing_call = fetch_call_by_id(cur, call_id, owner)
+        if not existing_call:
+            raise HTTPException(status_code=404, detail="Call task not found")
+        if existing_call.get("recording_url"):
+            return existing_call
+
+        updated_call = persist_frejun_update(
+            cur,
+            call_id=call_id,
+            existing_call=existing_call,
+            payload_details=payload_details,
+            recording_source="frejun_call_logs",
+        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+
+    invalidate_calls_cache()
+    refresh_call_caches_async()
+    maybe_process_call_audio(call, updated_call)
+    return updated_call
 
 
 @router.post("/webhook")
-def frejun_webhook(payload: dict):
-    # This endpoint is called by FreJun to update call status
-    # Note: No authentication check here yet as we need to verify signatures later
+async def frejun_webhook(request: Request):
+    ensure_calls_schema_ready()
+    raw_body = await request.body()
+    if not raw_body:
+        raise HTTPException(status_code=400, detail="Webhook payload is empty")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid webhook payload: {exc}")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object")
+
+    payload_details = extract_payload_details(payload)
+
     frejun = FreJunManager()
-    frejun.handle_webhook(payload)
-    
-    # ── DEBUG: Log full payload for verification ──
-    print(f"DEBUG: FreJun Webhook Payload: {payload}")
-    
-    event_type = payload.get("event") or payload.get("event_type")
-    data = payload.get("data", {})
-    
-    # FreJun v2 sometimes nests everything inside data, sometimes at top level
-    call_status = data.get("status") or payload.get("status")
-    duration = data.get("duration") or data.get("call_duration") or payload.get("duration")
-    recording_url = data.get("recording_url") or data.get("recording") or data.get("call_recording") or payload.get("recording_url")
-    candidate_number = data.get("candidate_number") or payload.get("candidate_number")
-    
-    if candidate_number:
-        with get_db_connection_context() as conn:
-            if conn:
-                with conn.cursor() as cur:
-                    # 1. Determine final status and outcome
-                    is_completed = event_type in ['call_cut', 'completed', 'recording_ready']
-                    
-                    # If duration > 0, we know it was Answered
-                    inferred_outcome = None
-                    if duration and int(duration) > 0:
-                        inferred_outcome = 'Answered'
-                    elif call_status:
-                        inferred_outcome = str(call_status).capitalize()
+    validation = frejun.validate_webhook_signature(
+        method=request.method,
+        request_uri=build_frejun_request_uri(request),
+        raw_body=raw_body,
+        signature=request.headers.get("frejun-signature"),
+        signature_slim=request.headers.get("frejun-signature-slim"),
+        call_id=payload_details.get("call_id"),
+    )
+    if not validation.get("valid"):
+        status_code = 503 if "missing" in (validation.get("error") or "").lower() else 401
+        raise HTTPException(
+            status_code=status_code,
+            detail=validation.get("error", "Invalid FreJun webhook signature"),
+        )
 
-                    update_sql = """
-                        UPDATE calls 
-                        SET status = %s, 
-                            duration = GREATEST(duration, %s),
-                            recording_url = COALESCE(%s, recording_url),
-                            updated_at = NOW()
-                    """
-                    params = ['completed' if is_completed else 'ongoing', int(duration or 0), recording_url]
-                    
-                    if inferred_outcome:
-                        update_sql += ", outcome = %s"
-                        params.append(inferred_outcome)
-                    
-                    if is_completed:
-                        update_sql += ", completed_at = NOW()"
-                    
-                    update_sql += """
-                        WHERE candidate_id IN (SELECT id FROM candidates WHERE mobile_phone = %s)
-                        AND status != 'completed'
-                        RETURNING id
-                    """
-                    params.append(candidate_number)
-                    
-                    cur.execute(update_sql, params)
-                    res = cur.fetchone()
-                    conn.commit()
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
 
-                    # 2. If it's a new recording, trigger AI processing
-                    if res and recording_url:
-                        print(f"DEBUG: Triggering AI processing for call {res[0]} with URL {recording_url}")
-                        process_call_audio(res[0], recording_url)
-                        invalidate_calls_cache()
-                        refresh_call_caches_async()
+    cur = None
+    matched_call = None
+    updated_call = None
+    try:
+        cur = conn.cursor()
+        matched_call = find_call_match_for_frejun_payload(cur, payload_details)
+        if not matched_call:
+            return {
+                "status": "ignored",
+                "reason": "call_not_found",
+                "signature_mode": validation.get("mode"),
+            }
 
-    return {"status": "ok"}
+        updated_call = persist_frejun_update(
+            cur,
+            call_id=matched_call["id"],
+            existing_call=matched_call,
+            payload_details=payload_details,
+            recording_source=payload_details.get("recording_source"),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+
+    invalidate_calls_cache()
+    refresh_call_caches_async()
+    maybe_process_call_audio(matched_call, updated_call)
+
+    return {
+        "status": "ok",
+        "matched_call_id": updated_call["id"],
+        "signature_mode": validation.get("mode"),
+    }

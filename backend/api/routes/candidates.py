@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from backend.api import schemas, deps
+from backend.db.connection import get_db_connection, return_db_connection
+from backend.services.frejun_calls import transcript_preview
 from backend.pipeline.query import (
     process_query_main,
     load_all_profiles_from_db,
@@ -207,8 +209,7 @@ async def websocket_search(websocket: WebSocket):
 @router.patch("/candidates/{candidate_id}")
 async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user: schemas.User = Depends(deps.get_current_user)):
     """Update candidate fields manually"""
-    from backend.db.connection import get_db_connection, return_db_connection
-    
+
     # 1. Update Database
     conn = get_db_connection()
     if not conn:
@@ -243,3 +244,77 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
         PROFILES_BY_ID[candidate_id] = profile
 
     return {"success": True, "data": data}
+
+
+@router.get("/candidates/{candidate_id}/activity")
+async def get_candidate_activity(
+    candidate_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    from backend.api.routes.calls import ensure_calls_schema_ready, get_call_list_owner
+
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+
+    conn = get_db_connection(validate=True, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                c.id,
+                COALESCE(c.completed_at, c.updated_at, c.created_at) AS occurred_at,
+                c.status,
+                c.outcome,
+                c.duration,
+                c.recording_url,
+                c.summary,
+                c.transcript,
+                c.notes,
+                c.frejun_virtual_number,
+                cand.mobile_phone,
+                c.frejun_link,
+                c.frejun_summary_url
+            FROM calls c
+            JOIN call_lists cl ON c.list_id = cl.id
+            JOIN candidates cand ON c.candidate_id = cand.id
+            WHERE c.candidate_id = %s
+              AND LOWER(COALESCE(cl.created_by, '')) = %s
+              AND c.status = 'completed'
+            ORDER BY COALESCE(c.completed_at, c.updated_at, c.created_at) DESC, c.id DESC
+            """,
+            (candidate_id, owner),
+        )
+        rows = cur.fetchall()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+
+    items = []
+    for row in rows:
+        summary = (row[6] or row[8] or "").strip() or None
+        items.append(
+            {
+                "id": row[0],
+                "type": "call_completed",
+                "occurred_at": row[1],
+                "status": row[2],
+                "outcome": row[3],
+                "duration_seconds": row[4] or 0,
+                "recording_url": row[5],
+                "summary": summary,
+                "transcript_preview": transcript_preview(row[7]),
+                "from_number": row[9],
+                "to_number": row[10],
+                "source_url": row[11] or row[12] or row[5],
+            }
+        )
+
+    return {"items": items}

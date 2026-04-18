@@ -49,6 +49,37 @@ function mergePendingCallLists(serverLists = [], currentLists = []) {
     return sortCallListsByCreatedAt(merged)
 }
 
+function updateCallInCollection(collection = [], updatedCall) {
+    let found = false
+    const next = (collection || []).map(call => {
+        if (call?.id !== updatedCall?.id) {
+            return call
+        }
+        found = true
+        return { ...call, ...updatedCall }
+    })
+
+    return { next, found }
+}
+
+function patchCallAcrossCaches(callsCache = {}, updatedCall) {
+    const nextCache = {}
+    let found = false
+
+    for (const [queryKey, entries] of Object.entries(callsCache || {})) {
+        if (!Array.isArray(entries)) {
+            nextCache[queryKey] = entries
+            continue
+        }
+
+        const result = updateCallInCollection(entries, updatedCall)
+        nextCache[queryKey] = result.next
+        found = found || result.found
+    }
+
+    return { nextCache, found }
+}
+
 // API base URL
 // On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
 // causing cross-origin preflight failures.
@@ -1181,6 +1212,8 @@ export const useAppStore = create(persist((set, get) => ({
     callListsBackoffUntil: 0,
     callStatsBackoffUntil: 0,
     callsBackoffUntilByQuery: {},
+    candidateActivityCache: {},
+    candidateActivityFetchedAt: {},
 
     fetchCallLists: async (options = {}) => {
         const force = typeof options === 'boolean' ? options : options.force === true
@@ -1526,6 +1559,37 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
+    syncCallRecording: async (callId) => {
+        try {
+            const res = await axios.post(`${API_BASE}/calls/${callId}/sync-recording`, {}, { timeout: CALL_REQUEST_TIMEOUT_MS })
+            const updatedCall = res.data
+
+            set(state => {
+                const currentCalls = updateCallInCollection(state.calls, updatedCall)
+                const cachePatch = patchCallAcrossCaches(state.callsCache, updatedCall)
+                const nextActivityCache = { ...state.candidateActivityCache }
+                const nextActivityFetchedAt = { ...state.candidateActivityFetchedAt }
+
+                if (updatedCall?.candidate_id != null) {
+                    delete nextActivityCache[updatedCall.candidate_id]
+                    delete nextActivityFetchedAt[updatedCall.candidate_id]
+                }
+
+                return {
+                    calls: currentCalls.found ? currentCalls.next : state.calls,
+                    callsCache: cachePatch.nextCache,
+                    candidateActivityCache: nextActivityCache,
+                    candidateActivityFetchedAt: nextActivityFetchedAt,
+                }
+            })
+
+            return { success: true, data: updatedCall }
+        } catch (error) {
+            console.error('Failed to sync call recording:', error)
+            return { success: false, error: getRequestErrorMessage(error, 'Failed to sync call recording') }
+        }
+    },
+
     deleteCall: (callId) => {
         const previousState = {
             calls: get().calls,
@@ -1666,6 +1730,42 @@ export const useAppStore = create(persist((set, get) => ({
 
         set({ callStatsRequest: request })
         return request
+    },
+
+    fetchCandidateActivity: async (candidateId, options = {}) => {
+        const force = typeof options === 'boolean' ? options : options.force === true
+        const maxAgeMs = 15 * 1000
+        const state = get()
+        const cachedData = state.candidateActivityCache[candidateId]
+        const cachedAt = state.candidateActivityFetchedAt[candidateId] || 0
+        const isFresh = Array.isArray(cachedData) && cachedAt && (Date.now() - cachedAt < maxAgeMs)
+
+        if (!force && isFresh) {
+            return { success: true, data: cachedData, cached: true }
+        }
+
+        try {
+            const res = await axios.get(`${API_BASE}/candidates/${candidateId}/activity`, { timeout: CALL_REQUEST_TIMEOUT_MS })
+            const items = res.data?.items || []
+            const fetchedAt = Date.now()
+            set(state => ({
+                candidateActivityCache: {
+                    ...state.candidateActivityCache,
+                    [candidateId]: items,
+                },
+                candidateActivityFetchedAt: {
+                    ...state.candidateActivityFetchedAt,
+                    [candidateId]: fetchedAt,
+                },
+            }))
+            return { success: true, data: items, cached: false }
+        } catch (error) {
+            console.error('Failed to fetch candidate activity:', error)
+            if (Array.isArray(cachedData)) {
+                return { success: true, data: cachedData, cached: true }
+            }
+            return { success: false, error: getRequestErrorMessage(error, 'Failed to fetch candidate activity') }
+        }
     },
 
     initiateCall: async (callId) => {
