@@ -1402,20 +1402,22 @@ async def send_linkedin_chat_reply(
             try:
                 conn3 = get_db_connection()
                 if conn3:
-                    with conn3.cursor() as cur3:
-                        role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
-                        cur3.execute(
-                            f"""
-                            UPDATE candidate_outreach
-                            SET initial_li_message = %s,
-                                initial_li_message_at = NOW(),
-                                updated_at = NOW()
-                            WHERE candidate_id = %s AND {role_where}
-                              AND initial_li_message IS NULL
-                            """,
-                            (request.message, candidate_id, *role_params)
-                        )
-                        conn3.commit()
+                    try:
+                        with conn3.cursor() as cur3:
+                            role_where, role_params = _role_filter_sql(role_id, "recruitment_role_id")
+                            cur3.execute(
+                                f"""
+                                UPDATE candidate_outreach
+                                SET initial_li_message = %s,
+                                    initial_li_message_at = NOW(),
+                                    updated_at = NOW()
+                                WHERE candidate_id = %s AND {role_where}
+                                  AND initial_li_message IS NULL
+                                """,
+                                (request.message, candidate_id, *role_params)
+                            )
+                            conn3.commit()
+                    finally:
                         return_db_connection(conn3)
             except:
                 pass

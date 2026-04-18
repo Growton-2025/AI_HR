@@ -4,7 +4,7 @@ import tempfile
 import threading
 from typing import Optional
 from openai import OpenAI
-from backend.db.connection import get_db_connection
+from backend.db.connection import get_db_connection, return_db_connection
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -17,6 +17,7 @@ def process_call_audio(call_id: int, recording_url: str):
 
     # Run in a separate thread to avoid blocking the webhook response
     thread = threading.Thread(target=_process_audio_task, args=(call_id, recording_url))
+    thread.daemon = True
     thread.start()
 
 def _process_audio_task(call_id: int, recording_url: str):
@@ -52,7 +53,7 @@ def _process_audio_task(call_id: int, recording_url: str):
         summary_text = summary_res.choices[0].message.content
 
         # 4. Update Database
-        conn = get_db_connection()
+        conn = get_db_connection(validate=True, register_pgvector=False)
         if conn:
             try:
                 with conn.cursor() as cur:
@@ -76,7 +77,7 @@ def _process_audio_task(call_id: int, recording_url: str):
                 except Exception as cache_exc:
                     print(f"WARNING: Failed to refresh calls cache after AI processing for {call_id}: {cache_exc}")
             finally:
-                conn.close()
+                return_db_connection(conn)
 
     except Exception as e:
         print(f"ERROR: AI Processing failed for call {call_id}: {e}")

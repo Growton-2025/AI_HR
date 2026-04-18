@@ -40,6 +40,81 @@ def get_db_connection_params():
         "keepalives_count": 5
     }
 
+def _get_connection_pool_state():
+    """Best-effort snapshot for debugging pool pressure and leaks."""
+    global _connection_pool
+
+    if _connection_pool is None:
+        return "uninitialized"
+
+    try:
+        available = len(getattr(_connection_pool, "_pool", []))
+        used = len(getattr(_connection_pool, "_used", {}))
+        minconn = getattr(_connection_pool, "minconn", "?")
+        maxconn = getattr(_connection_pool, "maxconn", "?")
+        return f"available={available}, used={used}, min={minconn}, max={maxconn}"
+    except Exception as e:
+        return f"unavailable ({e})"
+
+def _discard_broken_connection(conn, reason="broken connection"):
+    """Remove a bad connection from the pool's bookkeeping."""
+    global _connection_pool
+
+    if not conn:
+        return
+
+    if _connection_pool:
+        try:
+            _connection_pool.putconn(conn, close=True)
+            return
+        except Exception as p_err:
+            logger.debug(f"Discarding {reason} via manual close after pool put failure: {p_err}")
+
+    try:
+        if not conn.closed:
+            conn.close()
+    except Exception:
+        pass
+
+def _reap_closed_checked_out_connections():
+    """
+    Recover pool slots from callers that closed pooled connections directly
+    instead of returning them to the pool.
+    """
+    global _connection_pool
+
+    if _connection_pool is None:
+        return 0
+
+    try:
+        used_items = list(getattr(_connection_pool, "_used", {}).items())
+    except RuntimeError:
+        return 0
+    except Exception as e:
+        logger.debug(f"Could not inspect checked-out pool connections: {e}")
+        return 0
+
+    reclaimed = 0
+    for key, conn in used_items:
+        try:
+            if not conn or not conn.closed:
+                continue
+            _connection_pool.putconn(conn, key=key, close=True)
+            reclaimed += 1
+        except Exception as e:
+            if "unkeyed" in str(e).lower():
+                continue
+            logger.debug(f"Failed to reclaim closed checked-out connection: {e}")
+
+    if reclaimed:
+        logger.warning(
+            "Reclaimed %s closed connection(s) that were still marked as checked out. Pool state: %s",
+            reclaimed,
+            _get_connection_pool_state(),
+        )
+
+    return reclaimed
+
 def _initialize_pool():
     """Initialize the connection pool if not already initialized."""
     global _connection_pool
@@ -89,6 +164,7 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
     current_delay = retry_delay
     
     for attempt in range(max_retries):
+        _reap_closed_checked_out_connections()
         try:
             # Get connection from pool
             conn = _connection_pool.getconn()
@@ -97,6 +173,7 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
                 raise Exception("Pool returned None connection")
             
             if conn.closed:
+                _discard_broken_connection(conn, "closed connection returned by pool")
                 raise psycopg2.InterfaceError("Pool returned a closed connection")
 
             if validate:
@@ -110,16 +187,7 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
                     logger.warning(
                         f"Stale/dead connection detected (Azure idle timeout?), discarding and retrying: {test_error}"
                     )
-                    try:
-                        # Very important: use putconn with close=True for the pool to track the removal
-                        _connection_pool.putconn(conn, close=True)
-                    except Exception as p_err:
-                        # If putconn fails (e.g. unkeyed), just close it manually as a last resort
-                        logger.debug(f"Discarding untracked/unkeyed dead connection: {p_err}")
-                        try:
-                            conn.close()
-                        except:
-                            pass
+                    _discard_broken_connection(conn, "stale/dead validated connection")
                     raise test_error  # retry loop will get a fresh connection
 
             
@@ -138,6 +206,12 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
         except (psycopg2.OperationalError, psycopg2.InterfaceError, Exception) as e:
             last_error = e
             error_msg = str(e).lower()
+
+            if "connection pool exhausted" in error_msg:
+                logger.warning(
+                    "Connection pool exhausted while acquiring a DB connection. Pool state: %s",
+                    _get_connection_pool_state(),
+                )
             
             # Check if this is a transient error worth retrying
             is_transient = any(keyword in error_msg for keyword in [
@@ -146,6 +220,7 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
                 "timeout",
                 "temporarily unavailable",
                 "too many connections",
+                "connection pool exhausted",
                 "connection reset",
                 "broken pipe"
             ])
@@ -159,12 +234,16 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
                 current_delay *= 2  # Exponential backoff
             else:
                 logger.error(
-                    f"Database connection failed after {attempt + 1} attempts: {e}"
+                    f"Database connection failed after {attempt + 1} attempts: {e}. "
+                    f"Pool state: {_get_connection_pool_state()}"
                 )
                 break
     
     # All retries failed
-    logger.error(f"Failed to get database connection after {max_retries} attempts. Last error: {last_error}")
+    logger.error(
+        f"Failed to get database connection after {max_retries} attempts. "
+        f"Last error: {last_error}. Pool state: {_get_connection_pool_state()}"
+    )
     return None
 
 def return_db_connection(conn, close=False):
@@ -192,7 +271,7 @@ def return_db_connection(conn, close=False):
                 except:
                     pass
             else:
-                logger.error(f"Error returning connection to pool: {e}")
+                logger.error(f"Error returning connection to pool: {e}. Pool state: {_get_connection_pool_state()}")
 
 def close_all_connections():
     """Close all connections in the pool. Call this on application shutdown."""

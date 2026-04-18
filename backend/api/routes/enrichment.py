@@ -90,20 +90,21 @@ async def receive_results(request: Request):
     if li_url and li_url != 'N/A':
         conn = get_db_connection()
         if conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE candidates 
-                    SET email = COALESCE(%s, email), 
-                        mobile_phone = COALESCE(%s, mobile_phone)
-                    WHERE linkedin = %s
-                """, (email, phone, li_url))
-                conn.commit()
-                logger.info(f"Updated candidate in DB for LinkedIn: {li_url}")
-                
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candidates 
+                        SET email = COALESCE(%s, email), 
+                            mobile_phone = COALESCE(%s, mobile_phone)
+                        WHERE linkedin = %s
+                    """, (email, phone, li_url))
+                    conn.commit()
+                    logger.info(f"Updated candidate in DB for LinkedIn: {li_url}")
+            finally:
+                return_db_connection(conn)
+
             # Update the in-memory cache so frontend polling works
             from backend.pipeline.query import update_candidate_contact
             update_candidate_contact(li_url, email, phone)
-            
-            return_db_connection(conn)
 
     return {"status": "success"}
