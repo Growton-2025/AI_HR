@@ -316,3 +316,101 @@ async def google_auth(request: schemas.GoogleAuthRequest):
 async def read_users_me(current_user: schemas.User = Depends(deps.get_current_user)):
     return current_user
 
+
+FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_CLIENT_ID", ""))
+FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "")
+FREJUN_OAUTH_REDIRECT_URI = "http://localhost:3002/api/auth/frejun-callback"
+
+@router.get("/frejun-callback")
+async def frejun_oauth_callback(code: str = None, error: str = None):
+    """
+    FreJun OAuth callback endpoint.
+    Set redirect URL in FreJun dashboard to: http://localhost:3002/api/auth/frejun-callback
+    """
+    if error:
+        return {"success": False, "error": error}
+    if not code:
+        return {"success": False, "error": "No authorization code received"}
+
+    # Exchange code for access token
+    token_url = "https://api.frejun.com/api/v2/integrations/token/"
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": FREJUN_OAUTH_REDIRECT_URI,
+        "client_id": FREJUN_OAUTH_CLIENT_ID,
+        "client_secret": FREJUN_OAUTH_CLIENT_SECRET,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(token_url, json=payload)
+
+        body = resp.json()
+        logger.info(f"FreJun token exchange status: {resp.status_code}")
+
+        if resp.status_code in (200, 201):
+            access_token = body.get("access_token") or body.get("data", {}).get("access_token", "")
+            refresh_token = body.get("refresh_token") or body.get("data", {}).get("refresh_token", "")
+
+            # Write fresh tokens to .env
+            env_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")
+            env_path = os.path.abspath(env_path)
+            _update_env_key(env_path, "FREJUN_ACCESS_TOKEN", access_token)
+            if refresh_token:
+                _update_env_key(env_path, "FREJUN_REFRESH_TOKEN", refresh_token)
+
+            logger.info(f"✅ FreJun OAuth: fresh token saved to .env")
+
+            # Return a simple HTML page so the user can copy the token
+            html = f"""<!DOCTYPE html>
+<html>
+<head><title>FreJun Token</title>
+<style>body{{font-family:monospace;padding:32px;background:#f0fdf4;}} pre{{background:#fff;padding:16px;border-radius:8px;word-break:break-all;border:1px solid #bbf7d0;}} h2{{color:#166534;}}</style>
+</head>
+<body>
+<h2>✅ FreJun OAuth Successful!</h2>
+<p><strong>Access Token</strong> (saved to .env automatically):</p>
+<pre id="token">{access_token}</pre>
+<p>The backend has been updated. Restart the frontend dev server or hard-refresh the browser to pick up the new token.</p>
+</body>
+</html>"""
+            from fastapi.responses import HTMLResponse
+            return HTMLResponse(content=html)
+        else:
+            logger.error(f"FreJun token exchange failed: {resp.status_code} {resp.text}")
+            # Try alternate payload with form encoding
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp2 = await client.post(token_url, data=payload,
+                                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+            body2 = resp2.text
+            return {"success": False, "status": resp.status_code, "body": body, "alt_body": body2}
+
+    except Exception as e:
+        logger.exception("FreJun OAuth callback error")
+        return {"success": False, "error": str(e)}
+
+
+def _update_env_key(env_path: str, key: str, value: str):
+    """Update or append a key in the .env file."""
+    try:
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+            new_lines = []
+            found = False
+            for line in lines:
+                if line.startswith(f"{key}=") or line.startswith(f"#{key}="):
+                    new_lines.append(f"{key}={value}\n")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
+                new_lines.append(f"{key}={value}\n")
+            with open(env_path, "w") as f:
+                f.writelines(new_lines)
+        else:
+            with open(env_path, "a") as f:
+                f.write(f"{key}={value}\n")
+    except Exception as e:
+        logger.warning(f"Could not update .env: {e}")

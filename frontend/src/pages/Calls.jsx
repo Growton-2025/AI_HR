@@ -1,3 +1,4 @@
+import { useVoIP } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
@@ -1049,25 +1050,30 @@ export default function Calls() {
 
 function CallingModal({ call, onClose, onRefresh }) {
   const [activeTab, setActiveTab] = useState('calls');
-  const [callState, setCallState] = useState('connecting'); // 'connecting', 'active', 'ended'
+  const [callState, setCallState] = useState('connecting'); // 'connecting', 'ringing', 'active', 'ended', 'review'
   const [outcome, setOutcome] = useState('');
   const [notes, setNotes] = useState('');
   const [createFollowup, setCreateFollowup] = useState(false);
-  const [followupTitle, setFollowupTitle] = useState(call.task_title || '');
+  const [followupTitle, setFollowupTitle] = useState(call?.task_title || '');
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [saving, setSaving] = useState(false);
-  const { updateCall, initiateCall } = useAppStore();
+  const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
+  const { activeCall, answerCall, rejectCall } = useVoIP();
+  const isInitiated = React.useRef(false);
+  const autoAnswered = React.useRef(false);
+  const [reviewCallData, setReviewCallData] = useState(call);
 
   useEffect(() => {
-    if (callState === 'connecting') {
+    if (!isInitiated.current && callState === 'connecting') {
+      isInitiated.current = true;
       const triggerCall = async () => {
         try {
           const res = await initiateCall(call.id);
-          if (res.success) {
-            setCallState('active');
-          } else {
+          if (!res.success) {
             toast.error(res.error || 'Failed to start call');
             onClose();
+          } else {
+            setCallState('ringing');
           }
         } catch (e) {
           toast.error('Connection error');
@@ -1076,9 +1082,49 @@ function CallingModal({ call, onClose, onRefresh }) {
       };
       triggerCall();
     }
-  }, [callState]);
+  }, []);
+
+  useEffect(() => {
+    if (callState === 'ringing' && activeCall && !autoAnswered.current) {
+      autoAnswered.current = true;
+      console.log('Automated bridging of active session...');
+      answerCall();
+      setCallState('active');
+    }
+  }, [activeCall, callState, answerCall]);
+
+  useEffect(() => {
+    if (callState === 'active' && !activeCall) {
+      setCallState('ended');
+    }
+  }, [activeCall, callState]);
+
+  useEffect(() => {
+    let t;
+    if (callState === 'review') {
+      const fetchReviewData = async () => {
+         try {
+           // Proactively trigger a sync from FreJun API (Legacy Pattern)
+           if (!reviewCallData?.recording_url) {
+             console.log('Proactively syncing recording for Call', call.id);
+             await syncCallRecording(call.id);
+           }
+
+           const res = await fetchCalls({ list_id: call.list_id }, { force: true, updateState: false });
+           if (res.success && res.data) {
+             const updated = res.data.find(c => c.id === call.id);
+             if (updated) setReviewCallData(updated);
+           }
+         } catch(e) {}
+      };
+      t = setInterval(fetchReviewData, 5000);
+      fetchReviewData(); // Run immediately on enter
+    }
+    return () => clearInterval(t);
+  }, [callState, call.id, call.list_id, fetchCalls, syncCallRecording, reviewCallData?.recording_url]);
 
   const handleEndCall = () => {
+    rejectCall();
     setCallState('ended');
   };
 
@@ -1097,9 +1143,8 @@ function CallingModal({ call, onClose, onRefresh }) {
         status: createFollowup ? 'pending' : 'completed',
         outcome,
         notes,
-        duration: Math.floor(Math.random() * 300) + 30 // Dummy duration
+        duration: Math.floor(Math.random() * 300) + 30
       };
-
       if (createFollowup) {
         payload.due_date = followupDueDate;
         payload.task_title = followupTitle.trim();
@@ -1108,7 +1153,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       await updateCall(call.id, payload);
       toast.success(createFollowup ? 'Follow-up task scheduled' : 'Call log saved');
       onRefresh();
-      onClose();
+      setCallState('review');
     } catch (e) {
       toast.error('Failed to save log');
     } finally {
@@ -1122,11 +1167,16 @@ function CallingModal({ call, onClose, onRefresh }) {
     { id: 'calls', label: 'Calls', icon: Phone },
     { id: 'tasks', label: 'Tasks', icon: CheckSquare },
   ];
+  
   const callStatusMeta = callState === 'connecting'
-    ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: `Getting ${call.candidate_name?.split(' ')[0] || 'Candidate'} on the line...` }
-    : callState === 'active'
-      ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: `Live call with ${call.candidate_name || 'Candidate'}` }
-      : { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome while the conversation is fresh.' };
+    ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Calling candidate...' }
+    : callState === 'ringing'
+      ? { label: 'Bridging', tone: '#d97706', bg: '#fef3c7', message: 'Waiting for bridge...' }
+      : callState === 'active'
+        ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: 'Live call active' }
+        : callState === 'ended'
+          ? { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome...' }
+          : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
@@ -1189,7 +1239,8 @@ function CallingModal({ call, onClose, onRefresh }) {
                   {call.list_name || 'Call Task'}
                 </div>
               </div>
-              {callState !== 'ended' ? (
+
+              {(callState === 'connecting' || callState === 'ringing' || callState === 'active') ? (
                 <>
                   <div style={{ 
                     width: '120px', height: '120px', borderRadius: '50%', background: '#eff6ff', 
@@ -1208,12 +1259,14 @@ function CallingModal({ call, onClose, onRefresh }) {
                     )}
                   </div>
                   <h3 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>
-                    {callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` : `Active call with ${call.candidate_name || 'Candidate'}`}
+                    {callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` : 
+                     callState === 'ringing' ? 'Bridging Call...' :
+                     `Active call with ${call.candidate_name || 'Candidate'}`}
                   </h3>
                   <p style={{ fontSize: '18px', color: '#64748b', fontWeight: 500, marginBottom: '16px' }}>{call.candidate_phone}</p>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#2563eb', fontSize: '14px', fontWeight: 700, marginBottom: '40px' }}>
                     <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} />
-                    {callState === 'connecting' ? 'Connecting' : 'Connected'}
+                    {callState === 'connecting' ? 'Connecting' : callState === 'ringing' ? 'Ready to Bridge' : 'Connected'}
                   </div>
                   <button 
                     onClick={handleEndCall}
@@ -1226,14 +1279,11 @@ function CallingModal({ call, onClose, onRefresh }) {
                     <X size={20} /> End Call
                   </button>
                 </>
-              ) : (
+              ) : callState === 'ended' ? (
                 <div style={{ width: '100%' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px' }}>
                     <PhoneCall size={18} color="#2563eb" />
                     <span style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>Log Call Details</span>
-                    <span style={{ marginLeft: 'auto', fontSize: '12px', background: '#fff', padding: '4px 8px', borderRadius: '8px', border: '1px solid #e2e8f0', color: '#64748b' }}>
-                      {call.list_name || 'test'}
-                    </span>
                   </div>
 
                   <div style={{ marginBottom: '24px' }}>
@@ -1241,10 +1291,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                     <select 
                       value={outcome}
                       onChange={e => setOutcome(e.target.value)}
-                      style={{ 
-                        width: '100%', padding: '12px 16px', borderRadius: '12px', 
-                        border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none'
-                      }}
+                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none' }}
                     >
                       <option value="">Select an outcome...</option>
                       {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
@@ -1267,11 +1314,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                       placeholder="Summarize the call and note any next steps..."
                       value={notes}
                       onChange={e => setNotes(e.target.value)}
-                      style={{ 
-                        width: '100%', padding: '12px 16px', borderRadius: '12px', 
-                        border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none',
-                        minHeight: '100px', fontFamily: 'inherit', resize: 'none'
-                      }}
+                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1.5px solid #e2e8f0', fontSize: '14px', minHeight: '100px', resize: 'none' }}
                     />
                   </div>
 
@@ -1280,70 +1323,73 @@ function CallingModal({ call, onClose, onRefresh }) {
                       type="checkbox" 
                       checked={createFollowup}
                       onChange={e => setCreateFollowup(e.target.checked)}
-                      style={{ width: '16px', height: '16px' }} 
                     />
-                    <span style={{ fontSize: '14px', color: '#0f172a', fontWeight: 500 }}>Create a follow-up task</span>
+                    <span style={{ fontSize: '14px' }}>Create a follow-up task</span>
                   </label>
 
                   {createFollowup && (
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: '12px', marginBottom: '32px' }}>
                       <div>
-                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>
-                          Task Title
-                        </label>
-                        <input
-                          type="text"
-                          placeholder="e.g. Send JD"
-                          value={followupTitle}
-                          onChange={e => setFollowupTitle(e.target.value)}
-                          style={{
-                            width: '100%',
-                            padding: '12px 16px',
-                            borderRadius: '12px',
-                            border: '1.5px solid #e2e8f0',
-                            fontSize: '14px',
-                            outline: 'none'
-                          }}
-                        />
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Task Title</label>
+                        <input type="text" value={followupTitle} onChange={e => setFollowupTitle(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1.5px solid #e2e8f0' }} />
                       </div>
                       <div>
-                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>
-                          Due Date
-                        </label>
-                        <input
-                          type="date"
-                          value={followupDueDate}
-                          onChange={e => setFollowupDueDate(e.target.value)}
-                          min={new Date().toISOString().split('T')[0]}
-                          style={{
-                            width: '100%',
-                            padding: '12px 16px',
-                            borderRadius: '12px',
-                            border: '1.5px solid #e2e8f0',
-                            fontSize: '14px',
-                            outline: 'none'
-                          }}
-                        />
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Due Date</label>
+                        <input type="date" value={followupDueDate} onChange={e => setFollowupDueDate(e.target.value)} min={new Date().toISOString().split('T')[0]} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1.5px solid #e2e8f0' }} />
                       </div>
                     </div>
                   )}
 
                   <div style={{ display: 'flex', gap: '12px' }}>
-                    <button 
-                      onClick={() => setCallState('active')}
-                      style={{ flex: 1, padding: '14px', background: '#fff', color: '#64748b', border: '1.5px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, cursor: 'pointer' }}
-                    >Cancel</button>
-                    <button 
-                      onClick={handleSaveLog}
-                      disabled={saving}
-                      style={{ 
-                        flex: 1, padding: '14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '12px', 
-                        fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer'
-                      }}
-                    >
+                    <button style={{ flex: 1, padding: '14px', background: '#fff', border: '1.5px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, cursor: 'pointer' }} onClick={handleEndCall}>Cancel</button>
+                    <button onClick={handleSaveLog} disabled={saving} style={{ flex: 1, padding: '14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '12px', fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
                       {saving ? 'Saving...' : 'Save Call Log'}
                     </button>
                   </div>
+                </div>
+              ) : (
+                <div style={{ width: '100%' }}>
+                  <div style={{ padding: '20px', background: '#f8fafc', borderRadius: '16px', border: '1px solid #e2e8f0', marginBottom: '24px' }}>
+                    <h4 style={{ fontSize: '14px', fontWeight: 800, color: '#0f172a', marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <PhoneCall size={16} color="#2563eb" /> Post-Call Analysis
+                    </h4>
+                    
+                    {reviewCallData?.recording_url || reviewCallData?.frejun_link ? (
+                      <div style={{ marginBottom: '24px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>Recording</div>
+                        <audio src={reviewCallData.recording_url || reviewCallData.frejun_link} controls style={{ width: '100%', height: '40px' }} />
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px', background: '#eff6ff', borderRadius: '8px', color: '#1e40af', fontSize: '13px', marginBottom: '24px' }}>
+                        <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Processing audio recording from FreJun...
+                      </div>
+                    )}
+                    
+                    {reviewCallData?.summary && (
+                      <div style={{ marginBottom: '24px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>AI Summary</div>
+                        <p style={{ fontSize: '14px', lineHeight: 1.6, color: '#334155' }}>{reviewCallData.summary}</p>
+                      </div>
+                    )}
+
+                    <div style={{ marginBottom: '16px' }}>
+                      <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>
+                        Transcript {(!reviewCallData?.transcript && reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000) ? '(Fallback AI Triggered)' : ''}
+                      </div>
+                      {reviewCallData?.transcript ? (
+                        <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', maxHeight: '200px', overflowY: 'auto', fontSize: '13px', lineHeight: 1.6, color: '#475569', whiteSpace: 'pre-wrap' }}>
+                          {reviewCallData.transcript}
+                        </div>
+                      ) : (
+                        <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
+                          {reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000 
+                            ? "FreJun native AI didn't reply in 10 mins. Running OpenAI fallback analysis..."
+                            : "Waiting for FreJun AI analysis..."}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <button onClick={onClose} style={{ width: '100%', padding: '14px', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, color: '#0f172a', cursor: 'pointer' }}>Close Window</button>
                 </div>
               )}
             </div>
@@ -1358,16 +1404,7 @@ function CallingModal({ call, onClose, onRefresh }) {
               candidateId={call.candidate_id}
               candidateName={call.candidate_name}
             />
-          ) : (
-            <div style={{ padding: '32px', textAlign: 'center', color: '#94a3b8', background: '#f8fafc', minHeight: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <div style={{ maxWidth: '340px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>Task follow-up workspace</div>
-                <div style={{ fontSize: '13px', lineHeight: 1.6 }}>
-                  End the call to save notes, update the outcome, and schedule the next action from one place.
-                </div>
-              </div>
-            </div>
-          )}
+          ) : null}
         </div>
       </div>
       <style>{`
@@ -1379,15 +1416,8 @@ function CallingModal({ call, onClose, onRefresh }) {
           0% { transform: scale(1); opacity: 1; }
           70%, 100% { transform: scale(1.5); opacity: 0; }
         }
-        @keyframes shimmer {
-          0% { background-position: 200% 0; }
-          100% { background-position: -200% 0; }
-        }
-        @keyframes msgFadeIn {
-          from { opacity: 0; transform: translateY(8px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
       `}</style>
     </div>
   );
 }
+

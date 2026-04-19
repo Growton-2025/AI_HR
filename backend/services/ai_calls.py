@@ -33,7 +33,7 @@ def _process_audio_task(call_id: int, recording_url: str):
             tmp.write(response.content)
 
         # 2. Transcribe using Whisper
-        print(f"DEBUG: Transcribing call {call_id}...")
+        print(f"DEBUG: [OpenAI Fallback] Transcribing call {call_id} using Whisper-1...")
         with open(tmp_path, "rb") as audio_file:
             transcript_res = client.audio.transcriptions.create(
                 model="whisper-1",
@@ -42,7 +42,7 @@ def _process_audio_task(call_id: int, recording_url: str):
         transcript_text = transcript_res.text
 
         # 3. Summarize using GPT-4o
-        print(f"DEBUG: Summarizing call {call_id}...")
+        print(f"DEBUG: [OpenAI Fallback] Summarizing call {call_id} using GPT-4o...")
         summary_res = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -53,6 +53,7 @@ def _process_audio_task(call_id: int, recording_url: str):
         summary_text = summary_res.choices[0].message.content
 
         # 4. Update Database
+        print(f"DEBUG: [OpenAI Fallback] Updating database for call {call_id}...")
         with get_db_connection_context(validate=True, register_pgvector=False) as conn:
             if conn:
                 with conn.cursor() as cur:
@@ -67,17 +68,17 @@ def _process_audio_task(call_id: int, recording_url: str):
                         (transcript_text, summary_text, call_id)
                     )
                     conn.commit()
-                print(f"DEBUG: Successfully processed AI content for call {call_id}")
+                print(f"DEBUG: [OpenAI Fallback] Successfully processed AI content for call {call_id}")
                 try:
                     from backend.api.routes.calls import invalidate_calls_cache, refresh_call_caches_async
 
                     invalidate_calls_cache()
                     refresh_call_caches_async()
                 except Exception as cache_exc:
-                    print(f"WARNING: Failed to refresh calls cache after AI processing for {call_id}: {cache_exc}")
+                    print(f"WARNING: [OpenAI Fallback] Failed to refresh calls cache: {cache_exc}")
 
     except Exception as e:
-        print(f"ERROR: AI Processing failed for call {call_id}: {e}")
+        print(f"ERROR: [OpenAI Fallback] AI Processing failed for call {call_id}: {e}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:

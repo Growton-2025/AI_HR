@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import threading
 import time
@@ -22,6 +23,8 @@ from backend.services.frejun_calls import (
     select_best_call_log_result,
     transcript_preview,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -291,19 +294,24 @@ def find_call_match_for_frejun_payload(cur, payload_details: Dict[str, Any]) -> 
 
     candidate_number = payload_details.get("candidate_number")
     candidate_digits = digits_only(candidate_number)
-    if candidate_digits:
+    if candidate_digits and len(candidate_digits) >= 10:
         last_ten = candidate_digits[-10:]
         cur.execute(
             f"""
             {CALLS_SELECT_QUERY}
-            WHERE regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g') = %s
-               OR RIGHT(regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g'), 10) = %s
-            ORDER BY
-                CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END,
+            WHERE (
+                regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g') = %s
+                OR RIGHT(regexp_replace(COALESCE(cand.mobile_phone, ''), '\\D', '', 'g'), 10) = %s
+                OR c.frejun_virtual_number = %s
+                OR RIGHT(regexp_replace(COALESCE(c.frejun_virtual_number, ''), '\\D', '', 'g'), 10) = %s
+            )
+            AND c.status IN ('completed', 'pending')
+            ORDER BY 
+                CASE WHEN c.transcript IS NULL THEN 0 ELSE 1 END,
                 c.created_at DESC
             LIMIT 1
             """,
-            (candidate_digits, last_ten),
+            (candidate_digits, last_ten, candidate_number, last_ten),
         )
         row = cur.fetchone()
         if row:
@@ -428,12 +436,12 @@ def persist_frejun_update(
     return fetch_call_by_id(cur, call_id)
 
 
-def maybe_process_call_audio(previous_call: dict, updated_call: dict):
+def maybe_process_call_audio(previous_call: dict, updated_call: dict, force_fallback: bool = False):
     previous_recording_url = previous_call.get("recording_url")
     next_recording_url = updated_call.get("recording_url")
     if not next_recording_url:
         return
-    if previous_recording_url:
+    if previous_recording_url and not force_fallback:
         return
     if updated_call.get("transcript") and updated_call.get("summary"):
         return
@@ -1322,6 +1330,29 @@ def sync_call_recording(
 
     invalidate_calls_cache()
     refresh_call_caches_async()
+    # Logic for falling back to internal AI (OpenAI) after 10 minutes
+    # even if FreJun hasn't returned a transcript yet.
+    if updated_call.get("recording_url") and not updated_call.get("transcript"):
+        completed_at = updated_call.get("completed_at")
+        if completed_at:
+            if isinstance(completed_at, str):
+                try:
+                    from dateutil.parser import parse
+                    completed_at = parse(completed_at)
+                except: pass
+            
+            # If it's been more than 10 minutes since the call ended, trigger fallback
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            # Ensure completed_at has timezone info if it's aware, or make it aware
+            if completed_at.tzinfo is None:
+                completed_at = completed_at.replace(tzinfo=timezone.utc)
+                
+            delta = (now - completed_at).total_seconds()
+            if delta > 600: # 10 minutes
+                print(f"DEBUG: Call {call_id} is stale (>10m). Triggering OpenAI fallback.")
+                maybe_process_call_audio(call, updated_call, force_fallback=True)
+
     maybe_process_call_audio(call, updated_call)
     return updated_call
 
@@ -1341,6 +1372,7 @@ async def frejun_webhook(request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object")
 
+    print(f"DEBUG: Received FreJun Webhook Payload: {json.dumps(payload)}")
     payload_details = extract_payload_details(payload)
 
     frejun = FreJunManager()

@@ -202,6 +202,25 @@ class FreJunManager:
                     ),
                 }
             if configured_virtual not in normalized_numbers:
+                # Fallback: match by last 10 digits
+                configured_digits = re.sub(r"\D", "", configured_virtual)
+                matched_key = None
+                if len(configured_digits) >= 10:
+                    last_ten = configured_digits[-10:]
+                    for k in normalized_numbers.keys():
+                        k_digits = re.sub(r"\D", "", k)
+                        if len(k_digits) >= 10 and k_digits[-10:] == last_ten:
+                            matched_key = k
+                            break
+                            
+                if matched_key:
+                    selected = normalized_numbers[matched_key]
+                    return {
+                        "success": True,
+                        "virtual_number": selected.get("number") or matched_key,
+                        "source": "configured",
+                    }
+                    
                 available = sorted(normalized_numbers.keys())
                 available_text = ", ".join(available) if available else "none"
                 return {
@@ -246,6 +265,22 @@ class FreJunManager:
             "source": "default" if selected.get("default_calling_number") else "first_available",
         }
 
+    def _get_agent_id(self, email: str) -> Optional[str]:
+        url = f"{self.base_url}/integrations/users/"
+        params = {"email": email}
+        try:
+            response = requests.get(url, headers=self._api_key_headers(), params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                for u in data:
+                    if u.get("email") == email:
+                        return u.get("user_id")
+                if data:
+                    return data[0].get("user_id")
+        except Exception:
+            logger.exception("Error getting agent ID")
+        return None
+
     def initiate_call(
         self,
         candidate_phone: str,
@@ -267,6 +302,9 @@ class FreJunManager:
             return {"success": False, "error": "Recruiter email missing (Set FREJUN_USER_EMAIL in .env)"}
         if not candidate_phone:
             return {"success": False, "error": "Candidate phone missing"}
+        if len(candidate_phone) == 10 and not candidate_phone.startswith("+"):
+            candidate_phone = f"+91{candidate_phone}"
+            
         if not self.api_key:
             return {
                 "success": False,
@@ -281,28 +319,43 @@ class FreJunManager:
         if not virtual_number:
             return {"success": False, "error": "Unable to determine a FreJun virtual number for this call"}
 
-        # Use the confirmed working v1 endpoint for call initiation
-        url = self.create_call_url
-        headers = self._api_key_headers()
+        # Format virtual number with country code for VoIP endpoint requirements
+        formatted_virtual_number = virtual_number
+        if len(str(formatted_virtual_number)) == 10 and not str(formatted_virtual_number).startswith("+"):
+            formatted_virtual_number = f"+91{formatted_virtual_number}"
 
-        # Email as query param is required by FreJun for tracking the initiating user
-        params = {"email": email}
-
-        payload = {
-            "user_email": email,
-            "candidate_number": candidate_phone,
-            "virtual_number": virtual_number,
-            "candidate_name": candidate_name or "Candidate"
-        }
-        if candidate_id:
-            payload["candidate_id"] = str(candidate_id)
-        if job_id:
-            payload["job_id"] = str(job_id)
-        if transaction_id:
-            payload["transaction_id"] = str(transaction_id)
+        agent_id = self._get_agent_id(email)
+        
+        if agent_id:
+            url = "https://api.frejun.com/api/v1/integrations/call-to-voip/"
+            params = {}
+            payload = {
+                "agent_id": agent_id,
+                "dstn_number": candidate_phone,
+                "virtual_number": formatted_virtual_number,
+                "candidate_name": candidate_name or "Candidate"
+            }
+            if transaction_id:
+                payload["transaction_id"] = str(transaction_id)
+        else:
+            url = self.create_call_url
+            params = {"email": email}
+            payload = {
+                "user_email": email,
+                "candidate_number": candidate_phone,
+                "virtual_number": formatted_virtual_number,
+                "candidate_name": candidate_name or "Candidate"
+            }
+            if candidate_id:
+                payload["candidate_id"] = str(candidate_id)
+            if job_id:
+                payload["job_id"] = str(job_id)
+            if transaction_id:
+                payload["transaction_id"] = str(transaction_id)
         
         try:
-            logger.info(f"Initiating FreJun call to {candidate_phone} via {virtual_number}")
+            headers = self._api_key_headers()
+            logger.info(f"Initiating FreJun call to {candidate_phone} via {formatted_virtual_number}")
             logger.debug(f"DEBUG: FreJun Params: {params}")
             logger.debug(f"DEBUG: FreJun Payload: {payload}")
 
@@ -539,6 +592,10 @@ class FreJunManager:
         body_text = raw_body.decode("utf-8")
         signature = (signature or "").strip()
         signature_slim = (signature_slim or "").strip()
+
+        # Check for debug bypass
+        if os.getenv("SKIP_FREJUN_WEBHOOK_SIGNATURE") == "true":
+            return {"valid": True, "mode": "bypass"}
 
         if signature:
             payload = f"{method}{request_uri}{body_text}".encode("utf-8")

@@ -11,6 +11,8 @@ import UserManagement from './pages/UserManagement'
 import TalentPool from './pages/TalentPool'
 import Dashboard from './pages/Dashboard'
 import Calls from './pages/Calls'
+import { VoIPProvider } from './context/VoIPContext'
+
 
 // Set axios header immediately on module load (before any component renders)
 const initToken = localStorage.getItem('token')
@@ -115,10 +117,20 @@ function App() {
                     </Routes>
                 )}
             </main>
+            {/* Floating VoIP call popup — appears over any page when a bridge call arrives */}
+
         </div>
     )
 }
 
-export default App
+function AppWithVoIP() {
+    return (
+        <VoIPProvider>
+            <App />
+        </VoIPProvider>
+    )
+}
+
+export default AppWithVoIP
 
 
