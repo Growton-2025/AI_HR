@@ -601,6 +601,18 @@ def create_schema(cur, conn):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(role_id, candidate_id)
         );
+        """),
+        ("frejun_oauth_credentials",
+        """
+        CREATE TABLE IF NOT EXISTS frejun_oauth_credentials (
+            id SERIAL PRIMARY KEY,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            frejun_user_email VARCHAR(255),
+            token_type VARCHAR(50) DEFAULT 'Bearer',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
     ]
 
