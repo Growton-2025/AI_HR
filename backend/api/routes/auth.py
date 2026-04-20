@@ -322,8 +322,10 @@ FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_C
 FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "").strip()
 
 def get_frejun_redirect_uri():
-    # Use local redirect if configured specifically or as fallback
-    is_local = os.getenv("USE_LOCAL_OAUTH", "true").lower() == "true"
+    # Auto-detect Azure environment to prevent accidental localhost redirection
+    is_azure = os.getenv("WEBSITE_HOSTNAME") is not None
+    is_local = not is_azure and os.getenv("USE_LOCAL_OAUTH", "true").lower() == "true"
+    
     if is_local:
         return "http://localhost:3002/api/auth/frejun-callback"
     return "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
