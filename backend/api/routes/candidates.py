@@ -220,10 +220,11 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
             with conn.cursor() as cur:
                 for field, value in data.items():
                     # Basic whitelist for security
-                    if field not in ['email', 'mobile_phone', 'linkedin', 'notes', 'name', 'first_name', 'last_name']:
+                    # 'phone' is the frontend alias for 'mobile_phone' — both must be allowed
+                    if field not in ['email', 'mobile_phone', 'phone', 'linkedin', 'notes', 'name', 'first_name', 'last_name']:
                         continue
 
-                    # Map frontend names to DB column names if different
+                    # Map frontend field name to actual DB column name
                     db_field = 'mobile_phone' if field == 'phone' else field
 
                     cur.execute(

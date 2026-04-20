@@ -8,7 +8,7 @@ import {
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming
 } from 'lucide-react';
-import { useAppStore } from '../store/useAppStore';
+import { useAppStore, API_BASE, BACKEND_BASE } from '../store/useAppStore';
 import { toast } from 'sonner';
 
 const formatLocalDate = (dateString) => {
@@ -1050,51 +1050,104 @@ export default function Calls() {
 
 function CallingModal({ call, onClose, onRefresh }) {
   const [activeTab, setActiveTab] = useState('calls');
-  const [callState, setCallState] = useState('connecting'); // 'connecting', 'ringing', 'active', 'ended', 'review'
+  const [callState, setCallState] = useState('preparing_softphone');
   const [outcome, setOutcome] = useState('');
   const [notes, setNotes] = useState('');
   const [createFollowup, setCreateFollowup] = useState(false);
   const [followupTitle, setFollowupTitle] = useState(call?.task_title || '');
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [saving, setSaving] = useState(false);
+  const [isAnswering, setIsAnswering] = useState(false);
+  const [dialMode, setDialMode] = useState('voip');
+  const [initiationError, setInitiationError] = useState('');
   const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
-  const { activeCall, answerCall, rejectCall } = useVoIP();
-  const isInitiated = React.useRef(false);
-  const autoAnswered = React.useRef(false);
+  const { activeCall, answerCall, rejectCall, voipStatus, voipError, agentEmail, retryVoip } = useVoIP();
+  const isInitiated = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
 
-  useEffect(() => {
-    if (!isInitiated.current && callState === 'connecting') {
-      isInitiated.current = true;
-      const triggerCall = async () => {
-        try {
-          const res = await initiateCall(call.id);
-          if (!res.success) {
-            toast.error(res.error || 'Failed to start call');
-            onClose();
-          } else {
-            setCallState('ringing');
-          }
-        } catch (e) {
-          toast.error('Connection error');
-          onClose();
-        }
-      };
-      triggerCall();
+
+
+  const triggerCall = useCallback(async () => {
+    setDialMode('voip');
+    setInitiationError('');
+    
+    // Check local VoIP status before initiating
+    if (voipStatus === 'error') {
+      setInitiationError(voipError || 'Browser VoIP is unavailable.');
+      setCallState('error');
+      return;
     }
-  }, []);
+
+    setCallState('connecting');
+    isInitiated.current = true;
+
+    try {
+      const res = await initiateCall(call.id, 'voip');
+      if (!res.success) {
+        const message = res.error || 'Failed to start browser VoIP call';
+        setInitiationError(message);
+        setCallState('error');
+        toast.error(message);
+        return;
+      }
+
+      setCallState('waiting_for_invite');
+    } catch (e) {
+      const message = 'Connection error while starting browser VoIP call';
+      setInitiationError(message);
+      setCallState('error');
+      toast.error(message);
+    }
+  }, [call.id, initiateCall, voipError, voipStatus]);
 
   useEffect(() => {
-    if (callState === 'ringing' && activeCall && !autoAnswered.current) {
-      autoAnswered.current = true;
-      console.log('Automated bridging of active session...');
-      answerCall();
+    if (isInitiated.current) return;
+
+    if (voipStatus === 'error') {
+      setInitiationError(voipError || 'Browser VoIP is unavailable.');
+      setCallState('error');
+      return;
+    }
+
+    if (voipStatus !== 'registered') {
+      setCallState('preparing_softphone');
+      return;
+    }
+
+    triggerCall();
+  }, [voipStatus, triggerCall]);
+
+  useEffect(() => {
+    if (callState === 'review' || dialMode !== 'voip') return;
+
+    if (voipStatus === 'error') {
+      setInitiationError(voipError || 'Browser VoIP failed.');
+      setCallState('error');
+      return;
+    }
+
+    if (activeCall?.state === 'connected' || voipStatus === 'connected') {
       setCallState('active');
+      return;
     }
-  }, [activeCall, callState, answerCall]);
+
+    if (activeCall?.state === 'answer_required' || voipStatus === 'answer_required') {
+      setCallState('answer_required');
+      return;
+    }
+
+    if (activeCall?.state === 'invite_received' || voipStatus === 'invite_received') {
+      setCallState('invite_received');
+      return;
+    }
+
+    if (isInitiated.current && !activeCall && voipStatus === 'registered' && callState === 'connecting') {
+      setCallState('waiting_for_invite');
+    }
+  }, [activeCall, callState, dialMode, voipError, voipStatus]);
 
   useEffect(() => {
-    if (callState === 'active' && !activeCall) {
+    if ((callState === 'answer_required' || callState === 'invite_received' || callState === 'active') && !activeCall) {
       setCallState('ended');
     }
   }, [activeCall, callState]);
@@ -1123,9 +1176,31 @@ function CallingModal({ call, onClose, onRefresh }) {
     return () => clearInterval(t);
   }, [callState, call.id, call.list_id, fetchCalls, syncCallRecording, reviewCallData?.recording_url]);
 
-  const handleEndCall = () => {
-    rejectCall();
+  const handleAnswer = async () => {
+    setIsAnswering(true);
+    const result = await answerCall();
+    setIsAnswering(false);
+
+    if (!result.success) {
+      const message = result.error || 'Failed to answer browser VoIP call';
+      setInitiationError(message);
+      toast.error(message);
+      return;
+    }
+
+    setCallState('invite_received');
+  };
+
+  const handleEndCall = async () => {
+    await rejectCall();
     setCallState('ended');
+  };
+
+  const handleRetryVoip = () => {
+    setInitiationError('');
+    setCallState('preparing_softphone');
+    isInitiated.current = false;
+    retryVoip();
   };
 
   const handleSaveLog = async () => {
@@ -1168,15 +1243,26 @@ function CallingModal({ call, onClose, onRefresh }) {
     { id: 'tasks', label: 'Tasks', icon: CheckSquare },
   ];
   
-  const callStatusMeta = callState === 'connecting'
-    ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Calling candidate...' }
-    : callState === 'ringing'
-      ? { label: 'Bridging', tone: '#d97706', bg: '#fef3c7', message: 'Waiting for bridge...' }
-      : callState === 'active'
-        ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: 'Live call active' }
-        : callState === 'ended'
-          ? { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome...' }
-          : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
+  const callStatusMeta = callState === 'preparing_softphone'
+    ? { label: 'Preparing', tone: '#2563eb', bg: '#eff6ff', message: 'Registering the browser softphone...' }
+    : callState === 'connecting'
+      ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Starting the browser VoIP call...' }
+      : callState === 'waiting_for_invite'
+        ? { label: 'Waiting', tone: '#d97706', bg: '#fef3c7', message: 'Waiting for FreJun to deliver the browser invite...' }
+        : callState === 'answer_required'
+          ? { label: 'Answer Required', tone: '#d97706', bg: '#fef3c7', message: 'The browser invite is ready. Answer to join the call.' }
+          : callState === 'invite_received'
+            ? { label: 'Joining', tone: '#2563eb', bg: '#eff6ff', message: 'Connecting browser audio...' }
+            : callState === 'active'
+              ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: 'Two-way browser VoIP call is active.' }
+              : callState === 'ended'
+                ? { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome...' }
+                : callState === 'error'
+                  ? { label: 'VoIP Error', tone: '#dc2626', bg: '#fef2f2', message: initiationError || voipError || 'Browser VoIP could not be established.' }
+                  : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
+
+  const callModeLabel = dialMode === 'voip' ? 'Browser VoIP' : 'Network Bridge';
+  const isLiveCallState = ['preparing_softphone', 'connecting', 'waiting_for_invite', 'answer_required', 'invite_received', 'active', 'error'].includes(callState);
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
@@ -1240,18 +1326,56 @@ function CallingModal({ call, onClose, onRefresh }) {
                 </div>
               </div>
 
-              {(callState === 'connecting' || callState === 'ringing' || callState === 'active') ? (
+              <div style={{ alignSelf: 'stretch', display: 'flex', justifyContent: 'space-between', gap: '12px', marginBottom: '24px' }}>
+                <div style={{ flex: 1, padding: '12px 14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Call Mode</div>
+                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>Browser VoIP</div>
+                </div>
+                <div style={{ flex: 1, padding: '12px 14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Softphone Agent</div>
+                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>{agentEmail || 'Loading...'}</div>
+                </div>
+              </div>
+
+              {voipStatus === 'error' && (
+                <div style={{ 
+                  alignSelf: 'stretch', marginBottom: '20px', padding: '20px', 
+                  borderRadius: '16px', background: '#fff7ed', border: '1px solid #fed7aa', 
+                  display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', textAlign: 'center'
+                }}>
+                  <div style={{ color: '#9a3412', fontSize: '14px', fontWeight: 700 }}>
+                    Browser VoIP Unavailable
+                  </div>
+                  <div style={{ color: '#c2410c', fontSize: '13px' }}>
+                    A manual reconnection is required to sync new VoIP credentials.
+                  </div>
+                  <a 
+                    href={`${BACKEND_BASE}/api/auth/frejun-login`} 
+                    style={{ 
+                      display: 'block', width: '100%', padding: '12px', background: '#2563eb', 
+                      color: '#fff', borderRadius: '12px', fontSize: '14px', fontWeight: 700, 
+                      textDecoration: 'none', transition: 'background 0.2s' 
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.background = '#1d4ed8'}
+                    onMouseLeave={e => e.currentTarget.style.background = '#2563eb'}
+                  >
+                    Connect FreJun VoIP
+                  </a>
+                </div>
+              )}
+
+              {isLiveCallState ? (
                 <>
                   <div style={{ 
                     width: '120px', height: '120px', borderRadius: '50%', background: '#eff6ff', 
                     display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '32px',
                     position: 'relative',
                     transition: 'transform 0.25s ease, box-shadow 0.25s ease',
-                    transform: callState === 'connecting' ? 'scale(1)' : 'scale(1.03)',
-                    boxShadow: callState === 'connecting' ? '0 0 0 0 rgba(37,99,235,0.18)' : '0 18px 30px -24px rgba(37,99,235,0.5)'
+                    transform: callState === 'active' ? 'scale(1.03)' : 'scale(1)',
+                    boxShadow: callState === 'active' ? '0 18px 30px -24px rgba(37,99,235,0.5)' : '0 0 0 0 rgba(37,99,235,0.18)'
                   }}>
-                    <Phone size={48} color="#2563eb" />
-                    {callState === 'connecting' && (
+                    {callState === 'answer_required' ? <PhoneIncoming size={48} color="#d97706" /> : <Phone size={48} color="#2563eb" />}
+                    {(callState === 'preparing_softphone' || callState === 'connecting' || callState === 'waiting_for_invite' || callState === 'invite_received') && (
                       <div style={{ 
                         position: 'absolute', inset: -10, borderRadius: '50%', 
                         border: '2px solid #2563eb', animation: 'ping 2s cubic-bezier(0, 0, 0.2, 1) infinite' 
@@ -1259,25 +1383,125 @@ function CallingModal({ call, onClose, onRefresh }) {
                     )}
                   </div>
                   <h3 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>
-                    {callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` : 
-                     callState === 'ringing' ? 'Bridging Call...' :
-                     `Active call with ${call.candidate_name || 'Candidate'}`}
+                    {callState === 'preparing_softphone' ? 'Preparing Browser Softphone...' :
+                     callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` :
+                     callState === 'waiting_for_invite' ? 'Waiting For Browser Invite...' :
+                     callState === 'answer_required' ? 'Answer Browser Call' :
+                     callState === 'invite_received' ? 'Joining Browser Call...' :
+                     callState === 'active' ? `Active call with ${call.candidate_name || 'Candidate'}` :
+                     'Browser VoIP unavailable'}
                   </h3>
                   <p style={{ fontSize: '18px', color: '#64748b', fontWeight: 500, marginBottom: '16px' }}>{call.candidate_phone}</p>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#2563eb', fontSize: '14px', fontWeight: 700, marginBottom: '40px' }}>
-                    <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} />
-                    {callState === 'connecting' ? 'Connecting' : callState === 'ringing' ? 'Ready to Bridge' : 'Connected'}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: callStatusMeta.tone, fontSize: '14px', fontWeight: 700, marginBottom: '40px' }}>
+                    {callState === 'answer_required' ? <PhoneIncoming size={14} /> : <RefreshCw size={14} style={{ animation: (callState === 'active' || callState === 'error') ? 'none' : 'spin 2s linear infinite' }} />}
+                    {callState === 'preparing_softphone' ? 'Registering softphone' :
+                     callState === 'connecting' ? 'Initiating call' :
+                     callState === 'waiting_for_invite' ? 'Waiting for browser invite' :
+                     callState === 'answer_required' ? 'Invite received' :
+                     callState === 'invite_received' ? 'Connecting browser audio' :
+                     callState === 'active' ? 'Connected' :
+                     'Needs attention'}
                   </div>
-                  <button 
-                    onClick={handleEndCall}
-                    style={{ 
-                      width: '100%', padding: '16px', background: '#fee2e2', color: '#ef4444', 
-                      border: 'none', borderRadius: '16px', fontSize: '15px', fontWeight: 700, 
-                      cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
-                    }}
-                  >
-                    <X size={20} /> End Call
-                  </button>
+
+                  {callState === 'answer_required' ? (
+                    <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+                      <button
+                        onClick={handleAnswer}
+                        disabled={isAnswering}
+                        style={{
+                          flex: 1,
+                          padding: '16px',
+                          background: '#dcfce7',
+                          color: '#15803d',
+                          border: 'none',
+                          borderRadius: '16px',
+                          fontSize: '15px',
+                          fontWeight: 700,
+                          cursor: isAnswering ? 'not-allowed' : 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '8px'
+                        }}
+                      >
+                        <PhoneIncoming size={20} /> {isAnswering ? 'Answering...' : 'Answer Call'}
+                      </button>
+                      <button
+                        onClick={handleEndCall}
+                        style={{
+                          flex: 1,
+                          padding: '16px',
+                          background: '#fee2e2',
+                          color: '#ef4444',
+                          border: 'none',
+                          borderRadius: '16px',
+                          fontSize: '15px',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '8px'
+                        }}
+                      >
+                        <X size={20} /> Reject
+                      </button>
+                    </div>
+                  ) : callState === 'error' ? (
+                    <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+                      <button
+                        onClick={handleRetryVoip}
+                        style={{
+                          flex: 1,
+                          padding: '16px',
+                          background: '#eff6ff',
+                          color: '#2563eb',
+                          border: 'none',
+                          borderRadius: '16px',
+                          fontSize: '15px',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '8px'
+                        }}
+                      >
+                        <RefreshCw size={20} /> Retry VoIP
+                      </button>
+                      <button
+                        onClick={onClose}
+                        style={{
+                          flex: 1,
+                          padding: '16px',
+                          background: '#fff',
+                          color: '#334155',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '16px',
+                          fontSize: '15px',
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '8px'
+                        }}
+                      >
+                        <X size={20} /> Close
+                      </button>
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={handleEndCall}
+                      style={{ 
+                        width: '100%', padding: '16px', background: '#fee2e2', color: '#ef4444', 
+                        border: 'none', borderRadius: '16px', fontSize: '15px', fontWeight: 700, 
+                        cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+                      }}
+                    >
+                      <X size={20} /> {callState === 'active' ? 'End Call' : 'Cancel Call'}
+                    </button>
+                  )}
                 </>
               ) : callState === 'ended' ? (
                 <div style={{ width: '100%' }}>
@@ -1420,4 +1644,3 @@ function CallingModal({ call, onClose, onRefresh }) {
     </div>
   );
 }
-

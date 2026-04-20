@@ -317,11 +317,33 @@ async def read_users_me(current_user: schemas.User = Depends(deps.get_current_us
     return current_user
 
 
-FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_CLIENT_ID", ""))
-FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "")
-FREJUN_OAUTH_REDIRECT_URI = "http://localhost:3002/api/auth/frejun-callback"
+# FreJun OAuth Configuration
+FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_CLIENT_ID", "")).strip()
+FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "").strip()
 
-@router.get("/frejun-callback")
+def get_frejun_redirect_uri():
+    # Use local redirect if configured specifically or as fallback
+    is_local = os.getenv("USE_LOCAL_OAUTH", "true").lower() == "true"
+    if is_local:
+        return "http://localhost:3002/api/auth/frejun-callback"
+    return "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
+
+@router.get("/auth/frejun-login")
+async def frejun_oauth_login():
+    """Redirect to FreJun authorization page."""
+    from fastapi.responses import RedirectResponse
+    
+    redirect_uri = get_frejun_redirect_uri()
+    auth_url = (
+        f"https://product.frejun.com/oauth/authorize/?"
+        f"client_id={FREJUN_OAUTH_CLIENT_ID}&"
+        f"redirect_uri={redirect_uri}&"
+        f"response_type=code&"
+        f"scope=oauth"
+    )
+    return RedirectResponse(url=auth_url)
+
+@router.get("/auth/frejun-callback")
 async def frejun_oauth_callback(code: str = None, error: str = None):
     """
     FreJun OAuth callback endpoint.
@@ -332,59 +354,79 @@ async def frejun_oauth_callback(code: str = None, error: str = None):
     if not code:
         return {"success": False, "error": "No authorization code received"}
 
-    # Exchange code for access token
-    token_url = "https://api.frejun.com/api/v2/integrations/token/"
-    payload = {
+    import base64
+    import httpx
+    
+    # Standard OAuth2 Token Exchange (Basic Auth Header + Form Data)
+    auth_str = f"{FREJUN_OAUTH_CLIENT_ID}:{FREJUN_OAUTH_CLIENT_SECRET}"
+    auth_b64 = base64.b64encode(auth_str.encode()).decode()
+    
+    headers = {
+        "Authorization": f"Basic {auth_b64}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    token_url = "https://api.frejun.com/api/v1/oauth/token/"
+    form_data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": FREJUN_OAUTH_REDIRECT_URI,
-        "client_id": FREJUN_OAUTH_CLIENT_ID,
-        "client_secret": FREJUN_OAUTH_CLIENT_SECRET,
+        "redirect_uri": get_frejun_redirect_uri(),
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(token_url, json=payload)
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(token_url, data=form_data, headers=headers)
 
-        body = resp.json()
+        body = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
         logger.info(f"FreJun token exchange status: {resp.status_code}")
 
-        if resp.status_code in (200, 201):
-            access_token = body.get("access_token") or body.get("data", {}).get("access_token", "")
-            refresh_token = body.get("refresh_token") or body.get("data", {}).get("refresh_token", "")
+        # Support deep access if API wraps response in 'data'
+        data_block = body.get("data", {}) if isinstance(body, dict) else {}
+        access_token = body.get("access_token") or data_block.get("access_token", "")
+        refresh_token = body.get("refresh_token") or data_block.get("refresh_token", "")
 
-            # Write fresh tokens to .env
-            env_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")
-            env_path = os.path.abspath(env_path)
+        if resp.status_code in (200, 201) and access_token:
+            # 1. Save to the new durable DB store (The "Forever Online" bridge)
+            expires_in = body.get("expires_in") or data_block.get("expires_in") or 21600
+            from backend.integrations.frejun import FreJunManager
+            try:
+                FreJunManager()._save_managed_token(access_token, refresh_token, int(expires_in), email)
+                logger.info(f"✅ FreJun OAuth: fresh token saved to database storage")
+            except Exception as db_err:
+                logger.error(f"Failed to persist FreJun token to DB: {db_err}")
+
+            # 2. Legacy Fallback: Write fresh tokens to .env
+            env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
             _update_env_key(env_path, "FREJUN_ACCESS_TOKEN", access_token)
             if refresh_token:
                 _update_env_key(env_path, "FREJUN_REFRESH_TOKEN", refresh_token)
 
             logger.info(f"✅ FreJun OAuth: fresh token saved to .env")
 
-            # Return a simple HTML page so the user can copy the token
+            # Return a simple HTML success page
             html = f"""<!DOCTYPE html>
 <html>
 <head><title>FreJun Token</title>
-<style>body{{font-family:monospace;padding:32px;background:#f0fdf4;}} pre{{background:#fff;padding:16px;border-radius:8px;word-break:break-all;border:1px solid #bbf7d0;}} h2{{color:#166534;}}</style>
+<style>body{{font-family:monospace;padding:32px;background:#f0fdf4;}} pre{{background:#fff;padding:16px;border-radius:8px;word-break:break-all;border:1px solid #bbf7d0;max-width:900px;}} h2{{color:#166534;}}</style>
 </head>
 <body>
 <h2>✅ FreJun OAuth Successful!</h2>
-<p><strong>Access Token</strong> (saved to .env automatically):</p>
-<pre id="token">{access_token}</pre>
-<p>The backend has been updated. Restart the frontend dev server or hard-refresh the browser to pick up the new token.</p>
+<p><strong>Tokens established and persistence bridge is LIVE.</strong></p>
+<pre id="token">Access Token: {access_token[:10]}...</pre>
+<p>The system will now maintain this connection automatically. <strong>Hard-refresh</strong> your dashboard to start calling.</p>
+<p><a href="http://localhost:3000/calls">→ Go back to Calls</a></p>
 </body>
 </html>"""
             from fastapi.responses import HTMLResponse
             return HTMLResponse(content=html)
         else:
             logger.error(f"FreJun token exchange failed: {resp.status_code} {resp.text}")
-            # Try alternate payload with form encoding
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp2 = await client.post(token_url, data=payload,
-                                          headers={"Content-Type": "application/x-www-form-urlencoded"})
-            body2 = resp2.text
-            return {"success": False, "status": resp.status_code, "body": body, "alt_body": body2}
+            return {
+                "success": False, 
+                "status": resp.status_code, 
+                "error": "Token exchange failed. Verify your Client ID and Secret match the dashboard.",
+                "raw_response": resp.text[:500]
+            }
 
     except Exception as e:
         logger.exception("FreJun OAuth callback error")

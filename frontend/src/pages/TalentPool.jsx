@@ -12,33 +12,51 @@ import {
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown';
 
 // ── Clickable Editable Cell (renders as <td>) ────────────────
-function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—' }) {
+// Always editable — click to enter edit mode with existing value pre-filled.
+// Pressing Enter or blurring saves. Clearing the value saves empty → renders as NA.
+function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'NA' }) {
   const [isEditing, setIsEditing] = useState(false);
   const [tempValue, setTempValue] = useState('');
+  const [displayValue, setDisplayValue] = useState(value || '');
   const [loading, setLoading] = useState(false);
 
-  const isNA = !value || ['na', 'n/a', 'none'].includes(value.toString().toLowerCase());
+  // Keep display in sync when parent value changes (e.g. after API refresh)
+  useEffect(() => {
+    if (!isEditing) setDisplayValue(value || '');
+  }, [value, isEditing]);
+
+  const isNA = !displayValue || ['na', 'n/a', 'none'].includes(displayValue.toString().toLowerCase());
 
   const handleSave = async () => {
-    if (tempValue !== value) {
-      setLoading(true);
-      await onUpdate(id, { [field]: tempValue });
-      setLoading(false);
-    }
+    const newVal = tempValue.trim();
+    // Always persist — even if unchanged — so the user can intentionally overwrite
+    setLoading(true);
+    await onUpdate(id, { [field]: newVal });
+    setDisplayValue(newVal); // optimistic local update
+    setLoading(false);
     setIsEditing(false);
+  };
+
+  const startEditing = (e) => {
+    e.stopPropagation(); // Don't bubble to row
+    setTempValue(displayValue); // Pre-fill with current value so user can edit / overwrite
+    setIsEditing(true);
   };
 
   if (isEditing) {
     return (
-      <td style={{ padding: '0 14px', borderRight: '1px solid #f1f5f9' }}>
+      <td
+        style={{ padding: '0 14px', borderRight: '1px solid #f1f5f9' }}
+        onClick={(e) => e.stopPropagation()}
+      >
         <input
           autoFocus
           value={tempValue}
           onChange={(e) => setTempValue(e.target.value)}
           onBlur={handleSave}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') handleSave();
-            if (e.key === 'Escape') setIsEditing(false);
+            if (e.key === 'Enter') { e.preventDefault(); handleSave(); }
+            if (e.key === 'Escape') { setIsEditing(false); }
           }}
           style={{
             width: '100%', padding: '4px 6px', border: '1px solid #f97316',
@@ -51,10 +69,10 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—'
 
   return (
     <td
-      onClick={() => { setIsEditing(true); setTempValue(isNA ? '' : (value || '')); }}
+      onClick={startEditing}
       style={{
         padding: '13px 14px', borderRight: '1px solid #f1f5f9',
-        fontSize: '12px', cursor: 'pointer',
+        fontSize: '12px', cursor: 'text',
         color: isNA ? '#f97316' : '#334155',
       }}
       title="Click to edit"
@@ -66,8 +84,8 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = '—'
         border: isNA ? '1px dashed rgba(249,115,22,0.4)' : 'none',
         display: 'inline-block',
       }}>
-        {isNA ? (value || placeholder) : value}
-        {loading && ' ...'}
+        {isNA ? placeholder : displayValue}
+        {loading && ' ⟳'}
       </span>
     </td>
   );
@@ -2228,13 +2246,21 @@ export default function TalentPool() {
 
               {displayedCandidates.map((c, idx) => (
                 <tr key={c.id || idx}
-                  onClick={() => toggleSelectOne(c.id)}
-                  style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', cursor: 'pointer', background: selectedIds.has(c.id) ? '#fff7ed' : 'transparent' }}
+                  style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', background: selectedIds.has(c.id) ? '#fff7ed' : 'transparent' }}
                   onMouseEnter={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = '#fafafa'; }}
                   onMouseLeave={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = 'transparent'; }}
                 >
-                  <td style={{ padding: '13px 14px', textAlign: 'center', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9' }}>
-                    <input type="checkbox" checked={selectedIds.has(c.id)} readOnly style={{ cursor: 'pointer' }} />
+                  {/* Checkbox cell — ONLY this cell toggles row selection */}
+                  <td
+                    style={{ padding: '13px 14px', textAlign: 'center', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9', cursor: 'pointer' }}
+                    onClick={(e) => { e.stopPropagation(); toggleSelectOne(c.id); }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(c.id)}
+                      onChange={() => toggleSelectOne(c.id)}
+                      style={{ cursor: 'pointer', pointerEvents: 'none' }}
+                    />
                   </td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
                   <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.last_name || ''}</td>
@@ -2258,50 +2284,52 @@ export default function TalentPool() {
                   </td>
                   {(() => {
                     const emailVal = contactInfo[c.id]?.email || c.email;
-                    const isShortlisted = contactInfo[c.id]?.enriching === false || c.enrichment_finished || ['Shortlisted', 'Followup / In conversation', 'In Conversation', 'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 'Shared with customer'].includes(c.status);
                     const isEnriching = contactInfo[c.id]?.enriching && !emailVal;
-                    const isNA = !emailVal || ['na', 'n/a', 'none'].includes((emailVal || '').toLowerCase());
 
                     if (isEnriching) {
                       return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
                     }
-                    if (!isShortlisted) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#d1d5db', borderRight: '1px solid #f1f5f9' }}>—</td>;
-                    }
-                    if (!isNA) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#334155', borderRight: '1px solid #f1f5f9' }}>{emailVal}</td>;
-                    }
+                    // Always render as editable — even when a value is present
                     return (
                       <ClickableEditableCell
+                        key={`email-${c.id}`}
                         id={c.id}
                         field="email"
-                        value={emailVal}
-                        onUpdate={updateFieldAndMaybeShortlist}
+                        value={emailVal || ''}
+                        onUpdate={(id, data) => {
+                          // Sync local contactInfo immediately so the cell reflects new value
+                          setContactInfo(prev => ({
+                            ...prev,
+                            [id]: { ...prev[id], email: data.email }
+                          }));
+                          return updateFieldAndMaybeShortlist(id, data);
+                        }}
                         placeholder="NA"
                       />
                     );
                   })()}
                   {(() => {
                     const phoneVal = contactInfo[c.id]?.phone || c.mobile_phone;
-                    const isShortlisted = contactInfo[c.id]?.enriching === false || c.enrichment_finished || ['Shortlisted', 'Followup / In conversation', 'In Conversation', 'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 'Shared with customer'].includes(c.status);
                     const isEnriching = contactInfo[c.id]?.enriching && !phoneVal;
-                    const isNA = !phoneVal || ['na', 'n/a', 'none'].includes((phoneVal || '').toLowerCase());
 
                     if (isEnriching) {
                       return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
                     }
-                    if (!isShortlisted) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#d1d5db', borderRight: '1px solid #f1f5f9' }}>—</td>;
-                    }
-                    if (!isNA) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#334155', borderRight: '1px solid #f1f5f9' }}>{phoneVal}</td>;
-                    }
+                    // Always render as editable — even when a value is present
                     return (
                       <ClickableEditableCell
+                        key={`phone-${c.id}`}
                         id={c.id}
                         field="phone"
-                        value={phoneVal}
-                        onUpdate={updateFieldAndMaybeShortlist}
+                        value={phoneVal || ''}
+                        onUpdate={(id, data) => {
+                          // Sync local contactInfo immediately so the cell reflects new value
+                          setContactInfo(prev => ({
+                            ...prev,
+                            [id]: { ...prev[id], phone: data.phone }
+                          }));
+                          return updateFieldAndMaybeShortlist(id, data);
+                        }}
                         placeholder="NA"
                       />
                     );

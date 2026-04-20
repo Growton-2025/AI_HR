@@ -466,6 +466,7 @@ class AddCandidatesRequest(BaseModel):
 
 class CallInitiateRequest(BaseModel):
     call_id: int
+    dial_mode: str = "voip"
 
 
 class CallUpdate(BaseModel):
@@ -1152,18 +1153,25 @@ def initiate_call(
         raise HTTPException(status_code=400, detail="Recruiter email missing for FreJun call initiation")
 
     frejun = FreJunManager()
+    logger.info(f"Initiating {request.dial_mode or 'voip'} call for {candidate_phone} by recruiter {recruiter_email}")
     result = frejun.initiate_call(
         candidate_phone=candidate_phone,
         recruiter_email=recruiter_email,
         candidate_name=candidate_name,
         candidate_id=str(candidate_id),
         transaction_id=transaction_id,
+        dial_mode=(request.dial_mode or "voip").strip().lower(),
     )
 
     if not result.get("success"):
+        detail = result.get("error", "FreJun initiation failed")
+        source = result.get("raw_response")
+        if source:
+            logger.error(f"FreJun Initiation Error Raw: {source}")
+        
         raise HTTPException(
-            status_code=result.get("status_code", 500), 
-            detail=result.get("error", "FreJun initiation failed")
+            status_code=result.get("status_code", 502), 
+            detail=detail
         )
 
     call_data = result.get("call_data") or {}
@@ -1221,6 +1229,7 @@ def initiate_call(
     return {
         "success": True,
         "message": "Call initiated",
+        "dial_mode": result.get("dial_mode", (request.dial_mode or "voip").strip().lower()),
         "frejun_data": result.get("data"),
         "call": updated_call,
     }
