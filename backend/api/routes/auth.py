@@ -358,6 +358,11 @@ async def frejun_oauth_callback(code: str = None, error: str = None):
     import httpx
     
     # Standard OAuth2 Token Exchange (Basic Auth Header + Form Data)
+    # DIAGNOSTIC: Verify if environment variables are being mangled by Azure ($ characters)
+    logger.info(f"DIAGNOSTIC: OAuth Secret Check - ID Length: {len(FREJUN_OAUTH_CLIENT_ID)}, Secret Length: {len(FREJUN_OAUTH_CLIENT_SECRET)}")
+    if len(FREJUN_OAUTH_CLIENT_SECRET) > 5:
+        logger.info(f"DIAGNOSTIC: Secret Signature: {FREJUN_OAUTH_CLIENT_SECRET[:7]}...")
+
     auth_str = f"{FREJUN_OAUTH_CLIENT_ID}:{FREJUN_OAUTH_CLIENT_SECRET}"
     auth_b64 = base64.b64encode(auth_str.encode()).decode()
     
