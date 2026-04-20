@@ -1,6 +1,6 @@
 
 from datetime import timedelta, datetime
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from backend.core.security import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES, get_password_hash, verify_password
 from backend.api import schemas
 from backend.api import deps
@@ -321,21 +321,28 @@ async def read_users_me(current_user: schemas.User = Depends(deps.get_current_us
 FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_CLIENT_ID", "")).strip()
 FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "").strip()
 
-def get_frejun_redirect_uri():
-    # Auto-detect Azure environment to prevent accidental localhost redirection
+def get_frejun_redirect_uri(request=None):
+    # Auto-detect Azure environment
     is_azure = os.getenv("WEBSITE_HOSTNAME") is not None
     is_local = not is_azure and os.getenv("USE_LOCAL_OAUTH", "true").lower() == "true"
     
     if is_local:
         return "http://localhost:3002/api/auth/frejun-callback"
+        
+    # If on Azure, we dynamically determine the protocol and host to ensure perfection
+    if request:
+        proto = request.headers.get("x-forwarded-proto", "https")
+        host = request.headers.get("x-forwarded-host", os.getenv("WEBSITE_HOSTNAME", "growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net"))
+        return f"{proto}://{host}/api/auth/frejun-callback"
+
     return "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
 
 @router.get("/auth/frejun-login")
-async def frejun_oauth_login():
+async def frejun_oauth_login(request: Request):
     """Redirect to FreJun authorization page."""
     from fastapi.responses import RedirectResponse
     
-    redirect_uri = get_frejun_redirect_uri()
+    redirect_uri = get_frejun_redirect_uri(request)
     auth_url = (
         f"https://product.frejun.com/oauth/authorize/?"
         f"client_id={FREJUN_OAUTH_CLIENT_ID}&"
@@ -346,10 +353,14 @@ async def frejun_oauth_login():
     return RedirectResponse(url=auth_url)
 
 @router.get("/auth/frejun-callback")
-async def frejun_oauth_callback(code: str = None, error: str = None):
+async def frejun_oauth_callback(
+    request: Request,
+    code: str = None, 
+    error: str = None, 
+    email: str = None
+):
     """
     FreJun OAuth callback endpoint.
-    Set redirect URL in FreJun dashboard to: http://localhost:3002/api/auth/frejun-callback
     """
     if error:
         return {"success": False, "error": error}
@@ -365,6 +376,9 @@ async def frejun_oauth_callback(code: str = None, error: str = None):
     if len(FREJUN_OAUTH_CLIENT_SECRET) > 5:
         logger.info(f"DIAGNOSTIC: Secret Signature: {FREJUN_OAUTH_CLIENT_SECRET[:7]}...")
 
+    redirect_uri = get_frejun_redirect_uri(request)
+    logger.info(f"DIAGNOSTIC: Using Redirect URI: {redirect_uri}")
+
     auth_str = f"{FREJUN_OAUTH_CLIENT_ID}:{FREJUN_OAUTH_CLIENT_SECRET}"
     auth_b64 = base64.b64encode(auth_str.encode()).decode()
     
@@ -377,7 +391,7 @@ async def frejun_oauth_callback(code: str = None, error: str = None):
     form_data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": get_frejun_redirect_uri(),
+        "redirect_uri": redirect_uri,
     }
 
     try:
