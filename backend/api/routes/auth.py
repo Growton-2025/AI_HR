@@ -329,13 +329,16 @@ def get_frejun_redirect_uri(request=None):
     if is_local:
         return "http://localhost:3002/api/auth/frejun-callback"
         
-    # If on Azure, we dynamically determine the protocol and host to ensure perfection
+    # [DEEP RESEARCH FIX] Force HTTPS and strip trailing slashes to match FreJun dashboard strictly
     if request:
-        proto = request.headers.get("x-forwarded-proto", "https")
+        # Azure often sends 'http' in x-forwarded-proto even if external is 'https'
+        # We FORCE 'https' for production to avoid Redirect URI mismatch (Invalid code)
         host = request.headers.get("x-forwarded-host", os.getenv("WEBSITE_HOSTNAME", "growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net"))
-        return f"{proto}://{host}/api/auth/frejun-callback"
+        uri = f"https://{host}/api/auth/frejun-callback"
+        return uri.rstrip('/')
 
-    return "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
+    fixed_uri = "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
+    return fixed_uri.rstrip('/')
 
 @router.get("/auth/frejun-login")
 async def frejun_oauth_login(request: Request):
