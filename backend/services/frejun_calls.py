@@ -28,6 +28,32 @@ SUMMARY_READY_EVENTS = {
     "call.summary",
 }
 
+RECRUITER_TRANSCRIPT_LABEL = "Recruiter"
+RECRUITER_SPEAKER_HINTS = {
+    "recruiter",
+    "agent",
+    "caller",
+    "interviewer",
+    "sales",
+    "sales rep",
+    "sales representative",
+    "user",
+    "speaker a",
+    "speaker 1",
+    "channel 0",
+    "channel 1",
+}
+CANDIDATE_SPEAKER_HINTS = {
+    "candidate",
+    "callee",
+    "customer",
+    "client",
+    "prospect",
+    "lead",
+    "speaker b",
+    "speaker 2",
+}
+
 
 def normalize_phone(value: Optional[str]) -> str:
     raw = (value or "").strip()
@@ -85,23 +111,81 @@ def normalize_duration_seconds(raw_duration: Any, event_name: Optional[str] = No
     return int(round(value))
 
 
-def extract_transcript_text(transcript: Any) -> Optional[str]:
+def _normalize_speaker_token(value: Optional[str]) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", (value or "").strip().lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _candidate_transcript_label(candidate_name: Optional[str]) -> str:
+    value = (candidate_name or "").strip()
+    return value or "Candidate"
+
+
+def _replace_string_transcript_labels(text: str, candidate_label: str) -> str:
+    value = text.strip()
+    if not value:
+        return ""
+
+    recruiter_pattern = r"^\s*(recruiter|agent|caller|interviewer|sales(?:\s+rep(?:resentative)?)?|user|speaker\s*a|speaker\s*1|channel\s*0|channel\s*1)\s*:"
+    candidate_pattern = r"^\s*(candidate|callee|customer|client|prospect|lead|speaker\s*b|speaker\s*2)\s*:"
+    value = re.sub(recruiter_pattern, f"{RECRUITER_TRANSCRIPT_LABEL}:", value, flags=re.IGNORECASE | re.MULTILINE)
+    value = re.sub(candidate_pattern, f"{candidate_label}:", value, flags=re.IGNORECASE | re.MULTILINE)
+    return value
+
+
+def _resolve_transcript_speaker_label(
+    raw_speaker: Optional[str],
+    *,
+    candidate_label: str,
+    speaker_map: Dict[str, str],
+) -> str:
+    normalized = _normalize_speaker_token(raw_speaker)
+    normalized_candidate = _normalize_speaker_token(candidate_label)
+
+    if normalized == normalized_candidate and normalized_candidate:
+        return candidate_label
+    if normalized in RECRUITER_SPEAKER_HINTS:
+        return RECRUITER_TRANSCRIPT_LABEL
+    if normalized in CANDIDATE_SPEAKER_HINTS:
+        return candidate_label
+    if normalized in speaker_map:
+        return speaker_map[normalized]
+
+    # FreJun transcript diarization is typically 2-party. For generic/unknown labels,
+    # we pin the first distinct speaker to Recruiter and the second to the candidate.
+    if len(speaker_map) == 0:
+        speaker_map[normalized] = RECRUITER_TRANSCRIPT_LABEL
+        return RECRUITER_TRANSCRIPT_LABEL
+    if len(speaker_map) == 1:
+        speaker_map[normalized] = candidate_label
+        return candidate_label
+
+    return candidate_label if normalized_candidate and normalized == normalized_candidate else (raw_speaker or candidate_label).strip() or candidate_label
+
+
+def extract_transcript_text(transcript: Any, *, candidate_name: Optional[str] = None) -> Optional[str]:
+    candidate_label = _candidate_transcript_label(candidate_name)
     if isinstance(transcript, str):
-        value = transcript.strip()
+        value = _replace_string_transcript_labels(transcript, candidate_label).strip()
         return value or None
 
     if not isinstance(transcript, Iterable):
         return None
 
     lines = []
+    speaker_map: Dict[str, str] = {}
     for item in transcript:
         if not isinstance(item, dict):
             continue
         text = (item.get("text") or "").strip()
         if not text:
             continue
-        speaker = (item.get("speaker") or "").strip()
-        lines.append(f"{speaker}: {text}" if speaker else text)
+        speaker = _resolve_transcript_speaker_label(
+            item.get("speaker"),
+            candidate_label=candidate_label,
+            speaker_map=speaker_map,
+        )
+        lines.append(f"{speaker}: {text}")
 
     return "\n".join(lines) if lines else None
 
@@ -236,6 +320,8 @@ def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
     if transcript in (None, ""):
         transcript = data.get("call_transcript")
 
+    candidate_name = payload.get("candidate_name") or data.get("candidate_name")
+
     ai_insights = payload.get("ai_insights")
     if not isinstance(ai_insights, dict):
         ai_insights = data.get("ai_insights")
@@ -244,7 +330,7 @@ def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     normalized_status = normalize_status(status)
     duration_seconds = normalize_duration_seconds(duration, event_name=event_name)
-    transcript_text = extract_transcript_text(transcript)
+    transcript_text = extract_transcript_text(transcript, candidate_name=candidate_name)
     summary_text = build_summary_text(
         ai_insights,
         fallback=payload.get("summary") or data.get("summary"),
@@ -265,7 +351,6 @@ def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
     event_id = payload.get("event_id") or data.get("event_id")
     link = payload.get("link") or data.get("link")
     recruiter_email = payload.get("call_creator") or data.get("call_creator") or payload.get("recruiter") or data.get("recruiter")
-    candidate_name = payload.get("candidate_name") or data.get("candidate_name")
     candidate_id = metadata.get("candidate_id") or payload.get("candidate_id") or data.get("candidate_id")
     transaction_id = metadata.get("transaction_id") or payload.get("transaction_id") or data.get("transaction_id")
     job_id = metadata.get("job_id") or payload.get("job_id") or data.get("job_id")
