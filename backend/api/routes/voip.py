@@ -1,9 +1,12 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.api import deps
 from backend.integrations.frejun import FreJunManager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.api_route("/token", methods=["GET", "POST"])
@@ -15,10 +18,16 @@ async def get_voip_token(current_user=Depends(deps.get_current_user)):
     """
     frejun = FreJunManager()
     recruiter_email = (frejun.user_email or current_user.email or "").strip() or None
-    result = frejun.get_voip_access_token(recruiter_email=recruiter_email)
+    result = frejun.ensure_browser_voip_ready(recruiter_email=recruiter_email)
 
     if not result.get("success"):
-        detail = result.get("error", "FreJun VoIP token refresh failed")
+        detail = result.get("detail") or {
+            "code": result.get("code") or "voip_unavailable",
+            "message": result.get("error", "FreJun VoIP token refresh failed"),
+            "action_label": result.get("action_label"),
+            "action_url": result.get("action_url"),
+            "metadata": result.get("metadata") or {},
+        }
         raw = result.get("raw_response")
         if raw:
             logger.error(f"FreJun VoIP refresh failure detail: {raw}")
@@ -33,4 +42,6 @@ async def get_voip_token(current_user=Depends(deps.get_current_user)):
         "agent_email": result.get("agent_email"),
         "expires_in": result.get("expires_in"),
         "source": result.get("source"),
+        "agent_id": result.get("agent_id"),
+        "metadata": result.get("metadata") or {},
     }

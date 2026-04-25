@@ -17,7 +17,60 @@ function getRequestErrorMessage(error, fallbackMessage) {
         return 'Cannot reach the server'
     }
 
-    return error.response?.data?.detail || fallbackMessage
+    const detail = error.response?.data?.detail
+    if (typeof detail === 'string' && detail.trim()) {
+        return detail
+    }
+    if (detail && typeof detail === 'object') {
+        if (typeof detail.message === 'string' && detail.message.trim()) {
+            return detail.message
+        }
+        if (typeof detail.error === 'string' && detail.error.trim()) {
+            return detail.error
+        }
+    }
+    return fallbackMessage
+}
+
+function getRequestErrorDetail(error, fallbackMessage) {
+    if (error?.code === 'ECONNABORTED') {
+        return {
+            message: 'Server is taking too long to respond',
+            code: 'timeout',
+            actionLabel: '',
+            actionUrl: '',
+            meta: null,
+        }
+    }
+
+    if (!error?.response) {
+        return {
+            message: 'Cannot reach the server',
+            code: 'network_unreachable',
+            actionLabel: '',
+            actionUrl: '',
+            meta: null,
+        }
+    }
+
+    const detail = error.response?.data?.detail
+    if (detail && typeof detail === 'object') {
+        return {
+            message: detail.message || detail.error || fallbackMessage,
+            code: detail.code || '',
+            actionLabel: detail.action_label || '',
+            actionUrl: detail.action_url || '',
+            meta: detail.metadata || null,
+        }
+    }
+
+    return {
+        message: typeof detail === 'string' && detail.trim() ? detail : fallbackMessage,
+        code: '',
+        actionLabel: '',
+        actionUrl: '',
+        meta: null,
+    }
 }
 
 function normalizeListName(name) {
@@ -1771,17 +1824,25 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
-    initiateCall: async (callId, dialMode = 'voip') => {
+    initiateCall: async (callId) => {
         try {
             const res = await axios.post(
                 `${API_BASE}/calls/initiate`,
-                { call_id: callId, dial_mode: dialMode },
+                { call_id: callId, dial_mode: 'voip' },
                 { timeout: 45000 }
             )
             return { success: true, data: res.data }
         } catch (error) {
             console.error('Failed to initiate call:', error)
-            return { success: false, error: getRequestErrorMessage(error, 'Initiation failed') }
+            const detail = getRequestErrorDetail(error, 'Initiation failed')
+            return {
+                success: false,
+                error: detail.message,
+                errorCode: detail.code,
+                actionLabel: detail.actionLabel,
+                actionUrl: detail.actionUrl,
+                errorMeta: detail.meta,
+            }
         }
     },
     

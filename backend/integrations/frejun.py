@@ -17,7 +17,6 @@ load_dotenv()
 class FreJunManager:
     def __init__(self):
         self.base_url = "https://api.frejun.com/api/v2"
-        self.create_call_url = "https://api.frejun.com/api/v1/integrations/create-call/"
         self.call_to_voip_url = "https://api.frejun.com/api/v1/integrations/call-to-voip/"
         self.calls_url = f"{self.base_url}/integrations/calls/"
         self.webhooks_url = f"{self.base_url}/integrations/webhooks/"
@@ -31,6 +30,22 @@ class FreJunManager:
         self.user_email = (os.getenv("FREJUN_USER_EMAIL") or "").strip()
         self.virtual_number = (os.getenv("FREJUN_VIRTUAL_NUMBER") or "").strip()
         self._token = None
+
+    @staticmethod
+    def _frejun_settings_url() -> str:
+        return "https://product.frejun.com/settings"
+
+    @staticmethod
+    def _frejun_virtual_numbers_url() -> str:
+        return "https://product.frejun.com/virtual-numbers"
+
+    @staticmethod
+    def _frejun_browser_calling_url() -> str:
+        return "https://product.frejun.com/billing"
+
+    @staticmethod
+    def _normalize_email(value: Optional[str]) -> str:
+        return (value or "").strip().lower()
 
     @staticmethod
     def _normalize_phone(value: Optional[str]) -> str:
@@ -75,6 +90,36 @@ class FreJunManager:
             return str(detail)
         return fallback
 
+    def _build_voip_error(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 424,
+        action_label: Optional[str] = None,
+        action_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        raw_response: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        detail = {
+            "code": code,
+            "message": message,
+            "action_label": action_label,
+            "action_url": action_url,
+            "metadata": metadata or {},
+        }
+        return {
+            "success": False,
+            "error": message,
+            "code": code,
+            "status_code": status_code,
+            "action_label": action_label,
+            "action_url": action_url,
+            "metadata": metadata or {},
+            "detail": detail,
+            "raw_response": raw_response,
+        }
+
     def _api_key_env_name(self) -> str:
         if (os.getenv("FREJUN_API_KEY") or "").strip():
             return "FREJUN_API_KEY"
@@ -96,7 +141,7 @@ class FreJunManager:
         credentials = f"{self.oauth_client_id}:{self.client_secret}".encode("utf-8")
         encoded = base64.b64encode(credentials).decode("utf-8")
         return {
-            "Authorization": f"Basic {encoded}",
+            "Authorization": f"Bearer {encoded}",
             "Content-Type": "application/json",
         }
 
@@ -110,18 +155,30 @@ class FreJunManager:
             return nested.get(key)
         return None
 
-    def _load_managed_token(self) -> Optional[Dict[str, Any]]:
-        """Load the latest managed OAuth credentials from the database."""
+    def _load_managed_token(self, email: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load managed OAuth credentials, preferring recruiter-specific rows."""
         conn = get_db_connection()
         if not conn:
             return None
+        normalized_email = self._normalize_email(email)
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
-                    FROM frejun_oauth_credentials
-                    ORDER BY updated_at DESC LIMIT 1
-                """)
+                if normalized_email:
+                    cur.execute(
+                        """
+                        SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
+                        FROM frejun_oauth_credentials
+                        WHERE LOWER(COALESCE(frejun_user_email, '')) = %s
+                        ORDER BY updated_at DESC LIMIT 1
+                        """,
+                        (normalized_email,),
+                    )
+                else:
+                    cur.execute("""
+                        SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
+                        FROM frejun_oauth_credentials
+                        ORDER BY updated_at DESC LIMIT 1
+                    """)
                 row = cur.fetchone()
                 if row:
                     return {
@@ -142,17 +199,45 @@ class FreJunManager:
         conn = get_db_connection()
         if not conn:
             return
+        normalized_email = self._normalize_email(email)
         try:
             expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
             with conn.cursor() as cur:
-                # We use a single global row for now as per assumptions
-                cur.execute("""
-                    INSERT INTO frejun_oauth_credentials 
-                    (access_token, refresh_token, expires_at, frejun_user_email, updated_at)
-                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-                """, (access_token, refresh_token, expires_at, email))
+                if normalized_email:
+                    cur.execute(
+                        """
+                        UPDATE frejun_oauth_credentials
+                        SET access_token = %s,
+                            refresh_token = %s,
+                            expires_at = %s,
+                            token_type = 'Bearer',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = (
+                            SELECT id FROM frejun_oauth_credentials
+                            WHERE LOWER(COALESCE(frejun_user_email, '')) = %s
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                        )
+                        """,
+                        (access_token, refresh_token, expires_at, normalized_email),
+                    )
+                    if cur.rowcount == 0:
+                        cur.execute(
+                            """
+                            INSERT INTO frejun_oauth_credentials
+                            (access_token, refresh_token, expires_at, frejun_user_email, token_type, updated_at)
+                            VALUES (%s, %s, %s, %s, 'Bearer', CURRENT_TIMESTAMP)
+                            """,
+                            (access_token, refresh_token, expires_at, normalized_email),
+                        )
+                else:
+                    cur.execute("""
+                        INSERT INTO frejun_oauth_credentials
+                        (access_token, refresh_token, expires_at, frejun_user_email, token_type, updated_at)
+                        VALUES (%s, %s, %s, %s, 'Bearer', CURRENT_TIMESTAMP)
+                    """, (access_token, refresh_token, expires_at, None))
                 conn.commit()
-                logger.info(f"FreJun managed tokens persisted/rotated for {email}")
+                logger.info(f"FreJun managed tokens persisted/rotated for {normalized_email or 'default account'}")
         except Exception as e:
             conn.rollback()
             logger.error(f"Error saving FreJun managed token: {e}")
@@ -177,14 +262,15 @@ class FreJunManager:
         return None
 
     def get_voip_access_token(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
-        email = (recruiter_email or self.user_email or "").strip()
+        email = self._normalize_email(recruiter_email or self.user_email)
 
         # 1. Try managed DB store first (The "Forever Online" bridge)
-        managed = self._load_managed_token()
+        managed = self._load_managed_token(email=email)
         if managed:
             access_token = managed["access_token"]
             refresh_token = managed["refresh_token"]
             expires_at = managed["expires_at"]
+            managed_email = self._normalize_email(managed.get("email"))
             
             # Check if token is still valid (with 5 min safety buffer)
             if expires_at > datetime.utcnow() + timedelta(minutes=5):
@@ -194,73 +280,75 @@ class FreJunManager:
                     "success": True,
                     "access_token": self._token,
                     "expires_in": int((expires_at - datetime.utcnow()).total_seconds()),
-                    "agent_email": email or managed["email"],
+                    "agent_email": email or managed_email,
                     "source": "database_cache",
                 }
             
             # Token expired - trigger rotation using stored refresh token
             logger.info("FreJun access token expired in DB. Attempting rotation...")
-            rotate_result = self._refresh_oauth_token(refresh_token, email or managed["email"])
+            rotate_result = self._refresh_oauth_token(refresh_token, email or managed_email)
             if rotate_result.get("success"):
                 return rotate_result
             
             # If refresh fails, we fall back to env or return failure
             logger.warning(f"FreJun background rotation failed: {rotate_result.get('error')}. Checking fallbacks...")
 
-        # 2. Fallback: Check for hardcoded Access Token in .env (Manual bypass)
-        if self.access_token:
-            self._token = self.access_token
-            return {
-                "success": True,
-                "access_token": self._token,
-                "expires_in": None,
-                "agent_email": email or self.user_email,
-                "source": "configured_access_token",
-            }
-
-        # 3. Fallback: Check for Refresh Token in .env (Legacy/Bootstrap)
+        # 2. Fallback: refresh from configured refresh token (hands-off rotation path)
         if self.refresh_token:
             rotate_result = self._refresh_oauth_token(self.refresh_token, email)
             if rotate_result.get("success"):
                 return rotate_result
+            logger.warning(
+                "FreJun configured refresh-token rotation failed: %s",
+                rotate_result.get("error"),
+            )
 
-        return {
-            "success": False,
-            "error": "FreJun browser VoIP is not connected. Please go to Settings and click 'Connect FreJun VoIP'.",
-            "status_code": 401,
-        }
+        return self._build_voip_error(
+            "oauth_not_connected",
+            "FreJun browser VoIP is not connected yet. Connect FreJun VoIP once to establish production OAuth access.",
+            status_code=401,
+            action_label="Connect FreJun VoIP",
+            action_url="/api/auth/frejun-login",
+            metadata={"agent_email": email},
+        )
 
     def _refresh_oauth_token(self, refresh_token: str, email: Optional[str]) -> Dict[str, Any]:
         """Internal helper to execute the OAuth refresh grant and persist results."""
         if not self.oauth_client_id or not self.client_secret:
-            return {
-                "success": False,
-                "error": "FreJun OAuth client credentials missing.",
-                "status_code": 500,
-            }
+            return self._build_voip_error(
+                "token_refresh_failed",
+                "FreJun OAuth client credentials are missing.",
+                status_code=500,
+                action_label="Open FreJun Settings",
+                action_url=self._frejun_settings_url(),
+                metadata={"agent_email": self._normalize_email(email)},
+            )
 
-        url = "https://api.frejun.com/api/v1/oauth/token/"
+        url = "https://api.frejun.com/api/v2/oauth/token/refresh/"
         credentials = f"{self.oauth_client_id}:{self.client_secret}".encode("utf-8")
         encoded = base64.b64encode(credentials).decode("utf-8")
         
         headers = {
-            "Authorization": f"Basic {encoded}",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "Authorization": f"Bearer {encoded}",
+            "Content-Type": "application/json",
         }
-        
-        form_data = {
-            "grant_type": "refresh_token",
-            "refresh": refresh_token
-        }
+        payload = {"refresh": refresh_token}
 
         try:
             logger.info(f"Requesting fresh FreJun token pair for {email}...")
-            response = requests.post(url, headers=headers, data=form_data, timeout=20)
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             body = self._parse_response_body(response)
 
             if response.status_code in (200, 201):
-                new_access = self._extract_nested_value(body, "access_token")
-                new_refresh = self._extract_nested_value(body, "refresh_token") or refresh_token
+                new_access = (
+                    self._extract_nested_value(body, "access")
+                    or self._extract_nested_value(body, "access_token")
+                )
+                new_refresh = (
+                    self._extract_nested_value(body, "refresh")
+                    or self._extract_nested_value(body, "refresh_token")
+                    or refresh_token
+                )
                 expires_in = self._extract_nested_value(body, "expires_in") or 21600
 
                 if new_access:
@@ -276,62 +364,88 @@ class FreJunManager:
                     }
 
             error_msg = self._extract_error_message(body, "FreJun refresh failed")
-            return {
-                "success": False,
-                "error": error_msg,
-                "status_code": response.status_code,
-                "raw_response": response.text
-            }
+            return self._build_voip_error(
+                "token_refresh_failed",
+                error_msg,
+                status_code=response.status_code or 502,
+                action_label="Connect FreJun VoIP",
+                action_url="/api/auth/frejun-login",
+                metadata={"agent_email": self._normalize_email(email)},
+                raw_response=response.text,
+            )
         except Exception as e:
             logger.exception("FreJun token refresh exception")
-            return {"success": False, "error": str(e), "status_code": 500}
+            return self._build_voip_error(
+                "token_refresh_failed",
+                str(e),
+                status_code=500,
+                action_label="Connect FreJun VoIP",
+                action_url="/api/auth/frejun-login",
+                metadata={"agent_email": self._normalize_email(email)},
+            )
 
-    def get_voip_agent(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
-        email = (recruiter_email or self.user_email or "").strip()
-        if not email:
-            return {
-                "success": False,
-                "error": "Recruiter email missing (Set FREJUN_USER_EMAIL in .env)",
-                "status_code": 400,
-            }
+    def _build_user_metadata(
+        self,
+        email: str,
+        user: Optional[Dict[str, Any]] = None,
+        *,
+        virtual_number: Optional[str] = None,
+        virtual_number_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload = user if isinstance(user, dict) else {}
+        numbers = payload.get("virtual_numbers")
+        if not isinstance(numbers, list):
+            numbers = []
+        return {
+            "agent_email": (payload.get("email") or email or "").strip().lower(),
+            "agent_id": str(payload.get("user_id") or payload.get("id") or "").strip() or None,
+            "bb_calling": bool(payload.get("bb_calling")),
+            "license": payload.get("license"),
+            "edge_domain": payload.get("edge_domain"),
+            "virtual_number_count": len(numbers),
+            "virtual_number": virtual_number,
+            "virtual_number_source": virtual_number_source,
+        }
 
-        token_result = self.get_voip_access_token(recruiter_email=email)
-        if not token_result.get("success"):
-            return token_result
-
-        # [ZERO-TOUCH] Use pre-configured Agent ID if available to bypass lookup
-        agent_id = os.getenv("FREJUN_AGENT_ID", "").strip()
-        if agent_id:
-            return {
-                "success": True,
-                "agent_id": agent_id,
-                "agent_email": email,
-                "token": token_result["access_token"]
-            }
-
+    def _retrieve_voip_user(self, access_token: str, email: str) -> Dict[str, Any]:
         try:
             response = requests.get(
-                f"{self.base_url}/integrations/users/",
-                headers=self._bearer_headers(token_result["access_token"]),
+                "https://api.frejun.com/api/v1/integrations/user/",
+                headers=self._bearer_headers(access_token),
                 params={"email": email},
                 timeout=15,
             )
             body = self._parse_response_body(response)
-            if response.status_code != 200:
-                return {
-                    "success": False,
-                    "error": self._extract_error_message(body, "Failed to retrieve FreJun VoIP agent"),
-                    "status_code": response.status_code,
-                    "raw_response": response.text,
-                }
+            users = []
 
-            data = body.get("data")
-            if isinstance(data, dict):
-                users = [data]
-            elif isinstance(data, list):
-                users = data
+            if response.status_code == 200:
+                data = body.get("data")
+                if isinstance(data, dict):
+                    users = [data]
             else:
-                users = []
+                fallback_response = requests.get(
+                    f"{self.base_url}/integrations/users/",
+                    headers=self._bearer_headers(access_token),
+                    params={"email": email},
+                    timeout=15,
+                )
+                fallback_body = self._parse_response_body(fallback_response)
+                if fallback_response.status_code != 200:
+                    return self._build_voip_error(
+                        "frejun_user_not_found",
+                        self._extract_error_message(fallback_body, "Failed to retrieve FreJun user"),
+                        status_code=fallback_response.status_code or response.status_code or 424,
+                        action_label="Connect FreJun VoIP",
+                        action_url="/api/auth/frejun-login",
+                        metadata={"agent_email": email},
+                        raw_response=fallback_response.text,
+                    )
+
+                data = fallback_body.get("data")
+                if isinstance(data, dict):
+                    users = [data]
+                elif isinstance(data, list):
+                    users = data
 
             matched_user = None
             for user in users:
@@ -342,39 +456,244 @@ class FreJunManager:
                 matched_user = users[0]
 
             if not isinstance(matched_user, dict):
+                return self._build_voip_error(
+                    "frejun_user_not_found",
+                    f"FreJun did not return a Browser VoIP user for {email}.",
+                    status_code=424,
+                    action_label="Connect FreJun VoIP",
+                    action_url="/api/auth/frejun-login",
+                    metadata={"agent_email": email},
+                )
+
+            return {"success": True, "user": matched_user}
+        except requests.exceptions.Timeout:
+            return self._build_voip_error(
+                "frejun_user_not_found",
+                "FreJun VoIP user lookup timed out.",
+                status_code=504,
+                action_label="Retry VoIP",
+                metadata={"agent_email": email},
+            )
+        except Exception as exc:
+            logger.exception("Error retrieving FreJun VoIP user")
+            return self._build_voip_error(
+                "frejun_user_not_found",
+                str(exc),
+                status_code=500,
+                action_label="Retry VoIP",
+                metadata={"agent_email": email},
+            )
+
+    def _enable_browser_calling(self, access_token: str, email: str) -> Dict[str, Any]:
+        try:
+            response = requests.patch(
+                "https://api.frejun.com/api/v1/integrations/user/",
+                headers=self._bearer_headers(access_token),
+                params={"email": email},
+                json={"browser_calls": True},
+                timeout=15,
+            )
+            body = self._parse_response_body(response)
+            if response.status_code in (200, 201):
                 return {
-                    "success": False,
-                    "error": (
-                        f"FreJun did not return a browser-calling user for {email}. "
-                        "Verify SDK/browser-calling access is enabled for this user."
-                    ),
-                    "status_code": 424,
+                    "success": True,
+                    "data": body.get("data") if isinstance(body, dict) else None,
+                    "version": "v1",
                 }
 
-            agent_id = matched_user.get("user_id") or matched_user.get("id")
-            if not agent_id:
+            return self._build_voip_error(
+                "browser_calling_enable_failed",
+                self._extract_error_message(body, "FreJun could not enable browser calling for this user."),
+                status_code=response.status_code or 424,
+                action_label="Open FreJun Browser Calling",
+                action_url=self._frejun_browser_calling_url(),
+                metadata={"agent_email": email},
+                raw_response=response.text,
+            )
+        except requests.exceptions.Timeout:
+            return self._build_voip_error(
+                "browser_calling_enable_failed",
+                "FreJun timed out while enabling browser calling for this user.",
+                status_code=504,
+                action_label="Open FreJun Browser Calling",
+                action_url=self._frejun_browser_calling_url(),
+                metadata={"agent_email": email},
+            )
+        except Exception as exc:
+            logger.exception("Error enabling FreJun browser calling")
+            return self._build_voip_error(
+                "browser_calling_enable_failed",
+                str(exc),
+                status_code=500,
+                action_label="Open FreJun Browser Calling",
+                action_url=self._frejun_browser_calling_url(),
+                metadata={"agent_email": email},
+            )
+
+    def ensure_browser_voip_ready(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
+        email = self._normalize_email(recruiter_email or self.user_email)
+        if not email:
+            return self._build_voip_error(
+                "frejun_user_not_found",
+                "Recruiter email is missing for FreJun Browser VoIP.",
+                status_code=400,
+                action_label="Connect FreJun VoIP",
+                action_url="/api/auth/frejun-login",
+            )
+
+        token_result = self.get_voip_access_token(recruiter_email=email)
+        if not token_result.get("success"):
+            return token_result
+
+        access_token = token_result["access_token"]
+        user_result = self._retrieve_voip_user(access_token, email)
+        if not user_result.get("success"):
+            return user_result
+
+        user = user_result["user"]
+        enable_attempted = False
+        enable_result: Optional[Dict[str, Any]] = None
+        if not bool(user.get("bb_calling")):
+            enable_attempted = True
+            enable_result = self._enable_browser_calling(access_token, email)
+            if not enable_result.get("success"):
+                return enable_result
+
+            user_result = self._retrieve_voip_user(access_token, email)
+            if not user_result.get("success"):
+                return user_result
+            user = user_result["user"]
+
+        if not bool(user.get("bb_calling")):
+            metadata = self._build_user_metadata(email, user)
+            if enable_attempted:
+                metadata["auto_enable_attempted"] = True
+                metadata["auto_enable_version"] = enable_result.get("version") if isinstance(enable_result, dict) else None
+                metadata["auto_enable_response"] = enable_result.get("data") if isinstance(enable_result, dict) else None
+            return self._build_voip_error(
+                "browser_calling_disabled",
+                (
+                    f"FreJun accepted the browser-calling update for {email}, but retrieve-user still reports "
+                    "bb_calling=false. This usually means browser-calling access is still not granted for this seat "
+                    "in FreJun Billing > Overview > Browser Calling > Manage Users, or Browser Calls is still off in "
+                    "the FreJun softphone or Chrome extension settings."
+                    if enable_attempted
+                    else f"FreJun browser calling is still disabled for {email}. Enable browser calling for this "
+                    "recruiter seat before starting Browser VoIP calls."
+                ),
+                status_code=424,
+                action_label="Open FreJun Browser Calling",
+                action_url=self._frejun_browser_calling_url(),
+                metadata=metadata,
+            )
+
+        agent_id = user.get("user_id") or user.get("id")
+        if not agent_id:
+            return self._build_voip_error(
+                "agent_id_missing",
+                f"FreJun returned user details for {email}, but no agent identifier was present.",
+                status_code=424,
+                action_label="Open FreJun Settings",
+                action_url=self._frejun_settings_url(),
+                metadata=self._build_user_metadata(email, user),
+            )
+
+        virtual_result = self._resolve_virtual_number(
+            recruiter_email=email,
+            user_payload=user,
+        )
+        if not virtual_result.get("success"):
+            return self._build_voip_error(
+                "virtual_number_missing",
+                virtual_result.get("error") or f"No dialable virtual number is configured in FreJun for {email}.",
+                status_code=424,
+                action_label="Open FreJun Virtual Numbers",
+                action_url=self._frejun_virtual_numbers_url(),
+                metadata=self._build_user_metadata(email, user),
+                raw_response=virtual_result.get("raw_response"),
+            )
+
+        return {
+            "success": True,
+            "agent_id": str(agent_id),
+            "agent_email": (user.get("email") or email).strip(),
+            "access_token": access_token,
+            "expires_in": token_result.get("expires_in"),
+            "source": token_result.get("source"),
+            "user": user,
+            "virtual_number": virtual_result.get("virtual_number"),
+            "virtual_number_source": virtual_result.get("source"),
+            "warning": virtual_result.get("warning"),
+            "metadata": self._build_user_metadata(
+                email,
+                user,
+                virtual_number=virtual_result.get("virtual_number"),
+                virtual_number_source=virtual_result.get("source"),
+            ),
+        }
+
+    def get_voip_agent(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
+        return self.ensure_browser_voip_ready(recruiter_email=recruiter_email)
+
+    def _resolve_virtual_number_from_user(self, user_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        configured_virtual = self._normalize_phone(self.virtual_number)
+        if not isinstance(user_payload, dict):
+            return {"success": False, "error": "FreJun user payload missing for virtual-number resolution"}
+
+        numbers = user_payload.get("virtual_numbers")
+        if not isinstance(numbers, list):
+            numbers = []
+
+        normalized_numbers = {}
+        for item in numbers:
+            if not isinstance(item, dict):
+                continue
+            normalized = self._normalize_phone(item.get("number"))
+            if normalized:
+                normalized_numbers[normalized] = item
+
+        if configured_virtual:
+            if configured_virtual in normalized_numbers:
+                selected = normalized_numbers[configured_virtual]
                 return {
-                    "success": False,
-                    "error": (
-                        f"FreJun returned user details for {email}, but no agent identifier was present."
-                    ),
-                    "status_code": 424,
+                    "success": True,
+                    "virtual_number": selected.get("number") or configured_virtual,
+                    "source": "user_payload_configured",
                 }
 
+            configured_digits = re.sub(r"\D", "", configured_virtual)
+            if len(configured_digits) >= 10:
+                last_ten = configured_digits[-10:]
+                for normalized, item in normalized_numbers.items():
+                    digits = re.sub(r"\D", "", normalized)
+                    if len(digits) >= 10 and digits[-10:] == last_ten:
+                        return {
+                            "success": True,
+                            "virtual_number": item.get("number") or normalized,
+                            "source": "user_payload_configured_last10",
+                        }
+
+        if numbers:
+            selected = next(
+                (item for item in numbers if isinstance(item, dict) and item.get("default_calling_number")),
+                numbers[0],
+            )
+            normalized = self._normalize_phone(selected.get("number"))
+            if normalized:
+                return {
+                    "success": True,
+                    "virtual_number": selected.get("number") or normalized,
+                    "source": "user_payload_default" if selected.get("default_calling_number") else "user_payload_first_available",
+                }
+
+        if configured_virtual:
             return {
                 "success": True,
-                "agent_id": str(agent_id),
-                "agent_email": (matched_user.get("email") or email).strip(),
-                "access_token": token_result["access_token"],
-                "expires_in": token_result.get("expires_in"),
-                "source": token_result.get("source"),
-                "user": matched_user,
+                "virtual_number": configured_virtual,
+                "source": "configured_fallback",
             }
-        except requests.exceptions.Timeout:
-            return {"success": False, "error": "FreJun VoIP agent lookup timed out", "status_code": 504}
-        except Exception as exc:
-            logger.exception("Error getting FreJun VoIP agent")
-            return {"success": False, "error": str(exc), "status_code": 500}
+
+        return {"success": False, "error": "No virtual numbers available in FreJun user payload"}
 
     def _iter_call_auth_attempts(self):
         seen = set()
@@ -431,8 +750,11 @@ class FreJunManager:
             logger.exception("Error retrieving FreJun virtual numbers")
             return {"success": False, "error": str(e)}
 
-    def _resolve_virtual_number(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
+    def _resolve_virtual_number(self, recruiter_email: Optional[str] = None, user_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         email = recruiter_email or self.user_email
+        user_resolution = self._resolve_virtual_number_from_user(user_payload)
+        if user_resolution.get("success"):
+            return user_resolution
         configured_virtual = self._normalize_phone(self.virtual_number)
         lookup = self.list_virtual_numbers(recruiter_email=email)
 
@@ -538,78 +860,91 @@ class FreJunManager:
         candidate_id: Optional[str] = None,
         job_id: Optional[str] = None,
         transaction_id: Optional[str] = None,
-        dial_mode: str = "voip",
     ) -> Dict:
         """
-        Initiates a 2-legged call via FreJun.
-        Rings the recruiter first, then the candidate.
+        Initiates a Browser VoIP call via FreJun.
+        FreJun calls the candidate first, then routes the recruiter to the softphone.
         """
         email = recruiter_email or self.user_email
         candidate_phone = self._normalize_phone(candidate_phone)
 
         # Validation
         if not email:
-            return {"success": False, "error": "Recruiter email missing (Set FREJUN_USER_EMAIL in .env)"}
+            return self._build_voip_error(
+                "frejun_user_not_found",
+                "Recruiter email missing (Set FREJUN_USER_EMAIL in .env)",
+                status_code=400,
+                action_label="Connect FreJun VoIP",
+                action_url="/api/auth/frejun-login",
+            )
         if not candidate_phone:
-            return {"success": False, "error": "Candidate phone missing"}
+            return self._build_voip_error(
+                "voip_call_start_failed",
+                "Candidate phone missing",
+                status_code=400,
+                metadata={"agent_email": self._normalize_email(email)},
+            )
         if len(candidate_phone) == 10 and not candidate_phone.startswith("+"):
             candidate_phone = f"+91{candidate_phone}"
-            
-        if not self.api_key:
-            return {
-                "success": False,
-                "error": f"FreJun API key missing (Set {self._api_key_env_name()} in the environment)",
-            }
 
-        virtual_result = self._resolve_virtual_number(recruiter_email=email)
-        if not virtual_result.get("success"):
-            return {"success": False, "error": virtual_result.get("error")}
+        readiness = self.ensure_browser_voip_ready(email)
+        if not readiness.get("success"):
+            return readiness
 
-        virtual_number = virtual_result.get("virtual_number")
+        virtual_number = readiness.get("virtual_number")
         if not virtual_number:
-            return {"success": False, "error": "Unable to determine a FreJun virtual number for this call"}
+            return self._build_voip_error(
+                "virtual_number_missing",
+                "Unable to determine a FreJun virtual number for this call.",
+                status_code=424,
+                action_label="Open FreJun Virtual Numbers",
+                action_url=self._frejun_virtual_numbers_url(),
+                metadata=readiness.get("metadata"),
+            )
 
         # Format virtual number with country code for VoIP endpoint requirements
         formatted_virtual_number = virtual_number
         if len(str(formatted_virtual_number)) == 10 and not str(formatted_virtual_number).startswith("+"):
             formatted_virtual_number = f"+91{formatted_virtual_number}"
 
-        # Browser VoIP initiation (Strictly enforced per user request)
-        agent_result = self.get_voip_agent(email)
-        if not agent_result.get("success"):
-            return {
-                "success": False,
-                "error": f"FreJun browser VoIP is unavailable: {agent_result.get('error')}",
-                "status_code": agent_result.get("status_code", 424),
-                "dial_mode": "voip",
-            }
-
         url = self.call_to_voip_url
-        params = {}
+        params = {"email": email}
         payload = {
-            "agent_id": agent_result["agent_id"],
+            "agent_id": readiness["agent_id"],
             "dstn_number": candidate_phone,
             "virtual_number": formatted_virtual_number,
             "candidate_name": candidate_name or "Candidate",
         }
+        if candidate_id:
+            payload["candidate_id"] = str(candidate_id)
+        if job_id:
+            payload["job_id"] = str(job_id)
         if transaction_id:
             payload["transaction_id"] = str(transaction_id)
-        
-        dial_mode = "voip" # Enforce dial mode for logging below
 
         try:
-            headers = self._bearer_headers(agent_result["token"])
+            access_token = readiness.get("access_token") or readiness.get("token")
+            if not access_token:
+                return self._build_voip_error(
+                    "voip_call_start_failed",
+                    "FreJun Browser VoIP token is unavailable for call initiation.",
+                    status_code=424,
+                    action_label="Connect FreJun VoIP",
+                    action_url="/api/auth/frejun-login",
+                    metadata=readiness.get("metadata"),
+                )
+
+            headers = self._bearer_headers(access_token)
             logger.info(
-                "Initiating FreJun %s call to %s via %s",
-                dial_mode,
+                "Initiating FreJun Browser VoIP call to %s via %s",
                 candidate_phone,
                 formatted_virtual_number,
             )
             logger.debug(f"DEBUG: FreJun Params: {params}")
             logger.debug(f"DEBUG: FreJun Payload: {payload}")
 
-            if virtual_result.get("warning"):
-                logger.warning("FreJun virtual-number lookup warning: %s", virtual_result.get("warning"))
+            if readiness.get("warning"):
+                logger.warning("FreJun virtual-number lookup warning: %s", readiness.get("warning"))
 
             response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
 
@@ -622,7 +957,7 @@ class FreJunManager:
                     "success": True,
                     "data": body,
                     "call_data": response_data,
-                    "dial_mode": dial_mode,
+                    "dial_mode": "voip",
                 }
             else:
                 message = self._extract_error_message(body, response.text or "FreJun request failed")
@@ -632,29 +967,32 @@ class FreJunManager:
                         "and that the selected virtual number is active for outbound calling."
                     )
                 logger.error(f"FreJun call failed with status {response.status_code}: {response.text}")
-                return {
-                    "success": False,
-                    "error": f"FreJun Error ({response.status_code}): {message}",
-                    "status_code": response.status_code,
-                    "raw_response": response.text,
-                    "dial_mode": dial_mode,
-                }
+                return self._build_voip_error(
+                    "voip_call_start_failed",
+                    f"FreJun Error ({response.status_code}): {message}",
+                    status_code=response.status_code or 502,
+                    action_label="Retry VoIP",
+                    metadata=readiness.get("metadata"),
+                    raw_response=response.text,
+                )
 
         except requests.exceptions.Timeout:
-            return {
-                "success": False,
-                "error": "FreJun API request timed out",
-                "status_code": 504,
-                "dial_mode": dial_mode,
-            }
+            return self._build_voip_error(
+                "voip_call_start_failed",
+                "FreJun API request timed out",
+                status_code=504,
+                action_label="Retry VoIP",
+                metadata=readiness.get("metadata"),
+            )
         except Exception as e:
             logger.exception("Error calling FreJun API")
-            return {
-                "success": False,
-                "error": str(e),
-                "status_code": 500,
-                "dial_mode": dial_mode,
-            }
+            return self._build_voip_error(
+                "voip_call_start_failed",
+                str(e),
+                status_code=500,
+                action_label="Retry VoIP",
+                metadata=readiness.get("metadata"),
+            )
 
     def handle_webhook(self, payload: Dict) -> Dict:
         """

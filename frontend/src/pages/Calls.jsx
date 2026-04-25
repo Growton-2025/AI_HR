@@ -8,7 +8,7 @@ import {
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming
 } from 'lucide-react';
-import { useAppStore, API_BASE, BACKEND_BASE } from '../store/useAppStore';
+import { useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
 
 const formatLocalDate = (dateString) => {
@@ -1058,22 +1058,34 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [saving, setSaving] = useState(false);
   const [isAnswering, setIsAnswering] = useState(false);
-  const [dialMode, setDialMode] = useState('voip');
   const [initiationError, setInitiationError] = useState('');
+  const [initiationErrorCode, setInitiationErrorCode] = useState('');
+  const [initiationActionLabel, setInitiationActionLabel] = useState('');
+  const [initiationActionUrl, setInitiationActionUrl] = useState('');
   const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
-  const { activeCall, answerCall, rejectCall, voipStatus, voipError, agentEmail, retryVoip } = useVoIP();
+  const { activeCall, answerCall, rejectCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, agentEmail, retryVoip } = useVoIP();
   const isInitiated = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
 
-
+  const effectiveError = initiationError || voipError || 'Browser VoIP could not be established.';
+  const effectiveErrorCode = initiationErrorCode || voipErrorCode || '';
+  const effectiveActionLabel = initiationActionLabel || voipActionLabel || '';
+  const effectiveActionUrl = initiationActionUrl || voipActionUrl || '';
+  const hasBlockingVoipError = voipStatus === 'error' || callState === 'error';
+  const displayedAgentEmail = agentEmail || voipMeta?.agent_email || call?.recruiter_email || 'Loading...';
 
   const triggerCall = useCallback(async () => {
-    setDialMode('voip');
     setInitiationError('');
+    setInitiationErrorCode('');
+    setInitiationActionLabel('');
+    setInitiationActionUrl('');
     
     // Check local VoIP status before initiating
     if (voipStatus === 'error') {
       setInitiationError(voipError || 'Browser VoIP is unavailable.');
+      setInitiationErrorCode(voipErrorCode || '');
+      setInitiationActionLabel(voipActionLabel || '');
+      setInitiationActionUrl(voipActionUrl || '');
       setCallState('error');
       return;
     }
@@ -1082,10 +1094,13 @@ function CallingModal({ call, onClose, onRefresh }) {
     isInitiated.current = true;
 
     try {
-      const res = await initiateCall(call.id, 'voip');
+      const res = await initiateCall(call.id);
       if (!res.success) {
         const message = res.error || 'Failed to start browser VoIP call';
         setInitiationError(message);
+        setInitiationErrorCode(res.errorCode || '');
+        setInitiationActionLabel(res.actionLabel || '');
+        setInitiationActionUrl(res.actionUrl || '');
         setCallState('error');
         toast.error(message);
         return;
@@ -1095,16 +1110,20 @@ function CallingModal({ call, onClose, onRefresh }) {
     } catch (e) {
       const message = 'Connection error while starting browser VoIP call';
       setInitiationError(message);
+      setInitiationErrorCode('voip_call_start_failed');
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, initiateCall, voipError, voipStatus]);
+  }, [call.id, initiateCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
 
   useEffect(() => {
     if (isInitiated.current) return;
 
     if (voipStatus === 'error') {
       setInitiationError(voipError || 'Browser VoIP is unavailable.');
+      setInitiationErrorCode(voipErrorCode || '');
+      setInitiationActionLabel(voipActionLabel || '');
+      setInitiationActionUrl(voipActionUrl || '');
       setCallState('error');
       return;
     }
@@ -1115,13 +1134,16 @@ function CallingModal({ call, onClose, onRefresh }) {
     }
 
     triggerCall();
-  }, [voipStatus, triggerCall]);
+  }, [triggerCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
 
   useEffect(() => {
-    if (callState === 'review' || dialMode !== 'voip') return;
+    if (callState === 'review') return;
 
     if (voipStatus === 'error') {
       setInitiationError(voipError || 'Browser VoIP failed.');
+      setInitiationErrorCode(voipErrorCode || '');
+      setInitiationActionLabel(voipActionLabel || '');
+      setInitiationActionUrl(voipActionUrl || '');
       setCallState('error');
       return;
     }
@@ -1144,7 +1166,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     if (isInitiated.current && !activeCall && voipStatus === 'registered' && callState === 'connecting') {
       setCallState('waiting_for_invite');
     }
-  }, [activeCall, callState, dialMode, voipError, voipStatus]);
+  }, [activeCall, callState, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
 
   useEffect(() => {
     if ((callState === 'answer_required' || callState === 'invite_received' || callState === 'active') && !activeCall) {
@@ -1198,9 +1220,17 @@ function CallingModal({ call, onClose, onRefresh }) {
 
   const handleRetryVoip = () => {
     setInitiationError('');
+    setInitiationErrorCode('');
+    setInitiationActionLabel('');
+    setInitiationActionUrl('');
     setCallState('preparing_softphone');
     isInitiated.current = false;
     retryVoip();
+  };
+
+  const handleBlockingAction = () => {
+    if (!effectiveActionUrl) return;
+    window.location.href = effectiveActionUrl;
   };
 
   const handleSaveLog = async () => {
@@ -1258,10 +1288,9 @@ function CallingModal({ call, onClose, onRefresh }) {
               : callState === 'ended'
                 ? { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome...' }
                 : callState === 'error'
-                  ? { label: 'VoIP Error', tone: '#dc2626', bg: '#fef2f2', message: initiationError || voipError || 'Browser VoIP could not be established.' }
+                  ? { label: 'VoIP Error', tone: '#dc2626', bg: '#fef2f2', message: effectiveError }
                   : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
 
-  const callModeLabel = dialMode === 'voip' ? 'Browser VoIP' : 'Network Bridge';
   const isLiveCallState = ['preparing_softphone', 'connecting', 'waiting_for_invite', 'answer_required', 'invite_received', 'active', 'error'].includes(callState);
 
   return (
@@ -1333,11 +1362,11 @@ function CallingModal({ call, onClose, onRefresh }) {
                 </div>
                 <div style={{ flex: 1, padding: '12px 14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
                   <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Softphone Agent</div>
-                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>{agentEmail || 'Loading...'}</div>
+                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>{displayedAgentEmail}</div>
                 </div>
               </div>
 
-              {voipStatus === 'error' && (
+              {hasBlockingVoipError && (
                 <div style={{ 
                   alignSelf: 'stretch', marginBottom: '20px', padding: '20px', 
                   borderRadius: '16px', background: '#fff7ed', border: '1px solid #fed7aa', 
@@ -1347,20 +1376,30 @@ function CallingModal({ call, onClose, onRefresh }) {
                     Browser VoIP Unavailable
                   </div>
                   <div style={{ color: '#c2410c', fontSize: '13px' }}>
-                    A manual reconnection is required to sync new VoIP credentials.
+                    {effectiveError}
                   </div>
-                  <a 
-                    href={`${BACKEND_BASE}/api/auth/frejun-login`} 
-                    style={{ 
-                      display: 'block', width: '100%', padding: '12px', background: '#2563eb', 
-                      color: '#fff', borderRadius: '12px', fontSize: '14px', fontWeight: 700, 
-                      textDecoration: 'none', transition: 'background 0.2s' 
-                    }}
-                    onMouseEnter={e => e.currentTarget.style.background = '#1d4ed8'}
-                    onMouseLeave={e => e.currentTarget.style.background = '#2563eb'}
-                  >
-                    Connect FreJun VoIP
-                  </a>
+                  {effectiveErrorCode === 'browser_calling_disabled' && voipMeta?.agent_id && (
+                    <div style={{ color: '#9a3412', fontSize: '12px', fontWeight: 600 }}>
+                      Seat: {displayedAgentEmail} • Agent ID: {voipMeta.agent_id}
+                    </div>
+                  )}
+                  {effectiveActionLabel && effectiveActionUrl && (
+                    <button
+                      onClick={handleBlockingAction}
+                      style={{
+                        display: 'block', width: '100%', padding: '12px', background: '#2563eb',
+                        color: '#fff', borderRadius: '12px', fontSize: '14px', fontWeight: 700,
+                        border: 'none', cursor: 'pointer'
+                      }}
+                    >
+                      {effectiveActionLabel}
+                    </button>
+                  )}
+                  {effectiveErrorCode && (
+                    <div style={{ color: '#9a3412', fontSize: '12px', fontWeight: 700 }}>
+                      Error code: {effectiveErrorCode}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1449,6 +1488,28 @@ function CallingModal({ call, onClose, onRefresh }) {
                     </div>
                   ) : callState === 'error' ? (
                     <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+                      {effectiveActionLabel && effectiveActionUrl && (
+                        <button
+                          onClick={handleBlockingAction}
+                          style={{
+                            flex: 1,
+                            padding: '16px',
+                            background: '#2563eb',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: '16px',
+                            fontSize: '15px',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px'
+                          }}
+                        >
+                          {effectiveActionLabel}
+                        </button>
+                      )}
                       <button
                         onClick={handleRetryVoip}
                         style={{

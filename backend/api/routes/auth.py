@@ -1,5 +1,7 @@
 
 from datetime import timedelta, datetime
+import base64
+import json
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from backend.core.security import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES, get_password_hash, verify_password
 from backend.api import schemas
@@ -322,6 +324,10 @@ FREJUN_OAUTH_CLIENT_ID = os.getenv("FREJUN_OAUTH_CLIENT_ID", os.getenv("FREJUN_C
 FREJUN_OAUTH_CLIENT_SECRET = os.getenv("FREJUN_CLIENT_SECRET", "").strip()
 
 def get_frejun_redirect_uri(request=None):
+    configured_uri = (os.getenv("FREJUN_OAUTH_REDIRECT_URI") or "").strip().rstrip("/")
+    if configured_uri:
+        return configured_uri
+
     # Auto-detect Azure environment
     is_azure = os.getenv("WEBSITE_HOSTNAME") is not None
     is_local = not is_azure and os.getenv("USE_LOCAL_OAUTH", "true").lower() == "true"
@@ -340,18 +346,44 @@ def get_frejun_redirect_uri(request=None):
     fixed_uri = "https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net/api/auth/frejun-callback"
     return fixed_uri.rstrip('/')
 
+def get_frejun_post_auth_url(request: Request | None = None) -> str:
+    configured = (os.getenv("FREJUN_POST_OAUTH_REDIRECT_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+
+    if request:
+        origin = (request.headers.get("origin") or "").strip().rstrip("/")
+        if origin:
+            return f"{origin}/calls"
+
+        forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
+        if forwarded_host:
+            return f"https://{forwarded_host}/calls"
+
+        host = (request.headers.get("host") or "").strip()
+        if host:
+            scheme = "http" if host.startswith("localhost:") or host.startswith("127.0.0.1:") else "https"
+            return f"{scheme}://{host}/calls"
+
+    return "http://localhost:3000/calls"
+
 @router.get("/auth/frejun-login")
-async def frejun_oauth_login(request: Request):
+async def frejun_oauth_login(request: Request, current_user: schemas.User = Depends(deps.get_current_user)):
     """Redirect to FreJun authorization page."""
     from fastapi.responses import RedirectResponse
     
     redirect_uri = get_frejun_redirect_uri(request)
+    state_payload = {
+        "app_user_email": (current_user.email or "").strip().lower(),
+    }
+    state = base64.urlsafe_b64encode(json.dumps(state_payload).encode("utf-8")).decode("utf-8")
     auth_url = (
         f"https://product.frejun.com/oauth/authorize/?"
         f"client_id={FREJUN_OAUTH_CLIENT_ID}&"
         f"redirect_uri={redirect_uri}&"
         f"response_type=code&"
-        f"scope=oauth"
+        f"scope=oauth&"
+        f"state={state}"
     )
     return RedirectResponse(url=auth_url)
 
@@ -360,8 +392,20 @@ async def frejun_oauth_callback(
     request: Request,
     code: str = None, 
     error: str = None, 
-    email: str = None
+    email: str = None,
+    state: str = None,
 ):
+    state_email = ""
+    if state:
+        try:
+            decoded = base64.urlsafe_b64decode(state.encode("utf-8")).decode("utf-8")
+            parsed = json.loads(decoded)
+            state_email = (parsed.get("app_user_email") or "").strip().lower()
+        except Exception:
+            logger.warning("FreJun OAuth callback state could not be decoded")
+
+    managed_email = (email or state_email).strip().lower() or None
+
     """
     FreJun OAuth callback endpoint.
     """
@@ -414,20 +458,13 @@ async def frejun_oauth_callback(
             expires_in = body.get("expires_in") or data_block.get("expires_in") or 21600
             from backend.integrations.frejun import FreJunManager
             try:
-                FreJunManager()._save_managed_token(access_token, refresh_token, int(expires_in), email)
+                FreJunManager()._save_managed_token(access_token, refresh_token, int(expires_in), managed_email)
                 logger.info(f"✅ FreJun OAuth: fresh token saved to database storage")
             except Exception as db_err:
                 logger.error(f"Failed to persist FreJun token to DB: {db_err}")
 
-            # 2. Legacy Fallback: Write fresh tokens to .env
-            env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
-            _update_env_key(env_path, "FREJUN_ACCESS_TOKEN", access_token)
-            if refresh_token:
-                _update_env_key(env_path, "FREJUN_REFRESH_TOKEN", refresh_token)
-
-            logger.info(f"✅ FreJun OAuth: fresh token saved to .env")
-
             # Return a simple HTML success page
+            post_auth_url = get_frejun_post_auth_url(request)
             html = f"""<!DOCTYPE html>
 <html>
 <head><title>FreJun Token</title>
@@ -437,8 +474,9 @@ async def frejun_oauth_callback(
 <h2>✅ FreJun OAuth Successful!</h2>
 <p><strong>Tokens established and persistence bridge is LIVE.</strong></p>
 <pre id="token">Access Token: {access_token[:10]}...</pre>
+<p><strong>Mapped App User:</strong> {managed_email or "not provided"}</p>
 <p>The system will now maintain this connection automatically. <strong>Hard-refresh</strong> your dashboard to start calling.</p>
-<p><a href="http://localhost:3000/calls">→ Go back to Calls</a></p>
+<p><a href="{post_auth_url}">→ Go back to Calls</a></p>
 </body>
 </html>"""
             from fastapi.responses import HTMLResponse
@@ -455,28 +493,3 @@ async def frejun_oauth_callback(
     except Exception as e:
         logger.exception("FreJun OAuth callback error")
         return {"success": False, "error": str(e)}
-
-
-def _update_env_key(env_path: str, key: str, value: str):
-    """Update or append a key in the .env file."""
-    try:
-        if os.path.exists(env_path):
-            with open(env_path, "r") as f:
-                lines = f.readlines()
-            new_lines = []
-            found = False
-            for line in lines:
-                if line.startswith(f"{key}=") or line.startswith(f"#{key}="):
-                    new_lines.append(f"{key}={value}\n")
-                    found = True
-                else:
-                    new_lines.append(line)
-            if not found:
-                new_lines.append(f"{key}={value}\n")
-            with open(env_path, "w") as f:
-                f.writelines(new_lines)
-        else:
-            with open(env_path, "a") as f:
-                f.write(f"{key}={value}\n")
-    except Exception as e:
-        logger.warning(f"Could not update .env: {e}")
