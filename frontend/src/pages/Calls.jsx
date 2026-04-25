@@ -52,6 +52,34 @@ const OUTCOMES = [
   'Wrong Number'
 ];
 
+const SUMMARY_PLACEHOLDER_PATTERNS = [
+  "transcript isn't fully provided",
+  'transcript is not fully provided',
+  'please share the full',
+  'please share the full or additional content',
+  'please share additional content',
+  'i can help summarize a typical recruitment call',
+  'when provided with full details',
+  'for me to assist you appropriately',
+  'not enough information',
+  'insufficient information',
+];
+
+const hasPlaceholderSummary = (value) => {
+  const text = (value || '').trim().toLowerCase();
+  if (!text) return false;
+  return SUMMARY_PLACEHOLDER_PATTERNS.some(pattern => text.includes(pattern));
+};
+
+const needsPostCallArtifacts = (callData) => {
+  if (!callData) return true;
+  if (!callData.recording_url) return true;
+  if (!(callData.transcript || '').trim()) return true;
+  if (!(callData.summary || '').trim()) return true;
+  if (hasPlaceholderSummary(callData.summary)) return true;
+  return false;
+};
+
 function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
   const [messages, setMessages] = useState([]);
@@ -1066,6 +1094,9 @@ function CallingModal({ call, onClose, onRefresh }) {
   const { activeCall, answerCall, rejectCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, agentEmail, retryVoip } = useVoIP();
   const isInitiated = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
+  const reviewSummary = (reviewCallData?.summary || '').trim();
+  const reviewTranscript = (reviewCallData?.transcript || '').trim();
+  const showReviewSummary = reviewSummary && !hasPlaceholderSummary(reviewSummary);
 
   const effectiveError = initiationError || voipError || 'Browser VoIP could not be established.';
   const effectiveErrorCode = initiationErrorCode || voipErrorCode || '';
@@ -1179,9 +1210,9 @@ function CallingModal({ call, onClose, onRefresh }) {
     if (callState === 'review') {
       const fetchReviewData = async () => {
          try {
-           // Proactively trigger a sync from FreJun API (Legacy Pattern)
-           if (!reviewCallData?.recording_url) {
-             console.log('Proactively syncing recording for Call', call.id);
+           // Keep syncing until recording, transcript, and summary are all healthy.
+           if (needsPostCallArtifacts(reviewCallData)) {
+             console.log('Proactively syncing call artifacts for Call', call.id);
              await syncCallRecording(call.id);
            }
 
@@ -1196,7 +1227,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       fetchReviewData(); // Run immediately on enter
     }
     return () => clearInterval(t);
-  }, [callState, call.id, call.list_id, fetchCalls, syncCallRecording, reviewCallData?.recording_url]);
+  }, [callState, call.id, call.list_id, fetchCalls, syncCallRecording, reviewCallData]);
 
   const handleAnswer = async () => {
     setIsAnswering(true);
@@ -1650,20 +1681,20 @@ function CallingModal({ call, onClose, onRefresh }) {
                       </div>
                     )}
                     
-                    {reviewCallData?.summary && (
+                    {showReviewSummary && (
                       <div style={{ marginBottom: '24px' }}>
                         <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>AI Summary</div>
-                        <p style={{ fontSize: '14px', lineHeight: 1.6, color: '#334155' }}>{reviewCallData.summary}</p>
+                        <p style={{ fontSize: '14px', lineHeight: 1.6, color: '#334155' }}>{reviewSummary}</p>
                       </div>
                     )}
 
                     <div style={{ marginBottom: '16px' }}>
                       <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>
-                        Transcript {(!reviewCallData?.transcript && reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000) ? '(Fallback AI Triggered)' : ''}
+                        Transcript {(!reviewTranscript && reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000) ? '(Fallback AI Triggered)' : ''}
                       </div>
-                      {reviewCallData?.transcript ? (
+                      {reviewTranscript ? (
                         <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', maxHeight: '200px', overflowY: 'auto', fontSize: '13px', lineHeight: 1.6, color: '#475569', whiteSpace: 'pre-wrap' }}>
-                          {reviewCallData.transcript}
+                          {reviewTranscript}
                         </div>
                       ) : (
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
