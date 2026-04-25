@@ -19,7 +19,10 @@ from backend.services.frejun_calls import (
     extract_transcript_text,
     build_summary_text,
     humanize_status,
+    is_placeholder_summary,
     normalize_phone,
+    prefer_better_summary,
+    prefer_richer_text,
     select_best_call_log_result,
     transcript_preview,
 )
@@ -364,8 +367,8 @@ def persist_frejun_update(
     next_outcome = coalesce_text(payload_details.get("outcome"), existing_call.get("outcome"))
     next_notes = coalesce_text(existing_call.get("notes"), payload_details.get("notes"))
     next_recording_url = coalesce_text(existing_call.get("recording_url"), payload_details.get("recording_url"))
-    next_transcript = coalesce_text(existing_call.get("transcript"), payload_details.get("transcript_text"))
-    next_summary = coalesce_text(existing_call.get("summary"), payload_details.get("summary_text"))
+    next_transcript = prefer_richer_text(existing_call.get("transcript"), payload_details.get("transcript_text"))
+    next_summary = prefer_better_summary(existing_call.get("summary"), payload_details.get("summary_text"))
     next_frejun_status = coalesce_text(payload_details.get("frejun_status"), existing_call.get("frejun_status"))
     next_frejun_call_id = coalesce_text(payload_details.get("call_id"), existing_call.get("frejun_call_id"))
     next_frejun_event_id = coalesce_text(payload_details.get("event_id"), existing_call.get("frejun_event_id"))
@@ -443,9 +446,25 @@ def maybe_process_call_audio(previous_call: dict, updated_call: dict, force_fall
         return
     if previous_recording_url and not force_fallback:
         return
-    if updated_call.get("transcript") and updated_call.get("summary"):
+    if not call_artifacts_need_repair(updated_call):
         return
     process_call_audio(updated_call["id"], next_recording_url)
+
+
+def call_artifacts_need_repair(call_data: Optional[dict]) -> bool:
+    if not isinstance(call_data, dict):
+        return False
+
+    transcript = (call_data.get("transcript") or "").strip()
+    summary = (call_data.get("summary") or "").strip()
+
+    if not transcript:
+        return True
+    if not summary:
+        return True
+    if is_placeholder_summary(summary):
+        return True
+    return False
 
 
 class CallListCreate(BaseModel):
@@ -1275,14 +1294,13 @@ def sync_call_recording(
 
     if not call:
         raise HTTPException(status_code=404, detail="Call task not found")
-    if call.get("recording_url"):
-        return call
 
-    if not (
+    has_frejun_identifiers = bool(
         call.get("frejun_call_id")
         or call.get("frejun_event_id")
         or call.get("frejun_transaction_id")
-    ):
+    )
+    if not has_frejun_identifiers and not call.get("recording_url"):
         raise HTTPException(
             status_code=400,
             detail="This call is missing FreJun identifiers and cannot be synced yet",
@@ -1293,92 +1311,72 @@ def sync_call_recording(
         or (os.getenv("FREJUN_USER_EMAIL") or current_user.email or "").strip()
     )
 
+    updated_call = call
     frejun = FreJunManager()
-    lookup = frejun.get_call_logs(
-        recruiter_email=recruiter_email,
-        call_id=call.get("frejun_call_id"),
-        event_id=call.get("frejun_event_id"),
-        transaction_id=call.get("frejun_transaction_id"),
-        candidate_number=call.get("candidate_phone"),
-        candidate_id=str(call.get("candidate_id")),
-    )
-    if not lookup.get("success"):
-        raise HTTPException(
-            status_code=lookup.get("status_code") or 502,
-            detail=lookup.get("error", "FreJun call-log lookup failed"),
+    if has_frejun_identifiers:
+        lookup = frejun.get_call_logs(
+            recruiter_email=recruiter_email,
+            call_id=call.get("frejun_call_id"),
+            event_id=call.get("frejun_event_id"),
+            transaction_id=call.get("frejun_transaction_id"),
+            candidate_number=call.get("candidate_phone"),
+            candidate_id=str(call.get("candidate_id")),
         )
+        if not lookup.get("success"):
+            if call.get("recording_url") and call_artifacts_need_repair(call):
+                maybe_process_call_audio(call, call, force_fallback=True)
+                return call
+            raise HTTPException(
+                status_code=lookup.get("status_code") or 502,
+                detail=lookup.get("error", "FreJun call-log lookup failed"),
+            )
 
-    best_result = select_best_call_log_result(
-        lookup.get("results") or [],
-        frejun_call_id=call.get("frejun_call_id"),
-        frejun_event_id=call.get("frejun_event_id"),
-        frejun_transaction_id=call.get("frejun_transaction_id"),
-        candidate_number=call.get("candidate_phone"),
-    )
-    if not best_result:
-        return call
-
-    payload_details = extract_payload_details(build_call_log_payload(best_result))
-
-    conn = get_calls_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-    cur = None
-    updated_call = None
-    try:
-        cur = conn.cursor()
-        existing_call = fetch_call_by_id(cur, call_id, owner)
-        if not existing_call:
-            raise HTTPException(status_code=404, detail="Call task not found")
-        if existing_call.get("recording_url"):
-            return existing_call
-
-        updated_call = persist_frejun_update(
-            cur,
-            call_id=call_id,
-            existing_call=existing_call,
-            payload_details=payload_details,
-            recording_source="frejun_call_logs",
+        best_result = select_best_call_log_result(
+            lookup.get("results") or [],
+            frejun_call_id=call.get("frejun_call_id"),
+            frejun_event_id=call.get("frejun_event_id"),
+            frejun_transaction_id=call.get("frejun_transaction_id"),
+            candidate_number=call.get("candidate_phone"),
         )
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception as exc:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        if cur:
-            cur.close()
-        return_db_connection(conn)
+        if best_result:
+            payload_details = extract_payload_details(build_call_log_payload(best_result))
 
-    invalidate_calls_cache()
-    refresh_call_caches_async()
-    # Logic for falling back to internal AI (OpenAI) after 10 minutes
-    # even if FreJun hasn't returned a transcript yet.
-    if updated_call.get("recording_url") and not updated_call.get("transcript"):
-        completed_at = updated_call.get("completed_at")
-        if completed_at:
-            if isinstance(completed_at, str):
-                try:
-                    from dateutil.parser import parse
-                    completed_at = parse(completed_at)
-                except: pass
-            
-            # If it's been more than 10 minutes since the call ended, trigger fallback
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            # Ensure completed_at has timezone info if it's aware, or make it aware
-            if completed_at.tzinfo is None:
-                completed_at = completed_at.replace(tzinfo=timezone.utc)
-                
-            delta = (now - completed_at).total_seconds()
-            if delta > 600: # 10 minutes
-                print(f"DEBUG: Call {call_id} is stale (>10m). Triggering OpenAI fallback.")
-                maybe_process_call_audio(call, updated_call, force_fallback=True)
+            conn = get_calls_db_connection()
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
 
-    maybe_process_call_audio(call, updated_call)
+            cur = None
+            try:
+                cur = conn.cursor()
+                existing_call = fetch_call_by_id(cur, call_id, owner)
+                if not existing_call:
+                    raise HTTPException(status_code=404, detail="Call task not found")
+
+                updated_call = persist_frejun_update(
+                    cur,
+                    call_id=call_id,
+                    existing_call=existing_call,
+                    payload_details=payload_details,
+                    recording_source="frejun_call_logs",
+                )
+                conn.commit()
+            except HTTPException:
+                conn.rollback()
+                raise
+            except Exception as exc:
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=str(exc))
+            finally:
+                if cur:
+                    cur.close()
+                return_db_connection(conn)
+
+            invalidate_calls_cache()
+            refresh_call_caches_async()
+    if updated_call.get("recording_url") and call_artifacts_need_repair(updated_call):
+        maybe_process_call_audio(call, updated_call, force_fallback=True)
+    else:
+        maybe_process_call_audio(call, updated_call)
     return updated_call
 
 

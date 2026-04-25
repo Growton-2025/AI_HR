@@ -28,6 +28,23 @@ SUMMARY_READY_EVENTS = {
     "call.summary",
 }
 
+SHORT_CALL_SUMMARY = "Very brief exchange; no meaningful screening details captured."
+SUMMARY_PLACEHOLDER_PATTERNS = (
+    "transcript isn't fully provided",
+    "transcript is not fully provided",
+    "please share the full",
+    "please share the full or additional content",
+    "please share additional content",
+    "i can help summarize a typical recruitment call",
+    "when provided with full details",
+    "for me to assist you appropriately",
+    "full or additional content",
+    "cannot summarize",
+    "can't summarize",
+    "not enough information",
+    "insufficient information",
+)
+
 RECRUITER_TRANSCRIPT_LABEL = "Recruiter"
 RECRUITER_SPEAKER_HINTS = {
     "recruiter",
@@ -133,6 +150,46 @@ def _replace_string_transcript_labels(text: str, candidate_label: str) -> str:
     return value
 
 
+def _has_explicit_speaker_labels(text: str) -> bool:
+    return bool(re.search(r"(?m)^\s*[^:\n]{1,40}:\s+\S", text or ""))
+
+
+def _split_plain_transcript_turns(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return []
+
+    parts = re.split(r"(?<=[.!?])\s+", normalized)
+    turns = [part.strip() for part in parts if part and part.strip()]
+    return turns
+
+
+def _guess_speaker_labeled_transcript(text: str, candidate_label: str) -> Optional[str]:
+    value = (text or "").strip()
+    if not value:
+        return None
+
+    if _has_explicit_speaker_labels(value):
+        return value
+
+    turns = _split_plain_transcript_turns(value)
+    if len(turns) < 2:
+        return None
+
+    # Keep this heuristic narrow: only relabel short conversational turns,
+    # where alternating recruiter/candidate is a reasonable fallback.
+    if len(turns) > 20:
+        return None
+    if any(len(re.findall(r"\b\w+\b", turn)) > 18 for turn in turns):
+        return None
+
+    labeled_lines = []
+    for idx, turn in enumerate(turns):
+        label = RECRUITER_TRANSCRIPT_LABEL if idx % 2 == 0 else candidate_label
+        labeled_lines.append(f"{label}: {turn}")
+    return "\n".join(labeled_lines)
+
+
 def _resolve_transcript_speaker_label(
     raw_speaker: Optional[str],
     *,
@@ -167,6 +224,9 @@ def extract_transcript_text(transcript: Any, *, candidate_name: Optional[str] = 
     candidate_label = _candidate_transcript_label(candidate_name)
     if isinstance(transcript, str):
         value = _replace_string_transcript_labels(transcript, candidate_label).strip()
+        guessed = _guess_speaker_labeled_transcript(value, candidate_label)
+        if guessed:
+            value = guessed
         return value or None
 
     if not isinstance(transcript, Iterable):
@@ -191,10 +251,7 @@ def extract_transcript_text(transcript: Any, *, candidate_name: Optional[str] = 
 
 
 def build_summary_text(ai_insights: Any, fallback: Any = None) -> Optional[str]:
-    if isinstance(fallback, str) and fallback.strip():
-        fallback_text = fallback.strip()
-    else:
-        fallback_text = None
+    fallback_text = normalize_summary_text(fallback)
 
     if not isinstance(ai_insights, dict):
         return fallback_text
@@ -207,11 +264,11 @@ def build_summary_text(ai_insights: Any, fallback: Any = None) -> Optional[str]:
     action_items = (summary_block.get("action_items") or "").strip()
 
     if transcript_summary and action_items:
-        return f"{transcript_summary}\n\nAction Items:\n{action_items}"
+        return normalize_summary_text(f"{transcript_summary}\n\nAction Items:\n{action_items}")
     if transcript_summary:
-        return transcript_summary
+        return normalize_summary_text(transcript_summary)
     if action_items:
-        return f"Action Items:\n{action_items}"
+        return normalize_summary_text(f"Action Items:\n{action_items}")
     return fallback_text
 
 
@@ -472,3 +529,86 @@ def coalesce_text(*values: Any) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def is_placeholder_summary(value: Optional[str]) -> bool:
+    text = (value or "").strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in SUMMARY_PLACEHOLDER_PATTERNS)
+
+
+def is_brief_transcript(value: Optional[str]) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    words = re.findall(r"\b\w+\b", text)
+    if len(words) <= 12:
+        return True
+    lines = [line for line in text.splitlines() if line.strip()]
+    return len(lines) <= 2 and len(text) <= 120
+
+
+def normalize_summary_text(
+    value: Any,
+    *,
+    transcript_text: Optional[str] = None,
+    short_call_fallback: bool = False,
+) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if is_placeholder_summary(text):
+        if short_call_fallback and is_brief_transcript(transcript_text):
+            return SHORT_CALL_SUMMARY
+        return None
+    return text
+
+
+def prefer_richer_text(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
+    current = (existing or "").strip()
+    candidate = (incoming or "").strip()
+
+    if not current:
+        return candidate or None
+    if not candidate:
+        return current
+    if current == candidate:
+        return current
+
+    current_lines = [line for line in current.splitlines() if line.strip()]
+    candidate_lines = [line for line in candidate.splitlines() if line.strip()]
+
+    # Prefer the incoming text if it clearly contains more of the conversation.
+    if len(candidate_lines) > len(current_lines):
+        return candidate
+    if len(candidate) > len(current):
+        return candidate
+    if current in candidate:
+        return candidate
+
+    return current
+
+
+def prefer_better_summary(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
+    current = normalize_summary_text(existing)
+    candidate = normalize_summary_text(incoming)
+
+    if not current:
+        return candidate or None
+    if not candidate:
+        return current
+    if current == candidate:
+        return current
+
+    current_placeholder = is_placeholder_summary(existing)
+    candidate_placeholder = is_placeholder_summary(incoming)
+
+    if current_placeholder and not candidate_placeholder:
+        return candidate
+    if candidate_placeholder and not current_placeholder:
+        return current
+
+    return prefer_richer_text(current, candidate)
