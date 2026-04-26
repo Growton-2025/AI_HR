@@ -31,6 +31,18 @@ class FreJunManager:
         self.virtual_number = (os.getenv("FREJUN_VIRTUAL_NUMBER") or "").strip()
         self._token = None
 
+    def _resolve_voip_identity(self, recruiter_email: Optional[str] = None) -> tuple[str, list[str]]:
+        requested_email = self._normalize_email(recruiter_email)
+        configured_email = self._normalize_email(self.user_email)
+        canonical_email = configured_email or requested_email
+
+        aliases: list[str] = []
+        for candidate in (canonical_email, requested_email):
+            if candidate and candidate not in aliases:
+                aliases.append(candidate)
+
+        return canonical_email, aliases
+
     @staticmethod
     def _frejun_settings_url() -> str:
         return "https://product.frejun.com/settings"
@@ -155,31 +167,69 @@ class FreJunManager:
             return nested.get(key)
         return None
 
-    def _load_managed_token(self, email: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def _load_managed_token(
+        self,
+        email: Optional[str] = None,
+        *,
+        candidate_emails: Optional[list[str]] = None,
+        allow_legacy_unmapped: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         """Load managed OAuth credentials, preferring recruiter-specific rows."""
         conn = get_db_connection()
         if not conn:
             return None
         normalized_email = self._normalize_email(email)
+        normalized_candidates = []
+        for candidate in candidate_emails or []:
+            normalized_candidate = self._normalize_email(candidate)
+            if normalized_candidate and normalized_candidate not in normalized_candidates:
+                normalized_candidates.append(normalized_candidate)
+        if normalized_email and normalized_email not in normalized_candidates:
+            normalized_candidates.insert(0, normalized_email)
         try:
             with conn.cursor() as cur:
-                if normalized_email:
-                    cur.execute(
-                        """
+                row = None
+                if normalized_candidates:
+                    select_sql = """
                         SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
                         FROM frejun_oauth_credentials
                         WHERE LOWER(COALESCE(frejun_user_email, '')) = %s
                         ORDER BY updated_at DESC LIMIT 1
-                        """,
-                        (normalized_email,),
-                    )
+                    """
+                    for candidate in normalized_candidates:
+                        cur.execute(
+                            select_sql,
+                            (candidate,),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            break
+                    if not row and allow_legacy_unmapped:
+                        # Older OAuth callbacks stored tokens without frejun_user_email.
+                        # Prefer that legacy bridge before forcing recruiters to reconnect.
+                        cur.execute(
+                            """
+                            SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
+                            FROM frejun_oauth_credentials
+                            WHERE COALESCE(NULLIF(TRIM(frejun_user_email), ''), '') = ''
+                            ORDER BY updated_at DESC LIMIT 1
+                            """
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            logger.info(
+                                "Using legacy unmapped FreJun OAuth token for %s until it is reconnected.",
+                                normalized_email or ",".join(normalized_candidates),
+                            )
                 else:
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT access_token, refresh_token, expires_at, frejun_user_email, token_type
                         FROM frejun_oauth_credentials
                         ORDER BY updated_at DESC LIMIT 1
-                    """)
-                row = cur.fetchone()
+                        """
+                    )
+                    row = cur.fetchone()
                 if row:
                     return {
                         "access_token": row[0],
@@ -193,6 +243,23 @@ class FreJunManager:
         finally:
             return_db_connection(conn)
         return None
+
+    def _promote_managed_token(
+        self,
+        access_token: str,
+        refresh_token: Optional[str],
+        expires_at: datetime,
+        email: Optional[str],
+    ) -> None:
+        canonical_email = self._normalize_email(email)
+        if not canonical_email or not refresh_token:
+            return
+
+        remaining_seconds = int((expires_at - datetime.utcnow()).total_seconds())
+        if remaining_seconds <= 0:
+            return
+
+        self._save_managed_token(access_token, refresh_token, remaining_seconds, canonical_email)
 
     def _save_managed_token(self, access_token: str, refresh_token: str, expires_in: int, email: Optional[str] = None):
         """Persist rotated OAuth tokens and expiry to the database."""
@@ -262,10 +329,10 @@ class FreJunManager:
         return None
 
     def get_voip_access_token(self, recruiter_email: Optional[str] = None) -> Dict[str, Any]:
-        email = self._normalize_email(recruiter_email or self.user_email)
+        email, email_aliases = self._resolve_voip_identity(recruiter_email)
 
         # 1. Try managed DB store first (The "Forever Online" bridge)
-        managed = self._load_managed_token(email=email)
+        managed = self._load_managed_token(email=email, candidate_emails=email_aliases)
         if managed:
             access_token = managed["access_token"]
             refresh_token = managed["refresh_token"]
@@ -276,6 +343,8 @@ class FreJunManager:
             if expires_at > datetime.utcnow() + timedelta(minutes=5):
                 logger.info(f"Using cached FreJun access token from DB (expires at {expires_at})")
                 self._token = access_token
+                if email and managed_email != email:
+                    self._promote_managed_token(access_token, refresh_token, expires_at, email)
                 return {
                     "success": True,
                     "access_token": self._token,
@@ -302,6 +371,18 @@ class FreJunManager:
                 "FreJun configured refresh-token rotation failed: %s",
                 rotate_result.get("error"),
             )
+
+        # 3. Bootstrap fallback for legacy env-only setups that do not yet have
+        # a durable refresh token bridge configured.
+        if self.access_token and not self.refresh_token:
+            self._token = self.access_token
+            return {
+                "success": True,
+                "access_token": self._token,
+                "expires_in": None,
+                "agent_email": email or self.user_email,
+                "source": "configured_access_token_bootstrap",
+            }
 
         return self._build_voip_error(
             "oauth_not_connected",

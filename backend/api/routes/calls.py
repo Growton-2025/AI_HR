@@ -6,6 +6,7 @@ import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
+import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from backend.api import deps, schemas
@@ -144,6 +145,23 @@ def get_call_list_owner(current_user: schemas.User) -> str:
     if not owner:
         raise HTTPException(status_code=400, detail="Current user is missing an email")
     return owner
+
+
+def build_call_initiation_error(
+    code: str,
+    message: str,
+    *,
+    action_label: Optional[str] = None,
+    action_url: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "action_label": action_label,
+        "action_url": action_url,
+        "metadata": metadata or {},
+    }
 
 def ensure_list_exists_for_owner(cur, list_id: int, owner: str):
     cur.execute(
@@ -1117,54 +1135,84 @@ def initiate_call(
     candidate_id = None
     recruiter_email = None
     transaction_id = None
+    configured_recruiter_email = (os.getenv("FREJUN_USER_EMAIL") or current_user.email or "").strip()
 
-    with get_db_connection_context(validate=True, register_pgvector=False) as conn:
-        if not conn:
-            raise HTTPException(status_code=500, detail="Database connection failed")
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    c.candidate_id,
-                    cand.name,
-                    cand.mobile_phone,
-                    COALESCE(NULLIF(c.frejun_recruiter_email, ''), NULLIF(%s, ''), NULLIF(cl.created_by, '')),
-                    COALESCE(NULLIF(c.frejun_transaction_id, ''), %s)
-                FROM calls c
-                JOIN candidates cand ON c.candidate_id = cand.id
-                JOIN call_lists cl ON c.list_id = cl.id
-                WHERE c.id = %s
-                  AND LOWER(COALESCE(cl.created_by, '')) = %s
-                """,
-                (
-                    (os.getenv("FREJUN_USER_EMAIL") or current_user.email or "").strip(),
-                    f"call:{call_id}",
-                    call_id,
-                    owner,
-                ),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Call task not found")
+    try:
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT candidate_id, list_id, frejun_recruiter_email, frejun_transaction_id
+                    FROM calls
+                    WHERE id = %s
+                    """,
+                    (call_id,),
+                )
+                call_row = cur.fetchone()
+                if not call_row:
+                    raise HTTPException(status_code=404, detail="Call task not found")
 
-            candidate_id = row[0]
-            candidate_name = row[1]
-            candidate_phone = row[2]
-            recruiter_email = (row[3] or "").strip()
-            transaction_id = (row[4] or "").strip() or f"call:{call_id}"
+                candidate_id = call_row[0]
+                list_id = call_row[1]
+                recruiter_email = (call_row[2] or "").strip()
+                transaction_id = (call_row[3] or "").strip() or f"call:{call_id}"
 
-            cur.execute(
-                """
-                UPDATE calls
-                SET
-                    frejun_transaction_id = COALESCE(NULLIF(frejun_transaction_id, ''), %s),
-                    frejun_recruiter_email = COALESCE(NULLIF(frejun_recruiter_email, ''), %s),
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (transaction_id, recruiter_email or None, call_id),
-            )
-            conn.commit()
+                cur.execute(
+                    """
+                    SELECT LOWER(COALESCE(created_by, ''))
+                    FROM call_lists
+                    WHERE id = %s
+                      AND LOWER(COALESCE(created_by, '')) = %s
+                    """,
+                    (list_id, owner),
+                )
+                list_row = cur.fetchone()
+                if not list_row:
+                    raise HTTPException(status_code=404, detail="Call task not found")
+
+                list_owner = (list_row[0] or "").strip()
+                recruiter_email = recruiter_email or configured_recruiter_email or list_owner
+
+                cur.execute(
+                    """
+                    SELECT name, mobile_phone
+                    FROM candidates
+                    WHERE id = %s
+                    """,
+                    (candidate_id,),
+                )
+                candidate_row = cur.fetchone()
+                if not candidate_row:
+                    raise HTTPException(status_code=404, detail="Candidate not found for call task")
+
+                candidate_name = candidate_row[0]
+                candidate_phone = candidate_row[1]
+
+                cur.execute(
+                    """
+                    UPDATE calls
+                    SET
+                        frejun_transaction_id = COALESCE(NULLIF(frejun_transaction_id, ''), %s),
+                        frejun_recruiter_email = COALESCE(NULLIF(frejun_recruiter_email, ''), %s),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (transaction_id, recruiter_email or None, call_id),
+                )
+                conn.commit()
+    except psycopg2.Error as exc:
+        logger.exception("Database error preparing call initiation for call %s", call_id)
+        raise HTTPException(
+            status_code=500,
+            detail=build_call_initiation_error(
+                "call_lookup_failed",
+                "Unable to load this call task right now. Please retry.",
+                action_label="Retry VoIP",
+                metadata={"call_id": call_id, "db_error": exc.__class__.__name__},
+            ),
+        ) from exc
 
     if not candidate_phone:
         raise HTTPException(status_code=400, detail="Candidate has no phone number")

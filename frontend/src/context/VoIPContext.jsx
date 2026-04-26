@@ -13,9 +13,12 @@ const VoIPContext = createContext({
   voipActionLabel: '',
   voipActionUrl: '',
   voipMeta: null,
+  voipConnectionEvent: null,
   agentEmail: '',
   retryVoip: () => {},
 });
+
+const SOFTPHONE_RECOVERY_WINDOW_MS = 5000;
 
 export function useVoIP() {
   return useContext(VoIPContext);
@@ -29,12 +32,19 @@ export function VoIPProvider({ children }) {
   const [voipActionLabel, setVoipActionLabel] = useState('');
   const [voipActionUrl, setVoipActionUrl] = useState('');
   const [voipMeta, setVoipMeta] = useState(null);
+  const [voipConnectionEvent, setVoipConnectionEvent] = useState(null);
   const [agentEmail, setAgentEmail] = useState('');
   const softphoneRef = useRef(null);
   const remoteAudioRef = useRef(null);
   const localAudioRef = useRef(null);
   const initDoneRef = useRef(false);
   const initInFlightRef = useRef(false);
+  const activeCallRef = useRef(null);
+  const voipStatusRef = useRef('disconnected');
+  const voipConnectionEventRef = useRef(null);
+  const softphoneGenerationRef = useRef(0);
+  const recoveryInFlightRef = useRef(false);
+  const recoveryTimerRef = useRef(null);
 
   useEffect(() => {
     const remoteAudio = document.createElement('audio');
@@ -53,6 +63,11 @@ export function VoIPProvider({ children }) {
     localAudioRef.current = localAudio;
 
     return () => {
+      softphoneGenerationRef.current += 1;
+      if (recoveryTimerRef.current) {
+        window.clearTimeout(recoveryTimerRef.current);
+        recoveryTimerRef.current = null;
+      }
       try {
         softphoneRef.current?.logout?.();
       } catch (_) {
@@ -69,12 +84,31 @@ export function VoIPProvider({ children }) {
     initSoftphone();
   }, []);
 
+  useEffect(() => {
+    activeCallRef.current = activeCall;
+  }, [activeCall]);
+
+  useEffect(() => {
+    voipStatusRef.current = voipStatus;
+  }, [voipStatus]);
+
+  useEffect(() => {
+    voipConnectionEventRef.current = voipConnectionEvent;
+  }, [voipConnectionEvent]);
+
   const clearVoipErrorState = () => {
     setVoipError('');
     setVoipErrorCode('');
     setVoipActionLabel('');
     setVoipActionUrl('');
     setVoipMeta(null);
+  };
+
+  const clearRecoveryTimer = () => {
+    if (recoveryTimerRef.current) {
+      window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
+    }
   };
 
   const applyVoipErrorState = (detail, fallbackMessage) => {
@@ -144,9 +178,66 @@ export function VoIPProvider({ children }) {
     });
   };
 
+  const hasLiveVoipActivity = () => (
+    Boolean(activeCallRef.current) || ['answer_required', 'invite_received', 'connected'].includes(voipStatusRef.current)
+  );
+
+  const recoverSoftphone = async (instanceId, { reconnect = false } = {}) => {
+    if (recoveryInFlightRef.current || softphoneGenerationRef.current !== instanceId || !softphoneRef.current) {
+      return;
+    }
+
+    recoveryInFlightRef.current = true;
+    clearRecoveryTimer();
+    clearVoipErrorState();
+    setVoipStatus(current => (
+      ['answer_required', 'invite_received', 'connected'].includes(current) ? current : 'connecting'
+    ));
+    recoveryTimerRef.current = window.setTimeout(() => {
+      if (softphoneGenerationRef.current !== instanceId) return;
+      recoveryInFlightRef.current = false;
+      recoveryTimerRef.current = null;
+
+      if (hasLiveVoipActivity() || voipStatusRef.current === 'registered') {
+        return;
+      }
+
+      const latestEvent = voipConnectionEventRef.current;
+      const message = latestEvent?.error || 'FreJun softphone registration failed';
+      applyVoipErrorState(
+        { message, code: 'softphone_registration_failed' },
+        'FreJun softphone registration failed',
+      );
+    }, SOFTPHONE_RECOVERY_WINDOW_MS);
+
+    try {
+      await softphoneRef.current.reset(reconnect);
+    } catch (error) {
+      clearRecoveryTimer();
+      recoveryInFlightRef.current = false;
+      if (softphoneGenerationRef.current !== instanceId || hasLiveVoipActivity()) {
+        return;
+      }
+
+      const message = error?.message || 'FreJun softphone registration failed';
+      applyVoipErrorState(
+        { message, code: 'softphone_registration_failed' },
+        'FreJun softphone registration failed',
+      );
+    } finally {
+      if (softphoneGenerationRef.current === instanceId) {
+        recoveryInFlightRef.current = Boolean(recoveryTimerRef.current);
+      }
+    }
+  };
+
   const initSoftphone = async ({ force = false } = {}) => {
     if (initInFlightRef.current) return;
     initInFlightRef.current = true;
+    const instanceId = softphoneGenerationRef.current + 1;
+    softphoneGenerationRef.current = instanceId;
+    clearRecoveryTimer();
+    recoveryInFlightRef.current = false;
 
     try {
       clearVoipErrorState();
@@ -190,26 +281,37 @@ export function VoIPProvider({ children }) {
 
       const listeners = {
         onConnectionStateChange: (type, state, maxRetriesReached, error) => {
+          if (softphoneGenerationRef.current !== instanceId) return;
+          const event = {
+            type,
+            state: String(state || ''),
+            maxRetriesReached: Boolean(maxRetriesReached),
+            error: error ? String(error) : '',
+          };
+          setVoipConnectionEvent(event);
           console.log(`[VoIP] ${type}: ${state}${error ? ` ERR:${error}` : ''}`);
+
           if (type === 'RegisterState' && state === 'Registered') {
+            clearRecoveryTimer();
+            recoveryInFlightRef.current = false;
             clearVoipErrorState();
             setVoipStatus(current => (current === 'connected' ? current : 'registered'));
             return;
           }
 
-          if (state === 'Error' || maxRetriesReached) {
-            applyVoipErrorState(
-              { message: String(error || 'FreJun softphone registration failed'), code: 'softphone_registration_failed' },
-              'FreJun softphone registration failed',
-            );
+          if (maxRetriesReached) {
+            if (!hasLiveVoipActivity() && !recoveryInFlightRef.current) {
+              void recoverSoftphone(instanceId, { reconnect: type === 'UserAgentState' });
+            }
             return;
           }
 
-          if (state === 'Unregistered' || state === 'Terminated') {
+          if (state === 'Unregistered' || state === 'Terminated' || (type === 'UserAgentState' && state === 'Stopped')) {
             setVoipStatus(current => (current === 'connected' ? current : 'disconnected'));
           }
         },
         onCallCreated: (sessionType, metadata) => {
+          if (softphoneGenerationRef.current !== instanceId) return;
           console.log('[VoIP] CALL CREATED', sessionType, metadata);
           const session = softphoneRef.current?.getSession;
           if (!session) {
@@ -220,7 +322,9 @@ export function VoIPProvider({ children }) {
             return;
           }
 
+          clearRecoveryTimer();
           clearVoipErrorState();
+          recoveryInFlightRef.current = false;
           setActiveCall({
             session,
             metadata,
@@ -230,13 +334,18 @@ export function VoIPProvider({ children }) {
           setVoipStatus('answer_required');
         },
         onCallRinging: (sessionType, metadata) => {
+          if (softphoneGenerationRef.current !== instanceId) return;
           console.log('[VoIP] CALL ESTABLISHED', sessionType, metadata);
           updateActiveCallState('connected', { metadata, sessionType });
+          clearRecoveryTimer();
           clearVoipErrorState();
+          recoveryInFlightRef.current = false;
           setVoipStatus('connected');
         },
         onCallHangup: (sessionType, metadata) => {
+          if (softphoneGenerationRef.current !== instanceId) return;
           console.log('[VoIP] CALL HANGUP', sessionType, metadata);
+          clearRecoveryTimer();
           setActiveCall(null);
           setVoipStatus('registered');
         },
@@ -247,6 +356,11 @@ export function VoIPProvider({ children }) {
         remote: remoteAudioRef.current,
       });
     } catch (error) {
+      if (softphoneGenerationRef.current !== instanceId) {
+        return;
+      }
+      clearRecoveryTimer();
+      recoveryInFlightRef.current = false;
       const message = error?.message || 'Failed to initialize the FreJun softphone';
       console.error('[VoIP] Init failed:', message, error);
       applyVoipErrorState(
@@ -337,6 +451,7 @@ export function VoIPProvider({ children }) {
         voipActionLabel,
         voipActionUrl,
         voipMeta,
+        voipConnectionEvent,
         agentEmail,
         retryVoip: () => initSoftphone({ force: true }),
       }}

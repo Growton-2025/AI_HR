@@ -368,13 +368,21 @@ def get_frejun_post_auth_url(request: Request | None = None) -> str:
     return "http://localhost:3000/calls"
 
 @router.get("/auth/frejun-login")
-async def frejun_oauth_login(request: Request, current_user: schemas.User = Depends(deps.get_current_user)):
+async def frejun_oauth_login(
+    request: Request,
+    current_user: schemas.User = Depends(deps.get_current_user),
+    mode: str = None,
+):
     """Redirect to FreJun authorization page."""
     from fastapi.responses import RedirectResponse
+    from backend.integrations.frejun import FreJunManager
     
     redirect_uri = get_frejun_redirect_uri(request)
+    manager = FreJunManager()
+    frejun_user_email = manager._normalize_email(manager.user_email or current_user.email)
     state_payload = {
         "app_user_email": (current_user.email or "").strip().lower(),
+        "frejun_user_email": frejun_user_email,
     }
     state = base64.urlsafe_b64encode(json.dumps(state_payload).encode("utf-8")).decode("utf-8")
     auth_url = (
@@ -385,6 +393,8 @@ async def frejun_oauth_login(request: Request, current_user: schemas.User = Depe
         f"scope=oauth&"
         f"state={state}"
     )
+    if mode == "url":
+        return {"auth_url": auth_url}
     return RedirectResponse(url=auth_url)
 
 @router.get("/auth/frejun-callback")
@@ -396,15 +406,20 @@ async def frejun_oauth_callback(
     state: str = None,
 ):
     state_email = ""
+    state_frejun_email = ""
     if state:
         try:
             decoded = base64.urlsafe_b64decode(state.encode("utf-8")).decode("utf-8")
             parsed = json.loads(decoded)
             state_email = (parsed.get("app_user_email") or "").strip().lower()
+            state_frejun_email = (parsed.get("frejun_user_email") or "").strip().lower()
         except Exception:
             logger.warning("FreJun OAuth callback state could not be decoded")
 
-    managed_email = (email or state_email).strip().lower() or None
+    from backend.integrations.frejun import FreJunManager
+    manager = FreJunManager()
+    configured_frejun_email = manager._normalize_email(manager.user_email)
+    managed_email = (email or state_frejun_email or configured_frejun_email or state_email).strip().lower() or None
 
     """
     FreJun OAuth callback endpoint.
@@ -456,9 +471,8 @@ async def frejun_oauth_callback(
         if resp.status_code in (200, 201) and access_token:
             # 1. Save to the new durable DB store (The "Forever Online" bridge)
             expires_in = body.get("expires_in") or data_block.get("expires_in") or 21600
-            from backend.integrations.frejun import FreJunManager
             try:
-                FreJunManager()._save_managed_token(access_token, refresh_token, int(expires_in), managed_email)
+                manager._save_managed_token(access_token, refresh_token, int(expires_in), managed_email)
                 logger.info(f"✅ FreJun OAuth: fresh token saved to database storage")
             except Exception as db_err:
                 logger.error(f"Failed to persist FreJun token to DB: {db_err}")

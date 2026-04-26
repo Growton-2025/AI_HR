@@ -8,7 +8,7 @@ import {
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming
 } from 'lucide-react';
-import { useAppStore } from '../store/useAppStore';
+import { BACKEND_BASE, useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
 
 const formatLocalDate = (dateString) => {
@@ -79,6 +79,8 @@ const needsPostCallArtifacts = (callData) => {
   if (hasPlaceholderSummary(callData.summary)) return true;
   return false;
 };
+
+const SOFTPHONE_PREPARING_TIMEOUT_MS = 12000;
 
 function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
@@ -1091,7 +1093,7 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
   const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
-  const { activeCall, answerCall, rejectCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, agentEmail, retryVoip } = useVoIP();
+  const { activeCall, answerCall, rejectCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, agentEmail, retryVoip } = useVoIP();
   const isInitiated = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
@@ -1200,6 +1202,63 @@ function CallingModal({ call, onClose, onRefresh }) {
   }, [activeCall, callState, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
 
   useEffect(() => {
+    const recovered = ['registered', 'answer_required', 'invite_received', 'connected'].includes(voipStatus);
+    if (!recovered) return;
+
+    setInitiationError('');
+    setInitiationErrorCode('');
+    setInitiationActionLabel('');
+    setInitiationActionUrl('');
+
+    if (callState !== 'error') return;
+
+    if (activeCall?.state === 'connected' || voipStatus === 'connected') {
+      setCallState('active');
+      return;
+    }
+
+    if (activeCall?.state === 'answer_required' || voipStatus === 'answer_required') {
+      setCallState('answer_required');
+      return;
+    }
+
+    if (activeCall?.state === 'invite_received' || voipStatus === 'invite_received') {
+      setCallState('invite_received');
+      return;
+    }
+
+    if (isInitiated.current && voipStatus === 'registered') {
+      setCallState('waiting_for_invite');
+      return;
+    }
+
+    setCallState('preparing_softphone');
+  }, [activeCall, callState, voipStatus]);
+
+  useEffect(() => {
+    if (callState !== 'preparing_softphone' || isInitiated.current) return undefined;
+    if (['registered', 'answer_required', 'invite_received', 'connected', 'error'].includes(voipStatus)) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (isInitiated.current) return;
+      if (['registered', 'answer_required', 'invite_received', 'connected', 'error'].includes(voipStatus)) {
+        return;
+      }
+
+      const exhausted = Boolean(voipConnectionEvent?.maxRetriesReached);
+      const message = voipConnectionEvent?.error
+        || (exhausted ? 'FreJun softphone registration failed' : 'FreJun softphone registration timed out');
+      setInitiationError(message);
+      setInitiationErrorCode(exhausted ? 'softphone_registration_failed' : 'softphone_registration_timeout');
+      setCallState('error');
+    }, SOFTPHONE_PREPARING_TIMEOUT_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [callState, voipConnectionEvent, voipStatus]);
+
+  useEffect(() => {
     if ((callState === 'answer_required' || callState === 'invite_received' || callState === 'active') && !activeCall) {
       setCallState('ended');
     }
@@ -1259,9 +1318,44 @@ function CallingModal({ call, onClose, onRefresh }) {
     retryVoip();
   };
 
-  const handleBlockingAction = () => {
+  const handleBlockingAction = async () => {
     if (!effectiveActionUrl) return;
-    window.location.href = effectiveActionUrl;
+
+    if (effectiveActionUrl.includes('/api/auth/frejun-login')) {
+      const appToken = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
+      if (!appToken) {
+        toast.error('Your session expired. Please sign in again and reconnect FreJun VoIP.');
+        return;
+      }
+
+      try {
+        const separator = effectiveActionUrl.includes('?') ? '&' : '?';
+        const response = await fetch(`${effectiveActionUrl}${separator}mode=url`, {
+          headers: {
+            Authorization: `Bearer ${appToken}`,
+          },
+        });
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok || !data?.auth_url) {
+          toast.error(data?.detail?.message || data?.detail || 'Unable to start FreJun OAuth');
+          return;
+        }
+
+        window.location.href = data.auth_url;
+        return;
+      } catch (_error) {
+        toast.error('Unable to reach the FreJun OAuth endpoint');
+        return;
+      }
+    }
+
+    if (/^https?:\/\//.test(effectiveActionUrl)) {
+      window.location.href = effectiveActionUrl;
+      return;
+    }
+
+    window.location.href = effectiveActionUrl.startsWith('/') ? effectiveActionUrl : `${BACKEND_BASE}/${effectiveActionUrl}`;
   };
 
   const handleSaveLog = async () => {
@@ -1305,7 +1399,14 @@ function CallingModal({ call, onClose, onRefresh }) {
   ];
   
   const callStatusMeta = callState === 'preparing_softphone'
-    ? { label: 'Preparing', tone: '#2563eb', bg: '#eff6ff', message: 'Registering the browser softphone...' }
+    ? {
+        label: 'Preparing',
+        tone: '#2563eb',
+        bg: '#eff6ff',
+        message: voipConnectionEvent?.maxRetriesReached
+          ? 'Recovering browser softphone registration...'
+          : 'Registering the browser softphone...',
+      }
     : callState === 'connecting'
       ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Starting the browser VoIP call...' }
       : callState === 'waiting_for_invite'
