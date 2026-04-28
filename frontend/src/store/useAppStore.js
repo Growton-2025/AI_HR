@@ -8,6 +8,25 @@ const CALL_RETRY_BACKOFF_MS = 3000
 
 axios.defaults.timeout = REQUEST_TIMEOUT_MS
 
+// PROD GRADE: Add a retry interceptor to handle transient network errors (like server restarts)
+axios.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+        const { config } = error;
+        
+        // Only retry if it's a network error (no response) and we haven't retried yet
+        if (!error.response && !config._retry && config.method === 'get') {
+            config._retry = true;
+            console.warn(`Transient network error on ${config.url}. Retrying...`);
+            // Wait 1.5s for the server to finish restarting if it was an auto-reload
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            return axios(config);
+        }
+        
+        return Promise.reject(error);
+    }
+);
+
 function getRequestErrorMessage(error, fallbackMessage) {
     if (error?.code === 'ECONNABORTED') {
         return 'Server is taking too long to respond'

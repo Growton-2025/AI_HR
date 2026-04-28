@@ -363,6 +363,12 @@ def get_frejun_post_auth_url(request: Request | None = None) -> str:
         host = (request.headers.get("host") or "").strip()
         if host:
             scheme = "http" if host.startswith("localhost:") or host.startswith("127.0.0.1:") else "https"
+            # [FIX] On local dev, redirect to the frontend port (3000) instead of the backend (3002)
+            if ":3002" in host:
+                host = host.replace(":3002", ":3000")
+            elif (host == "localhost" or host == "127.0.0.1") and scheme == "http":
+                host = f"{host}:3000"
+                
             return f"{scheme}://{host}/calls"
 
     return "http://localhost:3000/calls"
@@ -449,7 +455,7 @@ async def frejun_oauth_callback(
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    token_url = "https://api.frejun.com/api/v1/oauth/token/"
+    token_url = "https://api.frejun.com/api/v2/oauth/token/"
     form_data = {
         "grant_type": "authorization_code",
         "code": code,
