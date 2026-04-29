@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../store/useAppStore'
 import { Lock, Mail, ArrowRight, CheckCircle, Loader2, User, Phone, Eye, EyeOff, TrendingUp, Users, BarChart3 } from 'lucide-react'
@@ -217,25 +217,52 @@ function Login() {
   const googleButtonRef = useRef(null)
   const currentYear = new Date().getFullYear()
 
+  const renderGoogleButton = useCallback(() => {
+    if (!window.google?.accounts?.id || !googleButtonRef.current) return
+
+    const buttonWidth = Math.max(280, Math.floor(googleButtonRef.current.getBoundingClientRect().width))
+    googleButtonRef.current.innerHTML = ''
+
+    window.google.accounts.id.renderButton(googleButtonRef.current, {
+      theme: 'filled_black',
+      size: 'large',
+      width: buttonWidth,
+      shape: 'rectangular',
+      text: 'continue_with',
+    })
+  }, [])
+
   useEffect(() => {
     if (isAuthenticated) navigate('/')
   }, [isAuthenticated, navigate])
 
   useEffect(() => {
     if (!GOOGLE_CLIENT_ID || mode !== 'login') return
+    let resizeObserver
     const script = document.createElement('script')
     script.src = 'https://accounts.google.com/gsi/client'
     script.async = true
     script.defer = true
     script.onload = () => {
       window.google?.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: handleGoogleCallback })
-      if (googleButtonRef.current) {
-        window.google?.accounts.id.renderButton(googleButtonRef.current, { theme: 'filled_black', size: 'large', width: 380, shape: 'rectangular', text: 'continue_with' })
+      renderGoogleButton()
+
+      if (googleButtonRef.current && 'ResizeObserver' in window) {
+        resizeObserver = new window.ResizeObserver(() => {
+          renderGoogleButton()
+        })
+        resizeObserver.observe(googleButtonRef.current)
       }
     }
     document.body.appendChild(script)
-    return () => { try { document.body.removeChild(script) } catch (e) { } }
-  }, [mode])
+    return () => {
+      resizeObserver?.disconnect()
+      if (googleButtonRef.current) {
+        googleButtonRef.current.innerHTML = ''
+      }
+      try { document.body.removeChild(script) } catch (e) { }
+    }
+  }, [mode, renderGoogleButton])
 
   const handleGoogleCallback = async (response) => {
     setIsLoading(true)
