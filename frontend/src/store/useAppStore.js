@@ -168,7 +168,7 @@ const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
 export const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
 
 // Absolute base for OAuth and top-level redirects
-export const BACKEND_BASE = isLocalHost ? 'http://127.0.0.1:3002' : (API_URL || window.location.origin)
+export const BACKEND_BASE = isLocalHost ? 'http://127.0.0.1:8000' : (API_URL || window.location.origin)
 
 // WebSocket URL
 const BACKEND_HOST = useAbsoluteApi ? API_URL.replace(/^https?:\/\//, '') : window.location.host

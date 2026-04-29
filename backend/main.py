@@ -39,6 +39,13 @@ async def warm_backend_caches():
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
 
+    # Initialize Plivo background endpoint logic
+    try:
+        from backend.integrations import plivo_service
+        asyncio.create_task(plivo_service.setup_plivo())
+    except Exception as e:
+        print(f"Failed to kick off Plivo setup: {e}")
+
     # Run warmup tasks in the background so they don't block the application
     # from starting and responding to health checks.
     # We use a try-except here to catch any immediate setup errors.
@@ -140,6 +147,8 @@ app.include_router(calls.router, prefix="/api/calls", tags=["calls"])
 app.include_router(voip.router, prefix="/api/voip", tags=["voip"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
+from backend.api.routes import plivo
+app.include_router(plivo.router, prefix="/api/plivo", tags=["plivo"])
 from backend.api.routes import enrichment
 # Mount at /api for frontend calls to /api/enrich/{id}
 app.include_router(enrichment.router, prefix="/api", tags=["enrichment"])

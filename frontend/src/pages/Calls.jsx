@@ -423,7 +423,7 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
             <div style={{ maxWidth: '360px', textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '12px' }}>
               <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>No completed call activity yet</div>
               <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
-                {error || 'Completed FreJun calls with recordings, summaries, and outcomes will appear here as the activity timeline fills in.'}
+                {error || 'Completed Plivo calls with recordings, summaries, and outcomes will appear here as the activity timeline fills in.'}
               </div>
             </div>
           </div>
@@ -661,7 +661,7 @@ export default function Calls() {
       return;
     }
 
-    toast('Recording is not ready in FreJun yet');
+    toast('Recording is not ready in Plivo yet');
   };
 
   const filteredCalls = (calls || []).filter(c => 
@@ -993,7 +993,7 @@ export default function Calls() {
                               style={{ fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                             >
                               <ExternalLink size={14} />
-                              Open FreJun
+                              Open Plivo
                             </a>
                           )}
                           {!call.recording_url && (
@@ -1093,7 +1093,7 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
   const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
-  const { activeCall, answerCall, rejectCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, agentEmail, retryVoip } = useVoIP();
+  const { activeCall, answerCall, rejectCall, placeCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, agentEmail, retryVoip } = useVoIP();
   const isInitiated = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
@@ -1139,6 +1139,10 @@ function CallingModal({ call, onClose, onRefresh }) {
         return;
       }
 
+      if (placeCall && call.candidate_phone) {
+        await placeCall(call.candidate_phone);
+      }
+
       setCallState('waiting_for_invite');
     } catch (e) {
       const message = 'Connection error while starting browser VoIP call';
@@ -1147,7 +1151,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, initiateCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
+  }, [call.id, initiateCall, placeCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
 
   useEffect(() => {
     if (isInitiated.current) return;
@@ -1249,7 +1253,7 @@ function CallingModal({ call, onClose, onRefresh }) {
 
       const exhausted = Boolean(voipConnectionEvent?.maxRetriesReached);
       const message = voipConnectionEvent?.error
-        || (exhausted ? 'FreJun softphone registration failed' : 'FreJun softphone registration timed out');
+        || (exhausted ? 'Plivo softphone registration failed' : 'Plivo softphone registration timed out');
       setInitiationError(message);
       setInitiationErrorCode(exhausted ? 'softphone_registration_failed' : 'softphone_registration_timeout');
       setCallState('error');
@@ -1324,7 +1328,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     if (effectiveActionUrl.includes('/api/auth/frejun-login')) {
       const appToken = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
       if (!appToken) {
-        toast.error('Your session expired. Please sign in again and reconnect FreJun VoIP.');
+        toast.error('Your session expired. Please sign in again and reconnect Plivo VoIP.');
         return;
       }
 
@@ -1338,14 +1342,14 @@ function CallingModal({ call, onClose, onRefresh }) {
         const data = await response.json().catch(() => ({}));
 
         if (!response.ok || !data?.auth_url) {
-          toast.error(data?.detail?.message || data?.detail || 'Unable to start FreJun OAuth');
+          toast.error(data?.detail?.message || data?.detail || 'Unable to start Plivo connection');
           return;
         }
 
         window.location.href = data.auth_url;
         return;
       } catch (_error) {
-        toast.error('Unable to reach the FreJun OAuth endpoint');
+        toast.error('Unable to reach the Plivo endpoint');
         return;
       }
     }
@@ -1410,7 +1414,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     : callState === 'connecting'
       ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Starting the browser VoIP call...' }
       : callState === 'waiting_for_invite'
-        ? { label: 'Waiting', tone: '#d97706', bg: '#fef3c7', message: 'Waiting for FreJun to deliver the browser invite...' }
+        ? { label: 'Waiting', tone: '#d97706', bg: '#fef3c7', message: 'Waiting to deliver the browser invite...' }
         : callState === 'answer_required'
           ? { label: 'Answer Required', tone: '#d97706', bg: '#fef3c7', message: 'The browser invite is ready. Answer to join the call.' }
           : callState === 'invite_received'
@@ -1487,16 +1491,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                 </div>
               </div>
 
-              <div style={{ alignSelf: 'stretch', display: 'flex', justifyContent: 'space-between', gap: '12px', marginBottom: '24px' }}>
-                <div style={{ flex: 1, padding: '12px 14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Call Mode</div>
-                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>Browser VoIP</div>
-                </div>
-                <div style={{ flex: 1, padding: '12px 14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                  <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Softphone Agent</div>
-                  <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a' }}>{displayedAgentEmail}</div>
-                </div>
-              </div>
+              {/* Call Mode / Agent Cards Removed */}
 
               {hasBlockingVoipError && (
                 <div style={{ 
@@ -1778,7 +1773,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                       </div>
                     ) : (
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px', background: '#eff6ff', borderRadius: '8px', color: '#1e40af', fontSize: '13px', marginBottom: '24px' }}>
-                        <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Processing audio recording from FreJun...
+                        <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Polling for recording stream from Plivo...
                       </div>
                     )}
                     
@@ -1800,8 +1795,8 @@ function CallingModal({ call, onClose, onRefresh }) {
                       ) : (
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
                           {reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000 
-                            ? "FreJun native AI didn't reply in 10 mins. Running OpenAI fallback analysis..."
-                            : "Waiting for FreJun AI analysis..."}
+                            ? "Plivo native AI didn't reply in 10 mins. Running OpenAI fallback analysis..."
+                            : "Waiting for Plivo AI analysis..."}
                         </div>
                       )}
                     </div>

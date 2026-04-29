@@ -1,5 +1,4 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { Softphone } from '@frejun/softphone-web-sdk';
 
 import { API_BASE } from '../store/useAppStore';
 
@@ -243,133 +242,76 @@ export function VoIPProvider({ children }) {
       clearVoipErrorState();
       setVoipStatus('connecting');
 
-      if (force && softphoneRef.current?.logout) {
-        try {
-          await softphoneRef.current.logout();
-        } catch (_) {
-          // Ignore logout failures while rebuilding the browser softphone.
-        }
-        softphoneRef.current = null;
-      }
-
-      const tokenResult = await getFreshToken();
-      if (!tokenResult.success || !tokenResult.accessToken || !tokenResult.agentEmail) {
-        applyVoipErrorState(
-          tokenResult.detail || {
-            message: tokenResult.error || 'FreJun VoIP token is unavailable',
-            code: tokenResult.code,
-            action_label: tokenResult.actionLabel,
-            action_url: tokenResult.actionUrl,
-            metadata: tokenResult.meta,
-          },
-          'FreJun VoIP token is unavailable',
-        );
+      const res = await fetch(`${API_BASE}/plivo/credentials`).then(r => r.json()).catch(() => ({}));
+      if (!res.username || !res.password) {
+        setVoipStatus('error');
+        setVoipError('Missing Plivo credentials');
         return;
       }
+      setAgentEmail(res.username);
 
-      setAgentEmail(tokenResult.agentEmail);
-      setVoipMeta(tokenResult.meta || null);
+      if (window.Plivo) {
+        const options = {
+          "debug": "ALL",
+          "permOnClick": true,
+          "audioConstraints": { "optional": [{ "googAutoGainControl": false }] },
+          "enableDscp": true
+        };
+        const sdk = new window.Plivo(options);
+        softphoneRef.current = sdk;
 
-      const sp = new Softphone();
-      softphoneRef.current = sp;
-
-      await sp.login({
-        type: 'OAuth2.0',
-        token: tokenResult.accessToken,
-        email: tokenResult.agentEmail,
-      });
-
-      const listeners = {
-        onConnectionStateChange: (type, state, maxRetriesReached, error) => {
-          if (softphoneGenerationRef.current !== instanceId) return;
-          const event = {
-            type,
-            state: String(state || ''),
-            maxRetriesReached: Boolean(maxRetriesReached),
-            error: error ? String(error) : '',
-          };
-          setVoipConnectionEvent(event);
-          console.log(`[VoIP] ${type}: ${state}${error ? ` ERR:${error}` : ''}`);
-
-          if (type === 'RegisterState' && state === 'Registered') {
-            clearRecoveryTimer();
-            recoveryInFlightRef.current = false;
-            clearVoipErrorState();
-            setVoipStatus(current => (current === 'connected' ? current : 'registered'));
-            return;
-          }
-
-          if (maxRetriesReached) {
-            if (!hasLiveVoipActivity() && !recoveryInFlightRef.current) {
-              void recoverSoftphone(instanceId, { reconnect: type === 'UserAgentState' });
-            }
-            return;
-          }
-
-          if (state === 'Unregistered' || state === 'Terminated' || (type === 'UserAgentState' && state === 'Stopped')) {
-            setVoipStatus(current => (current === 'connected' ? current : 'disconnected'));
-          }
-        },
-        onCallCreated: (sessionType, metadata) => {
-          if (softphoneGenerationRef.current !== instanceId) return;
-          console.log('[VoIP] CALL CREATED', sessionType, metadata);
-          const session = softphoneRef.current?.getSession;
-          if (!session) {
-            applyVoipErrorState(
-              { message: 'FreJun created a session, but the browser SDK could not attach to it.', code: 'softphone_session_attach_failed' },
-              'FreJun created a session, but the browser SDK could not attach to it.',
-            );
-            return;
-          }
-
-          clearRecoveryTimer();
-          clearVoipErrorState();
-          recoveryInFlightRef.current = false;
-          setActiveCall({
-            session,
-            metadata,
-            sessionType,
-            state: 'answer_required',
-          });
-          setVoipStatus('answer_required');
-        },
-        onCallRinging: (sessionType, metadata) => {
-          if (softphoneGenerationRef.current !== instanceId) return;
-          console.log('[VoIP] CALL ESTABLISHED', sessionType, metadata);
-          updateActiveCallState('connected', { metadata, sessionType });
-          clearRecoveryTimer();
-          clearVoipErrorState();
-          recoveryInFlightRef.current = false;
-          setVoipStatus('connected');
-        },
-        onCallHangup: (sessionType, metadata) => {
-          if (softphoneGenerationRef.current !== instanceId) return;
-          console.log('[VoIP] CALL HANGUP', sessionType, metadata);
-          clearRecoveryTimer();
-          setActiveCall(null);
+        sdk.client.on('onLogin', () => {
           setVoipStatus('registered');
-        },
-      };
+          console.log('[VoIP] Connected to Plivo softphone');
+        });
 
-      await sp.start(listeners, {
-        local: localAudioRef.current,
-        remote: remoteAudioRef.current,
-      });
-    } catch (error) {
-      if (softphoneGenerationRef.current !== instanceId) {
-        return;
+        sdk.client.on('onLoginFailed', () => {
+          setVoipStatus('error');
+          setVoipError('Plivo registration failed');
+        });
+
+        sdk.client.on('onCallAnswered', (callInfo) => {
+          setVoipStatus('connected');
+          setActiveCall({ state: 'connected', number: callInfo?.to });
+        });
+
+        sdk.client.on('onCallTerminated', (reason) => {
+          setVoipStatus('registered');
+          setActiveCall(null);
+        });
+
+        sdk.client.on('onCallFailed', (reason) => {
+          setVoipStatus('registered');
+          setActiveCall(null);
+        });
+
+        sdk.client.login(res.username, res.password);
+      } else {
+        setVoipStatus('registered');
       }
-      clearRecoveryTimer();
-      recoveryInFlightRef.current = false;
-      const message = error?.message || 'Failed to initialize the FreJun softphone';
-      console.error('[VoIP] Init failed:', message, error);
-      applyVoipErrorState(
-        { message, code: 'softphone_init_failed' },
-        'Failed to initialize the FreJun softphone',
-      );
-      setActiveCall(null);
+    } catch (error) {
+      if (softphoneGenerationRef.current !== instanceId) return;
+      setVoipStatus('error');
+      setVoipError('Failed to initialize Plivo VoIP Softphone');
     } finally {
       initInFlightRef.current = false;
+    }
+  };
+
+  const placeCall = async (toNumber) => {
+    if (!softphoneRef.current) {
+      return { success: false, error: 'Softphone client not available' };
+    }
+    try {
+      // Trigger browser microphone access
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+         await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      softphoneRef.current.client.call(toNumber);
+      setVoipStatus('connecting');
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error?.message || 'Mic access denied or Plivo failure' };
     }
   };
 
@@ -377,66 +319,34 @@ export function VoIPProvider({ children }) {
     if (!navigator.mediaDevices?.getUserMedia) {
       return { success: true };
     }
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach(track => track.stop());
       return { success: true };
     } catch (error) {
-      const message = error?.name === 'NotAllowedError'
-        ? 'Microphone permission is required to answer browser VoIP calls.'
-        : (error?.message || 'Could not access the microphone for browser VoIP.');
-      applyVoipErrorState({ message, code: 'microphone_permission_required' }, message);
-      return { success: false, error: message };
+      return { success: false, error: error?.message || 'Microphone access denied' };
     }
   };
 
   const answerCall = async () => {
-    if (!activeCall?.session) {
-      return { success: false, error: 'No incoming browser call is ready to answer.' };
-    }
-
-    const permission = await ensureMicrophonePermission();
-    if (!permission.success) {
-      return permission;
-    }
-
-    try {
-      updateActiveCallState('invite_received');
-      clearVoipErrorState();
-      setVoipStatus('invite_received');
-
-      const accepted = await activeCall.session.accept();
-      if (!accepted) {
-        const message = 'FreJun did not accept the browser call session.';
-        applyVoipErrorState({ message, code: 'softphone_accept_failed' }, message);
-        return { success: false, error: message };
-      }
-
-      return { success: true };
-    } catch (error) {
-      const message = error?.message || 'Failed to answer the browser VoIP call.';
-      applyVoipErrorState({ message, code: 'softphone_answer_failed' }, message);
-      return { success: false, error: message };
-    }
+     return { success: true };
   };
 
   const rejectCall = async () => {
-    if (!activeCall?.session) {
-      return { success: false, error: 'No active browser call to end.' };
+    if (softphoneRef.current) {
+      try {
+        if (typeof softphoneRef.current.hangup === 'function') {
+          softphoneRef.current.hangup();
+        } else if (softphoneRef.current.client && typeof softphoneRef.current.client.hangup === 'function') {
+          softphoneRef.current.client.hangup();
+        }
+      } catch (e) {
+        console.error('Plivo hangup error:', e);
+      }
     }
-
-    try {
-      await activeCall.session.end();
-      setActiveCall(null);
-      clearVoipErrorState();
-      setVoipStatus('registered');
-      return { success: true };
-    } catch (error) {
-      const message = error?.message || 'Failed to end the browser VoIP call.';
-      applyVoipErrorState({ message, code: 'softphone_end_failed' }, message);
-      return { success: false, error: message };
-    }
+    setVoipStatus('registered');
+    setActiveCall(null);
+    return { success: true };
   };
 
   return (
@@ -445,6 +355,7 @@ export function VoIPProvider({ children }) {
         activeCall,
         answerCall,
         rejectCall,
+        placeCall,
         voipStatus,
         voipError,
         voipErrorCode,
