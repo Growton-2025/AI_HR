@@ -7,16 +7,54 @@ import {
   Shield, CheckCircle2, Users, BarChart2
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { useShallow } from 'zustand/react/shallow';
 
 // ── Tool definitions ─────────────────────────────────────────
 const TOOLS = [
-  { id: 'screening', label: 'Screening',    icon: Search,         color: '#6366f1', bg: '#eef2ff' },
-  { id: 'roles',     label: 'Manage Roles', icon: LayoutGrid,     color: '#d97706', bg: '#fffbeb' },
-  { id: 'campaigns', label: 'Campaigns',    icon: Monitor,        color: '#059669', bg: '#ecfdf5' },
-  { id: 'messages',  label: 'Messages',     icon: MessagesSquare, color: '#2563eb', bg: '#eff6ff' },
-  { id: 'calls',     label: 'Calls',        icon: Mic,            color: '#db2777', bg: '#fdf2f8' },
-  { id: 'talent_pool', label: 'Talent Pool', icon: Users,          color: '#f97316', bg: '#fff7ed' },
+  { id: 'screening', label: 'Screening',    icon: Search,         color: '#475569', bg: '#f8fafc' },
+  { id: 'roles',     label: 'Manage Roles', icon: LayoutGrid,     color: '#8b6b44', bg: '#fcf8f2' },
+  { id: 'campaigns', label: 'Campaigns',    icon: Monitor,        color: '#166534', bg: '#f3faf5' },
+  { id: 'messages',  label: 'Messages',     icon: MessagesSquare, color: '#1d4ed8', bg: '#f5f9ff' },
+  { id: 'calls',     label: 'Calls',        icon: Mic,            color: '#334155', bg: '#f8fafc' },
+  { id: 'talent_pool', label: 'Talent Pool', icon: Users,          color: '#7c3f13', bg: '#faf5ef' },
 ];
+
+const PANEL_STYLE = {
+  background: 'rgba(255,255,255,0.84)',
+  backdropFilter: 'blur(16px)',
+  border: '1px solid rgba(226,232,240,0.92)',
+  boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
+};
+
+const PRIMARY_BUTTON_STYLE = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: '8px',
+  padding: '10px 18px',
+  background: '#111827',
+  color: '#fff',
+  border: '1px solid #111827',
+  borderRadius: '12px',
+  fontWeight: 700,
+  fontSize: '14px',
+  cursor: 'pointer',
+  fontFamily: 'inherit',
+  boxShadow: '0 12px 24px rgba(15,23,42,0.12)',
+  transition: 'all 0.15s',
+};
+
+const SECONDARY_BUTTON_STYLE = {
+  padding: '12px',
+  background: '#fff',
+  border: '1px solid rgba(203,213,225,0.9)',
+  borderRadius: '10px',
+  color: '#475569',
+  fontWeight: 600,
+  fontSize: '14px',
+  cursor: 'pointer',
+  fontFamily: 'inherit',
+};
 
 // ── Compact Toggle ────────────────────────────────────────────
 function Toggle({ checked, onChange, color }) {
@@ -48,7 +86,7 @@ function Toggle({ checked, onChange, color }) {
 // ── Avatar ────────────────────────────────────────────────────
 function Avatar({ name }) {
   const initials = (name || '?').split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
-  const palette = ['#6366f1','#f59e0b','#10b981','#3b82f6','#ec4899','#f97316','#8b5cf6'];
+  const palette = ['#475569','#8b6b44','#166534','#334155','#1d4ed8','#7c3f13','#6b7280'];
   const color = palette[(name?.charCodeAt(0) || 0) % palette.length];
   return (
     <div style={{
@@ -81,11 +119,11 @@ function ModalInput({ icon: Icon, label, type = 'text', value, onChange, placeho
           onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
           style={{
             width: '100%', padding: '11px 13px 11px 40px',
-            background: '#f8fafc',
-            border: `1.5px solid ${focused ? '#f97316' : '#e2e8f0'}`,
+            background: '#fff',
+            border: `1px solid ${focused ? 'rgba(194, 124, 63, 0.4)' : 'rgba(203,213,225,0.9)'}`,
             borderRadius: '10px', color: '#0f172a', fontSize: '14px',
             outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s',
-            boxShadow: focused ? '0 0 0 3px rgba(249,115,22,0.08)' : 'none',
+            boxShadow: focused ? '0 0 0 3px rgba(194,124,63,0.10)' : 'none',
             fontFamily: 'inherit',
           }}
         />
@@ -121,7 +159,13 @@ function SkeletonRow() {
 
 // ── Main Component ────────────────────────────────────────────
 const UserManagement = () => {
-  const { recruiters, fetchRecruiters, createRecruiter, updateRecruiterPermissions, deleteRecruiter } = useAppStore();
+  const { recruiters, fetchRecruiters, createRecruiter, updateRecruiterPermissions, deleteRecruiter } = useAppStore(useShallow((state) => ({
+    recruiters: state.recruiters,
+    fetchRecruiters: state.fetchRecruiters,
+    createRecruiter: state.createRecruiter,
+    updateRecruiterPermissions: state.updateRecruiterPermissions,
+    deleteRecruiter: state.deleteRecruiter,
+  })));
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [newUser, setNewUser] = useState({ name: '', email: '', password: '' });
   const [loading, setLoading] = useState(false);
@@ -181,11 +225,14 @@ const UserManagement = () => {
   const maxSourced = Math.max(...recruiterStats.map(r => r.sourced), 1);
 
   return (
-    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif' }}>
+    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', padding: '8px 0 12px' }}>
 
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '28px' }}>
+      <div style={{ ...PANEL_STYLE, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '24px', padding: '24px 28px', borderRadius: '24px' }}>
         <div>
+          <div style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>
+            Team operations
+          </div>
           <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', marginBottom: '5px', letterSpacing: '-0.5px' }}>
             Recruiter Management
           </h1>
@@ -209,18 +256,9 @@ const UserManagement = () => {
           </button>
           <button
             onClick={() => setIsModalOpen(true)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: '8px',
-              padding: '10px 18px',
-              background: '#f97316', color: 'white',
-              border: 'none', borderRadius: '10px',
-              fontWeight: 700, fontSize: '14px',
-              cursor: 'pointer', fontFamily: 'inherit',
-              boxShadow: '0 2px 8px rgba(249,115,22,0.25)',
-              transition: 'all 0.15s',
-            }}
-            onMouseEnter={e => e.currentTarget.style.background = '#ea580c'}
-            onMouseLeave={e => e.currentTarget.style.background = '#f97316'}
+            style={PRIMARY_BUTTON_STYLE}
+            onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 16px 28px rgba(15,23,42,0.16)'; }}
+            onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = '0 12px 24px rgba(15,23,42,0.12)'; }}
           >
             <UserPlus size={16} /> Add Recruiter
           </button>
@@ -230,15 +268,14 @@ const UserManagement = () => {
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '14px', marginBottom: '24px' }}>
         {[
-          { label: 'Team Members', value: recruiters.length, accent: '#f97316', icon: User, loading: isFetching && recruiters.length === 0 },
-          { label: 'Permissions Granted', value: totalPerms, accent: '#6366f1', icon: Shield, loading: isFetching && recruiters.length === 0 },
-          { label: 'Tools Available', value: TOOLS.length, accent: '#059669', icon: CheckCircle2, loading: false },
+          { label: 'Team Members', value: recruiters.length, accent: '#8b6b44', icon: User, loading: isFetching && recruiters.length === 0 },
+          { label: 'Permissions Granted', value: totalPerms, accent: '#475569', icon: Shield, loading: isFetching && recruiters.length === 0 },
+          { label: 'Tools Available', value: TOOLS.length, accent: '#166534', icon: CheckCircle2, loading: false },
         ].map(({ label, value, accent, icon: Icon, loading }) => (
           <div key={label} style={{
-            background: '#fff', border: '1.5px solid #f1f5f9',
+            ...PANEL_STYLE,
             borderRadius: '14px', padding: '18px 20px',
             display: 'flex', alignItems: 'center', gap: '14px',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
           }}>
             <div style={{ width: 40, height: 40, borderRadius: '10px', background: accent + '12', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <Icon size={18} color={accent} />
@@ -257,19 +294,17 @@ const UserManagement = () => {
 
       {/* Charts Section (Admin Special) */}
       <div style={{ 
-        background: '#fff', 
-        border: '1.5px solid #f1f5f9', 
+        ...PANEL_STYLE,
         borderRadius: '20px', 
         padding: '24px', 
         marginBottom: '24px',
-        boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
       }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
           <div>
             <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '4px' }}>Recruiter Performance</h2>
             <p style={{ fontSize: '13px', color: '#94a3b8' }}>Comparing sourcing volume and successful conversions</p>
           </div>
-          <BarChart2 size={20} color="#f97316" />
+          <BarChart2 size={20} color="#64748b" />
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -284,7 +319,7 @@ const UserManagement = () => {
                   <div style={{ 
                     width: `${(stat.sourced / maxSourced) * 100}%`, 
                     height: '100%', 
-                    background: '#f97316',
+                    background: '#8b6b44',
                     transition: 'width 0.6s cubic-bezier(0.16, 1, 0.3, 1)'
                   }} />
                   <div style={{ position: 'absolute', right: '8px', fontSize: '10px', fontWeight: 800, color: stat.sourced / maxSourced > 0.8 ? '#fff' : '#64748b' }}>
@@ -305,7 +340,7 @@ const UserManagement = () => {
                 </div>
               </div>
               <div style={{ width: '80px', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
-                 <span style={{ fontSize: '11px', fontWeight: 700, color: '#f97316' }}>Sourced</span>
+                 <span style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44' }}>Sourced</span>
                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#22c55e' }}>Shortlisted</span>
               </div>
             </div>
@@ -319,7 +354,7 @@ const UserManagement = () => {
       </div>
 
       {/* Table */}
-      <div style={{ background: '#fff', border: '1.5px solid #f1f5f9', borderRadius: '16px', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+      <div style={{ ...PANEL_STYLE, borderRadius: '18px', overflow: 'hidden' }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: '#f8fafc', borderBottom: '1.5px solid #f1f5f9' }}>
@@ -349,7 +384,7 @@ const UserManagement = () => {
                     </div>
                     <p style={{ color: '#64748b', fontWeight: 600, fontSize: '15px', margin: 0 }}>No recruiters yet</p>
                     <p style={{ color: '#cbd5e1', fontSize: '13px', margin: 0 }}>Add your first team member to get started</p>
-                    <button onClick={() => setIsModalOpen(true)} style={{ marginTop: '4px', padding: '8px 18px', background: '#fff7ed', border: '1.5px solid #fed7aa', borderRadius: '8px', color: '#f97316', fontWeight: 700, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+                    <button onClick={() => setIsModalOpen(true)} style={{ marginTop: '4px', padding: '8px 18px', background: '#fff', border: '1px solid rgba(203,213,225,0.9)', borderRadius: '10px', color: '#334155', fontWeight: 700, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
                       + Add First Recruiter
                     </button>
                   </div>
@@ -496,7 +531,7 @@ const UserManagement = () => {
         >
           <div style={{
             background: '#fff',
-            border: '1.5px solid #f1f5f9',
+            border: '1px solid rgba(226,232,240,0.92)',
             borderRadius: '20px',
             width: '100%', maxWidth: '420px',
             padding: '32px',
@@ -524,11 +559,11 @@ const UserManagement = () => {
 
               <div style={{ display: 'flex', gap: '10px', marginTop: '24px' }}>
                 <button type="button" onClick={() => setIsModalOpen(false)}
-                  style={{ flex: 1, padding: '12px', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: '10px', color: '#64748b', fontWeight: 600, fontSize: '14px', cursor: 'pointer', fontFamily: 'inherit' }}>
+                  style={{ ...SECONDARY_BUTTON_STYLE, flex: 1 }}>
                   Cancel
                 </button>
                 <button type="submit" disabled={loading}
-                  style={{ flex: 1.5, padding: '12px', background: '#f97316', border: 'none', borderRadius: '10px', color: '#fff', fontWeight: 700, fontSize: '14px', cursor: loading ? 'not-allowed' : 'pointer', fontFamily: 'inherit', opacity: loading ? 0.75 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', boxShadow: '0 2px 8px rgba(249,115,22,0.25)', transition: 'all 0.15s' }}>
+                  style={{ ...PRIMARY_BUTTON_STYLE, flex: 1.5, padding: '12px', opacity: loading ? 0.75 : 1, cursor: loading ? 'not-allowed' : 'pointer' }}>
                   {loading ? <Loader2 size={17} style={{ animation: 'spin 1s linear infinite' }} /> : <><UserPlus size={16} /> Create Recruiter</>}
                 </button>
               </div>

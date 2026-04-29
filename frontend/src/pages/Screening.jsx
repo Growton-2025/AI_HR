@@ -3,6 +3,7 @@ import { useAppStore } from '../store/useAppStore'
 import SearchResults from '../components/SearchResults'
 import RoleAssignment from '../components/RoleAssignment'
 import { Search, SearchCode, X, Cpu, Database, Check, Loader2, SearchX, AlertCircle, Activity, Sparkles, RotateCcw } from 'lucide-react'
+import { useShallow } from 'zustand/react/shallow'
 
 function buildRetrySuggestions(query) {
     const trimmedQuery = (query || '').trim()
@@ -44,7 +45,23 @@ function Screening() {
         selectedCandidates,
         screenStep,
         setScreenStep,
-    } = useAppStore()
+    } = useAppStore(useShallow((state) => ({
+        searchQuery: state.searchQuery,
+        setSearchQuery: state.setSearchQuery,
+        isSearching: state.isSearching,
+        searchProgress: state.searchProgress,
+        statusMessage: state.statusMessage,
+        searchResults: state.searchResults,
+        usage: state.usage,
+        searchOutcome: state.searchOutcome,
+        lastSearchError: state.lastSearchError,
+        searchCandidatesStream: state.searchCandidatesStream,
+        stopSearch: state.stopSearch,
+        clearSearch: state.clearSearch,
+        selectedCandidates: state.selectedCandidates,
+        screenStep: state.screenStep,
+        setScreenStep: state.setScreenStep,
+    })))
 
     const [inputQuery, setInputQuery] = useState(searchQuery)
     const selectedCount = Object.keys(selectedCandidates).length

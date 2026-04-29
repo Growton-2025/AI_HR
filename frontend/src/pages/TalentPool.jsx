@@ -2,6 +2,7 @@ import React, { startTransition, useState, useEffect, useCallback, useRef } from
 import { useAppStore, API_BASE } from '../store/useAppStore';
 import axios from 'axios';
 import { toast } from 'sonner';
+import { useShallow } from 'zustand/react/shallow';
 import {
   Search, ExternalLink, ChevronLeft, ChevronRight, Filter,
   User, Building2, MapPin, Briefcase, BarChart2,
@@ -14,7 +15,7 @@ import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components
 // ── Clickable Editable Cell (renders as <td>) ────────────────
 // Always editable — click to enter edit mode with existing value pre-filled.
 // Pressing Enter or blurring saves. Clearing the value saves empty → renders as NA.
-function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'NA' }) {
+function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'Not available' }) {
   const [isEditing, setIsEditing] = useState(false);
   const [tempValue, setTempValue] = useState('');
   const [displayValue, setDisplayValue] = useState(value || '');
@@ -46,7 +47,7 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'NA' 
   if (isEditing) {
     return (
       <td
-        style={{ padding: '0 14px', borderRight: '1px solid #f1f5f9' }}
+        style={{ padding: '0 14px', borderRight: '1px solid #eef2f7' }}
         onClick={(e) => e.stopPropagation()}
       >
         <input
@@ -59,8 +60,9 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'NA' 
             if (e.key === 'Escape') { setIsEditing(false); }
           }}
           style={{
-            width: '100%', padding: '4px 6px', border: '1px solid #f97316',
-            borderRadius: '4px', fontSize: '12px', fontFamily: 'inherit', outline: 'none',
+            width: '100%', padding: '6px 8px', border: '1px solid rgba(203, 213, 225, 0.9)',
+            borderRadius: '8px', fontSize: '12px', fontFamily: 'inherit', outline: 'none',
+            background: '#fff', color: '#111827',
           }}
         />
       </td>
@@ -71,18 +73,20 @@ function ClickableEditableCell({ id, field, value, onUpdate, placeholder = 'NA' 
     <td
       onClick={startEditing}
       style={{
-        padding: '13px 14px', borderRight: '1px solid #f1f5f9',
+        padding: '13px 14px', borderRight: '1px solid #eef2f7',
         fontSize: '12px', cursor: 'text',
-        color: isNA ? '#f97316' : '#334155',
+        color: isNA ? '#94a3b8' : '#334155',
       }}
       title="Click to edit"
     >
       <span style={{
         padding: isNA ? '2px 6px' : '0',
         borderRadius: '4px',
-        background: isNA ? 'rgba(249,115,22,0.06)' : 'transparent',
-        border: isNA ? '1px dashed rgba(249,115,22,0.4)' : 'none',
+        background: isNA ? '#f8fafc' : 'transparent',
+        border: isNA ? '1px solid #e2e8f0' : 'none',
         display: 'inline-block',
+        fontStyle: isNA ? 'italic' : 'normal',
+        fontWeight: isNA ? 500 : 400,
       }}>
         {isNA ? placeholder : displayValue}
         {loading && ' ⟳'}
@@ -326,8 +330,8 @@ function ExpBar({ value, max = 40 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
       <span style={{ fontSize: '13px', fontWeight: 600, color: '#0f172a', minWidth: 32 }}>{value}y</span>
-      <div style={{ width: 44, height: 5, background: '#e2e8f0', borderRadius: 3, overflow: 'hidden' }}>
-        <div style={{ width: `${pct}%`, height: '100%', background: '#3b82f6', borderRadius: 3 }} />
+      <div style={{ width: 44, height: 5, background: '#dbe1e8', borderRadius: 999, overflow: 'hidden' }}>
+        <div style={{ width: `${pct}%`, height: '100%', background: '#0f172a', borderRadius: 999 }} />
       </div>
     </div>
   );
@@ -353,13 +357,13 @@ function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange
 
   return (
     <div style={{ marginBottom: 14 }}>
-      <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+      <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>
         {label}
       </label>
       <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: '8px' }}>
         <div style={{ position: 'relative' }}>
           {Icon && (
-            <span style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#94a3b8', display: 'flex' }}>
+            <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: '#9ca3af', display: 'flex' }}>
               <Icon size={13} />
             </span>
           )}
@@ -370,14 +374,23 @@ function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange
             onKeyDown={handleKeyDown}
             placeholder={values.length === 0 ? placeholder : "Add more..."}
             style={{
-              width: '100%', padding: Icon ? '8px 10px 8px 30px' : '8px 10px',
-              background: '#fff', border: '1.5px solid #e2e8f0',
-              borderRadius: 8, color: '#0f172a', fontSize: 13,
-              outline: 'none', transition: 'border-color 0.15s',
+              width: '100%', padding: Icon ? '10px 12px 10px 34px' : '10px 12px',
+              background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(203, 213, 225, 0.9)',
+              borderRadius: 12, color: '#111827', fontSize: 13,
+              outline: 'none', transition: 'border-color 0.15s, box-shadow 0.15s, background 0.15s',
               fontFamily: 'inherit', boxSizing: 'border-box',
+              boxShadow: 'inset 0 1px 2px rgba(15,23,42,0.03)',
             }}
-            onFocus={e => e.target.style.borderColor = '#f97316'}
-            onBlur={e => e.target.style.borderColor = '#e2e8f0'}
+            onFocus={e => {
+              e.target.style.borderColor = 'rgba(194, 124, 63, 0.5)';
+              e.target.style.boxShadow = '0 0 0 3px rgba(194, 124, 63, 0.12)';
+              e.target.style.background = '#fff';
+            }}
+            onBlur={e => {
+              e.target.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+              e.target.style.boxShadow = 'inset 0 1px 2px rgba(15,23,42,0.03)';
+              e.target.style.background = 'rgba(255,255,255,0.92)';
+            }}
           />
         </div>
         {values.length > 0 && (
@@ -385,9 +398,9 @@ function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange
             {values.map(tag => (
               <span key={tag} style={{
                 display: 'inline-flex', alignItems: 'center', gap: '6px',
-                background: '#f1f5f9', color: '#475569', padding: '3px 8px',
-                borderRadius: '6px', fontSize: '11px', fontWeight: 600,
-                border: '1px solid #e2e8f0'
+                background: '#eef2f6', color: '#334155', padding: '4px 9px',
+                borderRadius: '999px', fontSize: '11px', fontWeight: 600,
+                border: '1px solid rgba(203, 213, 225, 0.9)'
               }}>
                 {tag}
                 <X size={12} style={{ cursor: 'pointer', color: '#94a3b8' }} onClick={() => removeTag(tag)} />
@@ -403,7 +416,7 @@ function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange
 function SelectFilter({ label, value, onChange, options, placeholder }) {
   return (
     <div style={{ marginBottom: 14 }}>
-      <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+      <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>
         {label}
       </label>
       <div style={{ position: 'relative' }}>
@@ -411,19 +424,29 @@ function SelectFilter({ label, value, onChange, options, placeholder }) {
           value={value}
           onChange={e => onChange(e.target.value)}
           style={{
-            width: '100%', padding: '8px 28px 8px 10px',
-            background: '#fff', border: '1.5px solid #e2e8f0',
-            borderRadius: 8, color: value ? '#0f172a' : '#94a3b8', fontSize: 13,
+            width: '100%', padding: '10px 32px 10px 12px',
+            background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(203, 213, 225, 0.9)',
+            borderRadius: 12, color: value ? '#111827' : '#94a3b8', fontSize: 13,
             outline: 'none', appearance: 'none', cursor: 'pointer',
             fontFamily: 'inherit', boxSizing: 'border-box',
+            boxShadow: 'inset 0 1px 2px rgba(15,23,42,0.03)',
+            transition: 'border-color 0.15s, box-shadow 0.15s, background 0.15s',
           }}
-          onFocus={e => e.target.style.borderColor = '#f97316'}
-          onBlur={e => e.target.style.borderColor = '#e2e8f0'}
+          onFocus={e => {
+            e.target.style.borderColor = 'rgba(194, 124, 63, 0.5)';
+            e.target.style.boxShadow = '0 0 0 3px rgba(194, 124, 63, 0.12)';
+            e.target.style.background = '#fff';
+          }}
+          onBlur={e => {
+            e.target.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+            e.target.style.boxShadow = 'inset 0 1px 2px rgba(15,23,42,0.03)';
+            e.target.style.background = 'rgba(255,255,255,0.92)';
+          }}
         >
           <option value="">{placeholder}</option>
           {options.map(o => <option key={o} value={o}>{o}</option>)}
         </select>
-        <ChevronDown size={13} color="#94a3b8" style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
+        <ChevronDown size={13} color="#94a3b8" style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
       </div>
     </div>
   );
@@ -436,17 +459,17 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
   return (
     <div style={{ marginBottom: 18 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <label style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+        <label style={{ fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
           {label}
         </label>
-        <span style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8' }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: '#64748b' }}>
           {minValue} - {maxValue} yrs
         </span>
       </div>
 
       <div style={{ position: 'relative', height: 20, display: 'flex', alignItems: 'center', padding: '0 4px' }}>
         {/* Track Background */}
-        <div style={{ position: 'absolute', left: 4, right: 4, height: 4, background: '#e2e8f0', borderRadius: 2 }} />
+        <div style={{ position: 'absolute', left: 4, right: 4, height: 4, background: '#d8dee8', borderRadius: 999 }} />
 
         {/* Active Range Highlight */}
         <div style={{
@@ -454,8 +477,8 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
           left: `calc(4px + ${minPos}%)`,
           width: `${maxPos - minPos}%`,
           height: 4,
-          background: '#3b82f6',
-          borderRadius: 2,
+          background: '#0f172a',
+          borderRadius: 999,
           zIndex: 1
         }} />
 
@@ -493,9 +516,9 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
             width: 16px;
             height: 16px;
             border-radius: 50%;
-            background: #2563eb;
+            background: #0f172a;
             border: 2px solid #fff;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+            box-shadow: 0 6px 12px rgba(15,23,42,0.18);
             cursor: pointer;
             z-index: 10;
           }
@@ -505,9 +528,9 @@ function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
             width: 16px;
             height: 16px;
             border-radius: 50%;
-            background: #2563eb;
+            background: #0f172a;
             border: 2px solid #fff;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+            box-shadow: 0 6px 12px rgba(15,23,42,0.18);
             cursor: pointer;
             z-index: 10;
           }
@@ -523,6 +546,24 @@ const CONTACT_INFO_STORAGE_KEY = 'talent-pool-contact-info-v1';
 
 function normalizeTalentPoolText(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeContactValue(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const normalized = text.toLowerCase();
+  if (['na', 'n/a', 'none', 'null', 'undefined'].includes(normalized)) {
+    return '';
+  }
+  return text;
+}
+
+function resolveContactValue(...values) {
+  for (const value of values) {
+    const normalized = normalizeContactValue(value);
+    if (normalized) return normalized;
+  }
+  return '';
 }
 
 function splitTalentPoolFilterValues(values = [], inputValue = '') {
@@ -694,7 +735,8 @@ function buildLocalTalentPoolView(rows = [], {
 const readPersistedContactInfo = () => {
   if (typeof window === 'undefined') return {};
   try {
-    const raw = window.sessionStorage.getItem(CONTACT_INFO_STORAGE_KEY);
+    const raw = window.localStorage.getItem(CONTACT_INFO_STORAGE_KEY)
+      || window.sessionStorage.getItem(CONTACT_INFO_STORAGE_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : {};
@@ -712,37 +754,71 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
     : 0;
 
   const cards = [
-    { label: 'Total Sourced', value: summary.total_sourced, icon: UserPlus, color: '#f97316' },
-    { label: 'Pipeline Success', value: summary.shortlisted, icon: Activity, color: '#22c55e', status: 'Shortlisted' },
-    { label: 'Conversion', value: `${conversionRate}%`, icon: BarChart2, color: '#3b82f6' },
-    { label: 'Following Up', value: summary.pipeline_health['Followup / In conversation'] || 0, icon: MessageSquareMore, color: '#eab308', status: 'Followup / In conversation' },
+    { label: 'Total sourced', value: summary.total_sourced, icon: UserPlus, tone: 'warm' },
+    { label: 'Shortlisted', value: summary.shortlisted, icon: Activity, tone: 'emerald', status: 'Shortlisted' },
+    { label: 'Conversion rate', value: `${conversionRate}%`, icon: BarChart2, tone: 'slate' },
+    { label: 'In follow up', value: summary.pipeline_health?.['Followup / In conversation'] || 0, icon: MessageSquareMore, tone: 'amber', status: 'Followup / In conversation' },
   ];
 
   const recruiterPerf = analytics.recruiter_performance || [];
+  const tones = {
+    warm: {
+      accent: '#c27c3f',
+      iconBg: 'rgba(194, 124, 63, 0.12)',
+      cardBg: 'linear-gradient(180deg, #ffffff 0%, #fcf8f3 100%)',
+      border: 'rgba(194, 124, 63, 0.18)',
+    },
+    emerald: {
+      accent: '#2f855a',
+      iconBg: 'rgba(47, 133, 90, 0.12)',
+      cardBg: 'linear-gradient(180deg, #ffffff 0%, #f5fbf7 100%)',
+      border: 'rgba(47, 133, 90, 0.16)',
+    },
+    slate: {
+      accent: '#334155',
+      iconBg: 'rgba(51, 65, 85, 0.12)',
+      cardBg: 'linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)',
+      border: 'rgba(148, 163, 184, 0.2)',
+    },
+    amber: {
+      accent: '#9a6b28',
+      iconBg: 'rgba(154, 107, 40, 0.12)',
+      cardBg: 'linear-gradient(180deg, #ffffff 0%, #fcf8f2 100%)',
+      border: 'rgba(154, 107, 40, 0.16)',
+    },
+  };
 
   return (
-    <div style={{ padding: '20px', background: '#fff', borderBottom: '1.5px solid #f1f5f9' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: role === 'admin' && recruiterPerf.length > 0 ? '24px' : '0' }}>
+    <div style={{ padding: 0 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '12px', marginBottom: role === 'admin' && recruiterPerf.length > 0 ? '16px' : '0' }}>
         {cards.map((card, i) => {
           const Icon = card.icon;
+          const tone = tones[card.tone] || tones.slate;
           return (
             <div
               key={i}
               onClick={() => card.status && onStatClick(card.status)}
               style={{
-                background: '#fff', padding: '16px', borderRadius: '16px', border: '1.5px solid #f1f5f9',
-                cursor: card.status ? 'pointer' : 'default', transition: 'all 0.2s',
-                display: 'flex', alignItems: 'center', gap: '16px',
-                boxShadow: '0 1px 3px rgba(0,0,0,0.02)'
+                background: tone.cardBg,
+                padding: '16px',
+                borderRadius: '18px',
+                border: `1px solid ${tone.border}`,
+                cursor: card.status ? 'pointer' : 'default',
+                transition: 'transform 0.2s ease, box-shadow 0.2s ease',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '14px',
+                boxShadow: '0 12px 24px rgba(15,23,42,0.04)'
               }}
-              onMouseEnter={e => card.status && (e.currentTarget.style.transform = 'translateY(-2px)', e.currentTarget.style.boxShadow = '0 10px 15px -3px rgba(0,0,0,0.05)')}
-              onMouseLeave={e => card.status && (e.currentTarget.style.transform = 'none', e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.02)')}
+              onMouseEnter={e => card.status && (e.currentTarget.style.transform = 'translateY(-1px)', e.currentTarget.style.boxShadow = '0 16px 30px rgba(15,23,42,0.06)')}
+              onMouseLeave={e => card.status && (e.currentTarget.style.transform = 'none', e.currentTarget.style.boxShadow = '0 12px 24px rgba(15,23,42,0.04)')}
             >
-              <div style={{ width: 44, height: 44, borderRadius: '12px', background: `${card.color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: card.color }}>
+              <div style={{ width: 42, height: 42, borderRadius: '14px', background: tone.iconBg, display: 'flex', alignItems: 'center', justifyContent: 'center', color: tone.accent }}>
                 <Icon size={20} />
               </div>
-              <div>
-                <div style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.02em', marginTop: '4px' }}>{card.label}</div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>{card.label}</div>
+                <div style={{ fontSize: '28px', lineHeight: 1, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.03em' }}>{card.value?.toLocaleString?.() || card.value}</div>
               </div>
             </div>
           );
@@ -750,9 +826,9 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
       </div>
 
       {role === 'admin' && recruiterPerf.length > 0 && (
-        <div style={{ background: '#f8fafc', borderRadius: '16px', padding: '16px', border: '1px solid #e2e8f0' }}>
-          <div style={{ fontSize: '12px', fontWeight: 800, color: '#0f172a', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Users size={14} color="#f97316" /> Recruiter Leaderboard
+        <div style={{ background: 'rgba(248, 250, 252, 0.82)', borderRadius: '18px', padding: '14px', border: '1px solid rgba(226, 232, 240, 0.9)' }}>
+          <div style={{ fontSize: '12px', fontWeight: 800, color: '#0f172a', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Users size={14} color="#64748b" /> Recruiter performance
           </div>
           <div style={{ display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '4px' }}>
             {recruiterPerf.map((perf, i) => (
@@ -760,19 +836,19 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
                 key={i}
                 onClick={() => onRecruiterClick(perf.recruiter)}
                 style={{
-                  minWidth: '160px', background: '#fff', padding: '10px 14px', borderRadius: '12px', border: '1px solid #e2e8f0',
+                  minWidth: '176px', background: '#fff', padding: '12px 14px', borderRadius: '14px', border: '1px solid rgba(226, 232, 240, 0.95)',
                   display: 'flex', flexDirection: 'column', gap: '4px', cursor: 'pointer', transition: 'all 0.15s'
                 }}
-                onMouseEnter={e => e.currentTarget.style.borderColor = '#f97316'}
-                onMouseLeave={e => e.currentTarget.style.borderColor = '#e2e8f0'}
+                onMouseEnter={e => e.currentTarget.style.borderColor = 'rgba(194, 124, 63, 0.32)'}
+                onMouseLeave={e => e.currentTarget.style.borderColor = 'rgba(226, 232, 240, 0.95)'}
               >
                 <div style={{ fontSize: '13px', fontWeight: 700, color: '#0f172a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{perf.recruiter}</div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span style={{ fontSize: '11px', color: '#64748b' }}>{perf.sourced} sourced</span>
-                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#22c55e' }}>{perf.conversion}% hit</span>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: '#334155' }}>{perf.conversion}% hit</span>
                 </div>
-                <div style={{ height: '4px', width: '100%', background: '#f1f5f9', borderRadius: '2px', overflow: 'hidden', marginTop: '4px' }}>
-                  <div style={{ height: '100%', width: `${perf.conversion}%`, background: '#22c55e' }} />
+                <div style={{ height: '4px', width: '100%', background: '#e2e8f0', borderRadius: '999px', overflow: 'hidden', marginTop: '4px' }}>
+                  <div style={{ height: '100%', width: `${perf.conversion}%`, background: '#334155' }} />
                 </div>
               </div>
             ))}
@@ -788,6 +864,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick })
 // Structure: { [candidateId]: { email: { messages, ts }, linkedin: { messages, ts } } }
 const _chatCache = {};
 const CHAT_CACHE_TTL_MS = 30_000; // 30 seconds — same as backend cache TTL
+const OPTIMISTIC_MESSAGE_TTL_MS = 15 * 60 * 1000;
 
 function _getCached(candidateId, platform) {
   const entry = _chatCache[candidateId]?.[platform];
@@ -821,63 +898,88 @@ function ConversationModal({ candidate, onClose }) {
   // loading = active tab has no messages yet; refreshing = manual sync in progress
   const [loading, setLoading] = useState(!_getCached(candidate.id, defaultPlatform));
   const [refreshing, setRefreshing] = useState(false);
-  const [liSyncing, setLiSyncing] = useState(false);
+  const [syncingByPlatform, setSyncingByPlatform] = useState({ email: false, linkedin: false });
   const [replyText, setReplyText] = useState('');
   const [sending, setSending] = useState(false);
   const [localSentMessagesByPlatform, setLocalSentMessagesByPlatform] = useState({ email: [], linkedin: [] });
 
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
   const sendChatReply = useAppStore(state => state.sendChatReply);
-  const { heyreachCampaignId, triggerHeyReachOutreach } = useAppStore();
+  const { heyreachCampaignId, triggerHeyReachOutreach } = useAppStore(useShallow((state) => ({
+    heyreachCampaignId: state.heyreachCampaignId,
+    triggerHeyReachOutreach: state.triggerHeyReachOutreach,
+  })));
   const [isTriggering, setIsTriggering] = useState(false);
   const [hasTriggered, setHasTriggered] = useState(false);
   const messagesEndRef = useRef(null);
   const threadsRef = useRef(threads);
   const requestSeqRef = useRef({ email: 0, linkedin: 0 });
   const candidateIdRef = useRef(candidate.id);
+  const activePlatformRef = useRef(defaultPlatform);
 
   useEffect(() => { threadsRef.current = threads; }, [threads]);
   useEffect(() => { candidateIdRef.current = candidate.id; }, [candidate.id]);
+  useEffect(() => { activePlatformRef.current = platform; }, [platform]);
 
   const activeThread = threads[platform] || { messages: [], loaded: false, error: '' };
+  const activeThreadSyncing = Boolean(syncingByPlatform[platform]);
   const messages = activeThread.messages || [];
   const localSentMessages = localSentMessagesByPlatform[platform] || [];
-  const conversationAccent = platform === 'linkedin' ? '#0077b5' : '#f97316';
+  const conversationAccent = '#111827';
+  const conversationAccentMuted = '#64748b';
+  const conversationBorder = 'rgba(203, 213, 225, 0.92)';
+  const platformTabs = [
+    { id: 'linkedin', label: 'LinkedIn', icon: Linkedin },
+    { id: 'email', label: 'Email', icon: Mail }
+  ];
+  const normalizeMessageBody = (value) => (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const getMessageTimestamp = (msg) => {
+    const value = new Date(msg?.time || msg?.created_at || msg?.timestamp || 0).getTime();
+    return Number.isFinite(value) ? value : 0;
+  };
 
   // ── Core fetch function ────────────────────────────────────────────────────
   const loadMessages = useCallback(async ({
     silent = false,
-    targetPlatform = platform,
+    targetPlatform = activePlatformRef.current,
     force = false
   } = {}) => {
     const candidateId = candidate.id;
-    const requestSeq = ++requestSeqRef.current[targetPlatform];
-    const isActiveTab = targetPlatform === platform;
+    const resolvedPlatform = targetPlatform || activePlatformRef.current;
+    const requestSeq = ++requestSeqRef.current[resolvedPlatform];
+    const isActiveTab = resolvedPlatform === activePlatformRef.current;
 
     // Show loader only on active tab when no messages cached
-    if (isActiveTab && !silent && !threadsRef.current[targetPlatform]?.loaded) {
+    if (isActiveTab && !silent && !threadsRef.current[resolvedPlatform]?.loaded) {
       setLoading(true);
     } else if (isActiveTab && !silent) {
       setRefreshing(true);
     }
 
-    const res = await fetchChatHistory(0, candidateId, targetPlatform, force);
+    const res = await fetchChatHistory(0, candidateId, resolvedPlatform, force);
 
     // Discard stale responses (candidate changed or newer request fired)
-    if (candidateIdRef.current !== candidateId || requestSeqRef.current[targetPlatform] !== requestSeq) return;
+    if (candidateIdRef.current !== candidateId || requestSeqRef.current[resolvedPlatform] !== requestSeq) return res;
 
     if (res.success) {
       const msgs = res.messages || [];
-      _setCached(candidateId, targetPlatform, msgs); // persist in module cache
+      _setCached(candidateId, resolvedPlatform, msgs); // persist in module cache
       setThreads(prev => ({
         ...prev,
-        [targetPlatform]: { messages: msgs, loaded: true, error: '' }
+        [resolvedPlatform]: { messages: msgs, loaded: true, error: '' }
       }));
-      if (targetPlatform === 'linkedin') setLiSyncing(Boolean(res.syncing));
+      setSyncingByPlatform(prev => ({
+        ...prev,
+        [resolvedPlatform]: Boolean(res.syncing),
+      }));
     } else {
       setThreads(prev => ({
         ...prev,
-        [targetPlatform]: { ...prev[targetPlatform], loaded: true, error: res.error || 'Failed to load' }
+        [resolvedPlatform]: { ...prev[resolvedPlatform], loaded: true, error: res.error || 'Failed to load' }
+      }));
+      setSyncingByPlatform(prev => ({
+        ...prev,
+        [resolvedPlatform]: false,
       }));
     }
 
@@ -885,7 +987,9 @@ function ConversationModal({ candidate, onClose }) {
       setLoading(false);
       if (!silent) setRefreshing(false);
     }
-  }, [candidate.id, fetchChatHistory, platform]);
+
+    return res;
+  }, [candidate.id, fetchChatHistory]);
 
   // ── On candidate change: reset state (but preserve module cache) ───────────
   useEffect(() => {
@@ -896,50 +1000,25 @@ function ConversationModal({ candidate, onClose }) {
     threadsRef.current = nextThreads;
     requestSeqRef.current = { email: 0, linkedin: 0 };
     setThreads(nextThreads);
+    setPlatform(defaultPlatform);
+    activePlatformRef.current = defaultPlatform;
+    setSyncingByPlatform({ email: false, linkedin: false });
     setLocalSentMessagesByPlatform({ email: [], linkedin: [] });
     setLoading(!_getCached(candidate.id, defaultPlatform));
     setRefreshing(false);
     setReplyText('');
     setHasTriggered(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candidate.id]);
+  }, [candidate.id, defaultPlatform]);
 
-  // ── On modal open: fetch BOTH tabs in parallel (SWR) ──────────────────────
+  // ── On modal open: fetch active thread first, then prefetch the other tab ──
   useEffect(() => {
-    const candidateId = candidate.id;
-    requestSeqRef.current = { email: 0, linkedin: 0 };
+    const primaryPlatform = defaultPlatform;
+    const secondaryPlatform = primaryPlatform === 'linkedin' ? 'email' : 'linkedin';
 
-    // Fetch both platforms simultaneously — don't wait for active tab first
-    Promise.all([
-      fetchChatHistory(0, candidateId, 'email', false),
-      fetchChatHistory(0, candidateId, 'linkedin', false),
-    ]).then(([emailRes, liRes]) => {
-      if (candidateIdRef.current !== candidateId) return;
-
-      setThreads(prev => {
-        const next = { ...prev };
-        if (emailRes.success) {
-          const msgs = emailRes.messages || [];
-          _setCached(candidateId, 'email', msgs);
-          next.email = { messages: msgs, loaded: true, error: '' };
-        } else {
-          next.email = { ...prev.email, loaded: true, error: emailRes.error || 'Failed' };
-        }
-        if (liRes.success) {
-          const msgs = liRes.messages || [];
-          _setCached(candidateId, 'linkedin', msgs);
-          next.linkedin = { messages: msgs, loaded: true, error: '' };
-        } else {
-          next.linkedin = { ...prev.linkedin, loaded: true, error: liRes.error || 'Failed' };
-        }
-        return next;
-      });
-      if (liRes.success) setLiSyncing(Boolean(liRes.syncing));
-      setLoading(false);
-      setRefreshing(false);
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candidate.id]);
+    void loadMessages({ targetPlatform: primaryPlatform, silent: false });
+    void loadMessages({ targetPlatform: secondaryPlatform, silent: true });
+  }, [candidate.id, defaultPlatform, loadMessages]);
 
   // ── Tab switch: if already loaded just show, else fetch ────────────────────
   useEffect(() => {
@@ -947,45 +1026,34 @@ function ConversationModal({ candidate, onClose }) {
     const cached = threadsRef.current[platform];
     if (!cached?.loaded) {
       setLoading(true);
-      loadMessages({ targetPlatform: platform });
+      if (requestSeqRef.current[platform] === 0) {
+        void loadMessages({ targetPlatform: platform });
+      }
     } else {
       setLoading(false);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform]);
 
-  // ── Intelligent Fast Poll — if LinkedIn is syncing, poll every 2s ─────────────────
+  // ── Fast poll whichever active thread is currently syncing ─────────────────
   useEffect(() => {
-    if (platform !== 'linkedin' || !liSyncing) return;
-    
-    // Fast poll while syncing
-    const interval = setInterval(() => {
-      const cid = candidateIdRef.current;
-      fetchChatHistory(0, cid, 'linkedin', false).then(res => {
-        if (res.success && candidateIdRef.current === cid) {
-          const msgs = res.messages || [];
-          _setCached(cid, 'linkedin', msgs);
-          setThreads(prev => ({ ...prev, linkedin: { messages: msgs, loaded: true, error: '' } }));
-          setLiSyncing(Boolean(res.syncing));
-        }
-      });
-    }, 2000);
-    
-    return () => clearInterval(interval);
-  }, [candidate.id, platform, liSyncing, fetchChatHistory]);
+    if (!activeThreadSyncing) return;
 
-  // ── Standard background poll — keep both tabs fresh ──────────────────────────
+    const interval = setInterval(() => {
+      void loadMessages({ silent: true, targetPlatform: activePlatformRef.current });
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [activeThreadSyncing, loadMessages]);
+
+  // ── Standard background poll — keep both tabs fresh and apply results ──────
   useEffect(() => {
     const interval = setInterval(() => {
-      const cid = candidateIdRef.current;
-      // Poll both platforms silently every 30s for general freshness
-      Promise.all([
-        fetchChatHistory(0, cid, 'email', false),
-        fetchChatHistory(0, cid, 'linkedin', false),
-      ]); 
-    }, 30000);
+      void loadMessages({ silent: true, targetPlatform: 'email' });
+      void loadMessages({ silent: true, targetPlatform: 'linkedin' });
+    }, 15000);
     return () => clearInterval(interval);
-  }, [candidate.id, fetchChatHistory]);
+  }, [candidate.id, loadMessages]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -1022,7 +1090,16 @@ function ConversationModal({ candidate, onClose }) {
 
     const res = await sendChatReply(0, candidate.id, text, activePlatform);
     if (res.success) {
-      setTimeout(() => loadMessages({ silent: true, targetPlatform: activePlatform }), 3000);
+      setSyncingByPlatform(prev => ({
+        ...prev,
+        [activePlatform]: true,
+      }));
+      window.setTimeout(() => {
+        void loadMessages({ silent: true, targetPlatform: activePlatform, force: true });
+      }, 1500);
+      window.setTimeout(() => {
+        void loadMessages({ silent: true, targetPlatform: activePlatform, force: true });
+      }, 5000);
     } else {
       setLocalSentMessagesByPlatform(prev => ({
         ...prev,
@@ -1042,7 +1119,7 @@ function ConversationModal({ candidate, onClose }) {
     const uniqueServerMsgs = [];
     const serverMsgsSeen = new Set();
     serverMsgs.forEach(msg => {
-      const msgKey = `${msg.type}-${(msg.email_body || '').trim().toLowerCase()}-${msg.time}`;
+      const msgKey = `${msg.type}-${normalizeMessageBody(msg.email_body)}-${getMessageTimestamp(msg)}`;
       if (!serverMsgsSeen.has(msgKey)) {
         uniqueServerMsgs.push(msg);
         serverMsgsSeen.add(msgKey);
@@ -1053,20 +1130,23 @@ function ConversationModal({ candidate, onClose }) {
     const pendingToShow = localMsgs.filter(lm => {
       const match = uniqueServerMsgs.some(sm => {
         if (sm.type !== 'SENT') return false;
-        const sBody = (sm.email_body || '').trim().toLowerCase();
-        const lBody = (lm.email_body || '').trim().toLowerCase();
-        // Match if one includes the other, but only for first 50 chars to avoid false hits on generic "hi"
-        return sBody === lBody || sBody.includes(lBody) || lBody.includes(sBody);
+        const sBody = normalizeMessageBody(sm.email_body);
+        const lBody = normalizeMessageBody(lm.email_body);
+        if (!sBody || !lBody || sBody !== lBody) return false;
+
+        const serverTime = getMessageTimestamp(sm);
+        const localTime = getMessageTimestamp(lm);
+        if (!serverTime || !localTime) return true;
+
+        return Math.abs(serverTime - localTime) <= 10 * 60 * 1000;
       });
-      // Also expire local messages after 60s if they haven't synced, to prevent ghosting
-      const age = (Date.now() - (lm.sentAt || 0)) / 1000;
-      return !match && age < 60;
+      const ageMs = Date.now() - (lm.sentAt || 0);
+      return !match && ageMs < OPTIMISTIC_MESSAGE_TTL_MS;
     });
 
     const combined = [...uniqueServerMsgs, ...pendingToShow];
     return combined.sort((a, b) => {
-      const getT = (m) => new Date(m.time || m.created_at || m.timestamp || 0).getTime();
-      return getT(a) - getT(b);
+      return getMessageTimestamp(a) - getMessageTimestamp(b);
     });
   };
 
@@ -1122,14 +1202,14 @@ function ConversationModal({ candidate, onClose }) {
               <MessageSquare size={14} />
               <span>Real-time Sync Active</span>
               {refreshing && (
-                <span style={{ fontSize: '11px', color: conversationAccent, fontWeight: 700, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                   <div style={{ width: 4, height: 4, borderRadius: '50%', background: conversationAccent, animation: 'pulse 1s infinite' }} />
+                <span style={{ fontSize: '11px', color: conversationAccentMuted, fontWeight: 700, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                   <div style={{ width: 4, height: 4, borderRadius: '50%', background: conversationAccentMuted, animation: 'pulse 1s infinite' }} />
                    UPDATING
                 </span>
               )}
-              {!refreshing && platform === 'linkedin' && liSyncing && (
-                <span style={{ fontSize: '11px', color: '#0077b5', fontWeight: 600, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '5px', opacity: 0.8 }}>
-                   <div style={{ width: 5, height: 5, borderRadius: '50%', background: '#0077b5', animation: 'pulse 1.4s ease-in-out infinite' }} />
+              {!refreshing && activeThreadSyncing && (
+                <span style={{ fontSize: '11px', color: conversationAccentMuted, fontWeight: 600, marginLeft: '4px', display: 'flex', alignItems: 'center', gap: '5px', opacity: 0.8 }}>
+                   <div style={{ width: 5, height: 5, borderRadius: '50%', background: conversationAccentMuted, animation: 'pulse 1.4s ease-in-out infinite' }} />
                    Fetching latest…
                 </span>
               )}
@@ -1159,10 +1239,7 @@ function ConversationModal({ candidate, onClose }) {
 
         {/* Tabs */}
         <div style={{ display: 'flex', padding: '0 32px', borderBottom: '1px solid #f1f5f9', background: '#fff', gap: '24px' }}>
-          {[
-            { id: 'linkedin', label: 'LinkedIn', icon: Linkedin, color: '#0077b5' },
-            { id: 'email', label: 'Email', icon: Mail, color: '#f97316' }
-          ].map(t => (
+          {platformTabs.map(t => (
             <button
               key={t.id}
               onClick={() => setPlatform(t.id)}
@@ -1170,7 +1247,7 @@ function ConversationModal({ candidate, onClose }) {
                 padding: '16px 4px',
                 background: 'transparent',
                 border: 'none',
-                borderBottom: platform === t.id ? `3px solid ${t.color}` : '3px solid transparent',
+                borderBottom: platform === t.id ? `3px solid ${conversationAccent}` : '3px solid transparent',
                 color: platform === t.id ? '#0f172a' : '#64748b',
                 fontWeight: platform === t.id ? 700 : 500,
                 fontSize: '14px',
@@ -1182,10 +1259,13 @@ function ConversationModal({ candidate, onClose }) {
                 position: 'relative'
               }}
             >
-              <t.icon size={18} color={platform === t.id ? t.color : '#94a3b8'} strokeWidth={platform === t.id ? 2.5 : 2} />
+              <t.icon size={18} color={platform === t.id ? conversationAccent : '#94a3b8'} strokeWidth={platform === t.id ? 2.3 : 2} />
               {t.label}
+              {syncingByPlatform[t.id] && platform !== t.id && (
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: conversationAccentMuted, position: 'absolute', top: 12, right: -6, border: '2px solid #fff', opacity: 0.85 }} />
+              )}
               {t.id === 'linkedin' && hasLiResponse && platform !== 'linkedin' && (
-                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', position: 'absolute', top: 12, right: -6, border: '2px solid #fff' }} />
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: conversationAccentMuted, position: 'absolute', top: 12, right: -6, border: '2px solid #fff' }} />
               )}
             </button>
           ))}
@@ -1202,14 +1282,14 @@ function ConversationModal({ candidate, onClose }) {
            ) : displayMessages.length === 0 ? (
              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', gap: '16px', animation: 'fadeIn 0.4s ease-out' }}>
                <div style={{ width: 64, height: 64, borderRadius: '20px', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05)' }}>
-                 <MessageSquare size={32} opacity={0.5} color={conversationAccent} />
+                 <MessageSquare size={32} opacity={0.5} color={conversationAccentMuted} />
                </div>
-                <div style={{ textAlign: 'center', animation: 'slideUp 0.4s ease-out 0.1s backwards' }}>
+               <div style={{ textAlign: 'center', animation: 'slideUp 0.4s ease-out 0.1s backwards' }}>
                   <div style={{ fontWeight: 600, color: '#475569', fontSize: '15px' }}>
-                    {platform === 'linkedin' && liSyncing ? 'Loading latest messages...' : 'No messages yet'}
+                    {activeThreadSyncing ? 'Loading latest messages...' : 'No messages yet'}
                   </div>
                   <div style={{ fontSize: '13px', marginTop: '4px' }}>
-                    {platform === 'linkedin' && liSyncing ? 'This usually takes a few seconds' : 'Start the conversation below'}
+                    {activeThreadSyncing ? 'This usually takes a few seconds' : 'Start the conversation below'}
                   </div>
                 </div>
                {platform === 'linkedin' && !heyreachCampaignId && (
@@ -1220,14 +1300,25 @@ function ConversationModal({ candidate, onClose }) {
                      setIsTriggering(false);
                      if (res.success) {
                        setHasTriggered(true);
-                       loadMessages({ silent: true });
+                       setSyncingByPlatform(prev => ({ ...prev, linkedin: true }));
+                       void loadMessages({ silent: true, targetPlatform: 'linkedin', force: true });
                      }
                    }}
                    disabled={isTriggering || hasTriggered}
                    style={{
-                     marginTop: '12px', padding: '10px 20px', background: '#0077b5', color: '#fff',
-                     border: 'none', borderRadius: '12px', fontWeight: 600, fontSize: '13px', cursor: 'pointer',
-                     display: 'flex', alignItems: 'center', gap: '8px'
+                     marginTop: '12px',
+                     padding: '10px 20px',
+                     background: conversationAccent,
+                     color: '#fff',
+                     border: `1px solid ${conversationAccent}`,
+                     borderRadius: '12px',
+                     fontWeight: 600,
+                     fontSize: '13px',
+                     cursor: 'pointer',
+                     display: 'flex',
+                     alignItems: 'center',
+                     gap: '8px',
+                     boxShadow: '0 12px 24px rgba(15,23,42,0.12)'
                    }}
                  >
                    {isTriggering ? 'Starting...' : hasTriggered ? 'Campaign Started' : 'Start LinkedIn Outreach'}
@@ -1294,13 +1385,13 @@ function ConversationModal({ candidate, onClose }) {
                      marginBottom: isConsecutive ? '4px' : '16px'
                    }}>
                      <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', flexDirection: isCandidate ? 'row' : 'row-reverse' }}>
-                       <div style={{
+                     <div style={{
                          width: 28, height: 28, borderRadius: '10px',
                          visibility: isConsecutive ? 'hidden' : 'visible',
                          background: isCandidate ? '#fff' : conversationAccent,
                          display: 'flex', alignItems: 'center', justifyContent: 'center',
-                         fontSize: '12px', fontWeight: 700, color: isCandidate ? conversationAccent : '#fff',
-                         border: isCandidate ? `1.5px solid ${conversationAccent}20` : 'none',
+                         fontSize: '12px', fontWeight: 700, color: isCandidate ? '#475569' : '#fff',
+                         border: isCandidate ? `1px solid ${conversationBorder}` : 'none',
                          boxShadow: '0 2px 4px rgba(0,0,0,0.05)',
                          flexShrink: 0
                        }}>
@@ -1313,8 +1404,8 @@ function ConversationModal({ candidate, onClose }) {
                          color: isCandidate ? '#334155' : '#fff',
                          fontSize: '14.5px',
                          lineHeight: '1.5',
-                         boxShadow: isCandidate ? '0 4px 6px -1px rgba(0,0,0,0.05)' : `0 10px 15px -3px ${conversationAccent}15`,
-                         border: isCandidate ? '1px solid #f1f5f9' : 'none',
+                         boxShadow: isCandidate ? '0 4px 6px -1px rgba(0,0,0,0.05)' : '0 12px 24px rgba(15,23,42,0.12)',
+                         border: isCandidate ? `1px solid ${conversationBorder}` : '1px solid #111827',
                          whiteSpace: 'pre-wrap',
                          wordBreak: 'break-word',
                          position: 'relative'
@@ -1350,8 +1441,8 @@ function ConversationModal({ candidate, onClose }) {
         <div style={{ padding: '24px 32px', background: '#fff', borderTop: '1px solid #f1f5f9' }}>
           <div style={{
             display: 'flex', alignItems: 'center', gap: '12px', background: '#f8fafc',
-            padding: '8px 8px 8px 16px', borderRadius: '20px', border: '1.5px solid #e2e8f0',
-            transition: 'border-color 0.2s', focusWithin: { borderColor: conversationAccent }
+            padding: '8px 8px 8px 16px', borderRadius: '20px', border: `1px solid ${conversationBorder}`,
+            transition: 'border-color 0.2s'
           }}>
             <textarea
               value={replyText}
@@ -1376,7 +1467,7 @@ function ConversationModal({ candidate, onClose }) {
               style={{
                 width: 40, height: 40, borderRadius: '16px',
                 background: replyText.trim() ? conversationAccent : '#e2e8f0',
-                color: '#fff', border: 'none', cursor: 'pointer',
+                color: '#fff', border: replyText.trim() ? `1px solid ${conversationAccent}` : '1px solid #e2e8f0', cursor: 'pointer',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 transition: 'all 0.2s', transform: sending ? 'scale(0.9)' : 'none'
               }}
@@ -1411,7 +1502,7 @@ function ConversationModal({ candidate, onClose }) {
 
 
 export default function TalentPool() {
-  const { user } = useAppStore();
+  const user = useAppStore(state => state.user);
   const role = user?.role || 'recruiter';
   const permissions = user?.permissions || {};
 
@@ -1506,7 +1597,7 @@ export default function TalentPool() {
   const syncOutreachResponses = useAppStore(state => state.syncOutreachResponses);
   const shortlistAndOutreach = useAppStore(state => state.shortlistAndOutreach);
   const updateCandidateField = useAppStore(state => state.updateCandidateField);
-  const { heyreachCampaignId } = useAppStore();
+  const heyreachCampaignId = useAppStore(state => state.heyreachCampaignId);
   const didInitRef = useRef(false);
   const talentPoolRequestSeqRef = useRef(0);
   const visibleCandidatesRef = useRef(candidates);
@@ -1530,16 +1621,16 @@ export default function TalentPool() {
             const data = res?.data;
             if (!data) return;
 
-            const email = data.email || '';
-            const phone = data.phone || data.mobile_phone || '';
+            const email = resolveContactValue(data.email);
+            const phone = resolveContactValue(data.phone, data.mobile_phone);
             const done = Boolean(email || phone || data.enrichment_finished);
             if (!done) return;
 
             setContactInfo(prev => {
               const current = prev[id] || {};
               const next = {
-                email: email || current.email || '',
-                phone: phone || current.phone || '',
+                email: resolveContactValue(email, current.email),
+                phone: resolveContactValue(phone, current.phone),
                 enriching: false
               };
               if (
@@ -1581,7 +1672,7 @@ export default function TalentPool() {
 
   useEffect(() => {
     try {
-      window.sessionStorage.setItem(CONTACT_INFO_STORAGE_KEY, JSON.stringify(contactInfo));
+      window.localStorage.setItem(CONTACT_INFO_STORAGE_KEY, JSON.stringify(contactInfo));
     } catch {
       // Ignore storage write errors (private mode, quota, etc.)
     }
@@ -1596,10 +1687,12 @@ export default function TalentPool() {
         || talentPoolIndex?.rows?.find(c => c.id === candidateId)
         || candidates.find(c => c.id === candidateId)
         || {};
+      const email = resolveContactValue(current.email, row.email);
+      const phone = resolveContactValue(current.phone, row.phone, row.mobile_phone);
       const next = {
-        email: current.email || row.email || '',
-        phone: current.phone || row.phone || row.mobile_phone || '',
-        enriching: !(current.email || current.phone || row.email || row.phone || row.mobile_phone)
+        email,
+        phone,
+        enriching: !(email || phone)
       };
       return { ...prev, [candidateId]: next };
     });
@@ -1622,10 +1715,12 @@ export default function TalentPool() {
       setContactInfo(prev => ({
         ...prev,
         [candidateId]: {
-          email: d.email || prev[candidateId]?.email || '',
-          phone: d.phone || prev[candidateId]?.phone || '',
+          email: resolveContactValue(d.email, prev[candidateId]?.email),
+          phone: resolveContactValue(d.phone, prev[candidateId]?.phone),
           // If Clay was triggered (no data yet), keep enriching=true
-          enriching: d.contact_enriching && !(d.email || prev[candidateId]?.email) && !(d.phone || prev[candidateId]?.phone)
+          enriching: d.contact_enriching
+            && !resolveContactValue(d.email, prev[candidateId]?.email)
+            && !resolveContactValue(d.phone, prev[candidateId]?.phone)
         }
       }));
       setShortlistCard(d);
@@ -1679,8 +1774,8 @@ export default function TalentPool() {
       for (const row of rows) {
         if (!row?.id) continue;
         const existing = prev[row.id] || {};
-        const email = row.email || existing.email || '';
-        const phone = row.phone || existing.phone || '';
+        const email = resolveContactValue(row.email, existing.email);
+        const phone = resolveContactValue(row.phone, row.mobile_phone, existing.phone);
         const enriching = Boolean(existing.enriching && !(email || phone));
 
         if (!email && !phone && !existing.enriching) continue;
@@ -1701,9 +1796,39 @@ export default function TalentPool() {
 
   // Load metadata (dropdown options)
   useEffect(() => {
-    axios.get(`${API_BASE}/candidates/browse/meta`).then(r => setMeta(r.data)).catch(() => { });
+    let cancelled = false;
+    let idleId = null;
+    let timeoutId = null;
+
+    axios.get(`${API_BASE}/candidates/browse/meta`).then(r => {
+      if (!cancelled) {
+        setMeta(r.data);
+      }
+    }).catch(() => { });
+
     fetchAnalytics();
-    void fetchTalentPoolIndex();
+
+    const prefetchTalentPoolIndex = () => {
+      if (!cancelled) {
+        void fetchTalentPoolIndex();
+      }
+    };
+
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+      idleId = window.requestIdleCallback(prefetchTalentPoolIndex, { timeout: 1200 });
+    } else {
+      timeoutId = window.setTimeout(prefetchTalentPoolIndex, 250);
+    }
+
+    return () => {
+      cancelled = true;
+      if (idleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [fetchAnalytics, fetchTalentPoolIndex]);
 
   const hasSemanticProductFilter = splitTalentPoolFilterValues(
@@ -1846,26 +1971,35 @@ export default function TalentPool() {
 
   useEffect(() => {
     let cancelled = false;
+    let timeoutId = null;
+    let nextDelayMs = 15000;
 
     const syncTalentPoolReplies = async () => {
       const res = await syncOutreachResponses(0);
       const updatedCount = Number(res?.data?.updated_count || 0);
-      if (!cancelled && res?.success && updatedCount > 0) {
+      if (cancelled) {
+        return;
+      }
+
+      if (res?.success && updatedCount > 0) {
         if (canUseInstantLocalFilteringRef.current) {
           await fetchTalentPoolIndex({ force: true });
         } else {
           fetchRef.current(pageRef.current);
         }
       }
+
+      nextDelayMs = res?.success ? 15000 : Math.min(nextDelayMs * 2, 60000);
+      timeoutId = window.setTimeout(syncTalentPoolReplies, nextDelayMs);
     };
 
-    // Run once initially, then stagger
-    syncTalentPoolReplies();
-    const interval = setInterval(syncTalentPoolReplies, 15000);
+    timeoutId = window.setTimeout(syncTalentPoolReplies, 0);
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
     };
   }, [syncOutreachResponses, fetchTalentPoolIndex]);
 
@@ -1941,33 +2075,44 @@ export default function TalentPool() {
     else { setSortBy(sortKey); setSortDir('asc'); }
   };
 
+  const panelSurface = {
+    background: 'rgba(255,255,255,0.84)',
+    backdropFilter: 'blur(18px)',
+    border: '1px solid rgba(226, 232, 240, 0.92)',
+    boxShadow: '0 18px 40px rgba(15,23,42,0.06)',
+  };
+  const surfaceBorder = 'rgba(226, 232, 240, 0.9)';
+
   return (
-    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 0, height: '100vh', overflow: 'hidden' }}>
+    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 18, height: '100vh', overflow: 'hidden', padding: '22px', boxSizing: 'border-box' }}>
 
       {/* ── Left Filter Sidebar ── */}
       <aside style={{
-        width: isFilterCollapsed ? 0 : 200, 
-        minWidth: isFilterCollapsed ? 0 : 200, 
-        padding: isFilterCollapsed ? 0 : '20px 16px',
-        background: '#fff', 
-        borderRight: isFilterCollapsed ? 'none' : '1.5px solid #f1f5f9',
+        width: isFilterCollapsed ? 0 : 220,
+        minWidth: isFilterCollapsed ? 0 : 220,
+        padding: isFilterCollapsed ? 0 : '20px 18px',
+        background: panelSurface.background,
+        backdropFilter: panelSurface.backdropFilter,
+        border: isFilterCollapsed ? 'none' : panelSurface.border,
+        boxShadow: isFilterCollapsed ? 'none' : panelSurface.boxShadow,
+        borderRadius: isFilterCollapsed ? 0 : 24,
         overflowX: 'hidden',
-        overflowY: 'auto', 
+        overflowY: 'auto',
         flexShrink: 0,
-        display: 'flex', 
-        flexDirection: 'column', 
+        display: 'flex',
+        flexDirection: 'column',
         gap: 0,
         transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
         position: 'relative',
         opacity: isFilterCollapsed ? 0 : 1,
         visibility: isFilterCollapsed ? 'hidden' : 'visible'
       }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 800, fontSize: 14, color: '#0f172a' }}>
-            <SlidersHorizontal size={15} color="#f97316" /> Filters
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, paddingBottom: 12, borderBottom: `1px solid ${surfaceBorder}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 800, fontSize: 14, color: '#0f172a', letterSpacing: '-0.01em' }}>
+            <SlidersHorizontal size={15} color="#64748b" /> Filters
           </div>
           {hasFilters && (
-            <button onClick={clearFilters} style={{ background: 'none', border: 'none', color: '#ef4444', fontSize: 11, fontWeight: 700, cursor: 'pointer', padding: 0, display: 'flex', alignItems: 'center', gap: 3 }}>
+            <button onClick={clearFilters} style={{ background: '#eef2f6', border: '1px solid rgba(203, 213, 225, 0.85)', color: '#475569', fontSize: 11, fontWeight: 700, cursor: 'pointer', padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 4, borderRadius: 999 }}>
               <X size={11} /> Clear
             </button>
           )}
@@ -2007,14 +2152,14 @@ export default function TalentPool() {
           <button
             onClick={clearFilters}
             style={{
-              width: '100%', padding: '10px', borderRadius: '10px',
-              background: '#fff', border: '1.5px solid #f1f5f9',
-              color: '#d33', fontSize: '12px', fontWeight: 700,
+              width: '100%', padding: '11px 12px', borderRadius: '12px',
+              background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)',
+              color: '#334155', fontSize: '12px', fontWeight: 700,
               cursor: 'pointer', transition: 'all 0.2s',
               display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
             }}
-            onMouseEnter={e => { e.currentTarget.style.background = '#fff1f1'; e.currentTarget.style.borderColor = '#fee2e2'; }}
-            onMouseLeave={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = '#f1f5f9'; }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#f8fafc'; e.currentTarget.style.borderColor = 'rgba(148, 163, 184, 0.75)'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)'; }}
           >
             <RefreshCw size={14} /> Reset All Filters
           </button>
@@ -2023,112 +2168,153 @@ export default function TalentPool() {
       </aside>
 
       {/* ── Main Content ── */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f8fafc' }}>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', gap: 18 }}>
 
         {/* Top bar */}
-        <div style={{ 
-          padding: '14px 20px', 
-          background: '#fff', 
-          borderBottom: '1.5px solid #f1f5f9', 
-          display: 'flex', 
-          alignItems: 'center', 
-          gap: 12,
-          position: 'relative'
-        }}>
-          {/* Sidebar Toggle Button */}
-          <button
-            onClick={toggleFilterSidebar}
-            title={isFilterCollapsed ? "Show Filters" : "Hide Filters"}
-            style={{
-              background: isFilterCollapsed ? '#f97316' : '#fff',
-              border: '1.5px solid #e2e8f0',
-              borderRadius: '8px',
-              width: '32px',
-              height: '32px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              cursor: 'pointer',
-              color: isFilterCollapsed ? '#fff' : '#64748b',
-              transition: 'all 0.2s',
-              marginRight: '8px',
-              boxShadow: isFilterCollapsed ? '0 4px 6px -1px rgba(249, 115, 22, 0.2)' : 'none'
-            }}
-            onMouseEnter={e => {
-              if (!isFilterCollapsed) e.currentTarget.style.borderColor = '#f97316';
-              e.currentTarget.style.transform = 'scale(1.05)';
-            }}
-            onMouseLeave={e => {
-              if (!isFilterCollapsed) e.currentTarget.style.borderColor = '#e2e8f0';
-              e.currentTarget.style.transform = 'scale(1)';
-            }}
-          >
-            {isFilterCollapsed ? <Filter size={16} /> : <ChevronLeft size={18} />}
-          </button>
-
-          {/* Global search */}
-          <div style={{ position: 'relative', flex: 1, maxWidth: 380 }}>
-            <Search size={15} color="#94a3b8" style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)' }} />
-            <input
-              type="text"
-              value={globalSearch}
-              onChange={e => setGlobalSearch(e.target.value)}
-              placeholder="Global search across all columns..."
+        <div style={{ ...panelSurface, borderRadius: 24, overflow: 'hidden', flexShrink: 0 }}>
+          <div style={{
+            padding: '18px 20px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 14,
+            flexWrap: 'wrap',
+            borderBottom: analytics ? `1px solid ${surfaceBorder}` : 'none'
+          }}>
+            <button
+              onClick={toggleFilterSidebar}
+              title={isFilterCollapsed ? "Show Filters" : "Hide Filters"}
               style={{
-                width: '100%', padding: '9px 34px 9px 34px',
-                background: '#f8fafc', border: '1.5px solid #e2e8f0',
-                borderRadius: 10, color: '#0f172a', fontSize: 13,
-                outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box',
-                transition: 'border-color 0.15s',
+                background: isFilterCollapsed ? '#0f172a' : '#fff',
+                border: '1px solid rgba(203, 213, 225, 0.9)',
+                borderRadius: '12px',
+                width: '38px',
+                height: '38px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: isFilterCollapsed ? '#fff' : '#64748b',
+                transition: 'all 0.2s',
+                boxShadow: '0 10px 24px rgba(15,23,42,0.05)'
               }}
-              onFocus={e => { e.target.style.borderColor = '#f97316'; e.target.style.background = '#fff'; }}
-              onBlur={e => { e.target.style.borderColor = '#e2e8f0'; e.target.style.background = '#f8fafc'; }}
-            />
-            {globalSearch && (
-              <X 
-                size={14} 
-                color="#94a3b8" 
-                style={{ position: 'absolute', right: 11, top: '50%', transform: 'translateY(-50%)', cursor: 'pointer' }}
-                onClick={() => setGlobalSearch('')}
-              />
-            )}
-          </div>
+              onMouseEnter={e => {
+                if (!isFilterCollapsed) e.currentTarget.style.borderColor = 'rgba(194, 124, 63, 0.32)';
+                e.currentTarget.style.transform = 'translateY(-1px)';
+              }}
+              onMouseLeave={e => {
+                if (!isFilterCollapsed) e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+                e.currentTarget.style.transform = 'none';
+              }}
+            >
+              {isFilterCollapsed ? <Filter size={16} /> : <ChevronLeft size={18} />}
+            </button>
 
-          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10 }}>
-            {/* Total count */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-              <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 700 }}>
-                {loading && !displayedCandidates.length ? '...' : `${displayedTotal.toLocaleString()} candidates`}
-              </span>
-              {isRevalidating && (
-                <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <RefreshCw size={10} className="revalidating" /> Syncing updates
-                </span>
+            <div style={{ minWidth: 150 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                Candidate operations
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', letterSpacing: '-0.03em' }}>
+                Talent Pool
+              </div>
+            </div>
+
+            <div style={{ position: 'relative', flex: '1 1 320px', maxWidth: 460, minWidth: 220 }}>
+              <Search size={15} color="#94a3b8" style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)' }} />
+              <input
+                type="text"
+                value={globalSearch}
+                onChange={e => setGlobalSearch(e.target.value)}
+                placeholder="Search candidates, titles, companies, cities..."
+                style={{
+                  width: '100%', padding: '11px 36px 11px 36px',
+                  background: 'rgba(255,255,255,0.9)', border: '1px solid rgba(203, 213, 225, 0.9)',
+                  borderRadius: 14, color: '#0f172a', fontSize: 13,
+                  outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box',
+                  transition: 'border-color 0.15s, box-shadow 0.15s, background 0.15s',
+                  boxShadow: 'inset 0 1px 2px rgba(15,23,42,0.03)',
+                }}
+                onFocus={e => {
+                  e.target.style.borderColor = 'rgba(194, 124, 63, 0.5)';
+                  e.target.style.boxShadow = '0 0 0 3px rgba(194, 124, 63, 0.12)';
+                  e.target.style.background = '#fff';
+                }}
+                onBlur={e => {
+                  e.target.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+                  e.target.style.boxShadow = 'inset 0 1px 2px rgba(15,23,42,0.03)';
+                  e.target.style.background = 'rgba(255,255,255,0.9)';
+                }}
+              />
+              {globalSearch && (
+                <X
+                  size={14}
+                  color="#94a3b8"
+                  style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', cursor: 'pointer' }}
+                  onClick={() => setGlobalSearch('')}
+                />
               )}
             </div>
-            <button onClick={async () => {
-              if (canUseInstantLocalFiltering) {
-                setIsRevalidating(true);
-                try {
-                  const result = await fetchTalentPoolIndex({ force: true });
-                  if (!result?.success) {
-                    toast.error(result?.error || 'Failed to refresh candidates');
+
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 700 }}>
+                  {loading && !displayedCandidates.length ? '...' : `${displayedTotal.toLocaleString()} candidates`}
+                </span>
+                {isRevalidating ? (
+                  <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <RefreshCw size={10} className="revalidating" /> Syncing updates
+                  </span>
+                ) : (
+                  <span style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600 }}>
+                    Live workspace view
+                  </span>
+                )}
+              </div>
+              <button onClick={async () => {
+                if (canUseInstantLocalFiltering) {
+                  setIsRevalidating(true);
+                  try {
+                    const result = await fetchTalentPoolIndex({ force: true });
+                    if (!result?.success) {
+                      toast.error(result?.error || 'Failed to refresh candidates');
+                    }
+                  } finally {
+                    setIsRevalidating(false);
                   }
-                } finally {
-                  setIsRevalidating(false);
+                  return;
                 }
-                return;
-              }
-              await fetchCandidates(page);
-            }}
-              style={{ width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', color: '#64748b' }}>
-              <RefreshCw size={14} style={{ animation: loading || isRevalidating ? 'spin 1s linear infinite' : 'none' }} />
-            </button>
+                await fetchCandidates(page);
+              }}
+                style={{ width: 38, height: 38, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 12, cursor: 'pointer', color: '#64748b', boxShadow: '0 10px 24px rgba(15,23,42,0.05)' }}>
+                <RefreshCw size={14} style={{ animation: loading || isRevalidating ? 'spin 1s linear infinite' : 'none' }} />
+              </button>
+            </div>
           </div>
+
+          {analytics && (
+            <div style={{ padding: '18px 20px 20px' }}>
+              <StatisticsDashboard
+                analytics={analytics}
+                role={role}
+                onStatClick={(status) => {
+                  startTransition(() => {
+                    setActiveStatusTab(status);
+                  });
+                  setPage(1);
+                }}
+                onRecruiterClick={(recruiter) => {
+                  startTransition(() => {
+                    setFilter('created_by', recruiter);
+                  });
+                  setPage(1);
+                }}
+              />
+            </div>
+          )}
         </div>
 
+        <div style={{ ...panelSurface, flex: 1, minHeight: 0, borderRadius: 24, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {/* Status tabs */}
-        <div style={{ padding: '12px 20px', background: '#fff', borderBottom: '1.5px solid #f1f5f9', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none' }}>
+        <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: `1px solid ${surfaceBorder}`, display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none' }}>
           {['', ...RECRUITMENT_STAGES].map(tab => {
             const isActive = activeStatusTab === tab;
             const count = tab === '' ? (displayedTotal || 0) : (displayedStatusCounts?.[tab] || 0);
@@ -2143,35 +2329,35 @@ export default function TalentPool() {
                   setPage(1);
                 }}
                 style={{
-                  padding: '6px 14px', borderRadius: '30px', border: isActive ? '1.5px solid #f97316' : '1.5px solid #e2e8f0',
-                  background: isActive ? '#fff7ed' : '#f8fafc', cursor: 'pointer', fontSize: 12, fontWeight: 700,
-                  color: isActive ? '#f97316' : '#64748b', whiteSpace: 'nowrap',
+                  padding: '7px 14px', borderRadius: '999px', border: isActive ? '1px solid #111827' : '1px solid rgba(203, 213, 225, 0.9)',
+                  background: isActive ? '#111827' : 'rgba(255,255,255,0.72)', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                  color: isActive ? '#fff' : '#64748b', whiteSpace: 'nowrap',
                   display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'inherit',
                   transition: 'all 0.15s',
-                  boxShadow: isActive ? '0 2px 4px rgba(249, 115, 22, 0.1)' : 'none',
+                  boxShadow: isActive ? '0 10px 18px rgba(15,23,42,0.12)' : 'none',
                 }}
                 onMouseEnter={e => {
                   if (!isActive) {
-                    e.currentTarget.style.borderColor = '#cbd5e1';
-                    e.currentTarget.style.background = '#f1f5f9';
+                    e.currentTarget.style.borderColor = 'rgba(148, 163, 184, 0.75)';
+                    e.currentTarget.style.background = '#fff';
                   }
                 }}
                 onMouseLeave={e => {
                   if (!isActive) {
-                    e.currentTarget.style.borderColor = '#e2e8f0';
-                    e.currentTarget.style.background = '#f8fafc';
+                    e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+                    e.currentTarget.style.background = 'rgba(255,255,255,0.72)';
                   }
                 }}
               >
                 {tab === '' ? (
-                  <span style={{ color: isActive ? '#f97316' : '#0f172a' }}>All ({displayedTotal})</span>
+                  <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({displayedTotal})</span>
                 ) : (
                   <>
-                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: style.dot || '#94a3b8' }} />
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: isActive ? '#fff' : (style.dot || '#94a3b8') }} />
                     {tab}
                     <span style={{
                       marginLeft: 4, padding: '1px 6px', borderRadius: 10, fontSize: 10,
-                      background: isActive ? '#f97316' : '#e2e8f0',
+                      background: isActive ? 'rgba(255,255,255,0.14)' : '#e2e8f0',
                       color: isActive ? '#fff' : '#64748b'
                     }}>
                       {count}
@@ -2184,22 +2370,22 @@ export default function TalentPool() {
         </div>
 
         {/* Table */}
-        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'auto' }}>
+        <div style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 2000 }}>
             <thead>
-              <tr style={{ background: '#fff', borderBottom: '1.5px solid #f1f5f9', position: 'sticky', top: 0, zIndex: 10 }}>
+              <tr style={{ background: 'rgba(248,250,252,0.96)', borderBottom: `1px solid ${surfaceBorder}`, position: 'sticky', top: 0, zIndex: 10, backdropFilter: 'blur(12px)' }}>
                 {cols.filter(c => !c.hidden).map((col, index) => (
                   <th key={col.key}
                     onClick={() => col.key === 'selection' ? toggleSelectAll() : handleSort(col.sortKey)}
                     style={{
                       padding: '11px 14px', textAlign: 'left',
-                      fontSize: 11, fontWeight: 700, color: '#94a3b8',
-                      textTransform: 'uppercase', letterSpacing: '0.06em',
+                      fontSize: 11, fontWeight: 700, color: '#64748b',
+                      textTransform: 'uppercase', letterSpacing: '0.08em',
                       minWidth: col.w, cursor: (col.sortKey || col.key === 'selection') ? 'pointer' : 'default',
                       whiteSpace: 'nowrap', userSelect: 'none',
-                      borderBottom: '1.5px solid #f1f5f9',
-                      borderRight: '1.5px solid #f1f5f9',
-                      borderLeft: index === 0 ? '1.5px solid #f1f5f9' : 'none'
+                      borderBottom: `1px solid ${surfaceBorder}`,
+                      borderRight: `1px solid ${surfaceBorder}`,
+                      borderLeft: index === 0 ? `1px solid ${surfaceBorder}` : 'none'
                     }}
                   >
                     {col.key === 'selection' ? (
@@ -2219,7 +2405,7 @@ export default function TalentPool() {
             <tbody>
               {loading && displayedCandidates.length === 0 && (
                 Array.from({ length: 10 }).map((_, i) => (
-                  <tr key={i} style={{ borderBottom: '1px solid #f8fafc' }}>
+                  <tr key={i} style={{ borderBottom: '1px solid #eef2f7' }}>
                     {cols.filter(c => !c.hidden).map((c, j) => (
                       <td key={j} style={{ padding: '13px 14px' }}>
                         <div style={{ height: 13, borderRadius: 6, background: 'linear-gradient(90deg,#f1f5f9 25%,#e2e8f0 50%,#f1f5f9 75%)', backgroundSize: '200% 100%', animation: 'shimmer 1.2s infinite', width: c.w * 0.6 }} />
@@ -2233,12 +2419,12 @@ export default function TalentPool() {
                 <tr>
                   <td colSpan={cols.filter(c => !c.hidden).length} style={{ padding: '80px 20px', textAlign: 'center' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-                      <div style={{ width: 56, height: 56, background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <div style={{ width: 56, height: 56, background: '#f8fafc', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <User size={24} color="#cbd5e1" />
                       </div>
                       <p style={{ color: '#64748b', fontWeight: 600, fontSize: 15, margin: 0 }}>No candidates found</p>
                       <p style={{ color: '#cbd5e1', fontSize: 13, margin: 0 }}>Try adjusting your filters or search query</p>
-                      {hasFilters && <button onClick={clearFilters} style={{ padding: '8px 16px', background: '#fff7ed', border: '1.5px solid #fed7aa', borderRadius: 8, color: '#f97316', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>Clear Filters</button>}
+                      {hasFilters && <button onClick={clearFilters} style={{ padding: '8px 16px', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, color: '#334155', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>Clear Filters</button>}
                     </div>
                   </td>
                 </tr>
@@ -2246,13 +2432,13 @@ export default function TalentPool() {
 
               {displayedCandidates.map((c, idx) => (
                 <tr key={c.id || idx}
-                  style={{ borderBottom: '1px solid #f8fafc', transition: 'background 0.1s', background: selectedIds.has(c.id) ? '#fff7ed' : 'transparent' }}
-                  onMouseEnter={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = '#fafafa'; }}
+                  style={{ borderBottom: '1px solid #eef2f7', transition: 'background 0.1s', background: selectedIds.has(c.id) ? 'rgba(194, 124, 63, 0.10)' : 'transparent' }}
+                  onMouseEnter={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = '#f8fafc'; }}
                   onMouseLeave={e => { if (!selectedIds.has(c.id)) e.currentTarget.style.background = 'transparent'; }}
                 >
                   {/* Checkbox cell — ONLY this cell toggles row selection */}
                   <td
-                    style={{ padding: '13px 14px', textAlign: 'center', borderRight: '1px solid #f1f5f9', borderLeft: '1px solid #f1f5f9', cursor: 'pointer' }}
+                    style={{ padding: '13px 14px', textAlign: 'center', borderRight: '1px solid #eef2f7', borderLeft: '1px solid #eef2f7', cursor: 'pointer' }}
                     onClick={(e) => { e.stopPropagation(); toggleSelectOne(c.id); }}
                   >
                     <input
@@ -2262,32 +2448,32 @@ export default function TalentPool() {
                       style={{ cursor: 'pointer', pointerEvents: 'none' }}
                     />
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.first_name || ''}</td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.last_name || ''}</td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', borderRight: '1px solid #f1f5f9' }}>{c.title || c.headline || ''}</td>
-                  <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #eef2f7' }}>{c.first_name || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #eef2f7' }}>{c.last_name || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', borderRight: '1px solid #eef2f7' }}>{c.title || c.headline || ''}</td>
+                  <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
                     {c.linkedin
                       ? <a href={c.linkedin} target="_blank" rel="noreferrer" style={{ color: '#2563eb', display: 'flex', alignItems: 'center' }} onClick={e => e.stopPropagation()}>
                         <ExternalLink size={14} />
                       </a>
-                      : <span style={{ color: '#94a3b8', fontSize: 11, fontWeight: 500 }}>NA</span>}
+                      : <span style={{ color: '#94a3b8', fontSize: 11, fontWeight: 500, fontStyle: 'italic' }}>Not linked</span>}
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #f1f5f9' }}>{c.company || ''}</td>
-                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #f1f5f9' }}>{c.product_service || ''}</td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>{c.city || ''}</td>
-                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #f1f5f9' }}>{c.location_type || ''}</td>
-                  <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #eef2f7' }}>{c.company || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #eef2f7' }}>{c.product_service || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #eef2f7' }}>{c.city || ''}</td>
+                  <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #eef2f7' }}>{c.location_type || ''}</td>
+                  <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
                     <ExpBar value={c.total_experience_years || 0} />
                   </td>
-                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #eef2f7' }}>
                     {c.avg_tenure_years > 0 ? `${c.avg_tenure_years}y` : ''}
                   </td>
                   {(() => {
-                    const emailVal = contactInfo[c.id]?.email || c.email;
+                    const emailVal = resolveContactValue(contactInfo[c.id]?.email, c.email);
                     const isEnriching = contactInfo[c.id]?.enriching && !emailVal;
 
                     if (isEnriching) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#8b6b44', borderRight: '1px solid #eef2f7', fontStyle: 'italic' }}>Fetching...</td>;
                     }
                     // Always render as editable — even when a value is present
                     return (
@@ -2300,20 +2486,20 @@ export default function TalentPool() {
                           // Sync local contactInfo immediately so the cell reflects new value
                           setContactInfo(prev => ({
                             ...prev,
-                            [id]: { ...prev[id], email: data.email }
+                            [id]: { ...prev[id], email: normalizeContactValue(data.email) }
                           }));
                           return updateFieldAndMaybeShortlist(id, data);
                         }}
-                        placeholder="NA"
+                        placeholder="Not available"
                       />
                     );
                   })()}
                   {(() => {
-                    const phoneVal = contactInfo[c.id]?.phone || c.mobile_phone;
+                    const phoneVal = resolveContactValue(contactInfo[c.id]?.phone, c.phone, c.mobile_phone);
                     const isEnriching = contactInfo[c.id]?.enriching && !phoneVal;
 
                     if (isEnriching) {
-                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#f97316', borderRight: '1px solid #f1f5f9', fontStyle: 'italic' }}>Fetching...</td>;
+                      return <td style={{ padding: '13px 14px', fontSize: 12, color: '#8b6b44', borderRight: '1px solid #eef2f7', fontStyle: 'italic' }}>Fetching...</td>;
                     }
                     // Always render as editable — even when a value is present
                     return (
@@ -2326,15 +2512,15 @@ export default function TalentPool() {
                           // Sync local contactInfo immediately so the cell reflects new value
                           setContactInfo(prev => ({
                             ...prev,
-                            [id]: { ...prev[id], phone: data.phone }
+                            [id]: { ...prev[id], phone: normalizeContactValue(data.phone) }
                           }));
                           return updateFieldAndMaybeShortlist(id, data);
                         }}
-                        placeholder="NA"
+                        placeholder="Not available"
                       />
                     );
                   })()}
-                  <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
                     <StatusDropdown
                       status={c.status}
                       candidateId={c.id}
@@ -2347,7 +2533,7 @@ export default function TalentPool() {
                   <td
                     onClick={(e) => { e.stopPropagation(); setSelectedCandidateForChat(c); }}
                     style={{
-                      padding: '13px 14px', borderRight: '1px solid #f1f5f9',
+                      padding: '13px 14px', borderRight: '1px solid #eef2f7',
                       cursor: 'pointer'
                     }}
                   >
@@ -2391,15 +2577,15 @@ export default function TalentPool() {
                       )}
                     </div>
                   </td>
-                  <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
+                  <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
                     <EditableNotes candidateId={c.id} initialNotes={c.notes} />
                   </td>
                   {isSemanticSearch && (
-                    <td style={{ padding: '13px 14px', borderRight: '1px solid #f1f5f9' }}>
+                    <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
                       <div style={{
-                        display: 'inline-flex', padding: '4px 8px', borderRadius: '6px',
-                        background: c.match_score > 80 ? '#dcfce7' : c.match_score > 60 ? '#fef9c3' : '#f1f5f9',
-                        color: c.match_score > 80 ? '#166534' : c.match_score > 60 ? '#854d0e' : '#475569',
+                        display: 'inline-flex', padding: '4px 8px', borderRadius: '999px',
+                        background: c.match_score > 80 ? '#e7f6ec' : c.match_score > 60 ? '#f7f0e4' : '#edf2f7',
+                        color: c.match_score > 80 ? '#166534' : c.match_score > 60 ? '#8b6b44' : '#475569',
                         fontSize: '11px'
                       }}>
                         {c.match_score}% Match
@@ -2413,31 +2599,31 @@ export default function TalentPool() {
         </div>
 
         {/* Pagination */}
-        <div style={{ padding: '12px 20px', background: '#fff', borderTop: '1.5px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderTop: `1px solid ${surfaceBorder}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 13, color: '#94a3b8' }}>Rows per page:</span>
+              <span style={{ fontSize: 13, color: '#64748b' }}>Rows per page:</span>
               <select
                 value={pageSize}
                 onChange={e => {
                   setTpPagination(1, Number(e.target.value));
                 }}
                 style={{
-                  padding: '4px 8px', borderRadius: '6px', border: '1.5px solid #e2e8f0',
+                  padding: '6px 10px', borderRadius: '10px', border: '1px solid rgba(203, 213, 225, 0.9)',
                   fontSize: '12px', fontWeight: 600, color: '#0f172a', outline: 'none',
-                  background: '#f8fafc', cursor: 'pointer'
+                  background: '#fff', cursor: 'pointer'
                 }}
               >
                 {PAGE_SIZE_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
               </select>
             </div>
-            <span style={{ fontSize: 13, color: '#94a3b8' }}>
+            <span style={{ fontSize: 13, color: '#64748b' }}>
               Showing {displayedTotal === 0 ? 0 : Math.min((page - 1) * pageSize + 1, displayedTotal)}–{Math.min(page * pageSize, displayedTotal)} of <strong style={{ color: '#0f172a' }}>{displayedTotal.toLocaleString()}</strong> candidates
             </span>
           </div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
-              style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 7, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1 }}>
+              style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1 }}>
               <ChevronLeft size={14} color="#64748b" />
             </button>
 
@@ -2455,15 +2641,15 @@ export default function TalentPool() {
                   pages.push(
                     <button key={i} onClick={() => setPage(i)}
                       style={{
-                        width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: i === page ? '#f97316' : '#f8fafc',
-                        border: `1.5px solid ${i === page ? '#f97316' : '#e2e8f0'}`,
-                        borderRadius: 7, cursor: 'pointer', fontSize: 13,
+                        width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: i === page ? '#0f172a' : '#fff',
+                        border: `1px solid ${i === page ? '#0f172a' : 'rgba(203, 213, 225, 0.9)'}`,
+                        borderRadius: 10, cursor: 'pointer', fontSize: 13,
                         fontWeight: i === page ? 700 : 500, color: i === page ? '#fff' : '#64748b',
                         transition: 'all 0.15s'
                       }}
-                      onMouseEnter={e => i !== page && (e.currentTarget.style.borderColor = '#cbd5e1')}
-                      onMouseLeave={e => i !== page && (e.currentTarget.style.borderColor = '#e2e8f0')}
+                      onMouseEnter={e => i !== page && (e.currentTarget.style.borderColor = 'rgba(148, 163, 184, 0.75)')}
+                      onMouseLeave={e => i !== page && (e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)')}
                     >
                       {i}
                     </button>
@@ -2479,11 +2665,12 @@ export default function TalentPool() {
             })()}
 
             <button onClick={() => setPage(p => Math.min(displayedTotalPages, p + 1))} disabled={page === displayedTotalPages}
-              style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 7, cursor: page === displayedTotalPages ? 'not-allowed' : 'pointer', opacity: page === displayedTotalPages ? 0.4 : 1 }}>
+              style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === displayedTotalPages ? 'not-allowed' : 'pointer', opacity: page === displayedTotalPages ? 0.4 : 1 }}>
               <ChevronRight size={14} color="#64748b" />
             </button>
           </div>
         </div>
+      </div>
       </div>
 
       {showAddToListModal && (
@@ -2510,12 +2697,12 @@ export default function TalentPool() {
           <button
             onClick={() => setShowAddToListModal(true)}
             style={{
-              padding: '8px 16px', background: '#f97316', color: '#fff', border: 'none',
+              padding: '8px 16px', background: '#fff', color: '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
               borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
               display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
             }}
-            onMouseEnter={e => e.currentTarget.style.background = '#ea580c'}
-            onMouseLeave={e => e.currentTarget.style.background = '#f97316'}
+            onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+            onMouseLeave={e => e.currentTarget.style.background = '#fff'}
           >
             <Phone size={14} /> Add to Call List
           </button>
@@ -2569,7 +2756,12 @@ export default function TalentPool() {
 }
 
 function AddToListModal({ selectedCount, onClose, onSuccess, candidateIds }) {
-  const { callLists, fetchCallLists, createCallList, addCandidatesToCallList } = useAppStore();
+  const { callLists, fetchCallLists, createCallList, addCandidatesToCallList } = useAppStore(useShallow((state) => ({
+    callLists: state.callLists,
+    fetchCallLists: state.fetchCallLists,
+    createCallList: state.createCallList,
+    addCandidatesToCallList: state.addCandidatesToCallList,
+  })));
   const [loading, setLoading] = useState(false);
   const [newListName, setNewListName] = useState('');
   const [selectedListId, setSelectedListId] = useState('');

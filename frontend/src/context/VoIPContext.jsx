@@ -6,6 +6,7 @@ const VoIPContext = createContext({
   activeCall: null,
   answerCall: async () => ({ success: false }),
   rejectCall: async () => ({ success: false }),
+  placeCall: async () => ({ success: false }),
   voipStatus: 'disconnected',
   voipError: '',
   voipErrorCode: '',
@@ -13,11 +14,55 @@ const VoIPContext = createContext({
   voipActionUrl: '',
   voipMeta: null,
   voipConnectionEvent: null,
+  voipCallEvent: null,
   agentEmail: '',
   retryVoip: () => {},
 });
 
 const SOFTPHONE_RECOVERY_WINDOW_MS = 5000;
+
+const extractVoipDetailText = (value, depth = 0) => {
+  if (!value || depth > 3) return '';
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (Array.isArray(value)) {
+    return value.map(item => extractVoipDetailText(item, depth + 1)).filter(Boolean).join(' ');
+  }
+  if (typeof value === 'object') {
+    return [
+      value.error,
+      value.message,
+      value.reason,
+      value.cause,
+      value.hangupCause,
+      value.hangup_cause,
+      value.code,
+      value.status,
+    ]
+      .map(item => extractVoipDetailText(item, depth + 1))
+      .filter(Boolean)
+      .join(' ');
+  }
+  return '';
+};
+
+const formatVoipDetailText = (value) => (
+  String(value || '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+);
+
+const buildVoipCallEvent = (type, detail = {}, fallbackNumber = '') => {
+  const reasonText = formatVoipDetailText(extractVoipDetailText(detail));
+  return {
+    at: Date.now(),
+    type,
+    origin: detail?.origin || '',
+    number: detail?.to || detail?.from || fallbackNumber || '',
+    reasonText,
+    raw: detail,
+  };
+};
 
 export function useVoIP() {
   return useContext(VoIPContext);
@@ -32,6 +77,7 @@ export function VoIPProvider({ children }) {
   const [voipActionUrl, setVoipActionUrl] = useState('');
   const [voipMeta, setVoipMeta] = useState(null);
   const [voipConnectionEvent, setVoipConnectionEvent] = useState(null);
+  const [voipCallEvent, setVoipCallEvent] = useState(null);
   const [agentEmail, setAgentEmail] = useState('');
   const softphoneRef = useRef(null);
   const remoteAudioRef = useRef(null);
@@ -241,6 +287,7 @@ export function VoIPProvider({ children }) {
     try {
       clearVoipErrorState();
       setVoipStatus('connecting');
+      setVoipCallEvent(null);
 
       const res = await fetch(`${API_BASE}/plivo/credentials`).then(r => r.json()).catch(() => ({}));
       if (!res.username || !res.password) {
@@ -261,26 +308,34 @@ export function VoIPProvider({ children }) {
         softphoneRef.current = sdk;
 
         sdk.client.on('onLogin', () => {
+          clearVoipErrorState();
+          setVoipConnectionEvent({ at: Date.now(), state: 'registered', maxRetriesReached: false, error: '' });
           setVoipStatus('registered');
           console.log('[VoIP] Connected to Plivo softphone');
         });
 
-        sdk.client.on('onLoginFailed', () => {
+        sdk.client.on('onLoginFailed', (reason) => {
+          const message = formatVoipDetailText(extractVoipDetailText(reason)) || 'Plivo registration failed';
+          setVoipConnectionEvent({ at: Date.now(), state: 'login_failed', maxRetriesReached: false, error: message });
           setVoipStatus('error');
-          setVoipError('Plivo registration failed');
+          setVoipError(message);
         });
 
         sdk.client.on('onCallAnswered', (callInfo) => {
+          clearVoipErrorState();
           setVoipStatus('connected');
-          setActiveCall({ state: 'connected', number: callInfo?.to });
+          setVoipCallEvent(buildVoipCallEvent('connected', callInfo, activeCallRef.current?.number));
+          setActiveCall({ state: 'connected', number: callInfo?.to || activeCallRef.current?.number || '' });
         });
 
         sdk.client.on('onCallTerminated', (reason) => {
+          setVoipCallEvent(buildVoipCallEvent('terminated', reason, activeCallRef.current?.number));
           setVoipStatus('registered');
           setActiveCall(null);
         });
 
         sdk.client.on('onCallFailed', (reason) => {
+          setVoipCallEvent(buildVoipCallEvent('failed', reason, activeCallRef.current?.number));
           setVoipStatus('registered');
           setActiveCall(null);
         });
@@ -303,6 +358,8 @@ export function VoIPProvider({ children }) {
       return { success: false, error: 'Softphone client not available' };
     }
     try {
+      setVoipCallEvent({ at: Date.now(), type: 'dialing', origin: 'local', number: toNumber, reasonText: '', raw: null });
+      setActiveCall({ state: 'dialing', number: toNumber });
       // Trigger browser microphone access
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
          await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -311,6 +368,7 @@ export function VoIPProvider({ children }) {
       setVoipStatus('connecting');
       return { success: true };
     } catch (error) {
+      setActiveCall(null);
       return { success: false, error: error?.message || 'Mic access denied or Plivo failure' };
     }
   };
@@ -344,6 +402,14 @@ export function VoIPProvider({ children }) {
         console.error('Plivo hangup error:', e);
       }
     }
+    setVoipCallEvent({
+      at: Date.now(),
+      type: 'terminated',
+      origin: 'local',
+      number: activeCallRef.current?.number || '',
+      reasonText: 'ended locally',
+      raw: null,
+    });
     setVoipStatus('registered');
     setActiveCall(null);
     return { success: true };
@@ -363,6 +429,7 @@ export function VoIPProvider({ children }) {
         voipActionUrl,
         voipMeta,
         voipConnectionEvent,
+        voipCallEvent,
         agentEmail,
         retryVoip: () => initSoftphone({ force: true }),
       }}

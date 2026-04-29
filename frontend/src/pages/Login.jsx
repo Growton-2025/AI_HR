@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../store/useAppStore'
 import { Lock, Mail, ArrowRight, CheckCircle, Loader2, User, Phone, Eye, EyeOff, TrendingUp, Users, BarChart3 } from 'lucide-react'
 import { toast } from 'sonner'
+import { useShallow } from 'zustand/react/shallow'
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || ''
 
@@ -16,7 +17,7 @@ const styles = {
   },
   leftPanel: {
     width: '45%',
-    background: 'linear-gradient(145deg, #1a0a00 0%, #7c2d12 40%, #f97316 100%)',
+    background: 'linear-gradient(155deg, #111827 0%, #1f2937 50%, #7c5a2f 100%)',
     display: 'flex',
     flexDirection: 'column',
     justifyContent: 'space-between',
@@ -27,7 +28,7 @@ const styles = {
   },
   rightPanel: {
     flex: 1,
-    background: '#0a0a0a',
+    background: 'linear-gradient(180deg, #f3f5f7 0%, #ebeff3 100%)',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -37,10 +38,16 @@ const styles = {
   formCard: {
     width: '100%',
     maxWidth: '420px',
+    background: 'rgba(255,255,255,0.92)',
+    border: '1px solid rgba(226,232,240,0.92)',
+    borderRadius: '28px',
+    padding: '40px',
+    boxShadow: '0 22px 50px rgba(15,23,42,0.10)',
+    backdropFilter: 'blur(16px)',
   },
   label: {
     display: 'block',
-    color: '#a1a1aa',
+    color: '#64748b',
     fontSize: '12px',
     fontWeight: 600,
     marginBottom: '8px',
@@ -54,10 +61,10 @@ const styles = {
   input: {
     width: '100%',
     padding: '14px 16px 14px 46px',
-    background: '#18181b',
-    border: '1.5px solid #27272a',
+    background: '#ffffff',
+    border: '1px solid rgba(203,213,225,0.92)',
     borderRadius: '12px',
-    color: '#ffffff',
+    color: '#0f172a',
     fontSize: '15px',
     outline: 'none',
     transition: 'border-color 0.2s, box-shadow 0.2s',
@@ -68,7 +75,7 @@ const styles = {
     left: '14px',
     top: '50%',
     transform: 'translateY(-50%)',
-    color: '#52525b',
+    color: '#94a3b8',
     display: 'flex',
     alignItems: 'center',
   },
@@ -79,7 +86,7 @@ const styles = {
     transform: 'translateY(-50%)',
     background: 'none',
     border: 'none',
-    color: '#52525b',
+    color: '#94a3b8',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
@@ -88,9 +95,9 @@ const styles = {
   primaryBtn: {
     width: '100%',
     padding: '15px',
-    background: '#f97316',
+    background: '#111827',
     color: 'white',
-    border: 'none',
+    border: '1px solid #111827',
     borderRadius: '12px',
     fontSize: '15px',
     fontWeight: 700,
@@ -101,7 +108,7 @@ const styles = {
     gap: '8px',
     transition: 'all 0.2s',
     letterSpacing: '0.01em',
-    boxShadow: '0 4px 15px rgba(249, 115, 22, 0.3)',
+    boxShadow: '0 14px 28px rgba(15, 23, 42, 0.14)',
   },
   divider: {
     display: 'flex',
@@ -112,10 +119,10 @@ const styles = {
   dividerLine: {
     flex: 1,
     height: '1px',
-    background: '#27272a',
+    background: '#e2e8f0',
   },
   dividerText: {
-    color: '#3f3f46',
+    color: '#94a3b8',
     fontSize: '12px',
     fontWeight: 600,
     letterSpacing: '0.05em',
@@ -123,7 +130,7 @@ const styles = {
   },
   switchText: {
     textAlign: 'center',
-    color: '#71717a',
+    color: '#64748b',
     fontSize: '14px',
     marginTop: '28px',
     lineHeight: 1.6,
@@ -131,7 +138,7 @@ const styles = {
   switchLink: {
     background: 'none',
     border: 'none',
-    color: '#f97316',
+    color: '#8b6b44',
     cursor: 'pointer',
     fontWeight: 700,
     fontSize: '14px',
@@ -140,10 +147,10 @@ const styles = {
   otpInput: {
     width: '100%',
     padding: '18px',
-    background: '#18181b',
-    border: '1.5px solid #27272a',
+    background: '#ffffff',
+    border: '1px solid rgba(203,213,225,0.92)',
     borderRadius: '12px',
-    color: '#ffffff',
+    color: '#0f172a',
     fontSize: '28px',
     letterSpacing: '10px',
     textAlign: 'center',
@@ -177,8 +184,8 @@ function InputField({ icon: Icon, label, type = 'text', value, onChange, placeho
           style={{
             ...styles.input,
             paddingRight: hasEye ? '46px' : '16px',
-            borderColor: focused ? '#f97316' : '#27272a',
-            boxShadow: focused ? '0 0 0 3px rgba(249,115,22,0.1)' : 'none',
+            borderColor: focused ? 'rgba(194,124,63,0.45)' : 'rgba(203,213,225,0.92)',
+            boxShadow: focused ? '0 0 0 3px rgba(194,124,63,0.10)' : 'none',
           }}
         />
         {hasEye && (
@@ -193,7 +200,14 @@ function InputField({ icon: Icon, label, type = 'text', value, onChange, placeho
 
 function Login() {
   const navigate = useNavigate()
-  const { login, loginWithGoogle, register, verifyOtp, resendOtp, isAuthenticated } = useAppStore()
+  const { login, loginWithGoogle, register, verifyOtp, resendOtp, isAuthenticated } = useAppStore(useShallow((state) => ({
+    login: state.login,
+    loginWithGoogle: state.loginWithGoogle,
+    register: state.register,
+    verifyOtp: state.verifyOtp,
+    resendOtp: state.resendOtp,
+    isAuthenticated: state.isAuthenticated,
+  })))
 
   const [mode, setMode] = useState('login')
   const [isLoading, setIsLoading] = useState(false)
@@ -201,6 +215,7 @@ function Login() {
   const [otp, setOtp] = useState('')
   const [otpFocused, setOtpFocused] = useState(false)
   const googleButtonRef = useRef(null)
+  const currentYear = new Date().getFullYear()
 
   useEffect(() => {
     if (isAuthenticated) navigate('/')
@@ -289,13 +304,13 @@ function Login() {
       {/* ── Left Branding Panel ── */}
       <div style={styles.leftPanel}>
         {/* Background glow */}
-        <div style={{ position: 'absolute', top: '-20%', right: '-20%', width: '500px', height: '500px', borderRadius: '50%', background: 'rgba(255,255,255,0.06)', filter: 'blur(80px)', pointerEvents: 'none' }} />
-        <div style={{ position: 'absolute', bottom: '-10%', left: '-10%', width: '350px', height: '350px', borderRadius: '50%', background: 'rgba(0,0,0,0.3)', filter: 'blur(80px)', pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', top: '-20%', right: '-20%', width: '500px', height: '500px', borderRadius: '50%', background: 'rgba(255,255,255,0.05)', filter: 'blur(80px)', pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', bottom: '-10%', left: '-10%', width: '350px', height: '350px', borderRadius: '50%', background: 'rgba(124,92,47,0.28)', filter: 'blur(80px)', pointerEvents: 'none' }} />
 
         {/* Logo */}
         <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ width: '42px', height: '42px', background: 'white', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 4px 12px rgba(0,0,0,0.2)' }}>
-            <span style={{ color: '#f97316', fontWeight: 900, fontSize: '22px' }}>G</span>
+          <div style={{ width: '42px', height: '42px', background: 'white', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 20px rgba(0,0,0,0.22)' }}>
+            <span style={{ color: '#8b6b44', fontWeight: 900, fontSize: '22px' }}>G</span>
           </div>
           <span style={{ fontSize: '22px', fontWeight: 800, letterSpacing: '-0.5px' }}>Growton</span>
         </div>
@@ -324,7 +339,7 @@ function Login() {
 
         {/* Footer */}
         <div style={{ position: 'relative', opacity: 0.45, fontSize: '12px' }}>
-          © 2025 Growton · Talent Intelligence
+          © {currentYear} Growton · Talent Intelligence
         </div>
       </div>
 
@@ -334,12 +349,12 @@ function Login() {
 
           {/* Header */}
           <div style={{ marginBottom: '36px' }}>
-            <h2 style={{ fontSize: '28px', fontWeight: 800, color: '#ffffff', marginBottom: '8px', letterSpacing: '-0.5px' }}>
+            <h2 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px', letterSpacing: '-0.5px' }}>
               {mode === 'login' && 'Welcome back'}
               {mode === 'register' && 'Create your account'}
               {mode === 'verify' && 'Check your email'}
             </h2>
-            <p style={{ color: '#71717a', fontSize: '15px', lineHeight: 1.5 }}>
+            <p style={{ color: '#64748b', fontSize: '15px', lineHeight: 1.5 }}>
               {mode === 'login' && 'Sign in to your Growton workspace'}
               {mode === 'register' && 'Join thousands of recruiters using Growton'}
               {mode === 'verify' && `We sent a code to ${formData.email}`}
@@ -384,7 +399,7 @@ function Login() {
               <InputField icon={Lock} label="Password" value={formData.password} onChange={e => setFormData({ ...formData, password: e.target.value })} placeholder="Create a strong password" required hasEye />
               <InputField icon={Phone} label="Phone (optional)" type="tel" value={formData.phone} onChange={e => setFormData({ ...formData, phone: e.target.value })} placeholder="+1 555 000 0000" />
 
-              <button type="submit" disabled={isLoading} style={{ ...styles.primaryBtn, marginTop: '8px', background: 'white', color: '#0a0a0a', boxShadow: '0 4px 15px rgba(255,255,255,0.15)', opacity: isLoading ? 0.7 : 1 }}>
+              <button type="submit" disabled={isLoading} style={{ ...styles.primaryBtn, marginTop: '8px', opacity: isLoading ? 0.7 : 1 }}>
                 {isLoading ? <Loader2 size={20} style={{ animation: 'spin 1s linear infinite' }} /> : 'Create Account'}
               </button>
 
@@ -399,8 +414,8 @@ function Login() {
           {mode === 'verify' && (
             <form onSubmit={handleVerify}>
               <div style={{ textAlign: 'center', marginBottom: '28px' }}>
-                <div style={{ width: '72px', height: '72px', background: '#18181b', border: '2px solid #27272a', borderRadius: '20px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', marginBottom: '20px' }}>
-                  <Mail size={32} color="#f97316" />
+                <div style={{ width: '72px', height: '72px', background: '#f8fafc', border: '1px solid rgba(203,213,225,0.92)', borderRadius: '20px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', marginBottom: '20px' }}>
+                  <Mail size={32} color="#8b6b44" />
                 </div>
               </div>
 
@@ -416,8 +431,8 @@ function Login() {
                   onBlur={() => setOtpFocused(false)}
                   style={{
                     ...styles.otpInput,
-                    borderColor: otpFocused ? '#f97316' : '#27272a',
-                    boxShadow: otpFocused ? '0 0 0 3px rgba(249,115,22,0.1)' : 'none',
+                    borderColor: otpFocused ? 'rgba(194,124,63,0.45)' : 'rgba(203,213,225,0.92)',
+                    boxShadow: otpFocused ? '0 0 0 3px rgba(194,124,63,0.10)' : 'none',
                   }}
                 />
               </div>

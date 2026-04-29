@@ -1,4 +1,4 @@
-import { useVoIP } from '../context/VoIPContext';
+import { VoIPProvider, useVoIP } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { BACKEND_BASE, useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
+import { useShallow } from 'zustand/react/shallow';
 
 const formatLocalDate = (dateString) => {
   if (!dateString) return 'N/A';
@@ -52,6 +53,40 @@ const OUTCOMES = [
   'Wrong Number'
 ];
 
+const CALL_PANEL_STYLE = {
+  background: 'rgba(255,255,255,0.86)',
+  backdropFilter: 'blur(16px)',
+  border: '1px solid rgba(226,232,240,0.92)',
+  boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
+};
+
+const CALL_PRIMARY_BUTTON = {
+  background: '#111827',
+  color: '#fff',
+  border: '1px solid #111827',
+  borderRadius: '12px',
+  fontWeight: 700,
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: '8px',
+  boxShadow: '0 12px 24px rgba(15,23,42,0.12)',
+};
+
+const CALL_SECONDARY_BUTTON = {
+  background: '#fff',
+  color: '#334155',
+  border: '1px solid rgba(203,213,225,0.9)',
+  borderRadius: '12px',
+  fontWeight: 700,
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: '8px',
+};
+
 const SUMMARY_PLACEHOLDER_PATTERNS = [
   "transcript isn't fully provided",
   'transcript is not fully provided',
@@ -81,6 +116,127 @@ const needsPostCallArtifacts = (callData) => {
 };
 
 const SOFTPHONE_PREPARING_TIMEOUT_MS = 12000;
+
+const cleanVoipReasonText = (value) => (
+  String(value || '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+);
+
+const buildCallWrapUpMeta = (event, candidateName) => {
+  const firstName = candidateName?.trim()?.split(/\s+/)?.[0] || 'The candidate';
+  const reasonText = cleanVoipReasonText(event?.reasonText || event?.message || '');
+  const lowerReason = reasonText.toLowerCase();
+
+  const baseMeta = {
+    label: 'Wrap-up',
+    title: 'Call ended',
+    message: 'Capture the outcome and next step below.',
+    tone: '#8b6b44',
+    bg: '#f8f5ef',
+    border: 'rgba(148, 115, 77, 0.22)',
+    suggestedOutcome: '',
+  };
+
+  if (event?.type === 'failed') {
+    if (lowerReason.includes('busy')) {
+      return {
+        ...baseMeta,
+        title: 'Line busy',
+        message: `${firstName}'s line was busy, so the browser call did not connect.`,
+        suggestedOutcome: 'No Answer',
+      };
+    }
+
+    if (lowerReason.includes('no answer') || lowerReason.includes('timeout') || lowerReason.includes('unanswered')) {
+      return {
+        ...baseMeta,
+        title: 'No answer',
+        message: `${firstName} did not answer the browser call.`,
+        suggestedOutcome: 'No Answer',
+      };
+    }
+
+    if (lowerReason.includes('rejected') || lowerReason.includes('declined') || lowerReason.includes('cancel')) {
+      return {
+        ...baseMeta,
+        title: 'Call declined',
+        message: `${firstName} declined or ended the browser call before it connected.`,
+      };
+    }
+
+    return {
+      ...baseMeta,
+      title: 'Call could not connect',
+      message: reasonText
+        ? `The browser call did not connect: ${reasonText}.`
+        : 'The browser call did not connect. Review the outcome and next step below.',
+    };
+  }
+
+  if (event?.origin === 'local') {
+    return {
+      ...baseMeta,
+      title: 'Call ended',
+      message: 'You ended the browser call. Capture the outcome and next step below.',
+    };
+  }
+
+  if (lowerReason.includes('busy')) {
+    return {
+      ...baseMeta,
+      title: 'Line busy',
+      message: `${firstName}'s line was busy and the browser call ended.`,
+      suggestedOutcome: 'No Answer',
+    };
+  }
+
+  if (lowerReason.includes('no answer') || lowerReason.includes('timeout') || lowerReason.includes('unanswered')) {
+    return {
+      ...baseMeta,
+      title: 'No answer',
+      message: `${firstName} did not answer the call.`,
+      suggestedOutcome: 'No Answer',
+    };
+  }
+
+  if (
+    lowerReason.includes('remote')
+    || lowerReason.includes('hangup')
+    || lowerReason.includes('hang up')
+    || lowerReason.includes('terminated')
+    || lowerReason.includes('rejected')
+    || lowerReason.includes('declined')
+  ) {
+    return {
+      ...baseMeta,
+      title: 'Candidate disconnected',
+      message: `${firstName} ended the call from their side.`,
+      tone: '#334155',
+      bg: '#f8fafc',
+      border: 'rgba(148, 163, 184, 0.24)',
+    };
+  }
+
+  if (reasonText) {
+    return {
+      ...baseMeta,
+      message: `The browser call ended: ${reasonText}.`,
+      tone: '#334155',
+      bg: '#f8fafc',
+      border: 'rgba(148, 163, 184, 0.24)',
+    };
+  }
+
+  return {
+    ...baseMeta,
+    message: `${firstName} ended or disconnected the browser call.`,
+    tone: '#334155',
+    bg: '#f8fafc',
+    border: 'rgba(148, 163, 184, 0.24)',
+  };
+};
 
 function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   const fetchChatHistory = useAppStore(state => state.fetchChatHistory);
@@ -374,8 +530,8 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
             width: '38px',
             height: '38px',
             borderRadius: '12px',
-            background: '#eff6ff',
-            color: '#2563eb',
+            background: '#f8fafc',
+            color: '#475569',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center'
@@ -432,7 +588,7 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
             <div key={item.id} style={{ position: 'relative', padding: '18px', borderRadius: '20px', background: '#fff', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', marginBottom: '14px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <div style={{ width: '36px', height: '36px', borderRadius: '12px', background: '#eff6ff', color: '#2563eb', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <div style={{ width: '36px', height: '36px', borderRadius: '12px', background: '#f8fafc', color: '#475569', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     <PhoneIncoming size={18} />
                   </div>
                   <div>
@@ -493,13 +649,37 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
 }
 
 export default function Calls() {
-  const { 
-    calls, fetchCalls, 
-    callLists, fetchCallLists,
+  const {
+    calls,
+    fetchCalls,
+    callLists,
+    fetchCallLists,
     callsLastQueryKey,
-    callStats, fetchCallStats,
-    updateCall, deleteCall, deleteCallList, createCallList, clearCallsState, syncCallRecording
-  } = useAppStore();
+    callStats,
+    fetchCallStats,
+    updateCall,
+    deleteCall,
+    deleteCallList,
+    createCallList,
+    clearCallsState,
+    syncCallRecording,
+    sidebarWidth,
+  } = useAppStore(useShallow((state) => ({
+    calls: state.calls,
+    fetchCalls: state.fetchCalls,
+    callLists: state.callLists,
+    fetchCallLists: state.fetchCallLists,
+    callsLastQueryKey: state.callsLastQueryKey,
+    callStats: state.callStats,
+    fetchCallStats: state.fetchCallStats,
+    updateCall: state.updateCall,
+    deleteCall: state.deleteCall,
+    deleteCallList: state.deleteCallList,
+    createCallList: state.createCallList,
+    clearCallsState: state.clearCallsState,
+    syncCallRecording: state.syncCallRecording,
+    sidebarWidth: state.sidebarWidth,
+  })));
 
   const [activeTab, setActiveTab] = useState('today');
   const [loading, setLoading] = useState(false);
@@ -532,6 +712,11 @@ export default function Calls() {
       clearTimeout(retryTimerRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || window.scrollX === 0) return;
+    window.scrollTo({ left: 0, top: window.scrollY });
+  }, [sidebarWidth, activeTab, selectedList]);
 
   const fetchData = useCallback(async () => {
     if (retryTimerRef.current) {
@@ -601,10 +786,10 @@ export default function Calls() {
   }, [fetchData]);
 
   const stats = [
-    { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#2563eb', bg: '#eff6ff' },
-    { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#f59e0b', bg: '#fffbeb' },
-    { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#10b981', bg: '#ecfdf5' },
-    { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#8b5cf6', bg: '#f5f3ff' },
+    { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#334155', bg: '#f8fafc' },
+    { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#8b6b44', bg: '#fcf8f2' },
+    { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#166534', bg: '#f3faf5' },
+    { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#475569', bg: '#f8fafc' },
   ];
 
   const handleDial = (call) => {
@@ -681,28 +866,31 @@ export default function Calls() {
   const showListsLoading = activeTab === 'lists' && !selectedList && loading && !callLists.length;
 
   return (
-    <div style={{ padding: '32px', background: '#f8fafc', minHeight: '100vh', fontFamily: '"Inter", sans-serif' }}>
-      <header style={{ marginBottom: '32px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+    <div style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
+      <header style={{ ...CALL_PANEL_STYLE, marginBottom: '28px', padding: '24px 28px', borderRadius: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px 24px' }}>
         <div>
-          <h1 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Tasks Dashboard</h1>
-          <p style={{ color: '#64748b', fontSize: '15px' }}>Track your calling progress and lists</p>
+          <div style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>
+            Call operations
+          </div>
+          <h1 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Calls Workspace</h1>
+          <p style={{ color: '#64748b', fontSize: '15px' }}>Track your calling progress and call lists</p>
           {fetchNotice && (
-            <div style={{ marginTop: '12px', padding: '10px 14px', borderRadius: '12px', background: '#fff7ed', color: '#c2410c', fontSize: '13px', fontWeight: 600, border: '1px solid #fdba74' }}>
+            <div style={{ marginTop: '12px', padding: '10px 14px', borderRadius: '12px', background: '#fcf8f2', color: '#8b6b44', fontSize: '13px', fontWeight: 600, border: '1px solid rgba(194,124,63,0.2)' }}>
               {fetchNotice}
             </div>
           )}
         </div>
         {isRevalidating && (
-          <div style={{ padding: '8px 16px', borderRadius: '12px', background: '#eff6ff', color: '#2563eb', fontSize: '12px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{ padding: '8px 16px', borderRadius: '12px', background: '#f8fafc', color: '#475569', fontSize: '12px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid rgba(203,213,225,0.9)' }}>
             <RefreshCw size={14} className="revalidating" /> Updating...
           </div>
         )}
       </header>
 
       {/* Stats Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '20px', marginBottom: '40px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '20px', marginBottom: '40px' }}>
         {stats.map((stat, i) => (
-          <div key={i} style={{ padding: '24px', background: '#fff', borderRadius: '20px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.01)' }}>
+          <div key={i} style={{ ...CALL_PANEL_STYLE, padding: '24px', borderRadius: '20px', minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
               <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: stat.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 <stat.icon size={20} color={stat.color} />
@@ -715,14 +903,14 @@ export default function Calls() {
       </div>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', gap: '32px' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', columnGap: '24px', rowGap: '10px' }}>
         {TABS.map(tab => (
           <button
             key={tab.id}
             onClick={() => { clearCallsState(); setActiveTab(tab.id); setSelectedList(null); }}
             style={{
-              padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #2563eb' : '2px solid transparent',
-              color: activeTab === tab.id ? '#2563eb' : '#64748b', fontSize: '14px', fontWeight: 600,
+              padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #111827' : '2px solid transparent',
+              color: activeTab === tab.id ? '#111827' : '#64748b', fontSize: '14px', fontWeight: 600,
               cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '-1px',
               transition: 'all 0.2s'
             }}
@@ -734,7 +922,7 @@ export default function Calls() {
       </div>
 
       {/* Content Area */}
-      <div style={{ background: '#fff', borderRadius: '24px', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+      <div style={{ ...CALL_PANEL_STYLE, borderRadius: '24px', overflow: 'hidden' }}>
         {activeTab === 'lists' && !selectedList ? (
           <div style={{ padding: '24px' }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
@@ -753,7 +941,7 @@ export default function Calls() {
               <div 
                 style={{ 
                   padding: '24px', borderRadius: '20px', 
-                  border: isCreatingList ? '2px solid #3b82f6' : '1px dashed #cbd5e1', 
+                  border: isCreatingList ? '1px solid #111827' : '1px dashed #cbd5e1',
                   background: isCreatingList ? '#fff' : '#f8fafc',
                   cursor: isCreatingList ? 'default' : 'pointer',
                   transition: 'all 0.2s ease',
@@ -792,14 +980,14 @@ export default function Calls() {
                       <button 
                         onClick={(e) => { e.stopPropagation(); handleCreateList(); }}
                         disabled={isSubmittingList}
-                        style={{ flex: 1, padding: '8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '8px', fontSize: '13px', fontWeight: 600, cursor: isSubmittingList ? 'wait' : 'pointer' }}
+                        style={{ ...CALL_PRIMARY_BUTTON, flex: 1, padding: '8px', fontSize: '13px', cursor: isSubmittingList ? 'wait' : 'pointer' }}
                       >
                         {isSubmittingList ? 'Saving...' : 'Save List'}
                       </button>
                       <button 
                         onClick={(e) => { e.stopPropagation(); setIsCreatingList(false); setNewListName(''); }}
                         disabled={isSubmittingList}
-                        style={{ padding: '8px 12px', background: '#f1f5f9', color: '#64748b', border: 'none', borderRadius: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}
+                        style={{ ...CALL_SECONDARY_BUTTON, padding: '8px 12px', fontSize: '13px' }}
                       >
                         Cancel
                       </button>
@@ -816,12 +1004,12 @@ export default function Calls() {
                     padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', cursor: 'pointer',
                     transition: 'all 0.2s'
                   }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#2563eb'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#111827'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
                   onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.transform = 'none'; }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
-                    <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: '#eff6ff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <List size={20} color="#2563eb" />
+                    <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <List size={20} color="#475569" />
                     </div>
                     <button 
                       onClick={(e) => {
@@ -849,7 +1037,7 @@ export default function Calls() {
           </div>
         ) : (
           <div style={{ minHeight: '400px' }}>
-            <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
               {selectedList && (
                 <button 
                   onClick={() => { clearCallsState(); setSelectedList(null); }}
@@ -862,12 +1050,12 @@ export default function Calls() {
                 {selectedList ? selectedList.name : activeTab === 'today' ? 'Due Today' : activeTab === 'upcoming' ? 'Upcoming' : 'Completed'}
               </h2>
               {selectedList && (
-                <span style={{ fontSize: '12px', background: '#eff6ff', color: '#2563eb', padding: '2px 8px', borderRadius: '20px', fontWeight: 600 }}>
+                <span style={{ fontSize: '12px', background: '#f8fafc', color: '#475569', padding: '2px 8px', borderRadius: '20px', fontWeight: 600, border: '1px solid rgba(203,213,225,0.9)' }}>
                   {(filteredCalls || []).length} Contacts
                 </span>
               )}
               
-              <div style={{ position: 'relative', marginLeft: 'auto', width: '240px' }}>
+              <div style={{ position: 'relative', marginLeft: 'auto', width: 'min(240px, 100%)', minWidth: '180px', flex: '1 1 220px' }}>
                 <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
                 <input 
                   type="text" 
@@ -914,7 +1102,7 @@ export default function Calls() {
                     <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '4px' }}>
                       {call.task_title || call.candidate_title || 'No Title'}
                     </p>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px', color: '#94a3b8' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap', fontSize: '12px', color: '#94a3b8' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <Phone size={12} /> {call.candidate_phone || 'N/A'}
                       </div>
@@ -937,13 +1125,13 @@ export default function Calls() {
                       )}
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '8px' }}>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {call.status === 'completed' && (
                       <button
                         onClick={() => setExpandedCallId(expandedCallId === call.id ? null : call.id)}
                         style={{
                           padding: '8px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
-                          background: '#fff', color: '#2563eb', border: '1.5px solid #dbeafe', cursor: 'pointer',
+                          background: '#fff', color: '#334155', border: '1px solid rgba(203,213,225,0.9)', cursor: 'pointer',
                           display: 'flex', alignItems: 'center', gap: '6px'
                         }}
                       >
@@ -964,9 +1152,9 @@ export default function Calls() {
                       disabled={call.status === 'completed'}
                       style={{ 
                         padding: '8px 16px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
-                        background: call.status === 'completed' ? '#f1f5f9' : '#2563eb',
+                        background: call.status === 'completed' ? '#f1f5f9' : '#111827',
                         color: call.status === 'completed' ? '#94a3b8' : '#fff',
-                        border: 'none', cursor: call.status === 'completed' ? 'not-allowed' : 'pointer',
+                        border: call.status === 'completed' ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: call.status === 'completed' ? 'not-allowed' : 'pointer',
                         display: 'flex', alignItems: 'center', gap: '8px'
                       }}
                     >
@@ -1003,9 +1191,9 @@ export default function Calls() {
                               style={{
                                 padding: '8px 12px',
                                 borderRadius: '10px',
-                                border: '1px solid #dbeafe',
-                                background: '#eff6ff',
-                                color: '#1d4ed8',
+                                border: '1px solid rgba(203,213,225,0.9)',
+                                background: '#fff',
+                                color: '#334155',
                                 fontSize: '12px',
                                 fontWeight: 700,
                                 cursor: syncingCallId === call.id ? 'wait' : 'pointer',
@@ -1068,11 +1256,13 @@ export default function Calls() {
       </div>
 
       {callingCandidate && (
-        <CallingModal 
-          call={callingCandidate} 
-          onClose={() => setCallingCandidate(null)} 
-          onRefresh={fetchData} 
-        />
+        <VoIPProvider>
+          <CallingModal 
+            call={callingCandidate} 
+            onClose={() => setCallingCandidate(null)} 
+            onRefresh={fetchData} 
+          />
+        </VoIPProvider>
       )}
     </div>
   );
@@ -1081,6 +1271,7 @@ export default function Calls() {
 function CallingModal({ call, onClose, onRefresh }) {
   const [activeTab, setActiveTab] = useState('calls');
   const [callState, setCallState] = useState('preparing_softphone');
+  const [callWrapUpMeta, setCallWrapUpMeta] = useState(null);
   const [outcome, setOutcome] = useState('');
   const [notes, setNotes] = useState('');
   const [createFollowup, setCreateFollowup] = useState(false);
@@ -1092,9 +1283,15 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationErrorCode, setInitiationErrorCode] = useState('');
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
-  const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore();
-  const { activeCall, answerCall, rejectCall, placeCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, agentEmail, retryVoip } = useVoIP();
+  const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore(useShallow((state) => ({
+    updateCall: state.updateCall,
+    initiateCall: state.initiateCall,
+    fetchCalls: state.fetchCalls,
+    syncCallRecording: state.syncCallRecording,
+  })));
+  const { activeCall, answerCall, rejectCall, placeCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, voipCallEvent, agentEmail, retryVoip } = useVoIP();
   const isInitiated = useRef(false);
+  const lastHandledCallEventRef = useRef(0);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
@@ -1112,6 +1309,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     setInitiationErrorCode('');
     setInitiationActionLabel('');
     setInitiationActionUrl('');
+    setCallWrapUpMeta(null);
     
     // Check local VoIP status before initiating
     if (voipStatus === 'error') {
@@ -1140,7 +1338,15 @@ function CallingModal({ call, onClose, onRefresh }) {
       }
 
       if (placeCall && call.candidate_phone) {
-        await placeCall(call.candidate_phone);
+        const placeResult = await placeCall(call.candidate_phone);
+        if (!placeResult?.success) {
+          const message = placeResult?.error || 'Browser VoIP could not start the call';
+          setInitiationError(message);
+          setInitiationErrorCode('browser_call_start_failed');
+          setCallState('error');
+          toast.error(message);
+          return;
+        }
       }
 
       setCallState('waiting_for_invite');
@@ -1269,6 +1475,42 @@ function CallingModal({ call, onClose, onRefresh }) {
   }, [activeCall, callState]);
 
   useEffect(() => {
+    if (!voipCallEvent?.at || lastHandledCallEventRef.current === voipCallEvent.at || callState === 'review') {
+      return;
+    }
+
+    lastHandledCallEventRef.current = voipCallEvent.at;
+
+    if (voipCallEvent.type === 'dialing') {
+      return;
+    }
+
+    if (voipCallEvent.type === 'connected') {
+      setCallWrapUpMeta(null);
+      return;
+    }
+
+    if (!['terminated', 'failed'].includes(voipCallEvent.type)) {
+      return;
+    }
+
+    const nextMeta = buildCallWrapUpMeta(voipCallEvent, call.candidate_name);
+    setCallWrapUpMeta(nextMeta);
+    if (!outcome && nextMeta.suggestedOutcome) {
+      setOutcome(nextMeta.suggestedOutcome);
+    }
+    setCallState('ended');
+
+    if (voipCallEvent.origin !== 'local') {
+      if (voipCallEvent.type === 'failed') {
+        toast.error(nextMeta.title);
+      } else {
+        toast.info(nextMeta.title);
+      }
+    }
+  }, [call.candidate_name, callState, outcome, voipCallEvent]);
+
+  useEffect(() => {
     let t;
     if (callState === 'review') {
       const fetchReviewData = async () => {
@@ -1308,6 +1550,7 @@ function CallingModal({ call, onClose, onRefresh }) {
   };
 
   const handleEndCall = async () => {
+    setCallWrapUpMeta(buildCallWrapUpMeta({ type: 'terminated', origin: 'local' }, call.candidate_name));
     await rejectCall();
     setCallState('ended');
   };
@@ -1317,6 +1560,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     setInitiationErrorCode('');
     setInitiationActionLabel('');
     setInitiationActionUrl('');
+    setCallWrapUpMeta(null);
     setCallState('preparing_softphone');
     isInitiated.current = false;
     retryVoip();
@@ -1422,7 +1666,12 @@ function CallingModal({ call, onClose, onRefresh }) {
             : callState === 'active'
               ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: 'Two-way browser VoIP call is active.' }
               : callState === 'ended'
-                ? { label: 'Wrap-up', tone: '#f97316', bg: '#fff7ed', message: 'Capture the outcome...' }
+                ? {
+                    label: callWrapUpMeta?.label || 'Wrap-up',
+                    tone: callWrapUpMeta?.tone || '#8b6b44',
+                    bg: callWrapUpMeta?.bg || '#f8f5ef',
+                    message: callWrapUpMeta?.message || 'Capture the outcome and next step below.',
+                  }
                 : callState === 'error'
                   ? { label: 'VoIP Error', tone: '#dc2626', bg: '#fef2f2', message: effectiveError }
                   : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
@@ -1443,10 +1692,10 @@ function CallingModal({ call, onClose, onRefresh }) {
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
                 style={{ 
-                  padding: '6px 12px', borderRadius: '8px', border: 'none', background: activeTab === tab.id ? '#fff' : 'transparent',
-                  color: activeTab === tab.id ? '#0f172a' : '#64748b', fontSize: '12px', fontWeight: 700, 
+                  padding: '6px 12px', borderRadius: '8px', border: activeTab === tab.id ? '1px solid #111827' : '1px solid transparent', background: activeTab === tab.id ? '#111827' : 'transparent',
+                  color: activeTab === tab.id ? '#fff' : '#64748b', fontSize: '12px', fontWeight: 700, 
                   cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px',
-                  boxShadow: activeTab === tab.id ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+                  boxShadow: activeTab === tab.id ? '0 6px 12px rgba(15,23,42,0.12)' : 'none'
                 }}
               >
                 <tab.icon size={14} />
@@ -1514,9 +1763,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                     <button
                       onClick={handleBlockingAction}
                       style={{
-                        display: 'block', width: '100%', padding: '12px', background: '#2563eb',
-                        color: '#fff', borderRadius: '12px', fontSize: '14px', fontWeight: 700,
-                        border: 'none', cursor: 'pointer'
+                        ...CALL_PRIMARY_BUTTON, display: 'block', width: '100%', padding: '12px', fontSize: '14px'
                       }}
                     >
                       {effectiveActionLabel}
@@ -1619,19 +1866,11 @@ function CallingModal({ call, onClose, onRefresh }) {
                         <button
                           onClick={handleBlockingAction}
                           style={{
+                            ...CALL_PRIMARY_BUTTON,
                             flex: 1,
                             padding: '16px',
-                            background: '#2563eb',
-                            color: '#fff',
-                            border: 'none',
                             borderRadius: '16px',
                             fontSize: '15px',
-                            fontWeight: 700,
-                            cursor: 'pointer',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            gap: '8px'
                           }}
                         >
                           {effectiveActionLabel}
@@ -1640,19 +1879,11 @@ function CallingModal({ call, onClose, onRefresh }) {
                       <button
                         onClick={handleRetryVoip}
                         style={{
+                          ...CALL_SECONDARY_BUTTON,
                           flex: 1,
                           padding: '16px',
-                          background: '#eff6ff',
-                          color: '#2563eb',
-                          border: 'none',
                           borderRadius: '16px',
                           fontSize: '15px',
-                          fontWeight: 700,
-                          cursor: 'pointer',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          gap: '8px'
                         }}
                       >
                         <RefreshCw size={20} /> Retry VoIP
@@ -1660,19 +1891,11 @@ function CallingModal({ call, onClose, onRefresh }) {
                       <button
                         onClick={onClose}
                         style={{
+                          ...CALL_SECONDARY_BUTTON,
                           flex: 1,
                           padding: '16px',
-                          background: '#fff',
-                          color: '#334155',
-                          border: '1px solid #cbd5e1',
                           borderRadius: '16px',
                           fontSize: '15px',
-                          fontWeight: 700,
-                          cursor: 'pointer',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          gap: '8px'
                         }}
                       >
                         <X size={20} /> Close
@@ -1693,6 +1916,25 @@ function CallingModal({ call, onClose, onRefresh }) {
                 </>
               ) : callState === 'ended' ? (
                 <div style={{ width: '100%' }}>
+                  {callWrapUpMeta && (
+                    <div
+                      style={{
+                        marginBottom: '20px',
+                        padding: '16px 18px',
+                        borderRadius: '14px',
+                        background: callWrapUpMeta.bg,
+                        border: `1px solid ${callWrapUpMeta.border}`,
+                        color: callWrapUpMeta.tone,
+                      }}
+                    >
+                      <div style={{ fontSize: '12px', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                        {callWrapUpMeta.title}
+                      </div>
+                      <div style={{ fontSize: '13px', marginTop: '6px', lineHeight: 1.5 }}>
+                        {callWrapUpMeta.message}
+                      </div>
+                    </div>
+                  )}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px' }}>
                     <PhoneCall size={18} color="#2563eb" />
                     <span style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>Log Call Details</span>
@@ -1703,7 +1945,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                     <select 
                       value={outcome}
                       onChange={e => setOutcome(e.target.value)}
-                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1.5px solid #e2e8f0', fontSize: '14px', outline: 'none' }}
+                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', outline: 'none', background: '#fff' }}
                     >
                       <option value="">Select an outcome...</option>
                       {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
@@ -1726,7 +1968,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                       placeholder="Summarize the call and note any next steps..."
                       value={notes}
                       onChange={e => setNotes(e.target.value)}
-                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1.5px solid #e2e8f0', fontSize: '14px', minHeight: '100px', resize: 'none' }}
+                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '100px', resize: 'none', background: '#fff' }}
                     />
                   </div>
 
@@ -1743,18 +1985,18 @@ function CallingModal({ call, onClose, onRefresh }) {
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: '12px', marginBottom: '32px' }}>
                       <div>
                         <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Task Title</label>
-                        <input type="text" value={followupTitle} onChange={e => setFollowupTitle(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1.5px solid #e2e8f0' }} />
+                        <input type="text" value={followupTitle} onChange={e => setFollowupTitle(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff' }} />
                       </div>
                       <div>
                         <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Due Date</label>
-                        <input type="date" value={followupDueDate} onChange={e => setFollowupDueDate(e.target.value)} min={new Date().toISOString().split('T')[0]} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1.5px solid #e2e8f0' }} />
+                        <input type="date" value={followupDueDate} onChange={e => setFollowupDueDate(e.target.value)} min={new Date().toISOString().split('T')[0]} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff' }} />
                       </div>
                     </div>
                   )}
 
                   <div style={{ display: 'flex', gap: '12px' }}>
-                    <button style={{ flex: 1, padding: '14px', background: '#fff', border: '1.5px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, cursor: 'pointer' }} onClick={handleEndCall}>Cancel</button>
-                    <button onClick={handleSaveLog} disabled={saving} style={{ flex: 1, padding: '14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '12px', fontWeight: 700, cursor: saving ? 'not-allowed' : 'pointer' }}>
+                    <button style={{ ...CALL_SECONDARY_BUTTON, flex: 1, padding: '14px' }} onClick={handleEndCall}>Cancel</button>
+                    <button onClick={handleSaveLog} disabled={saving} style={{ ...CALL_PRIMARY_BUTTON, flex: 1, padding: '14px', cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1 }}>
                       {saving ? 'Saving...' : 'Save Call Log'}
                     </button>
                   </div>
@@ -1801,7 +2043,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                       )}
                     </div>
                   </div>
-                  <button onClick={onClose} style={{ width: '100%', padding: '14px', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px', fontWeight: 700, color: '#0f172a', cursor: 'pointer' }}>Close Window</button>
+                  <button onClick={onClose} style={{ ...CALL_SECONDARY_BUTTON, width: '100%', padding: '14px', color: '#0f172a' }}>Close Window</button>
                 </div>
               )}
             </div>

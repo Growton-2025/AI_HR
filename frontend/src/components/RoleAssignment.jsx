@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { toast } from 'sonner'
+import { useShallow } from 'zustand/react/shallow'
 
 function RoleAssignment() {
     const {
@@ -12,7 +13,16 @@ function RoleAssignment() {
         assignCandidatesToRole,
         setScreenStep,
         clearSelections
-    } = useAppStore()
+    } = useAppStore(useShallow((state) => ({
+        selectedCandidates: state.selectedCandidates,
+        candidatePriorities: state.candidatePriorities,
+        candidateFeedback: state.candidateFeedback,
+        roles: state.roles,
+        fetchRoles: state.fetchRoles,
+        assignCandidatesToRole: state.assignCandidatesToRole,
+        setScreenStep: state.setScreenStep,
+        clearSelections: state.clearSelections,
+    })))
 
     const [selectedRoles, setSelectedRoles] = useState([])
     const [isAssigning, setIsAssigning] = useState(false)

@@ -1,13 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { Users, Activity, MessageSquareMore, TrendingUp, Globe, BarChart2, Layers, Award, PhoneCall } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer
 } from 'recharts';
 
-const COLORS_GEO   = ['#f97316', '#2563eb', '#7c3aed', '#0891b2', '#db2777', '#4f46e5', '#059669', '#334155'];
-const COLORS_IND   = ['#4f46e5', '#d97706', '#059669', '#dc2626', '#0d9488', '#b45309', '#6d28d9', '#475569'];
-const COLORS_SEG   = ['#0284c7', '#ea580c', '#6d28d9', '#16a34a', '#db2777', '#2563eb', '#475569', '#0d9488'];
+const COLORS_GEO   = ['#6b7280', '#2563eb', '#8b6b44', '#0f766e', '#475569', '#4f46e5', '#15803d', '#334155'];
+const COLORS_IND   = ['#475569', '#9a6b28', '#166534', '#1d4ed8', '#0f766e', '#7c3f13', '#5b21b6', '#64748b'];
+const COLORS_SEG   = ['#334155', '#8b6b44', '#1d4ed8', '#166534', '#475569', '#0f766e', '#7c3f13', '#6366f1'];
 
 const getEntryColor = (name, index, palette) => {
   if (name === 'Other' || name === 'Unknown') return '#475569';
@@ -17,11 +18,11 @@ const getEntryColor = (name, index, palette) => {
 const DashboardCard = ({ title, value, subtext, icon: Icon, color, loading }) => (
   <div
     style={{
-      background: '#fff',
-      borderRadius: '20px',
+      background: 'linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(248,250,252,0.94) 100%)',
+      borderRadius: '22px',
       padding: '24px',
-      boxShadow: '0 4px 6px -1px rgba(0,0,0,0.02)',
-      border: '1.5px solid #f1f5f9',
+      boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
+      border: '1px solid rgba(226,232,240,0.9)',
       display: 'flex', flexDirection: 'column', gap: '12px',
       transition: 'transform 0.2s, box-shadow 0.2s',
       position: 'relative',
@@ -30,7 +31,7 @@ const DashboardCard = ({ title, value, subtext, icon: Icon, color, loading }) =>
   >
     {loading && <div className="shimmer" style={{ position: 'absolute', inset: 0, opacity: 0.1, zIndex: 1 }} />}
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-      <div style={{ width: '48px', height: '48px', borderRadius: '14px', background: loading ? '#f1f5f9' : `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ width: '48px', height: '48px', borderRadius: '16px', background: loading ? '#f1f5f9' : `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center', border: loading ? 'none' : `1px solid ${color}18` }}>
         {!loading && <Icon size={24} color={color} />}
       </div>
     </div>
@@ -52,15 +53,16 @@ const DashboardCard = ({ title, value, subtext, icon: Icon, color, loading }) =>
 
 const ChartCard = ({ title, subtitle, icon: Icon, iconColor, children }) => (
   <div style={{
-    background: '#fff',
+    background: 'rgba(255,255,255,0.86)',
+    backdropFilter: 'blur(16px)',
     borderRadius: '24px',
     padding: '28px',
-    border: '1.5px solid #f1f5f9',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.02)',
+    border: '1px solid rgba(226,232,240,0.92)',
+    boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
   }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
       <h2 style={{ fontSize: '17px', fontWeight: 800, color: '#0f172a', margin: 0 }}>{title}</h2>
-      <Icon size={18} color={iconColor || '#f97316'} />
+      <Icon size={18} color={iconColor || '#64748b'} />
     </div>
     <p style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '16px', marginTop: 0 }}>{subtitle}</p>
     {children}
@@ -94,7 +96,13 @@ const CustomTooltip = ({ active, payload }) => {
 const CHART_MODES = ['Geography', 'Industry', 'Segment'];
 
 const Dashboard = () => {
-  const { user, analytics, fetchAnalytics, callStats, fetchCallStats } = useAppStore();
+  const { user, analytics, fetchAnalytics, callStats, fetchCallStats } = useAppStore(useShallow((state) => ({
+    user: state.user,
+    analytics: state.analytics,
+    fetchAnalytics: state.fetchAnalytics,
+    callStats: state.callStats,
+    fetchCallStats: state.fetchCallStats,
+  })));
   const [activeMode, setActiveMode] = useState(0);
   const [isRevalidating, setIsRevalidating] = useState(false);
   const hasLoadedRef = useRef(false);
@@ -125,10 +133,10 @@ const Dashboard = () => {
   const totalCalls = (callStats?.due_today || 0) + (callStats?.upcoming || 0) + (callStats?.completed || 0);
 
   const metricCards = [
-    { title: 'Total Sourced', value: displayMetrics.total_sourced?.toLocaleString(), subtext: 'Leads in talent pool', icon: Users, color: '#f97316' },
-    { title: 'Shortlisted', value: displayMetrics.shortlisted?.toLocaleString(), subtext: 'Approved leads', icon: Activity, color: '#22c55e' },
-    { title: 'Call Operations', value: totalCalls.toLocaleString(), subtext: `${callStats?.due_today || 0} Ongoing · ${callStats?.upcoming || 0} Upcoming · ${callStats?.completed || 0} Completed`, icon: PhoneCall, color: '#3b82f6' },
-    { title: 'Active Hub', value: ((displayMetrics.email_campaigns_active || 0) + (displayMetrics.linkedin_campaigns_active || 0)).toLocaleString(), subtext: `${displayMetrics.email_campaigns_active || 0} via Email · ${displayMetrics.linkedin_campaigns_active || 0} via LinkedIn`, icon: TrendingUp, color: '#ec4899' }
+    { title: 'Total Sourced', value: displayMetrics.total_sourced?.toLocaleString(), subtext: 'Leads in talent pool', icon: Users, color: '#8b6b44' },
+    { title: 'Shortlisted', value: displayMetrics.shortlisted?.toLocaleString(), subtext: 'Approved leads', icon: Activity, color: '#166534' },
+    { title: 'Call Operations', value: totalCalls.toLocaleString(), subtext: `${callStats?.due_today || 0} Ongoing · ${callStats?.upcoming || 0} Upcoming · ${callStats?.completed || 0} Completed`, icon: PhoneCall, color: '#334155' },
+    { title: 'Active Hub', value: ((displayMetrics.email_campaigns_active || 0) + (displayMetrics.linkedin_campaigns_active || 0)).toLocaleString(), subtext: `${displayMetrics.email_campaigns_active || 0} via Email · ${displayMetrics.linkedin_campaigns_active || 0} via LinkedIn`, icon: TrendingUp, color: '#475569' }
   ];
 
   const distributions = analytics?.distributions || { geo: [], industry: [], segment: [], functional: [] };
@@ -143,9 +151,12 @@ const Dashboard = () => {
   const total = current.data.reduce((s, d) => s + d.value, 0);
 
   return (
-    <div style={{ padding: '40px 40px 40px', fontFamily: '"Inter", sans-serif' }}>
+    <div style={{ padding: '24px 0 12px', fontFamily: '"Inter", sans-serif' }}>
       {/* Header */}
-      <div style={{ marginBottom: '36px' }}>
+      <div style={{ marginBottom: '28px', padding: '24px 28px', borderRadius: '26px', background: 'rgba(255,255,255,0.84)', backdropFilter: 'blur(16px)', border: '1px solid rgba(226,232,240,0.92)', boxShadow: '0 18px 40px rgba(15,23,42,0.05)' }}>
+        <div style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
+          Executive snapshot
+        </div>
         <h1 style={{ fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px', marginBottom: '6px' }}>
           Welcome back!
         </h1>
@@ -178,7 +189,7 @@ const Dashboard = () => {
           title="Lead Distribution"
           subtitle="Explore how all leads are distributed by region, industry, segment, or functional area"
           icon={Globe}
-          iconColor="#f97316"
+          iconColor="#64748b"
         >
           {/* Tab Switch */}
           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
@@ -188,13 +199,13 @@ const Dashboard = () => {
                 onClick={() => setActiveMode(i)}
                 style={{
                   padding: '6px 14px',
-                  borderRadius: '20px',
-                  border: 'none',
+                  borderRadius: '999px',
+                  border: activeMode === i ? '1px solid #111827' : '1px solid rgba(203,213,225,0.9)',
                   cursor: 'pointer',
                   fontSize: '12px',
                   fontWeight: 700,
                   transition: 'all 0.15s',
-                  background: activeMode === i ? '#f97316' : '#f1f5f9',
+                  background: activeMode === i ? '#111827' : '#fff',
                   color: activeMode === i ? '#fff' : '#64748b',
                 }}
               >
@@ -261,7 +272,7 @@ const Dashboard = () => {
           title={`By ${CHART_MODES[activeMode]}`}
           subtitle="Top segments by lead count"
           icon={BarChart2}
-          iconColor={activeMode === 0 ? '#f97316' : activeMode === 1 ? '#6366f1' : activeMode === 2 ? '#0ea5e9' : '#8b5cf6'}
+          iconColor={activeMode === 0 ? '#8b6b44' : activeMode === 1 ? '#475569' : activeMode === 2 ? '#0f766e' : '#64748b'}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             {(current.data.slice(0, 8)).map((item, i) => {
@@ -300,7 +311,7 @@ const Dashboard = () => {
             title="Team Performance"
             subtitle="Pipeline metrics broken down by recruiter"
             icon={Award}
-            iconColor="#eab308"
+            iconColor="#8b6b44"
           >
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>

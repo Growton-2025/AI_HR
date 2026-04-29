@@ -456,27 +456,45 @@ export const useAppStore = create(persist((set, get) => ({
     // Sidebar State
     sidebarWidth: 260,
     isSidebarCollapsed: false,
-    setSidebarWidth: (w) => set({ sidebarWidth: Math.max(56, Math.min(420, w)), isSidebarCollapsed: w < 120 }),
+    setSidebarWidth: (w) => set({ sidebarWidth: Math.max(72, Math.min(420, w)), isSidebarCollapsed: w < 120 }),
     toggleSidebar: () => {
         const { isSidebarCollapsed, sidebarWidth } = get()
         if (isSidebarCollapsed) {
             set({ isSidebarCollapsed: false, sidebarWidth: 240 })
         } else {
-            set({ isSidebarCollapsed: true, sidebarWidth: 56 })
+            set({ isSidebarCollapsed: true, sidebarWidth: 72 })
         }
     },
 
     updateCandidateField: async (candidateId, data) => {
         try {
             const res = await axios.patch(`${API_BASE}/candidates/${candidateId}`, data)
-            // Update cache locally
-            const { talentPoolCache } = get()
-            if (talentPoolCache.candidates) {
-                const updated = talentPoolCache.candidates.map(c => 
-                    c.id === candidateId ? { ...c, ...data } : c
-                )
-                set({ talentPoolCache: { ...talentPoolCache, candidates: updated } })
+            const normalizedPatch = { ...data }
+            if (Object.prototype.hasOwnProperty.call(data, 'phone')) {
+                normalizedPatch.phone = data.phone
+                normalizedPatch.mobile_phone = data.phone
             }
+
+            const patchCandidate = (candidate) => (
+                candidate?.id === candidateId ? { ...candidate, ...normalizedPatch } : candidate
+            )
+
+            set(state => ({
+                tpCandidates: (state.tpCandidates || []).map(patchCandidate),
+                talentPoolCache: state.talentPoolCache?.data
+                    ? {
+                        ...state.talentPoolCache,
+                        data: {
+                            ...state.talentPoolCache.data,
+                            candidates: (state.talentPoolCache.data.candidates || []).map(patchCandidate),
+                        },
+                    }
+                    : state.talentPoolCache,
+                talentPoolIndex: {
+                    ...(state.talentPoolIndex || { rows: [], lastFetchedAt: 0 }),
+                    rows: (state.talentPoolIndex?.rows || []).map(patchCandidate),
+                },
+            }))
             return { success: true, data: res.data }
         } catch (e) {
             console.error('Failed to update candidate field:', e)

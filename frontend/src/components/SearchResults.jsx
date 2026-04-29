@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { Linkedin } from 'lucide-react'
+import { useShallow } from 'zustand/react/shallow'
 
 function SearchResults() {
     const {
@@ -11,7 +12,15 @@ function SearchResults() {
         setCandidatePriority,
         candidateFeedback,
         setCandidateFeedback
-    } = useAppStore()
+    } = useAppStore(useShallow((state) => ({
+        searchResults: state.searchResults,
+        selectedCandidates: state.selectedCandidates,
+        toggleCandidateSelection: state.toggleCandidateSelection,
+        candidatePriorities: state.candidatePriorities,
+        setCandidatePriority: state.setCandidatePriority,
+        candidateFeedback: state.candidateFeedback,
+        setCandidateFeedback: state.setCandidateFeedback,
+    })))
 
     const [expandedSummary, setExpandedSummary] = useState(null)
 

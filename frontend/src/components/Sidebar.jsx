@@ -2,15 +2,21 @@ import { NavLink } from 'react-router-dom'
 import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { Search, Briefcase, Activity, MessageSquareMore, Phone, BarChart2, MoreHorizontal, LogOut, Users, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { useShallow } from 'zustand/react/shallow'
 
-const MIN_WIDTH = 56
+const MIN_WIDTH = 72
 const MAX_WIDTH = 420
 const ICON_THRESHOLD = 160
 
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
     const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
-    const { user, sidebarWidth, setSidebarWidth, isSidebarCollapsed, toggleSidebar } = useAppStore()
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar } = useAppStore(useShallow((state) => ({
+        user: state.user,
+        sidebarWidth: state.sidebarWidth,
+        setSidebarWidth: state.setSidebarWidth,
+        toggleSidebar: state.toggleSidebar,
+    })))
     const role = user?.role
     const permissions = user?.permissions || {}
     const isDragging = useRef(false)
@@ -62,46 +68,59 @@ function Sidebar() {
         return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
     }, [setSidebarWidth])
 
-    const navPad = isIconOnly ? '4px 6px' : '4px 10px'
-    const itemPad = isIconOnly ? '11px 0' : '9px 12px'
+    const navPad = isIconOnly ? '8px 8px' : '4px 10px'
+    const itemPad = isIconOnly ? '12px 0' : '9px 12px'
     const iconMr  = isIconOnly ? 0 : '9px'
 
     return (
-        <aside className="app-sidebar" style={{ width: sidebarWidth, display: 'flex', flexDirection: 'column' }}>
+        <aside
+            className="app-sidebar"
+            data-collapsed={isIconOnly ? 'true' : 'false'}
+            style={{ width: sidebarWidth, display: 'flex', flexDirection: 'column' }}
+        >
 
             {/* ── Logo & Toggle ── */}
             <div style={{
-                padding: isIconOnly ? '16px 0' : '20px 20px',
-                borderBottom: '1px solid rgba(255,255,255,0.06)',
-                display: 'flex', alignItems: 'center', justifyContent: isIconOnly ? 'center' : 'space-between', flexShrink: 0,
+                padding: isIconOnly ? '18px 0 16px' : '22px 18px 18px',
+                borderBottom: '1px solid rgba(255,255,255,0.07)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: isIconOnly ? 'center' : 'space-between',
+                flexDirection: isIconOnly ? 'column' : 'row',
+                gap: isIconOnly ? '12px' : 0,
+                flexShrink: 0,
             }}>
                 <img
                     src="https://cdn.prod.website-files.com/65e41b0d7632a225ef3abc4e/693509bb8da9f3b5e10554be_LOGO.svg"
                     alt="Growton"
-                    style={{ filter: 'brightness(0) invert(1)', width: isIconOnly ? '26px' : '90px', height: 'auto', objectFit: 'contain', flexShrink: 0 }}
+                    style={{ filter: 'brightness(0) invert(1)', width: isIconOnly ? '26px' : '88px', height: 'auto', objectFit: 'contain', flexShrink: 0, opacity: 0.96 }}
                 />
-                {!isIconOnly && (
-                    <button onClick={toggleSidebar} style={{ background: 'none', border: 'none', color: '#52525b', cursor: 'pointer', padding: '4px' }}>
-                        <PanelLeftClose size={18} />
-                    </button>
-                )}
-            </div>
-
-            {isIconOnly && (
-                <button onClick={toggleSidebar} style={{ 
-                    position: 'absolute', top: '70px', right: '-12px', background: '#f97316', 
-                    borderRadius: '50%', width: '24px', height: '24px', display: 'flex', 
-                    alignItems: 'center', justifyContent: 'center', border: 'none', color: '#fff',
-                    cursor: 'pointer', zIndex: 10001, boxShadow: '0 2px 8px rgba(249,115,22,0.4)' 
-                }}>
-                    <PanelLeftOpen size={14} />
+                <button
+                    onClick={toggleSidebar}
+                    style={{
+                        width: isIconOnly ? '34px' : '32px',
+                        height: isIconOnly ? '34px' : '32px',
+                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px solid rgba(255,255,255,0.08)',
+                        color: '#9ca3af',
+                        cursor: 'pointer',
+                        padding: 0,
+                        borderRadius: '11px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxShadow: isIconOnly ? '0 10px 20px rgba(15,23,42,0.2)' : 'none',
+                    }}
+                    title={isIconOnly ? 'Expand sidebar' : 'Collapse sidebar'}
+                >
+                    {isIconOnly ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={18} />}
                 </button>
-            )}
+            </div>
 
             {/* ── Top Section (nav) ── */}
             <div style={{ flex: '0 0 auto' }}>
                 {!isIconOnly && (
-                    <div style={{ fontSize: '9px', fontWeight: 800, color: '#3f3f46', textTransform: 'uppercase', letterSpacing: '1.5px', padding: '14px 16px 4px' }}>
+                    <div style={{ fontSize: '9px', fontWeight: 800, color: '#7c8697', textTransform: 'uppercase', letterSpacing: '1.5px', padding: '16px 16px 6px' }}>
                         Navigation
                     </div>
                 )}
@@ -124,9 +143,9 @@ function Sidebar() {
                 {/* Admin */}
                 {role === 'admin' && (
                     <>
-                        <div style={{ margin: '6px 10px', borderBottom: '1px solid rgba(255,255,255,0.06)' }} />
+                        <div style={{ margin: '10px 10px 8px', borderBottom: '1px solid rgba(255,255,255,0.06)' }} />
                         {!isIconOnly && (
-                            <div style={{ fontSize: '9px', fontWeight: 800, color: '#3f3f46', textTransform: 'uppercase', letterSpacing: '1.5px', padding: '0 16px 4px' }}>Admin</div>
+                            <div style={{ fontSize: '9px', fontWeight: 800, color: '#7c8697', textTransform: 'uppercase', letterSpacing: '1.5px', padding: '0 16px 6px' }}>Admin</div>
                         )}
                         <div style={{ padding: navPad }}>
                             <NavLink to="/admin/users"
@@ -143,11 +162,11 @@ function Sidebar() {
             </div>
 
             {/* ── Pipeline Stats ── always visible, adapts layout ── */}
-            <div style={{ flex: '0 0 auto', padding: isIconOnly ? '10px 6px' : '10px', marginTop: isIconOnly ? 'auto' : '12px' }}>
+            <div style={{ flex: '0 0 auto', padding: isIconOnly ? '12px 6px' : '12px 10px', marginTop: isIconOnly ? 'auto' : '14px' }}>
                 {!isIconOnly && (
                     <>
-                        <div style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', marginBottom: '10px' }} />
-                        <div style={{ fontSize: '9px', fontWeight: 800, color: '#3f3f46', textTransform: 'uppercase', letterSpacing: '1.5px', paddingLeft: '6px', marginBottom: '8px' }}>
+                        <div style={{ borderBottom: '1px solid rgba(255,255,255,0.06)', marginBottom: '12px' }} />
+                        <div style={{ fontSize: '9px', fontWeight: 800, color: '#7c8697', textTransform: 'uppercase', letterSpacing: '1.5px', paddingLeft: '6px', marginBottom: '10px' }}>
                             Pipeline
                         </div>
                     </>
@@ -155,32 +174,34 @@ function Sidebar() {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {/* Sourced */}
                     <div style={{
-                        background: 'rgba(249,115,22,0.08)', border: '1px solid rgba(249,115,22,0.15)',
-                        borderRadius: '8px', padding: isIconOnly ? '8px 0' : '8px 12px',
+                        background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                        borderRadius: '12px', padding: isIconOnly ? '10px 0' : '10px 12px',
                         display: 'flex', flexDirection: isIconOnly ? 'column' : 'row',
                         alignItems: 'center', gap: isIconOnly ? '2px' : '8px',
+                        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
                     }}>
-                        <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#f97316', lineHeight: 1 }}>
+                        <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#f4f4f5', lineHeight: 1 }}>
                             {analytics?.summary?.total_sourced?.toLocaleString() || 0}
                         </div>
                         {isIconOnly
-                            ? <div style={{ fontSize: '7px', color: '#52525b', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SRC</div>
-                            : <div style={{ fontSize: '9px', textTransform: 'uppercase', color: '#52525b', fontWeight: 700, letterSpacing: '0.05em' }}>Total Sourced</div>
+                            ? <div style={{ fontSize: '7px', color: '#a1a1aa', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SRC</div>
+                            : <div style={{ fontSize: '9px', textTransform: 'uppercase', color: '#a1a1aa', fontWeight: 700, letterSpacing: '0.08em' }}>Total Sourced</div>
                         }
                     </div>
                     {/* Shortlisted */}
                     <div style={{
-                        background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.15)',
-                        borderRadius: '8px', padding: isIconOnly ? '8px 0' : '8px 12px',
+                        background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                        borderRadius: '12px', padding: isIconOnly ? '10px 0' : '10px 12px',
                         display: 'flex', flexDirection: isIconOnly ? 'column' : 'row',
                         alignItems: 'center', gap: isIconOnly ? '2px' : '8px',
+                        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
                     }}>
-                        <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#22c55e', lineHeight: 1 }}>
+                        <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#f4f4f5', lineHeight: 1 }}>
                             {analytics?.summary?.shortlisted || 0}
                         </div>
                         {isIconOnly
-                            ? <div style={{ fontSize: '7px', color: '#52525b', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SHL</div>
-                            : <div style={{ fontSize: '9px', textTransform: 'uppercase', color: '#52525b', fontWeight: 700, letterSpacing: '0.05em' }}>Shortlisted</div>
+                            ? <div style={{ fontSize: '7px', color: '#a1a1aa', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SHL</div>
+                            : <div style={{ fontSize: '9px', textTransform: 'uppercase', color: '#a1a1aa', fontWeight: 700, letterSpacing: '0.08em' }}>Shortlisted</div>
                         }
                     </div>
                 </div>
@@ -191,43 +212,65 @@ function Sidebar() {
 
             {/* ── User Profile ── */}
             <div style={{
-                padding: isIconOnly ? '10px 6px' : '12px 10px',
-                borderTop: '1px solid rgba(255,255,255,0.07)',
+                padding: isIconOnly ? '10px 6px' : '14px 10px 12px',
+                borderTop: isIconOnly ? '1px solid rgba(255,255,255,0.07)' : 'none',
                 display: 'flex', alignItems: 'center',
                 gap: isIconOnly ? 0 : '8px',
                 flexDirection: isIconOnly ? 'column' : 'row',
                 flexShrink: 0, marginTop: isIconOnly ? '0' : '0',
             }}>
                 <div style={{
-                    width: 30, height: 30, borderRadius: '50%', flexShrink: 0,
-                    background: 'linear-gradient(135deg, #f97316 0%, #c2410c 100%)',
-                    color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontWeight: 700, fontSize: '10px', boxShadow: '0 2px 6px rgba(249,115,22,0.35)',
+                    width: '100%',
+                    padding: isIconOnly ? '0' : '12px 12px',
+                    borderRadius: isIconOnly ? '0' : '16px',
+                    border: isIconOnly ? 'none' : '1px solid rgba(255,255,255,0.07)',
+                    background: isIconOnly ? 'transparent' : 'rgba(255,255,255,0.03)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: isIconOnly ? 0 : '10px',
+                    flexDirection: isIconOnly ? 'column' : 'row',
                 }}>
-                    {user?.full_name ? user.full_name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0,2) : '??'}
-                </div>
-                {!isIconOnly && (
-                    <div style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
-                        <div style={{ fontSize: '12px', fontWeight: 600, color: '#f4f4f5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {user?.full_name || 'User'}
-                        </div>
-                        <div style={{ fontSize: '10px', color: '#52525b' }}>
-                            {role === 'admin' ? 'Admin' : 'Recruiter'}
-                        </div>
+                    <div style={{
+                        width: 30, height: 30, borderRadius: '50%', flexShrink: 0,
+                        background: 'linear-gradient(135deg, #c97b35 0%, #7c3f13 100%)',
+                        color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        fontWeight: 700, fontSize: '10px', boxShadow: '0 10px 18px rgba(15,23,42,0.24)',
+                    }}>
+                        {user?.full_name ? user.full_name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0,2) : '??'}
                     </div>
-                )}
-                <button onClick={() => useAppStore.getState().logout()}
-                    style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '3px', color: '#52525b', flexShrink: 0 }}
-                    title="Log Out"
-                >
-                    <LogOut size={14} />
-                </button>
+                    {!isIconOnly && (
+                        <div style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
+                            <div style={{ fontSize: '12px', fontWeight: 600, color: '#f4f4f5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {user?.full_name || 'User'}
+                            </div>
+                            <div style={{ fontSize: '10px', color: '#8b93a1' }}>
+                                {role === 'admin' ? 'Admin' : 'Recruiter'}
+                            </div>
+                        </div>
+                    )}
+                    <button onClick={() => useAppStore.getState().logout()}
+                        style={{
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            padding: '3px',
+                            color: '#8b93a1',
+                            flexShrink: 0,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                        }}
+                        title="Log Out"
+                    >
+                        <LogOut size={14} />
+                    </button>
+                </div>
             </div>
 
             {/* ── Drag Handle ── */}
             <div onMouseDown={onMouseDown}
                 style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: '6px', cursor: 'col-resize', zIndex: 100 }}
-                onMouseEnter={e => e.currentTarget.style.background = 'rgba(249,115,22,0.3)'}
+                onMouseEnter={e => e.currentTarget.style.background = 'rgba(249,115,22,0.14)'}
                 onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                 title="Drag to resize"
             />

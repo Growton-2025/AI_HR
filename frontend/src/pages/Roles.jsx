@@ -3,6 +3,7 @@ import { useAppStore } from '../store/useAppStore'
 import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown from '../components/StatusDropdown'
+import { useShallow } from 'zustand/react/shallow'
 
 function Roles() {
     const {
@@ -19,7 +20,20 @@ function Roles() {
         fetchOutreachStatus,
         triggerHeyReachOutreach,
         removeCandidateFromRole
-    } = useAppStore()
+    } = useAppStore(useShallow((state) => ({
+        roles: state.roles,
+        fetchRoles: state.fetchRoles,
+        createRole: state.createRole,
+        deleteRole: state.deleteRole,
+        viewingRole: state.viewingRole,
+        fetchRoleDetails: state.fetchRoleDetails,
+        clearViewingRole: state.clearViewingRole,
+        openRole: state.openRole,
+        outreachStatusCache: state.outreachStatusCache,
+        fetchOutreachStatus: state.fetchOutreachStatus,
+        triggerHeyReachOutreach: state.triggerHeyReachOutreach,
+        removeCandidateFromRole: state.removeCandidateFromRole,
+    })))
 
     const [newRoleName, setNewRoleName] = useState('')
     const [expandedSummary, setExpandedSummary] = useState(null)
@@ -32,7 +46,11 @@ function Roles() {
     const [isSyncing, setIsSyncing] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
     const [isLoadingRole, setIsLoadingRole] = useState(false)
-    const { heyreachCampaignId, setHeyreachCampaignId, lookupHeyReachCampaign } = useAppStore()
+    const { heyreachCampaignId, setHeyreachCampaignId, lookupHeyReachCampaign } = useAppStore(useShallow((state) => ({
+        heyreachCampaignId: state.heyreachCampaignId,
+        setHeyreachCampaignId: state.setHeyreachCampaignId,
+        lookupHeyReachCampaign: state.lookupHeyReachCampaign,
+    })))
 
 
     // Initial Load
@@ -380,7 +398,10 @@ function Roles() {
         }
     }, [chatMessages])
 
-    const { fetchChatHistory, sendChatReply } = useAppStore()
+    const { fetchChatHistory, sendChatReply } = useAppStore(useShallow((state) => ({
+        fetchChatHistory: state.fetchChatHistory,
+        sendChatReply: state.sendChatReply,
+    })))
 
     const handleOpenChat = async (candidate, platform = 'email') => {
         setChattingWith(candidate)
