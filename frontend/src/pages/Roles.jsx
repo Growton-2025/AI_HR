@@ -52,6 +52,8 @@ function Roles() {
     const [uploadTargetOptions, setUploadTargetOptions] = useState([])
     const [uploadPreviewBusy, setUploadPreviewBusy] = useState('')
     const [uploadCommitBusy, setUploadCommitBusy] = useState(false)
+    const [uploadRowCount, setUploadRowCount] = useState(0)
+    const [uploadProgress, setUploadProgress] = useState(null)
     const uploadFileRef = useRef(null)
 
     // Derived state for instant access
@@ -383,11 +385,26 @@ function Roles() {
             setUploadMappingDetails(res.data.mapping_details || {})
             setUploadRequiredTargets(res.data.required_targets || ['first_name', 'last_name', 'linkedin', 'city', 'title'])
             setUploadTargetOptions(res.data.target_options || [])
+            setUploadRowCount(Number(res.data.row_count) || 0)
+            setUploadProgress(null)
         } catch (e) {
             toast.error(e.response?.data?.detail || 'Preview failed')
         } finally {
             setUploadPreviewBusy('')
         }
+    }
+
+    const pollUploadStatus = async (uploadId) => {
+        for (let attempt = 0; attempt < 900; attempt += 1) {
+            const res = await axios.get(`${API_BASE}/candidates/uploads/${uploadId}`, { timeout: 60000 })
+            const next = res.data || {}
+            setUploadProgress(next)
+            if (['completed', 'completed_with_errors', 'failed'].includes(String(next.status || '').toLowerCase())) {
+                return next
+            }
+            await new Promise(resolve => window.setTimeout(resolve, 700))
+        }
+        throw new Error('Upload is still running. Check recent uploads for its status.')
     }
 
     const commitRoleUpload = async () => {
@@ -399,9 +416,14 @@ function Roles() {
         try {
             const res = await axios.post(`${API_BASE}/roles/${encodeURIComponent(uploadRole.name)}/upload/commit`, fd, {
                 headers: { 'Content-Type': 'multipart/form-data' },
-                timeout: 300000,
+                timeout: 120000,
             })
-            const d = res.data || {}
+            setUploadProgress(res.data || {})
+            const d = await pollUploadStatus(res.data?.upload_id)
+            if (String(d.status || '').toLowerCase() === 'failed') {
+                toast.error(d.error_message || 'Upload failed')
+                return
+            }
             const rows = Number(d.row_count) || 0
             const assigned = Number(d.role_assigned_count) || 0
             const skipped = Number(d.skipped) || 0
@@ -409,18 +431,13 @@ function Roles() {
             if (Array.isArray(d.errors) && d.errors.length > 0) {
                 toast.warning(`Some rows had issues: ${d.errors.slice(0, 3).join(' ')}`)
             }
-            setUploadRole(null)
-            setUploadFile(null)
-            setUploadHeaders([])
-            setUploadMapping({})
-            setUploadMappingDetails({})
             invalidateTalentPoolCaches()
             await fetchRoles({ force: true })
             if (viewingRole?.name === uploadRole.name) {
                 await fetchRoleDetails(uploadRole.name)
             }
         } catch (e) {
-            toast.error(e.response?.data?.detail || 'Upload failed')
+            toast.error(e.response?.data?.detail || e.message || 'Upload failed')
         } finally {
             setUploadCommitBusy(false)
         }
@@ -521,6 +538,8 @@ function Roles() {
                     details={uploadMappingDetails}
                     requiredTargets={uploadRequiredTargets}
                     targetOptions={uploadTargetOptions}
+                    rowCount={uploadRowCount}
+                    progress={uploadProgress}
                     busy={uploadCommitBusy}
                     onChange={(header, value) => setUploadMapping(prev => ({ ...prev, [header]: value }))}
                     onCancel={() => {
@@ -529,6 +548,8 @@ function Roles() {
                         setUploadHeaders([])
                         setUploadMapping({})
                         setUploadMappingDetails({})
+                        setUploadProgress(null)
+                        setUploadRowCount(0)
                     }}
                     onImport={commitRoleUpload}
                 />

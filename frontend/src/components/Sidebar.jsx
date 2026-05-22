@@ -97,9 +97,9 @@ function Sidebar() {
         normalizeCount(tpTotal) > 0 ||
         (tpStatusCounts && Object.keys(tpStatusCounts).length > 0)
     )
-    const browseTotal = hasTalentPoolSnapshot ? normalizeCount(tpTotal) : null
     const browseShortlisted = hasTalentPoolSnapshot ? getStatusCount(tpStatusCounts, 'Shortlisted') : null
-    const sourcedCount = normalizeCount(analytics?.summary?.total_sourced) ?? browseTotal
+    // Total sourced is a global KPI; filtered Talent Pool totals should not rewrite it.
+    const sourcedCount = normalizeCount(analytics?.summary?.total_sourced)
     const shortlistedCount = normalizeCount(analytics?.summary?.shortlisted) ?? browseShortlisted
 
     return (
@@ -111,7 +111,7 @@ function Sidebar() {
 
             {/* ── Logo & Toggle ── */}
             <div style={{
-                padding: isIconOnly ? '16px 0 14px' : '20px 18px 16px',
+                padding: isIconOnly ? '16px 0 14px' : '18px 18px 14px',
                 borderBottom: '1px solid rgba(255,255,255,0.07)',
                 display: 'flex',
                 alignItems: 'center',
@@ -125,13 +125,13 @@ function Sidebar() {
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: isIconOnly ? 'center' : 'flex-start',
-                        minWidth: isIconOnly ? '34px' : '118px',
-                        minHeight: isIconOnly ? '34px' : '34px',
+                        minWidth: isIconOnly ? '34px' : '142px',
+                        minHeight: isIconOnly ? '34px' : '36px',
                         padding: 0,
                         flexShrink: 0,
                     }}
                 >
-                    <HayasaBrand size="sidebar" tone="dark" iconOnly={isIconOnly} />
+                    <HayasaBrand size="sidebar" tone="dark" iconOnly={isIconOnly} layout="sidebarStack" />
                 </div>
                 <button
                     onClick={toggleSidebar}

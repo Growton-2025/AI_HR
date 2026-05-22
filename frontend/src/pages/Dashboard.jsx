@@ -18,53 +18,55 @@ const getEntryColor = (name, index, palette) => {
 const DashboardCard = ({ title, value, subtext, icon: Icon, color, loading }) => (
   <div
     style={{
-      background: 'linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(248,250,252,0.94) 100%)',
-      borderRadius: '22px',
-      padding: '24px',
-      boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
-      border: '1px solid rgba(226,232,240,0.9)',
-      display: 'flex', flexDirection: 'column', gap: '12px',
+      background: 'rgba(255,255,255,0.92)',
+      borderRadius: '14px',
+      padding: '18px 20px',
+      boxShadow: '0 12px 28px rgba(15,23,42,0.04)',
+      border: '1px solid rgba(226,232,240,0.92)',
+      display: 'flex', flexDirection: 'column', gap: '14px',
       transition: 'transform 0.2s, box-shadow 0.2s',
       position: 'relative',
       overflow: 'hidden'
     }}
   >
     {loading && <div className="shimmer" style={{ position: 'absolute', inset: 0, opacity: 0.1, zIndex: 1 }} />}
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-      <div style={{ width: '48px', height: '48px', borderRadius: '16px', background: loading ? '#f1f5f9' : `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center', border: loading ? 'none' : `1px solid ${color}18` }}>
-        {!loading && <Icon size={24} color={color} />}
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+      <div style={{ 
+        fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em',
+        width: loading ? '112px' : 'auto', height: loading ? '14px' : 'auto',
+        background: loading ? '#f1f5f9' : 'transparent', borderRadius: '4px'
+      }}>
+        {!loading && title}
+      </div>
+      <div style={{ width: '34px', height: '34px', borderRadius: '10px', background: loading ? '#f1f5f9' : `${color}12`, display: 'flex', alignItems: 'center', justifyContent: 'center', border: loading ? 'none' : `1px solid ${color}18`, flexShrink: 0 }}>
+        {!loading && <Icon size={17} color={color} />}
       </div>
     </div>
     <div>
       <div style={{ 
-        fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px',
-        width: loading ? '100px' : 'auto', height: loading ? '32px' : 'auto',
+        fontSize: '30px', fontWeight: 900, color: '#0f172a', letterSpacing: 0, lineHeight: 1,
+        width: loading ? '100px' : 'auto', height: loading ? '30px' : 'auto',
         background: loading ? '#f1f5f9' : 'transparent', borderRadius: '8px'
       }}>{!loading && value}</div>
-      <div style={{ 
-        fontSize: '14px', fontWeight: 700, color: '#64748b', marginTop: '4px',
-        width: loading ? '140px' : 'auto', height: loading ? '14px' : 'auto',
-        background: loading ? '#f1f5f9' : 'transparent', borderRadius: '4px'
-      }}>{!loading && title}</div>
-      {!loading && subtext && <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>{subtext}</div>}
+      {!loading && subtext && <div style={{ fontSize: '12px', color: '#64748b', marginTop: '8px', lineHeight: 1.45 }}>{subtext}</div>}
     </div>
   </div>
 );
 
 const ChartCard = ({ title, subtitle, icon: Icon, iconColor, children }) => (
   <div style={{
-    background: 'rgba(255,255,255,0.86)',
+    background: 'rgba(255,255,255,0.9)',
     backdropFilter: 'blur(16px)',
-    borderRadius: '24px',
-    padding: '28px',
+    borderRadius: '16px',
+    padding: '24px',
     border: '1px solid rgba(226,232,240,0.92)',
-    boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
+    boxShadow: '0 14px 30px rgba(15,23,42,0.04)',
   }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-      <h2 style={{ fontSize: '17px', fontWeight: 800, color: '#0f172a', margin: 0 }}>{title}</h2>
+      <h2 style={{ fontSize: '16px', fontWeight: 800, color: '#0f172a', margin: 0 }}>{title}</h2>
       <Icon size={18} color={iconColor || '#64748b'} />
     </div>
-    <p style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '16px', marginTop: 0 }}>{subtitle}</p>
+    <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '16px', marginTop: 0 }}>{subtitle}</p>
     {children}
   </div>
 );
@@ -153,22 +155,24 @@ const Dashboard = () => {
   return (
     <div style={{ padding: '24px 0 12px', fontFamily: '"Inter", sans-serif' }}>
       {/* Header */}
-      <div style={{ marginBottom: '28px', padding: '24px 28px', borderRadius: '26px', background: 'rgba(255,255,255,0.84)', backdropFilter: 'blur(16px)', border: '1px solid rgba(226,232,240,0.92)', boxShadow: '0 18px 40px rgba(15,23,42,0.05)' }}>
-        <div style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
-          Executive snapshot
+      <div style={{ marginBottom: '24px', padding: '0 4px' }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: '11px', fontWeight: 800, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '7px' }}>
+            Team analytics
+          </div>
+          <h1 style={{ fontSize: '28px', fontWeight: 900, color: '#0f172a', letterSpacing: 0, lineHeight: 1.1, marginBottom: '5px' }}>
+            Dashboard
+          </h1>
+          <p style={{ fontSize: '15px', color: '#64748b', margin: 0 }}>
+            Pipeline health across sourcing, screening, calls, and outreach.
+          </p>
         </div>
-        <h1 style={{ fontSize: '32px', fontWeight: 900, color: '#0f172a', letterSpacing: '-1px', marginBottom: '6px' }}>
-          Welcome back!
-        </h1>
-        <p style={{ fontSize: '15px', color: '#64748b' }}>
-          Here's your team's talent pipeline at a glance.
-        </p>
       </div>
 
       {/* Metric Cards */}
       <div style={{ 
         display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', 
-        gap: '20px', marginBottom: '36px',
+        gap: '16px', marginBottom: '28px',
         opacity: isRevalidating ? 0.7 : 1,
         transition: 'opacity 0.2s'
       }}>

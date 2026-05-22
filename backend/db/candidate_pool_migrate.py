@@ -78,9 +78,11 @@ def ensure_candidate_pool_migrations(conn) -> None:
                     file_headers JSONB DEFAULT '[]',
                     mapping JSONB DEFAULT '{}',
                     row_count INTEGER DEFAULT 0,
+                    processed_count INTEGER DEFAULT 0,
                     inserted_count INTEGER DEFAULT 0,
                     updated_count INTEGER DEFAULT 0,
                     skipped_count INTEGER DEFAULT 0,
+                    role_assigned_count INTEGER DEFAULT 0,
                     status VARCHAR(50) DEFAULT 'pending',
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -95,9 +97,11 @@ def ensure_candidate_pool_migrations(conn) -> None:
                 ("file_headers", "JSONB DEFAULT '[]'::jsonb"),
                 ("mapping", "JSONB DEFAULT '{}'::jsonb"),
                 ("row_count", "INTEGER DEFAULT 0"),
+                ("processed_count", "INTEGER DEFAULT 0"),
                 ("inserted_count", "INTEGER DEFAULT 0"),
                 ("updated_count", "INTEGER DEFAULT 0"),
                 ("skipped_count", "INTEGER DEFAULT 0"),
+                ("role_assigned_count", "INTEGER DEFAULT 0"),
                 ("status", "VARCHAR(50) DEFAULT 'pending'"),
                 ("error_message", "TEXT"),
                 ("role_id", "INTEGER"),
@@ -272,6 +276,38 @@ def ensure_candidate_pool_migrations(conn) -> None:
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS ix_candidates_norm_li ON candidates (normalized_linkedin);"
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_master_email_active
+                ON candidates (email)
+                WHERE owner_user_id IS NULL AND email IS NOT NULL
+                  AND COALESCE(is_archived, FALSE) = FALSE;
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_recruiter_email_active
+                ON candidates (owner_user_id, email)
+                WHERE owner_user_id IS NOT NULL AND email IS NOT NULL
+                  AND COALESCE(is_archived, FALSE) = FALSE;
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_master_import_identity_active
+                ON candidates (first_name, last_name, (raw_fields->>'import_company'))
+                WHERE owner_user_id IS NULL
+                  AND COALESCE(is_archived, FALSE) = FALSE;
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_recruiter_import_identity_active
+                ON candidates (owner_user_id, first_name, last_name, (raw_fields->>'import_company'))
+                WHERE owner_user_id IS NOT NULL
+                  AND COALESCE(is_archived, FALSE) = FALSE;
+                """
             )
 
             logger.info("Candidate pool migrations applied.")

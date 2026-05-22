@@ -35,6 +35,7 @@ def test_preview_falls_back_to_alias_mapping_when_model_unavailable(monkeypatch)
         "Job Title",
         "Company",
     ]
+    assert result["row_count"] == 1
     assert result["suggested_mapping"]["First Name"] == "first_name"
     assert result["suggested_mapping"]["LinkedIn URL"] == "linkedin"
     assert result["suggested_mapping"]["Job Title"] == "title"
@@ -133,3 +134,34 @@ def test_assign_imported_candidate_to_role_is_append_only_dedupe():
         candidate_id=9001,
     )
     assert assigned_again is False
+
+
+def test_upload_status_payload_includes_progress_and_errors():
+    class Stamp:
+        def isoformat(self):
+            return "2026-05-22T10:00:00"
+
+    payload = candidate_imports._upload_status_payload(
+        (
+            7,
+            22,
+            "talent.xlsx",
+            83,
+            37,
+            12,
+            24,
+            1,
+            9,
+            "processing",
+            44,
+            Stamp(),
+            "row 8: bad url\nrow 9: missing name",
+            None,
+        )
+    )
+
+    assert payload["upload_id"] == 7
+    assert payload["row_count"] == 83
+    assert payload["processed_count"] == 37
+    assert payload["role_assigned_count"] == 9
+    assert payload["errors"] == ["row 8: bad url", "row 9: missing name"]

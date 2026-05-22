@@ -783,7 +783,8 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
   const summary = analytics?.summary;
   if (!summary || typeof summary !== 'object') return null;
 
-  const displayTotal = tpTotal != null ? tpTotal : summary.total_sourced;
+  // Filters should narrow the table and status tabs, not rewrite the global sourced KPI.
+  const displayTotal = summary.total_sourced != null ? summary.total_sourced : tpTotal;
   const displayShortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted;
   const displayPipeline = tpStatusCounts || summary.pipeline_health || {};
 
@@ -1672,6 +1673,8 @@ export default function TalentPool() {
   const [uploadMapping, setUploadMapping] = useState({});
   const [uploadPreviewBusy, setUploadPreviewBusy] = useState(false);
   const [uploadCommitBusy, setUploadCommitBusy] = useState(false);
+  const [uploadRowCount, setUploadRowCount] = useState(0);
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [recentUploads, setRecentUploads] = useState([]);
   const [scopeRoles, setScopeRoles] = useState([]);
   const [contactInfo, setContactInfo] = useState(readPersistedContactInfo); // { [candidateId]: { email, phone, enriching } }
@@ -2369,6 +2372,8 @@ export default function TalentPool() {
       setUploadMappingDetails(res.data.mapping_details || {});
       setUploadRequiredTargets(res.data.required_targets || ['first_name', 'last_name', 'linkedin', 'city', 'title']);
       setUploadTargetOptions(res.data.target_options || []);
+      setUploadRowCount(Number(res.data.row_count) || 0);
+      setUploadProgress(null);
       const init = {};
       for (const h of headers) {
         init[h] = sm[h] || 'ignore';
@@ -2381,6 +2386,19 @@ export default function TalentPool() {
     } finally {
       setUploadPreviewBusy(false);
     }
+  };
+
+  const pollUploadStatus = async (uploadId) => {
+    for (let attempt = 0; attempt < 900; attempt += 1) {
+      const res = await axios.get(`${API_BASE}/candidates/uploads/${uploadId}`, { timeout: 60000 });
+      const next = res.data || {};
+      setUploadProgress(next);
+      if (['completed', 'completed_with_errors', 'failed'].includes(String(next.status || '').toLowerCase())) {
+        return next;
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 700));
+    }
+    throw new Error('Upload is still running. Check recent uploads for its status.');
   };
 
   const commitUpload = async () => {
@@ -2398,22 +2416,22 @@ export default function TalentPool() {
     try {
       const res = await axios.post(`${API_BASE}/candidates/upload/commit`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 300000,
+        timeout: 120000,
       });
-      const d = res.data || {};
+      setUploadProgress(res.data || {});
+      const d = await pollUploadStatus(res.data?.upload_id);
+      if (String(d.status || '').toLowerCase() === 'failed') {
+        toast.error(d.error_message || 'Upload failed');
+        return;
+      }
       const ins = Number(d.inserted) || 0;
       const upd = Number(d.updated) || 0;
       const skp = Number(d.skipped) || 0;
       const rowCount = Number(d.row_count);
-      const uniqueLi = Number(d.unique_linkedin_in_file);
       const errs = Array.isArray(d.errors) ? d.errors : [];
       const toastParts = [];
       if (Number.isFinite(rowCount) && rowCount > 0) {
-        let rowLine = `${rowCount} spreadsheet rows`;
-        if (Number.isFinite(uniqueLi) && uniqueLi > 0 && uniqueLi < rowCount) {
-          rowLine += ` (${uniqueLi} unique LinkedIn URLs — other rows repeat the same URL)`;
-        }
-        toastParts.push(rowLine);
+        toastParts.push(`${rowCount} spreadsheet rows`);
       }
       if (ins > 0) toastParts.push(`${ins} new added to your pool`);
       if (upd > 0) {
@@ -2430,9 +2448,6 @@ export default function TalentPool() {
         const warnBody = preview.length > 300 ? `${preview.slice(0, 297)}…` : preview;
         toast.warning(`Some rows had issues: ${warnBody}`);
       }
-      setUploadOpen(false);
-      setUploadFile(null);
-      setUploadMappingDetails({});
       invalidateTalentPoolCaches();
       await fetchCandidates(1);
       const runIndex = () => {
@@ -2450,7 +2465,7 @@ export default function TalentPool() {
         .then(r => setRecentUploads(r.data.uploads || []))
         .catch(() => { });
     } catch (e) {
-      toast.error(e.response?.data?.detail || 'Upload failed');
+      toast.error(e.response?.data?.detail || e.message || 'Upload failed');
     } finally {
       setUploadCommitBusy(false);
     }
@@ -3574,9 +3589,11 @@ export default function TalentPool() {
           details={uploadMappingDetails}
           requiredTargets={uploadRequiredTargets}
           targetOptions={uploadTargetOptions}
+          rowCount={uploadRowCount}
+          progress={uploadProgress}
           busy={uploadCommitBusy}
           onChange={(header, value) => setUploadMapping(prev => ({ ...prev, [header]: value }))}
-          onCancel={() => { setUploadOpen(false); setUploadFile(null); setUploadMappingDetails({}); }}
+          onCancel={() => { setUploadOpen(false); setUploadFile(null); setUploadMappingDetails({}); setUploadProgress(null); setUploadRowCount(0); }}
           onImport={commitUpload}
         />
       )}

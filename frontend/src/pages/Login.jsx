@@ -18,7 +18,10 @@ const styles = {
   },
   leftPanel: {
     width: '45%',
-    background: 'linear-gradient(155deg, #111827 0%, #1f2937 50%, #7c5a2f 100%)',
+    background: [
+      'linear-gradient(140deg, rgba(196,135,71,0.10) 0%, rgba(196,135,71,0) 34%)',
+      'linear-gradient(180deg, #090b10 0%, #11151d 54%, #191714 100%)',
+    ].join(', '),
     display: 'flex',
     flexDirection: 'column',
     justifyContent: 'space-between',
@@ -331,21 +334,18 @@ function Login() {
     <div style={styles.page}>
       {/* ── Left Branding Panel ── */}
       <div style={styles.leftPanel}>
-        {/* Background glow */}
-        <div style={{ position: 'absolute', top: '-20%', right: '-20%', width: '500px', height: '500px', borderRadius: '50%', background: 'rgba(255,255,255,0.05)', filter: 'blur(80px)', pointerEvents: 'none' }} />
-        <div style={{ position: 'absolute', bottom: '-10%', left: '-10%', width: '350px', height: '350px', borderRadius: '50%', background: 'rgba(124,92,47,0.28)', filter: 'blur(80px)', pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(90deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0) 40%)', pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: '36%', background: 'linear-gradient(180deg, rgba(196,135,71,0) 0%, rgba(196,135,71,0.12) 100%)', pointerEvents: 'none' }} />
 
         {/* Logo */}
-        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ maxWidth: '100%', padding: '12px 14px', borderRadius: '14px', border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.08)', boxShadow: '0 14px 32px rgba(0,0,0,0.16)' }}>
-            <HayasaBrand size="hero" tone="dark" />
-          </div>
+        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', minHeight: '48px' }}>
+          <HayasaBrand size="hero" tone="dark" layout="sidebarStack" />
         </div>
 
         {/* Hero Text */}
         <div style={{ position: 'relative' }}>
           <p style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', opacity: 0.7, marginBottom: '16px' }}>Talent Intelligence Platform</p>
-          <h1 style={{ fontSize: '44px', fontWeight: 900, lineHeight: 1.1, marginBottom: '24px', letterSpacing: '-1.5px' }}>
+          <h1 style={{ fontSize: '44px', fontWeight: 900, lineHeight: 1.1, marginBottom: '24px', letterSpacing: 0 }}>
             Hire the best,<br />10× faster.
           </h1>
           <p style={{ fontSize: '16px', opacity: 0.75, lineHeight: 1.7, maxWidth: '380px', marginBottom: '40px' }}>
@@ -376,7 +376,7 @@ function Login() {
 
           {/* Header */}
           <div style={{ marginBottom: '36px' }}>
-            <h2 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px', letterSpacing: '-0.5px' }}>
+            <h2 style={{ fontSize: '28px', fontWeight: 800, color: '#0f172a', marginBottom: '8px', letterSpacing: 0 }}>
               {mode === 'login' && 'Welcome back'}
               {mode === 'register' && 'Create your account'}
               {mode === 'verify' && 'Check your email'}

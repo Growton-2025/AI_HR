@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from backend.services.linkedin_normalize import normalize_linkedin
 
@@ -129,6 +129,35 @@ def fetch_best_contact_for_normalized_li(
     return row[0] or None, row[1] or None
 
 
+def fetch_best_contacts_for_normalized_lis(
+    cur, normalized_lis: Iterable[str]
+) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+    """Batch contact reuse for imports without changing single-row preference rules."""
+    keys = sorted({str(item).strip() for item in normalized_lis if str(item).strip()})
+    if not keys:
+        return {}
+    cur.execute(
+        """
+        SELECT DISTINCT ON (normalized_linkedin)
+               normalized_linkedin, email, COALESCE(mobile_phone, phone) AS ph
+        FROM candidates
+        WHERE normalized_linkedin = ANY(%s)
+          AND COALESCE(is_archived, FALSE) = FALSE
+        ORDER BY normalized_linkedin,
+          CASE WHEN email IS NOT NULL AND email <> '' THEN 0 ELSE 1 END,
+          CASE WHEN COALESCE(mobile_phone, phone) IS NOT NULL
+               AND COALESCE(mobile_phone, phone) <> '' THEN 0 ELSE 1 END,
+          id
+        """,
+        (keys,),
+    )
+    return {
+        row[0]: (row[1] or None, row[2] or None)
+        for row in cur.fetchall()
+        if row and row[0]
+    }
+
+
 def load_master_row(cur, master_id: int) -> Optional[Dict[str, Any]]:
     cur.execute(
         """
@@ -183,6 +212,8 @@ def upsert_master_catalog_row(
     notes: Optional[str],
     pool_source: str = POOL_SOURCE_CATALOG_FROM_UPLOAD,
     raw_fields_extra: Optional[Dict[str, Any]] = None,
+    existing_id: Optional[int] = None,
+    lookup_complete: bool = False,
 ) -> int:
     """Insert or update master library row keyed by normalized_linkedin."""
     name = (f"{first_name or ''} {last_name or ''}").strip() or "Unknown"
@@ -194,8 +225,8 @@ def upsert_master_catalog_row(
         rf.update(raw_fields_extra)
     rf_json = json.dumps(rf) if rf else "{}"
 
-    ex = None
-    if normalized_li:
+    ex = (existing_id,) if existing_id else None
+    if not ex and not lookup_complete and normalized_li:
         cur.execute(
             """
             SELECT id FROM candidates
@@ -206,7 +237,7 @@ def upsert_master_catalog_row(
             (normalized_li,),
         )
         ex = cur.fetchone()
-    if not ex and email:
+    if not ex and not lookup_complete and email:
         cur.execute(
             """
             SELECT id FROM candidates
@@ -217,7 +248,7 @@ def upsert_master_catalog_row(
             (email,),
         )
         ex = cur.fetchone()
-    if not ex and first_name and last_name and company_name:
+    if not ex and not lookup_complete and first_name and last_name and company_name:
         cur.execute(
             """
             SELECT id FROM candidates
@@ -315,6 +346,8 @@ def upsert_recruiter_pool_row(
     source_upload_id: Optional[int],
     assigned_by_user_id: Optional[int] = None,
     raw_fields_extra: Optional[Dict[str, Any]] = None,
+    existing_id: Optional[int] = None,
+    lookup_complete: bool = False,
 ) -> Tuple[int, str]:
     """
     Returns (candidate_id, 'inserted'|'updated').
@@ -329,8 +362,8 @@ def upsert_recruiter_pool_row(
     rf_json = json.dumps(rf) if rf else "{}"
     loc = location or city
 
-    ex = None
-    if normalized_li:
+    ex = (existing_id,) if existing_id else None
+    if not ex and not lookup_complete and normalized_li:
         cur.execute(
             """
             SELECT id FROM candidates
@@ -341,7 +374,7 @@ def upsert_recruiter_pool_row(
             (owner_id, normalized_li),
         )
         ex = cur.fetchone()
-    if not ex and email:
+    if not ex and not lookup_complete and email:
         cur.execute(
             """
             SELECT id FROM candidates
@@ -352,7 +385,7 @@ def upsert_recruiter_pool_row(
             (owner_id, email),
         )
         ex = cur.fetchone()
-    if not ex and first_name and last_name and company_name:
+    if not ex and not lookup_complete and first_name and last_name and company_name:
         cur.execute(
             """
             SELECT id FROM candidates
