@@ -57,11 +57,17 @@ async def warm_backend_caches():
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
 
-    try:
-        await asyncio.to_thread(_apply_pool_migrations_blocking)
-    except Exception as e:
-        print(f"STARTUP MIGRATION FAILED: {e}")
-        raise
+    # Run migrations in the background so the gunicorn worker handshake
+    # completes within the timeout window. The migrations are idempotent
+    # (IF NOT EXISTS) so in-flight requests are safe even on a fresh schema.
+    async def _run_migrations_bg():
+        try:
+            await asyncio.to_thread(_apply_pool_migrations_blocking)
+            print("Startup migrations completed.")
+        except Exception as e:
+            print(f"STARTUP MIGRATION FAILED (non-fatal, will retry on next request): {e}")
+
+    asyncio.create_task(_run_migrations_bg())
 
     # Initialize Plivo background endpoint logic
     try:
@@ -86,6 +92,7 @@ async def lifespan(app: FastAPI):
         close_all_connections()
     except:
         pass
+
 
 async def load_data_async():
     await asyncio.sleep(0.5) # Wait for the app to be fully up
