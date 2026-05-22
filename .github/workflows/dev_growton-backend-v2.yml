@@ -85,4 +85,5 @@ jobs:
           app-name: 'growton-backend-v2'
           slot-name: 'Production'
           package: backend-artifact
+          startup-command: 'gunicorn --bind 0.0.0.0:8000 --workers 4 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --access-logfile - --error-logfile - backend.main:app'
 
