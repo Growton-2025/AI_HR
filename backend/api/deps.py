@@ -75,19 +75,66 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> sch
     
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, email, role, permissions FROM users WHERE email = %s", (token_data.username,))
+            cur.execute(
+                """
+                SELECT id, name, email, role, permissions, archived_at
+                FROM users WHERE email = %s
+                """,
+                (token_data.username,),
+            )
             user = cur.fetchone()
             if not user:
                 raise credentials_exception
+            if user[5] is not None:
+                raise credentials_exception
             resolved_user = schemas.User(
-                id=user[0], 
-                username=user[2], 
-                email=user[2], 
-                full_name=user[1], 
-                role=user[3], 
+                id=user[0],
+                username=user[2],
+                email=user[2],
+                full_name=user[1],
+                role=user[3],
                 permissions=user[4] or {}
             )
             _set_cached_user(token_data.username, resolved_user)
             return resolved_user
+    finally:
+        return_db_connection(conn)
+
+
+def get_user_from_access_token(token: Optional[str]) -> Optional[schemas.User]:
+    """Resolve a user from a Bearer/JWT string (WebSocket / alternate clients)."""
+    if not token or token in ("undefined", "null"):
+        return None
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            return None
+    except (JWTError, ValidationError):
+        return None
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, email, role, permissions, archived_at
+                FROM users WHERE email = %s
+                """,
+                (username,),
+            )
+            user = cur.fetchone()
+            if not user or user[5] is not None:
+                return None
+            return schemas.User(
+                id=user[0],
+                username=user[2],
+                email=user[2],
+                full_name=user[1],
+                role=user[3],
+                permissions=user[4] or {},
+            )
     finally:
         return_db_connection(conn)

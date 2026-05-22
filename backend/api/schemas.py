@@ -32,6 +32,10 @@ class SearchRequest(BaseModel):
 
 class RoleCreate(BaseModel):
     name: str
+    job_description: Optional[str] = None
+
+class RoleUpdate(BaseModel):
+    job_description: Optional[str] = None
 
 class AssignmentDetail(BaseModel):
     candidate_id: int

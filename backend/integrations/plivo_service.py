@@ -14,8 +14,10 @@ PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN")
 PLIVO_NUMBER = os.getenv("PLIVO_NUMBER")
 
-endpoint_username = "user36080716489309010"
-endpoint_password = "TestPassword123!"
+endpoint_username = ""
+endpoint_password = ""
+endpoint_public_url = ""
+setup_error = ""
 
 # Store recordings in memory: CallUUID -> RecordingUrl
 recordings = {}
@@ -56,16 +58,34 @@ def normalize_number(number):
     else:
         return f"+{digits}" if digits else ""
 
-async def setup_plivo():
-    global endpoint_username, endpoint_password
+async def setup_plivo(force: bool = False):
+    global endpoint_username, endpoint_password, endpoint_public_url, setup_error
+    if endpoint_username and endpoint_password and not force:
+        return {
+            "success": True,
+            "username": endpoint_username,
+            "password": endpoint_password,
+            "public_url": endpoint_public_url,
+        }
+
     ngrok_url = get_ngrok_url()
+    endpoint_public_url = ngrok_url or ""
     if not ngrok_url:
-        logger.error("Ngrok not running. Cannot create Plivo App.")
-        return
+        endpoint_username = ""
+        endpoint_password = ""
+        setup_error = (
+            "Plivo softphone is not configured: set PUBLIC_URL or NGROK_URL, "
+            "or run ngrok so Plivo can reach /api/plivo/dial."
+        )
+        logger.error(setup_error)
+        return {"success": False, "error": setup_error, "code": "plivo_public_url_missing"}
     
     if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
-        logger.error("Plivo credentials missing")
-        return
+        endpoint_username = ""
+        endpoint_password = ""
+        setup_error = "Plivo softphone is not configured: PLIVO_AUTH_ID or PLIVO_AUTH_TOKEN is missing."
+        logger.error(setup_error)
+        return {"success": False, "error": setup_error, "code": "plivo_credentials_missing"}
         
     client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
     app_name = f"Softphone_App_{int(time.time())}"
@@ -92,10 +112,21 @@ async def setup_plivo():
         
         endpoint_username = getattr(endpoint_response, 'username', username)
         endpoint_password = password
+        setup_error = ""
         logger.info(f"Stored Credentials: {endpoint_username} / {endpoint_password}")
+        return {
+            "success": True,
+            "username": endpoint_username,
+            "password": endpoint_password,
+            "public_url": endpoint_public_url,
+        }
         
     except Exception as e:
-        logger.error(f"Failed to setup Plivo components: {e}")
+        endpoint_username = ""
+        endpoint_password = ""
+        setup_error = f"Failed to setup Plivo softphone components: {e}"
+        logger.error(setup_error)
+        return {"success": False, "error": setup_error, "code": "plivo_setup_failed"}
 
 def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: str, candidate_id: str, transaction_id: str):
     logger.info(f"Initiating outbound Plivo call to {candidate_phone} for recruiter {recruiter_email}")

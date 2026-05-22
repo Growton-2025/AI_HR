@@ -258,6 +258,11 @@ def return_db_connection(conn, close=False):
     
     if _connection_pool and conn:
         try:
+            if not conn.closed and not getattr(conn, "autocommit", False):
+                try:
+                    conn.rollback()
+                except Exception as rollback_error:
+                    logger.debug(f"Rollback before returning pooled connection failed: {rollback_error}")
             _connection_pool.putconn(conn, close=close)
         except Exception as e:
             # "unkeyed connection" means the pool is no longer tracking this specific object
@@ -369,7 +374,27 @@ def create_schema(cur, conn):
             hashed_password VARCHAR(255),
             role VARCHAR(50) DEFAULT 'recruiter',
             permissions JSONB DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            archived_at TIMESTAMP
+        );
+        """),
+        ("candidate_uploads",
+        """
+        CREATE TABLE IF NOT EXISTS candidate_uploads (
+            id SERIAL PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id),
+            filename VARCHAR(512),
+            file_headers JSONB DEFAULT '[]',
+            mapping JSONB DEFAULT '{}',
+            row_count INTEGER DEFAULT 0,
+            inserted_count INTEGER DEFAULT 0,
+            updated_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
+            status VARCHAR(50) DEFAULT 'pending',
+            error_message TEXT,
+            role_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
         );
         """),
         ("candidates",
@@ -379,11 +404,16 @@ def create_schema(cur, conn):
             name VARCHAR(255) NOT NULL,
             first_name VARCHAR(255),
             last_name VARCHAR(255),
-            linkedin VARCHAR(255) UNIQUE,
+            linkedin VARCHAR(1024),
             location TEXT,
             city VARCHAR(100),
             headline TEXT,
             about TEXT,
+            email VARCHAR(255),
+            phone VARCHAR(50),
+            mobile_phone VARCHAR(50),
+            notes TEXT,
+            status VARCHAR(100) DEFAULT 'To be started',
             skills TEXT,
             licenses_and_certifications TEXT,
             total_experience_years NUMERIC,
@@ -407,7 +437,70 @@ def create_schema(cur, conn):
             embedding VECTOR(1536),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP,
-            created_by VARCHAR(255)
+            created_by VARCHAR(255),
+            owner_user_id INTEGER REFERENCES users(id),
+            pool_source VARCHAR(50) DEFAULT 'legacy_master',
+            source_master_candidate_id INTEGER REFERENCES candidates(id),
+            source_upload_id INTEGER REFERENCES candidate_uploads(id),
+            assigned_by_user_id INTEGER REFERENCES users(id),
+            normalized_linkedin TEXT,
+            is_archived BOOLEAN DEFAULT FALSE
+        );
+        """),
+        ("ai_column_definitions",
+        """
+        CREATE TABLE IF NOT EXISTS ai_column_definitions (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            slug VARCHAR(255) NOT NULL,
+            owner_user_id INTEGER REFERENCES users(id),
+            view_scope VARCHAR(50) NOT NULL DEFAULT 'recruiter_pools',
+            recruiter_filter_id INTEGER REFERENCES users(id),
+            prompt_template TEXT NOT NULL,
+            mode VARCHAR(50) NOT NULL DEFAULT 'auto',
+            output_schema JSONB NOT NULL DEFAULT '[]'::jsonb,
+            required_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+            only_run_if JSONB NOT NULL DEFAULT '{}'::jsonb,
+            is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """),
+        ("ai_column_runs",
+        """
+        CREATE TABLE IF NOT EXISTS ai_column_runs (
+            id SERIAL PRIMARY KEY,
+            column_definition_id INTEGER NOT NULL REFERENCES ai_column_definitions(id) ON DELETE CASCADE,
+            selection_mode VARCHAR(50) NOT NULL,
+            selection_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            total INTEGER NOT NULL DEFAULT 0,
+            completed INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            status VARCHAR(50) NOT NULL DEFAULT 'queued',
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """),
+        ("ai_column_cells",
+        """
+        CREATE TABLE IF NOT EXISTS ai_column_cells (
+            id SERIAL PRIMARY KEY,
+            column_definition_id INTEGER NOT NULL REFERENCES ai_column_definitions(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+            primary_output TEXT,
+            outputs JSONB NOT NULL DEFAULT '{}'::jsonb,
+            details JSONB NOT NULL DEFAULT '{}'::jsonb,
+            status VARCHAR(50) NOT NULL DEFAULT 'idle',
+            error_message TEXT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            last_run_id INTEGER REFERENCES ai_column_runs(id) ON DELETE SET NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(column_definition_id, candidate_id)
         );
         """),
         ("companies",
@@ -587,6 +680,7 @@ def create_schema(cur, conn):
             id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             name VARCHAR(255) NOT NULL,
+            job_description TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """),

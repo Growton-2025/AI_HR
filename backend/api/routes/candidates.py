@@ -2,6 +2,8 @@
 import os
 import hashlib
 import base64
+import time
+import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -21,19 +23,33 @@ from backend.pipeline.query import (
     SEGMENT_SYNONYMS,
     COMPANY_DETAILS_TAXONOMY,
     CULTURE_TAXONOMY,
-    GEOGRAPHY_COUNTRY_TO_REGION_MAP
+    GEOGRAPHY_COUNTRY_TO_REGION_MAP,
 )
+from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER
 
 router = APIRouter()
+_analytics_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_ANALYTICS_CACHE_TTL = 60
 
 @router.get("/candidates")
-async def get_candidates(limit: int = 100, offset: int = 0):
-    """Get paginated list of all candidates"""
-    # Assuming PROFILES_BY_ID is populated. process_query_main loads it if not.
-    # It should be populated on import of query module if using the query.py logic I wrote.
+async def get_candidates(
+    limit: int = 100,
+    offset: int = 0,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Get paginated list of candidates scoped to the current user (recruiter = own pool only)."""
     all_profiles = list(PROFILES_BY_ID.values())
-    total = len(all_profiles)
-    paginated = all_profiles[offset:offset + limit]
+    if (current_user.role or "").strip().lower() == "admin":
+        scoped = [p for p in all_profiles if not p.get("is_archived")]
+    else:
+        scoped = [
+            p
+            for p in all_profiles
+            if not p.get("is_archived")
+            and p.get("owner_user_id") == current_user.id
+        ]
+    total = len(scoped)
+    paginated = scoped[offset : offset + limit]
 
     # Return simplified version for listing
     simplified = []
@@ -61,17 +77,43 @@ async def get_candidates(limit: int = 100, offset: int = 0):
 @router.get("/candidates/analytics")
 async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_current_user)):
     """Get performance analytics for the recruiter/admin"""
-    from backend.pipeline.query import get_analytics_summary
-    return await get_analytics_summary(current_user.email, current_user.role)
+    from backend.pipeline.query import get_analytics_summary, initialize_cache
 
-@router.get("/browse/meta")
+    if not PROFILES_BY_ID:
+        await asyncio.to_thread(initialize_cache)
+
+    key = f"{current_user.id}:{current_user.role}"
+    cached = _analytics_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _ANALYTICS_CACHE_TTL:
+        return cached[1]
+    data = await get_analytics_summary(current_user.email, current_user.role, current_user.id)
+    _analytics_cache[key] = (time.monotonic(), data)
+    return data
 
 @router.get("/candidates/{candidate_id}")
-async def get_candidate(candidate_id: int):
-    """Get detailed candidate profile"""
-    if candidate_id not in PROFILES_BY_ID:
+async def get_candidate(
+    candidate_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+    view_scope: Optional[str] = None,
+    recruiter_filter_id: Optional[int] = None,
+):
+    """Get detailed candidate profile (scoped)."""
+    prof = PROFILES_BY_ID.get(candidate_id)
+    if not prof or prof.get("is_archived"):
         raise HTTPException(status_code=404, detail="Candidate not found")
-    return PROFILES_BY_ID[candidate_id]
+    if (current_user.role or "").strip().lower() == "admin":
+        scope = view_scope or VIEW_SCOPE_MASTER
+        if not profile_passes_scope(
+            prof,
+            user_role=(current_user.role or "").strip().lower(),
+            user_id=current_user.id,
+            view_scope=scope,
+            recruiter_filter_id=recruiter_filter_id,
+        ):
+            raise HTTPException(status_code=404, detail="Candidate not found")
+    elif prof.get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return prof
 
 @router.post("/search")
 async def search_candidates(request: schemas.SearchRequest, current_user: schemas.User = Depends(deps.get_current_user)):
@@ -86,7 +128,13 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
     status_messages = []
 
     try:
-        async for item in process_query_main(request.query, session_id, tracker):
+        async for item in process_query_main(
+            request.query,
+            session_id,
+            tracker,
+            screening_user_id=current_user.id,
+            screening_role=current_user.role,
+        ):
             if isinstance(item, str):
                 status_messages.append(item)
             elif isinstance(item, dict):
@@ -114,10 +162,21 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
     }
 
 @router.post("/export")
-async def export_candidates(candidate_ids: List[int]):
-    """Export selected candidates to Excel (returns base64)"""
+async def export_candidates(
+    candidate_ids: List[int],
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Export selected candidates to Excel (returns base64). Scoped like browse."""
 
-    selected = {cid: PROFILES_BY_ID[cid] for cid in candidate_ids if cid in PROFILES_BY_ID}
+    allowed_ids: List[int] = []
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    for cid in candidate_ids:
+        p = PROFILES_BY_ID.get(cid)
+        if not p or p.get("is_archived"):
+            continue
+        if is_admin or p.get("owner_user_id") == current_user.id:
+            allowed_ids.append(cid)
+    selected = {cid: PROFILES_BY_ID[cid] for cid in allowed_ids}
     excel_bytes = profiles_to_excel(selected)
 
     return {
@@ -143,6 +202,12 @@ async def websocket_search(websocket: WebSocket):
             data = await websocket.receive_json()
             query = data.get("query", "")
             session_id = data.get("session_id", hashlib.sha256(os.urandom(32)).hexdigest())
+            token = data.get("token") or data.get("access_token")
+
+            ws_user = deps.get_user_from_access_token(token)
+            if not ws_user:
+                await websocket.send_json({"type": "error", "message": "Authentication required"})
+                continue
 
             if not query:
                 await websocket.send_json({"type": "error", "message": "Query is required"})
@@ -152,7 +217,13 @@ async def websocket_search(websocket: WebSocket):
 
             try:
                 # Use the pipeline generator
-                async for item in process_query_main(query, session_id, tracker):
+                async for item in process_query_main(
+                    query,
+                    session_id,
+                    tracker,
+                    screening_user_id=ws_user.id,
+                    screening_role=ws_user.role,
+                ):
                     if isinstance(item, str):
                         # Status message
                         await websocket.send_json({
@@ -212,6 +283,14 @@ async def websocket_search(websocket: WebSocket):
 async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user: schemas.User = Depends(deps.get_current_user)):
     """Update candidate fields manually"""
 
+    prof = PROFILES_BY_ID.get(candidate_id)
+    if not prof or prof.get("is_archived"):
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:
+        raise HTTPException(status_code=403, detail="Master library rows are read-only")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     # 1. Update Database
     try:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
@@ -245,6 +324,8 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
             # Handle alias
             if field == 'phone': profile['mobile_phone'] = value
         PROFILES_BY_ID[candidate_id] = profile
+    from backend.api.routes.browse import _invalidate_browse_cache
+    _invalidate_browse_cache()
 
     return {"success": True, "data": data}
 

@@ -1,7 +1,7 @@
 
-# AI HR Platform
+# Hayasa.ai
 
-A modern Candidate Search & Talent Intelligence Platform built with React (Frontend) and FastAPI (Backend).
+A growton.co product for Candidate Search & Talent Intelligence, built with React (Frontend) and FastAPI (Backend).
 
 ## Project Structure
 

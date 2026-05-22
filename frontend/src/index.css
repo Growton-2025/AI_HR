@@ -1,4 +1,4 @@
-/* Growton AI - Talent Intelligence Platform - Global Styles */
+/* Hayasa.ai - Talent Intelligence Platform - Global Styles */
 
 /* CSS Variables - Matching Streamlit theme */
 :root {
@@ -1424,6 +1424,16 @@ input:checked + .slider:before {
   display: flex;
   gap: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.roles-page .role-name-input {
+  background: #ffffff;
+  color: #0f172a;
+  border-color: #cbd5e1;
+}
+
+.roles-page .role-name-input::placeholder {
+  color: #64748b;
 }
 
 .roles-grid {

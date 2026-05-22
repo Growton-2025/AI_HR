@@ -202,11 +202,11 @@ const UserManagement = () => {
   };
 
   const handleDelete = async (id, name) => {
-    if (!window.confirm(`Remove "${name}"? This cannot be undone.`)) return;
+    if (!window.confirm(`Archive "${name}"? They will no longer be able to sign in; their candidate pool remains visible to admins.`)) return;
     setDeletingId(id);
     const res = await deleteRecruiter(id);
-    if (res.success) toast.success('Recruiter removed.');
-    else toast.error('Failed to remove recruiter.');
+    if (res.success) toast.success('Recruiter archived.');
+    else toast.error('Failed to archive recruiter.');
     setDeletingId(null);
   };
 

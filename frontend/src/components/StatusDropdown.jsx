@@ -27,7 +27,7 @@ export const STATUS_STYLES = {
   'shared with customer': { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
 };
 
-export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted }) {
+export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, disabled = false }) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const dropdownRef = useRef(null);
@@ -58,7 +58,23 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted })
     }
   };
 
-  const currentStyle = STATUS_STYLES[(status || '').toLowerCase()] || { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
+  const statusNorm = String(status ?? '').trim().toLowerCase();
+  const currentStyle = STATUS_STYLES[statusNorm] || { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
+
+  if (disabled) {
+    return (
+      <div style={{
+        display: 'inline-flex', alignItems: 'center', gap: '6px',
+        padding: '4px 10px', borderRadius: '20px',
+        fontSize: '11.5px', fontWeight: 700,
+        background: currentStyle.bg, color: currentStyle.color,
+        opacity: 0.85,
+      }}>
+        <span style={{ width: 6, height: 6, borderRadius: '50%', background: currentStyle.dot }} />
+        {status != null && status !== '' ? String(status) : '—'}
+      </div>
+    );
+  }
 
   return (
     <div style={{ position: 'relative' }} ref={dropdownRef}>
@@ -78,7 +94,7 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted })
         onMouseLeave={e => e.currentTarget.style.filter = 'none'}
       >
         <span style={{ width: 6, height: 6, borderRadius: '50%', background: currentStyle.dot }} />
-        {loading ? 'Updating...' : (status || 'Select Status')}
+        {loading ? 'Updating...' : (status != null && status !== '' ? String(status) : 'Select Status')}
         <ChevronDown size={12} style={{ opacity: 0.5 }} />
       </button>
 
@@ -91,7 +107,7 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted })
         }}>
           {RECRUITMENT_STAGES.map(stage => {
             const style = STATUS_STYLES[stage.toLowerCase()] || { dot: '#94a3b8' };
-            const isActive = stage === status;
+            const isActive = stage === String(status ?? '');
             return (
               <button
                 key={stage}

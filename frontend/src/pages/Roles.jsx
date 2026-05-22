@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw } from 'lucide-react'
+import axios from 'axios'
+import { API_BASE, useAppStore } from '../store/useAppStore'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
+import CsvMappingModal from '../components/CsvMappingModal'
 
 function Roles() {
     const {
@@ -19,7 +21,8 @@ function Roles() {
         outreachStatusCache,
         fetchOutreachStatus,
         triggerHeyReachOutreach,
-        removeCandidateFromRole
+        removeCandidateFromRole,
+        invalidateTalentPoolCaches
     } = useAppStore(useShallow((state) => ({
         roles: state.roles,
         fetchRoles: state.fetchRoles,
@@ -33,10 +36,23 @@ function Roles() {
         fetchOutreachStatus: state.fetchOutreachStatus,
         triggerHeyReachOutreach: state.triggerHeyReachOutreach,
         removeCandidateFromRole: state.removeCandidateFromRole,
+        invalidateTalentPoolCaches: state.invalidateTalentPoolCaches,
     })))
 
     const [newRoleName, setNewRoleName] = useState('')
+    const [jobDescriptionDraft, setJobDescriptionDraft] = useState('')
+    const [isSavingJobDescription, setIsSavingJobDescription] = useState(false)
     const [expandedSummary, setExpandedSummary] = useState(null)
+    const [uploadRole, setUploadRole] = useState(null)
+    const [uploadFile, setUploadFile] = useState(null)
+    const [uploadHeaders, setUploadHeaders] = useState([])
+    const [uploadMapping, setUploadMapping] = useState({})
+    const [uploadMappingDetails, setUploadMappingDetails] = useState({})
+    const [uploadRequiredTargets, setUploadRequiredTargets] = useState(['first_name', 'last_name', 'linkedin', 'city', 'title'])
+    const [uploadTargetOptions, setUploadTargetOptions] = useState([])
+    const [uploadPreviewBusy, setUploadPreviewBusy] = useState('')
+    const [uploadCommitBusy, setUploadCommitBusy] = useState(false)
+    const uploadFileRef = useRef(null)
 
     // Derived state for instant access
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
@@ -73,6 +89,10 @@ function Roles() {
             setIsLoadingRole(false)
         }
     }, [viewingRole])
+
+    useEffect(() => {
+        setJobDescriptionDraft(viewingRole?.job_description || '')
+    }, [viewingRole?.id, viewingRole?.job_description])
 
     // Silent sync function with useCallback to prevent stale closures
     const silentSync = useCallback(async () => {
@@ -111,6 +131,23 @@ function Roles() {
             toast.error('Failed to refresh')
         } finally {
             setIsRefreshing(false)
+        }
+    }
+
+    const handleSaveJobDescription = async () => {
+        if (!viewingRole?.name) return
+        setIsSavingJobDescription(true)
+        try {
+            await axios.patch(`${API_BASE}/roles/${encodeURIComponent(viewingRole.name)}`, {
+                job_description: jobDescriptionDraft
+            })
+            await fetchRoleDetails(viewingRole.name)
+            await fetchRoles({ force: true })
+            toast.success('Job description saved')
+        } catch (error) {
+            toast.error(error.response?.data?.detail || 'Failed to save job description')
+        } finally {
+            setIsSavingJobDescription(false)
         }
     }
 
@@ -273,15 +310,25 @@ function Roles() {
         const name = newRoleName.trim()
         setNewRoleName('')
 
-        // Instant Toast
-        toast.success(`Role "${name}" created`, { duration: 1000 })
-
         // Optimistic UI handled by store
         createRole(name).then(res => {
             if (!res.success) {
                 setNewRoleName(name)
                 toast.error(res.error || 'Failed to create role')
+                return
             }
+            const createdRole = {
+                id: res.data?.id,
+                name: res.data?.name || name,
+                candidate_count: 0,
+                upload_count: 0,
+            }
+            toast.success(`Role "${name}" created`, {
+                action: {
+                    label: 'Upload CSV',
+                    onClick: () => openRoleUploadPicker(createdRole),
+                },
+            })
         })
     }
 
@@ -307,6 +354,76 @@ function Roles() {
                 toast.error(res.error || 'Failed to remove candidate')
             }
         })
+    }
+
+    const openRoleUploadPicker = (role) => {
+        setUploadRole(role)
+        uploadFileRef.current?.click()
+    }
+
+    const runRoleUploadPreview = async (role, file) => {
+        if (!role?.name || !file) return
+        const fd = new FormData()
+        fd.append('file', file)
+        fd.append('use_llm', 'true')
+        setUploadPreviewBusy(role.name)
+        try {
+            const res = await axios.post(`${API_BASE}/roles/${encodeURIComponent(role.name)}/upload/preview`, fd, {
+                headers: { 'Content-Type': 'multipart/form-data' },
+                timeout: 120000,
+            })
+            const headers = res.data.headers || []
+            const sm = res.data.suggested_mapping || {}
+            const init = {}
+            for (const h of headers) init[h] = sm[h] || 'ignore'
+            setUploadRole(role)
+            setUploadFile(file)
+            setUploadHeaders(headers)
+            setUploadMapping(init)
+            setUploadMappingDetails(res.data.mapping_details || {})
+            setUploadRequiredTargets(res.data.required_targets || ['first_name', 'last_name', 'linkedin', 'city', 'title'])
+            setUploadTargetOptions(res.data.target_options || [])
+        } catch (e) {
+            toast.error(e.response?.data?.detail || 'Preview failed')
+        } finally {
+            setUploadPreviewBusy('')
+        }
+    }
+
+    const commitRoleUpload = async () => {
+        if (!uploadRole?.name || !uploadFile) return
+        const fd = new FormData()
+        fd.append('file', uploadFile)
+        fd.append('mapping_json', JSON.stringify(uploadMapping))
+        setUploadCommitBusy(true)
+        try {
+            const res = await axios.post(`${API_BASE}/roles/${encodeURIComponent(uploadRole.name)}/upload/commit`, fd, {
+                headers: { 'Content-Type': 'multipart/form-data' },
+                timeout: 300000,
+            })
+            const d = res.data || {}
+            const rows = Number(d.row_count) || 0
+            const assigned = Number(d.role_assigned_count) || 0
+            const skipped = Number(d.skipped) || 0
+            toast.success(`Import complete: ${rows} rows processed, ${assigned} new role assignment${assigned === 1 ? '' : 's'}${skipped ? `, ${skipped} skipped` : ''}.`)
+            if (Array.isArray(d.errors) && d.errors.length > 0) {
+                toast.warning(`Some rows had issues: ${d.errors.slice(0, 3).join(' ')}`)
+            }
+            setUploadRole(null)
+            setUploadFile(null)
+            setUploadHeaders([])
+            setUploadMapping({})
+            setUploadMappingDetails({})
+            invalidateTalentPoolCaches()
+            await fetchRoles({ force: true })
+            if (viewingRole?.name === uploadRole.name) {
+                await fetchRoleDetails(uploadRole.name)
+            }
+        } catch (e) {
+            toast.error(e.response?.data?.detail || 'Upload failed')
+        } finally {
+            setUploadCommitBusy(false)
+        }
     }
 
     const getPriorityBadge = (priority) => {
@@ -381,6 +498,43 @@ function Roles() {
             </div>
         )
     }
+
+    const uploadUi = (
+        <>
+            <input
+                ref={uploadFileRef}
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f && uploadRole) runRoleUploadPreview(uploadRole, f)
+                    e.target.value = ''
+                }}
+            />
+            {uploadRole && uploadFile && (
+                <CsvMappingModal
+                    title={`Map columns for ${uploadRole.name}`}
+                    subtitle="Review smart suggestions, adjust any field, then import this CSV into the role."
+                    headers={uploadHeaders}
+                    mapping={uploadMapping}
+                    details={uploadMappingDetails}
+                    requiredTargets={uploadRequiredTargets}
+                    targetOptions={uploadTargetOptions}
+                    busy={uploadCommitBusy}
+                    onChange={(header, value) => setUploadMapping(prev => ({ ...prev, [header]: value }))}
+                    onCancel={() => {
+                        setUploadRole(null)
+                        setUploadFile(null)
+                        setUploadHeaders([])
+                        setUploadMapping({})
+                        setUploadMappingDetails({})
+                    }}
+                    onImport={commitRoleUpload}
+                />
+            )}
+        </>
+    )
 
 
 
@@ -470,12 +624,70 @@ function Roles() {
                         <ArrowLeft size={16} /> Back to Roles
                     </button>
                     <h2 style={{ margin: 0, fontSize: '24px', fontWeight: 700, color: '#1e293b' }}>{viewingRole.name}</h2>
+                    <button
+                        className="btn btn-secondary"
+                        onClick={() => openRoleUploadPicker(viewingRole)}
+                        disabled={uploadPreviewBusy === viewingRole.name}
+                        style={{ marginLeft: 'auto' }}
+                    >
+                        <FileUp size={16} /> {uploadPreviewBusy === viewingRole.name ? 'Reading...' : 'Upload CSV'}
+                    </button>
                 </div>
+                {uploadUi}
 
                 <div className="result-banner">
                     <div className="result-banner-title">
-                        {viewingRole.candidates?.length || 0} Shortlisted Candidate(s)
+                        {viewingRole.candidate_count ?? viewingRole.candidates?.length ?? 0} Candidate(s)
                     </div>
+                    <div className="result-banner-subtitle">
+                        {Number(viewingRole.upload_count || 0)} role upload{Number(viewingRole.upload_count || 0) === 1 ? '' : 's'}
+                    </div>
+                </div>
+
+                <div style={{
+                    background: '#fff',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '10px',
+                    padding: '16px',
+                    marginBottom: '20px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '10px'
+                }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                        <div>
+                            <div style={{ fontSize: '13px', fontWeight: 800, color: '#0f172a' }}>Role job description</div>
+                            <div style={{ fontSize: '12px', color: '#64748b', marginTop: '3px' }}>
+                                Smart-column fit scoring uses this role context.
+                            </div>
+                        </div>
+                        <button
+                            className="btn btn-primary btn-sm"
+                            onClick={handleSaveJobDescription}
+                            disabled={isSavingJobDescription}
+                            style={{ height: '36px', padding: '0 16px' }}
+                        >
+                            {isSavingJobDescription ? 'Saving...' : 'Save JD'}
+                        </button>
+                    </div>
+                    <textarea
+                        value={jobDescriptionDraft}
+                        onChange={(event) => setJobDescriptionDraft(event.target.value)}
+                        rows={6}
+                        placeholder="Paste the role description, responsibilities, and must-have requirements."
+                        style={{
+                            width: '100%',
+                            resize: 'vertical',
+                            boxSizing: 'border-box',
+                            padding: '12px',
+                            borderRadius: '8px',
+                            border: '1px solid #cbd5e1',
+                            fontFamily: 'inherit',
+                            fontSize: '13px',
+                            lineHeight: 1.55,
+                            color: '#0f172a'
+                        }}
+                    />
                 </div>
 
                 {/* Optimized Action Bar */}
@@ -1027,6 +1239,7 @@ function Roles() {
     return (
         <div className="roles-page" style={{ width: '100%', position: 'relative', minHeight: '100vh', animation: 'fadeIn 0.2s ease-out' }}>
             <h2 className="screen-header">Role Management</h2>
+            {uploadUi}
 
             <div className="result-banner">
                 <div className="result-banner-title">{roles.length} Active Role(s)</div>
@@ -1037,7 +1250,7 @@ function Roles() {
             <div className="quick-add-container">
                 <input
                     type="text"
-                    className="input-field"
+                    className="input-field role-name-input"
                     placeholder="New Role Name (e.g. Senior Sales Director)"
                     value={newRoleName}
                     onChange={(e) => setNewRoleName(e.target.value)}
@@ -1077,6 +1290,15 @@ function Roles() {
                             </div>
                             <button className="role-delete-btn" onClick={() => handleDeleteRole(role.name)} title="Remove Role">
                                 <Trash2 size={16} />
+                            </button>
+                            <button
+                                className="role-delete-btn"
+                                onClick={() => openRoleUploadPicker(role)}
+                                title="Upload CSV to role"
+                                disabled={uploadPreviewBusy === role.name}
+                                style={{ color: '#0f766e' }}
+                            >
+                                {uploadPreviewBusy === role.name ? <Loader2 size={16} className="animate-spin" /> : <FileUp size={16} />}
                             </button>
                         </div>
                     ))

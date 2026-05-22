@@ -112,7 +112,7 @@ const Dashboard = () => {
       if (hasLoadedRef.current) {
         setIsRevalidating(true);
       }
-      await Promise.allSettled([fetchAnalytics(), fetchCallStats()]);
+      await Promise.allSettled([fetchAnalytics({ force: true }), fetchCallStats()]);
       hasLoadedRef.current = true;
       setIsRevalidating(false);
     };

@@ -1,5 +1,5 @@
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, Component } from 'react'
 import axios from 'axios'
 import { useShallow } from 'zustand/react/shallow'
 import { useAppStore } from './store/useAppStore'
@@ -14,6 +14,58 @@ const TalentPool = lazy(() => import('./pages/TalentPool'))
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const Calls = lazy(() => import('./pages/Calls'))
 
+class TalentPoolErrorBoundary extends Component {
+    constructor(props) {
+        super(props)
+        this.state = { error: null }
+    }
+    static getDerivedStateFromError(error) {
+        return { error }
+    }
+    render() {
+        if (this.state.error) {
+            return (
+                <div style={{ padding: '48px 32px', maxWidth: 720, margin: '0 auto', fontFamily: 'system-ui, sans-serif' }}>
+                    <h1 style={{ fontSize: 22, color: '#0f172a', marginBottom: 12 }}>Talent Pool could not load</h1>
+                    <p style={{ color: '#64748b', lineHeight: 1.6, marginBottom: 16 }}>
+                        Something went wrong while rendering this page. Open the browser developer console (F12 → Console) for the full stack trace.
+                    </p>
+                    <pre
+                        style={{
+                            background: '#f8fafc',
+                            border: '1px solid #e2e8f0',
+                            borderRadius: 12,
+                            padding: 16,
+                            overflow: 'auto',
+                            fontSize: 13,
+                            color: '#b91c1c',
+                            whiteSpace: 'pre-wrap',
+                        }}
+                    >
+                        {String(this.state.error?.message || this.state.error)}
+                    </pre>
+                    <button
+                        type="button"
+                        onClick={() => window.location.reload()}
+                        style={{
+                            marginTop: 20,
+                            padding: '10px 18px',
+                            borderRadius: 10,
+                            border: 'none',
+                            background: '#f97316',
+                            color: '#fff',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                        }}
+                    >
+                        Reload page
+                    </button>
+                </div>
+            )
+        }
+        return this.props.children
+    }
+}
 
 // Set axios header immediately on module load (before any component renders)
 const initToken = localStorage.getItem('token')
@@ -283,7 +335,14 @@ function App() {
                 <Route path="/dashboard" element={<Navigate to="/" replace />} />
                 <Route path="/screening" element={<Screening />} />
                 <Route path="/roles" element={<Roles />} />
-                <Route path="/talent-pool" element={<TalentPool />} />
+                <Route
+                    path="/talent-pool"
+                    element={
+                        <TalentPoolErrorBoundary>
+                            <TalentPool />
+                        </TalentPoolErrorBoundary>
+                    }
+                />
                 <Route path="/campaigns" element={<ComingSoon title="Campaign Management" description="Track and manage recruitment campaigns in one place" />} />
                 <Route path="/messages" element={<ComingSoon title="Messaging Center" description="Communicate with candidates directly from the platform" />} />
                 <Route path="/calls" element={<Calls />} />

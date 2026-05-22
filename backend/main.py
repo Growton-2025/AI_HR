@@ -6,12 +6,30 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.core.config import settings
-from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse, calls, voip
+from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse, calls, voip, candidate_imports, ai_columns
 
 from contextlib import asynccontextmanager
 import asyncio
 from backend.pipeline import query
 from backend.db.connection import get_db_connection_context
+
+
+def _apply_pool_migrations_blocking() -> None:
+    """Run pool/ownership migrations before any request — avoids login 500s if `archived_at` is missing."""
+    from backend.db.connection import get_db_connection, return_db_connection
+    from backend.db.ai_column_migrate import ensure_ai_column_migrations
+    from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        print("WARNING: Could not connect to DB for startup migrations.")
+        return
+    try:
+        ensure_candidate_pool_migrations(conn)
+        ensure_ai_column_migrations(conn)
+    finally:
+        return_db_connection(conn)
+
 
 async def warm_calls_backend():
     # Prime the DB-backed calls routes once so the first real page load
@@ -38,6 +56,12 @@ async def warm_backend_caches():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
+
+    try:
+        await asyncio.to_thread(_apply_pool_migrations_blocking)
+    except Exception as e:
+        print(f"STARTUP MIGRATION FAILED: {e}")
+        raise
 
     # Initialize Plivo background endpoint logic
     try:
@@ -92,7 +116,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Growton AI Backend is running"}
+    return {"message": "Hayasa.ai Backend is running"}
 
 @app.get("/api/health")
 async def health_check():
@@ -140,13 +164,14 @@ async def debug_db():
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(roles.router, prefix="/api/roles", tags=["roles"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
+app.include_router(candidate_imports.router, prefix="/api", tags=["imports"])
 app.include_router(candidates.router, prefix="/api", tags=["candidates"])
 app.include_router(stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(outreach.router, prefix="/api/outreach", tags=["outreach"])
 app.include_router(calls.router, prefix="/api/calls", tags=["calls"])
 app.include_router(voip.router, prefix="/api/voip", tags=["voip"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
-app.include_router(browse.router, prefix="/api", tags=["browse"])
+app.include_router(ai_columns.router, prefix="/api", tags=["ai-columns"])
 from backend.api.routes import plivo
 app.include_router(plivo.router, prefix="/api/plivo", tags=["plivo"])
 from backend.api.routes import enrichment
@@ -159,4 +184,4 @@ app.include_router(enrichment.router, tags=["enrichment-callback"])
 # Root routes
 @app.get("/")
 def read_root():
-    return {"message": "Growton AI Backend is running"}
+    return {"message": "Hayasa.ai Backend is running"}

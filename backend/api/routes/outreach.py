@@ -14,6 +14,7 @@ from backend.db.connection import (
 )
 from backend.integrations.smartlead import SmartleadBot
 from backend.integrations.heyreach import HeyReachBot
+from backend.services.linkedin_normalize import normalize_linkedin
 
 router = APIRouter()
 
@@ -1923,21 +1924,50 @@ async def heyreach_webhook(request: Dict):
         lead_data = request  # Fallback
 
     profile_url = lead_data.get("profile_url") or lead_data.get("profileUrl")
-    if not profile_url:
-        return {"status": "ignored", "reason": "no_profile_url"}
 
-    # Find candidate by LinkedIn URL
+    conv_id_early = request.get("conversation_id") or request.get("conversationId")
+
     try:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
             if not conn:
                 return {"status": "error", "reason": "db_connection_failed"}
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM candidates WHERE linkedin = %s", (profile_url,))
-                candidate_row = cur.fetchone()
-                if not candidate_row:
-                    return {"status": "ignored", "reason": "candidate_not_found"}
+                candidate_id = None
+                if conv_id_early:
+                    cur.execute(
+                        """
+                        SELECT candidate_id FROM candidate_outreach
+                        WHERE li_conversation_id = %s
+                        LIMIT 1
+                        """,
+                        (str(conv_id_early),),
+                    )
+                    cr = cur.fetchone()
+                    if cr:
+                        candidate_id = cr[0]
 
-                candidate_id = candidate_row[0]
+                if candidate_id is None and profile_url:
+                    norm = normalize_linkedin(profile_url)
+                    cur.execute(
+                        """
+                        SELECT c.id FROM candidates c
+                        LEFT JOIN candidate_outreach co
+                          ON co.candidate_id = c.id AND co.recruitment_role_id IS NULL
+                        WHERE (c.normalized_linkedin = %s OR c.linkedin = %s)
+                          AND COALESCE(c.is_archived, FALSE) = FALSE
+                        ORDER BY
+                          CASE WHEN co.li_conversation_id IS NOT NULL THEN 0 ELSE 1 END,
+                          c.id
+                        LIMIT 1
+                        """,
+                        (norm, profile_url),
+                    )
+                    candidate_row = cur.fetchone()
+                    if candidate_row:
+                        candidate_id = candidate_row[0]
+
+                if candidate_id is None:
+                    return {"status": "ignored", "reason": "candidate_not_found"}
 
                 new_status = None
                 new_response = None

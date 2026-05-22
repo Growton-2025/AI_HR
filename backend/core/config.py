@@ -2,8 +2,8 @@
 import os
 
 class Settings:
-    PROJECT_NAME: str = "AI HR Platform"
-    SECRET_KEY: str = "your-secret-key-keep-it-secret"
+    PROJECT_NAME: str = "Hayasa.ai"
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-keep-it-secret")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30 days
     

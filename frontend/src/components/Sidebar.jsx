@@ -3,19 +3,39 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { Search, Briefcase, Activity, MessageSquareMore, Phone, BarChart2, MoreHorizontal, LogOut, Users, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
+import HayasaBrand from './HayasaBrand'
 
 const MIN_WIDTH = 72
 const MAX_WIDTH = 420
 const ICON_THRESHOLD = 160
 
+const normalizeCount = (value) => {
+    if (value == null || value === '') return null
+    const count = Number(value)
+    return Number.isFinite(count) ? count : null
+}
+
+const getStatusCount = (counts, statusName) => {
+    if (!counts || typeof counts !== 'object') return null
+    if (counts[statusName] != null) return normalizeCount(counts[statusName])
+
+    const normalizedStatus = statusName.trim().toLowerCase()
+    const matchedKey = Object.keys(counts).find(key => key.trim().toLowerCase() === normalizedStatus)
+    return matchedKey ? normalizeCount(counts[matchedKey]) : null
+}
+
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
     const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
-    const { user, sidebarWidth, setSidebarWidth, toggleSidebar } = useAppStore(useShallow((state) => ({
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpCandidates, tpTotal, tpStatusCounts, talentPoolCache } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
         setSidebarWidth: state.setSidebarWidth,
         toggleSidebar: state.toggleSidebar,
+        tpCandidates: state.tpCandidates,
+        tpTotal: state.tpTotal,
+        tpStatusCounts: state.tpStatusCounts,
+        talentPoolCache: state.talentPoolCache,
     })))
     const role = user?.role
     const permissions = user?.permissions || {}
@@ -71,6 +91,16 @@ function Sidebar() {
     const navPad = isIconOnly ? '8px 8px' : '4px 10px'
     const itemPad = isIconOnly ? '12px 0' : '9px 12px'
     const iconMr  = isIconOnly ? 0 : '9px'
+    const hasTalentPoolSnapshot = Boolean(
+        talentPoolCache?.data ||
+        (Array.isArray(tpCandidates) && tpCandidates.length > 0) ||
+        normalizeCount(tpTotal) > 0 ||
+        (tpStatusCounts && Object.keys(tpStatusCounts).length > 0)
+    )
+    const browseTotal = hasTalentPoolSnapshot ? normalizeCount(tpTotal) : null
+    const browseShortlisted = hasTalentPoolSnapshot ? getStatusCount(tpStatusCounts, 'Shortlisted') : null
+    const sourcedCount = normalizeCount(analytics?.summary?.total_sourced) ?? browseTotal
+    const shortlistedCount = normalizeCount(analytics?.summary?.shortlisted) ?? browseShortlisted
 
     return (
         <aside
@@ -81,7 +111,7 @@ function Sidebar() {
 
             {/* ── Logo & Toggle ── */}
             <div style={{
-                padding: isIconOnly ? '18px 0 16px' : '22px 18px 18px',
+                padding: isIconOnly ? '16px 0 14px' : '20px 18px 16px',
                 borderBottom: '1px solid rgba(255,255,255,0.07)',
                 display: 'flex',
                 alignItems: 'center',
@@ -90,11 +120,19 @@ function Sidebar() {
                 gap: isIconOnly ? '12px' : 0,
                 flexShrink: 0,
             }}>
-                <img
-                    src="https://cdn.prod.website-files.com/65e41b0d7632a225ef3abc4e/693509bb8da9f3b5e10554be_LOGO.svg"
-                    alt="Growton"
-                    style={{ filter: 'brightness(0) invert(1)', width: isIconOnly ? '26px' : '88px', height: 'auto', objectFit: 'contain', flexShrink: 0, opacity: 0.96 }}
-                />
+                <div
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: isIconOnly ? 'center' : 'flex-start',
+                        minWidth: isIconOnly ? '34px' : '118px',
+                        minHeight: isIconOnly ? '34px' : '34px',
+                        padding: 0,
+                        flexShrink: 0,
+                    }}
+                >
+                    <HayasaBrand size="sidebar" tone="dark" iconOnly={isIconOnly} />
+                </div>
                 <button
                     onClick={toggleSidebar}
                     style={{
@@ -181,7 +219,7 @@ function Sidebar() {
                         boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
                     }}>
                         <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#f4f4f5', lineHeight: 1 }}>
-                            {analytics?.summary?.total_sourced?.toLocaleString() || 0}
+                            {sourcedCount == null ? '...' : sourcedCount.toLocaleString()}
                         </div>
                         {isIconOnly
                             ? <div style={{ fontSize: '7px', color: '#a1a1aa', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SRC</div>
@@ -197,7 +235,7 @@ function Sidebar() {
                         boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
                     }}>
                         <div style={{ fontSize: isIconOnly ? '14px' : '18px', fontWeight: 800, color: '#f4f4f5', lineHeight: 1 }}>
-                            {analytics?.summary?.shortlisted || 0}
+                            {shortlistedCount == null ? '...' : shortlistedCount.toLocaleString()}
                         </div>
                         {isIconOnly
                             ? <div style={{ fontSize: '7px', color: '#a1a1aa', fontWeight: 700, textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.5px' }}>SHL</div>

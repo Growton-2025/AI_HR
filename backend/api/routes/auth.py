@@ -27,19 +27,28 @@ async def login_for_access_token(request: schemas.LoginRequest):
     """
     Email & Password login endpoint.
     """
-    conn = get_db_connection()
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, is_verified, hashed_password, role FROM users WHERE email = %s", (request.email,))
+            cur.execute(
+                """
+                SELECT id, name, email, is_verified, hashed_password, role, archived_at
+                FROM users WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s))
+                """,
+                (request.email,),
+            )
             user = cur.fetchone()
             
             if not user:
                 raise HTTPException(status_code=400, detail="Incorrect email or password")
             
-            user_id, name, is_verified, hashed_password, role = user
+            user_id, name, email_canon, is_verified, hashed_password, role, archived_at = user
+
+            if archived_at is not None:
+                raise HTTPException(status_code=400, detail="Account is archived. Contact an administrator.")
             
             if not verify_password(request.password, hashed_password or ""):
                 raise HTTPException(status_code=400, detail="Incorrect email or password")
@@ -51,7 +60,7 @@ async def login_for_access_token(request: schemas.LoginRequest):
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": request.email, "role": role}, expires_delta=access_token_expires
+        data={"sub": email_canon, "role": role}, expires_delta=access_token_expires
     )
     return {
         "access_token": access_token, 
@@ -59,8 +68,8 @@ async def login_for_access_token(request: schemas.LoginRequest):
         "user": {
             "id": user_id,
             "full_name": name,
-            "email": request.email,
-            "username": request.email,
+            "email": email_canon,
+            "username": email_canon,
             "role": role,
             "permissions": {} 
         }

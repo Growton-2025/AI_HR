@@ -8,26 +8,30 @@ const CALL_RETRY_BACKOFF_MS = 3000
 
 axios.defaults.timeout = REQUEST_TIMEOUT_MS
 
-// PROD GRADE: Add a retry interceptor to handle transient network errors (like server restarts)
 axios.interceptors.response.use(
     (response) => response,
     async (error) => {
-        const { config } = error;
-        
-        // Only retry if it's a network error (no response) and we haven't retried yet
-        if (!error.response && !config._retry && config.method === 'get') {
-            config._retry = true;
-            console.warn(`Transient network error on ${config.url}. Retrying...`);
-            // Wait 1.5s for the server to finish restarting if it was an auto-reload
-            await new Promise(resolve => setTimeout(resolve, 1500));
-            return axios(config);
-        }
-        
-        return Promise.reject(error);
-    }
-);
+        const config = error?.config || {}
 
-function getRequestErrorMessage(error, fallbackMessage) {
+        if (!error?.response && !config._retry && config.method?.toLowerCase() === 'get') {
+            config._retry = true
+            await new Promise(resolve => setTimeout(resolve, 1500))
+            return axios(config)
+        }
+
+        if (error?.response?.status === 401 && localStorage.getItem('token')) {
+            localStorage.removeItem('token')
+            delete axios.defaults.headers.common['Authorization']
+            if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+                window.location.assign('/login')
+            }
+        }
+
+        return Promise.reject(error)
+    }
+)
+
+export function getRequestErrorMessage(error, fallbackMessage) {
     if (error?.code === 'ECONNABORTED') {
         return 'Server is taking too long to respond'
     }
@@ -40,6 +44,17 @@ function getRequestErrorMessage(error, fallbackMessage) {
     if (typeof detail === 'string' && detail.trim()) {
         return detail
     }
+    if (Array.isArray(detail)) {
+        const parts = detail.map((item) => {
+            if (typeof item === 'string') return item
+            if (item && typeof item.msg === 'string') return item.msg
+            if (item && typeof item.message === 'string') return item.message
+            return ''
+        }).filter(Boolean)
+        if (parts.length) {
+            return parts.join('; ')
+        }
+    }
     if (detail && typeof detail === 'object') {
         if (typeof detail.message === 'string' && detail.message.trim()) {
             return detail.message
@@ -47,6 +62,16 @@ function getRequestErrorMessage(error, fallbackMessage) {
         if (typeof detail.error === 'string' && detail.error.trim()) {
             return detail.error
         }
+    }
+    const status = error.response?.status
+    if (status === 401 || status === 403) {
+        return 'Not authorized — try signing in again'
+    }
+    if (status === 404) {
+        return 'API endpoint not found — check API URL / proxy configuration'
+    }
+    if (status) {
+        return `${fallbackMessage} (HTTP ${status})`
     }
     return fallbackMessage
 }
@@ -161,7 +186,7 @@ const isLocalHost = typeof window !== 'undefined' &&
 
 // Fallback to absolute production URL if env var failed to inject
 if (!API_URL && !isLocalHost) {
-  API_URL = 'https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net';
+    API_URL = 'https://growton-backend-v2-e3a3hxdmagfggcg9.centralindia-01.azurewebsites.net';
 }
 
 const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
@@ -246,6 +271,8 @@ export const useAppStore = create(persist((set, get) => ({
             // Set default header
             axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
 
+            get().invalidateTalentPoolCaches({ clearRows: true })
+
             return { success: true }
         } catch (error) {
             console.error('Login failed:', error)
@@ -257,6 +284,7 @@ export const useAppStore = create(persist((set, get) => ({
         localStorage.removeItem('token')
         delete axios.defaults.headers.common['Authorization']
         set({ token: null, isAuthenticated: false, user: null })
+        get().invalidateTalentPoolCaches({ clearRows: true })
     },
 
     // Google OAuth login
@@ -274,6 +302,7 @@ export const useAppStore = create(persist((set, get) => ({
 
             // Set default header
             axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
+            get().invalidateTalentPoolCaches({ clearRows: true })
             return { success: true }
         } catch (error) {
             console.error('Google login failed:', error)
@@ -320,7 +349,7 @@ export const useAppStore = create(persist((set, get) => ({
             axios.post(`${API_BASE}/admin/warm-all`);
             get().fetchCallStats({ force: true });
             get().fetchCalls({ due_filter: 'today', status: 'pending' }, { force: true });
-            get().fetchAnalytics(); 
+            get().fetchAnalytics();
             return { success: true }
         } catch (e) {
             console.error('Failed to trigger warm-all:', e)
@@ -347,11 +376,11 @@ export const useAppStore = create(persist((set, get) => ({
     updateCandidateNotes: async (id, notes) => {
         try {
             await axios.patch(`${API_BASE}/candidates/${id}/notes`, { notes });
-            
+
             // Update cache
             const cache = get().talentPoolCache;
             if (cache && cache.candidates) {
-                const updatedCandidates = cache.candidates.map(c => 
+                const updatedCandidates = cache.candidates.map(c =>
                     c.id === id ? { ...c, notes } : c
                 );
                 set({ talentPoolCache: { ...cache, candidates: updatedCandidates } });
@@ -399,22 +428,20 @@ export const useAppStore = create(persist((set, get) => ({
     fetchAnalytics: async (options = {}) => {
         const force = typeof options === 'boolean' ? options : options.force === true
         const state = get()
-        
-        // SWR: Return cached data immediately if we have it
+        const freshnessMs = 60 * 1000
+
         if (state.analytics && !force) {
-            // Still trigger a refresh in background if it's not "fresh" (e.g. older than 5s)
-            const isFreshEnough = state.analyticsLastFetchedAt && (Date.now() - state.analyticsLastFetchedAt < 5000)
-            if (isFreshEnough) {
-                return { success: true, data: state.analytics, cached: true }
+            if (!state.analyticsRequest && (!state.analyticsLastFetchedAt || Date.now() - state.analyticsLastFetchedAt >= freshnessMs)) {
+                setTimeout(() => { get().fetchAnalytics({ force: true }) }, 0)
             }
-            // If stale, return it but don't block
+            return { success: true, data: state.analytics, cached: true }
         }
 
         if (state.analyticsRequest) {
             return state.analyticsRequest
         }
 
-        const request = axios.get(`${API_BASE}/candidates/analytics`)
+        const request = axios.get(`${API_BASE}/candidates/analytics`, { timeout: 60000 })
             .then(res => {
                 set({
                     analytics: res.data,
@@ -452,7 +479,7 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, error: e.response?.data?.detail || 'Lookup failed' }
         }
     },
-    
+
     // Sidebar State
     sidebarWidth: 260,
     isSidebarCollapsed: false,
@@ -562,7 +589,7 @@ export const useAppStore = create(persist((set, get) => ({
         if (existingWs) {
             try {
                 existingWs.close()
-            } catch (_) {}
+            } catch (_) { }
         }
 
         const existingFallbackTimer = get()._searchFallbackTimer
@@ -601,7 +628,7 @@ export const useAppStore = create(persist((set, get) => ({
             clearFallbackTimer()
             try {
                 ws.close()
-            } catch (_) {}
+            } catch (_) { }
             set({ _ws: null })
             get().searchCandidates(query, {
                 initialStatus: 'Realtime screening unavailable. Running standard search...'
@@ -620,7 +647,8 @@ export const useAppStore = create(persist((set, get) => ({
 
         ws.onopen = () => {
             if (finished) return
-            ws.send(JSON.stringify({ query }))
+            const token = get().token
+            ws.send(JSON.stringify({ query, token }))
             set({ statusMessage: 'Processing query...' })
             armFallbackTimer(12000)
         }
@@ -723,7 +751,7 @@ export const useAppStore = create(persist((set, get) => ({
         if (ws) {
             try {
                 ws.close()
-            } catch (_) {}
+            } catch (_) { }
         }
         if (fallbackTimer) {
             window.clearTimeout(fallbackTimer)
@@ -747,6 +775,12 @@ export const useAppStore = create(persist((set, get) => ({
     selectedCandidates: {},
     candidatePriorities: {},
     candidateFeedback: {},
+
+    // AI Columns State
+    aiColumns: [],
+    setAiColumns: (columns) => set(state => ({ aiColumns: typeof columns === 'function' ? columns(state.aiColumns) : columns })),
+    aiColumnsLoading: false,
+    setAiColumnsLoading: (loading) => set({ aiColumnsLoading: loading }),
 
     toggleCandidateSelection: (id) => {
         set(state => {
@@ -891,7 +925,7 @@ export const useAppStore = create(persist((set, get) => ({
         try {
             const res = await axios.post(`${API_BASE}/roles`, { name })
             // Refresh with real server data in background
-            get().fetchRoles()
+            get().fetchRoles({ force: true })
             return { success: true, data: res.data }
         } catch (error) {
             // Rollback on error
@@ -971,7 +1005,7 @@ export const useAppStore = create(persist((set, get) => ({
             })
 
             // Refresh roles immediately to get correct counts from server
-            const rolesResult = await get().fetchRoles()
+            const rolesResult = await get().fetchRoles({ force: true })
             console.log('Refreshed roles after assignment:', rolesResult)
 
             // Background fetch to get Clay enriched data (emails/phones)
@@ -1012,10 +1046,12 @@ export const useAppStore = create(persist((set, get) => ({
 
         // 3. Remove from current view
         if (prevViewingRole?.name === roleName) {
-            set({ viewingRole: {
-                ...prevViewingRole,
-                candidates: prevViewingRole.candidates.filter(c => c.id !== candidateId)
-            }})
+            set({
+                viewingRole: {
+                    ...prevViewingRole,
+                    candidates: prevViewingRole.candidates.filter(c => c.id !== candidateId)
+                }
+            })
         }
 
         try {
@@ -1154,8 +1190,8 @@ export const useAppStore = create(persist((set, get) => ({
     tpPageSize: 25,
     tpGlobalSearch: '',
 
-    setTpFilters: (updater) => set((state) => ({ 
-        tpFilters: typeof updater === 'function' ? updater(state.tpFilters) : updater 
+    setTpFilters: (updater) => set((state) => ({
+        tpFilters: typeof updater === 'function' ? updater(state.tpFilters) : updater
     })),
     setTpActiveStatusTab: (tab) => set({ tpActiveStatusTab: tab }),
     setTpPagination: (page, pageSize) => set({ tpPage: page, tpPageSize: pageSize }),
@@ -1174,52 +1210,134 @@ export const useAppStore = create(persist((set, get) => ({
     talentPoolCache: { data: null, lastParamsString: null },
     talentPoolRequest: null,
     talentPoolRequestParamsString: '',
-    talentPoolIndex: { rows: [], lastFetchedAt: 0 },
+    talentPoolRequestSeq: 0,
+    talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
     talentPoolIndexRequest: null,
+    talentPoolIndexRequestParamsString: '',
+    talentPoolIndexRequestSeq: 0,
+    talentPoolViewScope: 'master',
+    talentPoolRecruiterFilterId: null,
+    talentPoolRoleFilterId: '',
+
+    buildTalentPoolScopeQuery: () => {
+        const u = get().user
+        const parts = []
+        if (u?.role === 'admin') {
+            const vs = get().talentPoolViewScope || 'master'
+            parts.push(`view_scope=${encodeURIComponent(vs)}`)
+            if (vs === 'recruiter_pools') {
+                const rid = get().talentPoolRecruiterFilterId
+                if (rid) parts.push(`recruiter_filter_id=${encodeURIComponent(rid)}`)
+            }
+        }
+        const roleId = get().talentPoolRoleFilterId
+        if (roleId) parts.push(`role_id=${encodeURIComponent(roleId)}`)
+        return parts.join('&')
+    },
+
+    buildTalentPoolQueryKey: (paramsString = '') => {
+        const scopeQ = get().buildTalentPoolScopeQuery()
+        return [paramsString, scopeQ].filter(Boolean).join('&')
+    },
+
+    setTalentPoolView: (viewScope, recruiterId = null) => {
+        set((state) => ({
+            talentPoolViewScope: viewScope,
+            talentPoolRecruiterFilterId: recruiterId,
+            talentPoolRoleFilterId: '',
+            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+            talentPoolRequestSeq: (state.talentPoolRequestSeq || 0) + 1,
+            talentPoolIndexRequest: null,
+            talentPoolIndexRequestParamsString: '',
+            talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
+        }))
+    },
+
+    setTalentPoolRoleFilter: (roleId = '') => {
+        set((state) => ({
+            talentPoolRoleFilterId: roleId || '',
+            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+            talentPoolRequestSeq: (state.talentPoolRequestSeq || 0) + 1,
+            talentPoolIndexRequest: null,
+            talentPoolIndexRequestParamsString: '',
+            talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
+        }))
+    },
+
+    invalidateTalentPoolCaches: (options = {}) => {
+        const clearRows = options.clearRows === true
+        set((state) => ({
+            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
+            ...(clearRows
+                ? {
+                    tpCandidates: [],
+                    tpTotal: 0,
+                    tpTotalPages: 1,
+                    tpStatusCounts: {},
+                }
+                : {}),
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+            talentPoolRequestSeq: (state.talentPoolRequestSeq || 0) + 1,
+            talentPoolIndexRequest: null,
+            talentPoolIndexRequestParamsString: '',
+            talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
+            analytics: null,
+            analyticsLastFetchedAt: 0,
+            analyticsRequest: null,
+        }))
+    },
 
     fetchTalentPool: async (paramsString, options = {}) => {
         const force = options.force === true
         const state = get()
         const cache = state.talentPoolCache || { data: null, lastParamsString: null }
+        const fullParams = get().buildTalentPoolQueryKey(paramsString)
 
-        if (state.talentPoolRequest && state.talentPoolRequestParamsString === paramsString) {
+        if (!force && state.talentPoolRequest && state.talentPoolRequestParamsString === fullParams) {
             return state.talentPoolRequest
         }
 
         // SWR Implementation: If we have cached data for these identical params, return it immediately.
         // This makes navigation back to Talent Pool feel instantaneous.
-        if (!force && cache.lastParamsString === paramsString && cache.data) {
+        if (!force && cache.lastParamsString === fullParams && cache.data) {
             const d = cache.data;
-            set({
-                tpCandidates: d.candidates || [],
-                tpTotal: d.total || 0,
-                tpTotalPages: d.total_pages || 1,
-                tpStatusCounts: d.status_counts || {}
-            })
+            const incomingHasRows = (d.candidates || []).length > 0 || Number(d.total || 0) > 0
+            const currentHasRows = (state.tpCandidates || []).length > 0 || Number(state.tpTotal || 0) > 0
+            if (incomingHasRows || !currentHasRows) {
+                set({
+                    tpCandidates: d.candidates || [],
+                    tpTotal: d.total || 0,
+                    tpTotalPages: d.total_pages || 1,
+                    tpStatusCounts: d.status_counts || {}
+                })
+            }
             // If the cache is relatively fresh (less than 1 min), don't even trigger a background fetch
             // But for now, we'll let the background fetch run to ensure 100% correctness.
         }
 
-        const request = axios.get(`${API_BASE}/candidates/browse?${paramsString}`)
+        const requestSeq = (state.talentPoolRequestSeq || 0) + 1
+        const request = axios.get(`${API_BASE}/candidates/browse?${fullParams}`)
             .then(res => {
                 const d = res.data;
-                const currentState = get();
-                if (currentState.talentPoolRequestParamsString === paramsString) {
-                    const incomingRows = d.candidates || [];
-                    const incomingMap = new Map(incomingRows.map(row => [row.id, row]));
-                    const mergedIndexRows = (currentState.talentPoolIndex?.rows || []).map(row =>
-                        incomingMap.has(row.id) ? { ...row, ...incomingMap.get(row.id) } : row
-                    );
+                const latestState = get()
+                if (
+                    latestState.talentPoolRequestSeq === requestSeq &&
+                    latestState.talentPoolRequestParamsString === fullParams
+                ) {
                     set({
                         tpCandidates: d.candidates || [],
                         tpTotal: d.total || 0,
                         tpTotalPages: d.total_pages || 1,
                         tpStatusCounts: d.status_counts || {},
-                        talentPoolCache: { data: d, lastParamsString: paramsString },
-                        talentPoolIndex: {
-                            ...currentState.talentPoolIndex,
-                            rows: mergedIndexRows.length ? mergedIndexRows : (currentState.talentPoolIndex?.rows || []),
-                        },
+                        talentPoolCache: { data: d, lastParamsString: fullParams },
                         talentPoolRequest: null,
                         talentPoolRequestParamsString: '',
                     })
@@ -1228,18 +1346,30 @@ export const useAppStore = create(persist((set, get) => ({
             })
             .catch(error => {
                 console.error('Failed to fetch talent pool:', error)
-                if (get().talentPoolRequestParamsString === paramsString) {
+                const latestState = get()
+                const isLatestRequest =
+                    latestState.talentPoolRequestSeq === requestSeq &&
+                    latestState.talentPoolRequestParamsString === fullParams
+                if (!isLatestRequest) {
+                    return { success: false, stale: true, error: 'Ignored stale talent pool request' }
+                }
+                if (isLatestRequest) {
                     set({ talentPoolRequest: null, talentPoolRequestParamsString: '' })
                 }
                 const latestCache = get().talentPoolCache
-                if (latestCache.lastParamsString === paramsString && latestCache.data) {
+                if (latestCache.lastParamsString === fullParams && latestCache.data) {
                     const d = latestCache.data;
-                    set({
-                        tpCandidates: d.candidates || [],
-                        tpTotal: d.total || 0,
-                        tpTotalPages: d.total_pages || 1,
-                        tpStatusCounts: d.status_counts || {}
-                    })
+                    const latestStateAfterError = get()
+                    const incomingHasRows = (d.candidates || []).length > 0 || Number(d.total || 0) > 0
+                    const currentHasRows = (latestStateAfterError.tpCandidates || []).length > 0 || Number(latestStateAfterError.tpTotal || 0) > 0
+                    if (incomingHasRows || !currentHasRows) {
+                        set({
+                            tpCandidates: d.candidates || [],
+                            tpTotal: d.total || 0,
+                            tpTotalPages: d.total_pages || 1,
+                            tpStatusCounts: d.status_counts || {}
+                        })
+                    }
                     return { success: true, data: d, cached: true }
                 }
                 return { success: false, error: getRequestErrorMessage(error, 'Failed to load candidates') }
@@ -1247,7 +1377,8 @@ export const useAppStore = create(persist((set, get) => ({
 
         set({
             talentPoolRequest: request,
-            talentPoolRequestParamsString: paramsString,
+            talentPoolRequestParamsString: fullParams,
+            talentPoolRequestSeq: requestSeq,
         })
 
         return request
@@ -1257,34 +1388,54 @@ export const useAppStore = create(persist((set, get) => ({
         const force = options.force === true
         const state = get()
         const freshnessMs = 5 * 60 * 1000
+        const scopeQ = get().buildTalentPoolScopeQuery()
+        const indexQs = ['page=1', 'page_size=5000', 'sort_by=name', 'sort_dir=asc', scopeQ].filter(Boolean).join('&')
 
-        if (!force && state.talentPoolIndex?.rows?.length && state.talentPoolIndex?.lastFetchedAt && (Date.now() - state.talentPoolIndex.lastFetchedAt) < freshnessMs) {
+        if (!force && state.talentPoolIndex?.lastParamsString === indexQs && state.talentPoolIndex?.rows?.length && state.talentPoolIndex?.lastFetchedAt && (Date.now() - state.talentPoolIndex.lastFetchedAt) < freshnessMs) {
             return { success: true, data: state.talentPoolIndex.rows, cached: true }
         }
 
-        if (state.talentPoolIndexRequest) {
+        if (!force && state.talentPoolIndexRequest && state.talentPoolIndexRequestParamsString === indexQs) {
             return state.talentPoolIndexRequest
         }
 
-        const request = axios.get(`${API_BASE}/candidates/browse?page=1&page_size=5000&sort_by=name&sort_dir=asc`)
+        const requestSeq = (state.talentPoolIndexRequestSeq || 0) + 1
+        const request = axios.get(`${API_BASE}/candidates/browse?${indexQs}`)
             .then(res => {
                 const rows = res.data?.candidates || []
-                set({
-                    talentPoolIndex: {
-                        rows,
-                        lastFetchedAt: Date.now(),
-                    },
-                    talentPoolIndexRequest: null,
-                })
+                const latestState = get()
+                if (
+                    latestState.talentPoolIndexRequestSeq === requestSeq &&
+                    latestState.talentPoolIndexRequestParamsString === indexQs
+                ) {
+                    set({
+                        talentPoolIndex: { rows, lastFetchedAt: Date.now(), lastParamsString: indexQs },
+                        talentPoolIndexRequest: null,
+                        talentPoolIndexRequestParamsString: '',
+                    })
+                }
                 return { success: true, data: rows, cached: false }
             })
             .catch(error => {
                 console.error('Failed to fetch talent pool index:', error)
-                set({ talentPoolIndexRequest: null })
+                const latestState = get()
+                const isLatestRequest =
+                    latestState.talentPoolIndexRequestSeq === requestSeq &&
+                    latestState.talentPoolIndexRequestParamsString === indexQs
+                if (!isLatestRequest) {
+                    return { success: false, stale: true, error: 'Ignored stale talent pool index request' }
+                }
+                if (isLatestRequest) {
+                    set({ talentPoolIndexRequest: null, talentPoolIndexRequestParamsString: '' })
+                }
                 return { success: false, error: getRequestErrorMessage(error, 'Failed to load talent pool index') }
             })
 
-        set({ talentPoolIndexRequest: request })
+        set({
+            talentPoolIndexRequest: request,
+            talentPoolIndexRequestParamsString: indexQs,
+            talentPoolIndexRequestSeq: requestSeq,
+        })
         return request
     },
 
@@ -1513,7 +1664,7 @@ export const useAppStore = create(persist((set, get) => ({
     fetchCalls: async (paramsArg = {}, optionsVal = {}) => {
         const force = typeof optionsVal === 'boolean' ? optionsVal : optionsVal.force === true
         const updateState = typeof optionsVal === 'object' ? optionsVal.updateState !== false : true
-        
+
         // Normalize params: if it's a number/string, assume it's a listId
         let params = paramsArg;
         if (typeof paramsArg === 'number' || (typeof paramsArg === 'string' && !paramsArg.includes('=') && !isNaN(paramsArg))) {
@@ -1882,7 +2033,7 @@ export const useAppStore = create(persist((set, get) => ({
             }
         }
     },
-    
+
     // Add explicitly to help UI clear state on tab switch
     clearCallsState: () => set({ calls: [], callsLastQueryKey: '' })
 }), {
@@ -1891,8 +2042,7 @@ export const useAppStore = create(persist((set, get) => ({
         user: state.user,
         heyreachCampaignId: state.heyreachCampaignId,
         isSidebarCollapsed: state.isSidebarCollapsed,
-        // PERSIST CRITICAL UI STATES FOR INSTANT LOAD
-        analytics: state.analytics,
+        // Do not persist analytics: stale zeros (failed fetch / cold cache) overwrite real counts after reload.
         tpCandidates: state.tpCandidates,
         tpTotal: state.tpTotal,
         tpStatusCounts: state.tpStatusCounts,
@@ -1931,25 +2081,3 @@ const token = localStorage.getItem('token')
 if (token) {
     axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
 }
-
-// ── Auto-logout on 401 ──
-// If any request gets a 401, the session has expired.
-// Clear everything and redirect to login with a message.
-axios.interceptors.response.use(
-    response => response,
-    error => {
-        if (error?.response?.status === 401) {
-            const currentToken = localStorage.getItem('token')
-            if (currentToken) {
-                // Only auto-logout if we actually had a token (real session expiry)
-                console.warn('Session expired — logging out automatically')
-                localStorage.removeItem('token')
-                delete axios.defaults.headers.common['Authorization']
-                // Show alert then reload to login page
-                alert('Your session has expired. Please log in again.')
-                window.location.href = '/login'
-            }
-        }
-        return Promise.reject(error)
-    }
-)

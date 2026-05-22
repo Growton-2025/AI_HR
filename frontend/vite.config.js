@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8000'
+
 export default defineConfig({
     plugins: [react()],
     server: {
@@ -12,11 +14,13 @@ export default defineConfig({
         },
         proxy: {
             '/api': {
-                target: 'http://127.0.0.1:8000',
+                target: apiProxyTarget,
                 changeOrigin: true,
                 ws: true,
-                timeout: 8000,
-                proxyTimeout: 8000,
+                // Large CSV/XLSX imports can run longer than typical API calls; short timeouts
+                // surface as failed commit/upload requests in dev.
+                timeout: 300000,
+                proxyTimeout: 300000,
             }
         }
     }

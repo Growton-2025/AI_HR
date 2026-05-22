@@ -1,12 +1,59 @@
-from fastapi import APIRouter, Query, HTTPException
-from typing import Optional, List
+from fastapi import APIRouter, Query, HTTPException, Depends
+from typing import Optional, List, Any
 from pydantic import BaseModel
 from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID
+from backend.api import deps, schemas
+from backend.services.candidate_pool import (
+    profile_passes_scope,
+    VIEW_SCOPE_MASTER,
+    VIEW_SCOPE_RECRUITER_POOLS,
+    VIEW_SCOPE_ALL_RECRUITER_POOLS,
+)
+from backend.db.connection import get_db_connection, return_db_connection
 import time
 import hashlib
 import json
 
 router = APIRouter()
+
+@router.get("/candidates/sample")
+async def get_sample_candidate(
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Return 5 candidate IDs+names directly from DB (no cache needed). Used for AI Column test fallback."""
+    from backend.db.connection import get_db_connection_context
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (c.id)
+                           c.id,
+                           COALESCE(c.first_name, split_part(c.name,' ',1), '') AS first_name,
+                           COALESCE(c.last_name,  split_part(c.name,' ',2), '') AS last_name,
+                           COALESCE(co.name, c.headline, '') AS company,
+                           COALESCE(r.title, c.headline, '') AS title
+                    FROM candidates c
+                    LEFT JOIN roles r    ON r.candidate_id = c.id
+                    LEFT JOIN companies co ON co.id = r.company_id
+                    ORDER BY c.id ASC, r.id ASC
+                    LIMIT 5
+                """)
+                rows = cur.fetchall()
+                return {
+                    "candidates": [
+                        {
+                            "id": row[0],
+                            "first_name": row[1],
+                            "last_name": row[2],
+                            "name": f"{row[1]} {row[2]}".strip(),
+                            "company": row[3],
+                            "title": row[4],
+                        }
+                        for row in rows
+                    ]
+                }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
 # ── Server-side browse result cache ───────────────────────────────────────────────
 # Caches filtered + paginated results so repeated requests return instantly
@@ -42,8 +89,272 @@ INDUSTRY_KEYWORDS = [
 ]
 
 
+def resolve_browse_scope(
+    current_user: schemas.User,
+    view_scope: Optional[str],
+    recruiter_filter_id: Optional[int],
+) -> tuple[str, Optional[int]]:
+    if (current_user.role or "").strip().lower() != "admin":
+        return VIEW_SCOPE_RECRUITER_POOLS, current_user.id
+
+    effective_scope = view_scope or VIEW_SCOPE_MASTER
+    effective_recruiter = recruiter_filter_id
+    if effective_scope == VIEW_SCOPE_RECRUITER_POOLS and not effective_recruiter:
+        raise HTTPException(
+            status_code=400,
+            detail="recruiter_filter_id is required when view_scope=recruiter_pools",
+        )
+    return effective_scope, effective_recruiter
+
+
+def _matches_filter(filter_str: Optional[str], target_val: Any) -> bool:
+    if not filter_str:
+        return True
+    filter_vals = [v.strip().lower() for v in str(filter_str).split(",") if v.strip()]
+    if not filter_vals:
+        return True
+    if not target_val:
+        return False
+    tv_lower = str(target_val).lower()
+    return any(v in tv_lower for v in filter_vals)
+
+
+def _role_candidate_id_set(
+    current_user: schemas.User,
+    *,
+    role_id: Optional[int],
+    view_scope: Optional[str],
+    recruiter_filter_id: Optional[int],
+) -> Optional[set[int]]:
+    if not role_id:
+        return None
+    owner_id = current_user.id
+    if (current_user.role or "").strip().lower() == "admin":
+        if view_scope == VIEW_SCOPE_RECRUITER_POOLS and recruiter_filter_id:
+            owner_id = recruiter_filter_id
+        elif view_scope == VIEW_SCOPE_ALL_RECRUITER_POOLS:
+            owner_id = None
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            if owner_id is None:
+                cur.execute("SELECT user_id FROM recruitment_roles WHERE id = %s", (role_id,))
+            else:
+                cur.execute(
+                    "SELECT user_id FROM recruitment_roles WHERE id = %s AND user_id = %s",
+                    (role_id, owner_id),
+                )
+            role = cur.fetchone()
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found for current scope")
+            cur.execute(
+                "SELECT candidate_id FROM recruitment_role_candidates WHERE role_id = %s",
+                (role_id,),
+            )
+            return {int(row[0]) for row in cur.fetchall()}
+    finally:
+        return_db_connection(conn)
+
+
+async def build_browse_candidate_rows(
+    *,
+    current_user: schemas.User,
+    view_scope: Optional[str] = None,
+    recruiter_filter_id: Optional[int] = None,
+    q: Optional[str] = None,
+    title: Optional[str] = None,
+    company: Optional[str] = None,
+    city: Optional[str] = None,
+    location_type: Optional[str] = None,
+    product_service: Optional[str] = None,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    min_exp: Optional[float] = None,
+    max_exp: Optional[float] = None,
+    min_avg_tenure: Optional[float] = None,
+    role_id: Optional[int] = None,
+    sort_by: Optional[str] = "name",
+    sort_dir: Optional[str] = "asc",
+) -> dict:
+    effective_scope, effective_recruiter = resolve_browse_scope(
+        current_user,
+        view_scope,
+        recruiter_filter_id,
+    )
+    role_candidate_ids = _role_candidate_id_set(
+        current_user,
+        role_id=role_id,
+        view_scope=effective_scope,
+        recruiter_filter_id=effective_recruiter,
+    )
+
+    all_profiles = [
+        p
+        for p in PROFILES_BY_ID.values()
+        if role_candidate_ids is None or int(p.get("id") or 0) in role_candidate_ids
+        if profile_passes_scope(
+            p,
+            user_role=(current_user.role or "").strip().lower(),
+            user_id=current_user.id,
+            view_scope=effective_scope,
+            recruiter_filter_id=effective_recruiter,
+        )
+    ]
+
+    semantic_scores = {}
+    if product_service and product_service.strip():
+        from backend.pipeline.query import get_semantic_scores
+
+        semantic_scores = await get_semantic_scores(product_service)
+
+    results = []
+    for p in all_profiles:
+        profile_id = p.get("id")
+        score = semantic_scores.get(profile_id, 0.0) if semantic_scores else None
+
+        primary_role = (p.get("roles") or [{}])[0]
+        city_val = (p.get("city") or "").strip() or (p.get("location") or "").split(",")[0].strip()
+        loc_val = p.get("work_preference") or p.get("location_type") or ""
+        company_product = (primary_role.get("company_details") or {}).get("product_service") or ""
+        extracted_prod = p.get("extracted_industry") or ""
+        cand_services = p.get("candidate_services") or ""
+
+        product_val = extracted_prod or cand_services or company_product or primary_role.get("industry") or ""
+        if not product_val:
+            search_text = f"{p.get('headline') or ''} {p.get('about') or ''}"
+            found = [kw for kw in INDUSTRY_KEYWORDS if kw.lower() in search_text.lower()]
+            if found:
+                product_val = ", ".join(list(set(found))[:3])
+
+        exp_val = p.get("total_experience_years") or 0
+        stability_val = p.get("avg_years_in_company") or 0
+        status_val = p.get("status") or ""
+        created_by_val = p.get("created_by") or ""
+        name_val = p.get("name") or ""
+        title_val = primary_role.get("title") or p.get("headline") or ""
+        company_val = primary_role.get("company") or ""
+        if not company_val and isinstance(p.get("raw_fields"), dict):
+            company_val = (p.get("raw_fields") or {}).get("import_company") or ""
+
+        if q:
+            ql = q.lower()
+            searchable = " ".join(str(v or "") for v in (name_val, title_val, company_val, city_val, p.get("linkedin"), p.get("normalized_linkedin"), p.get("email"), p.get("phone"), p.get("mobile_phone"))).lower()
+            if ql not in searchable:
+                continue
+
+        if not _matches_filter(title, title_val):
+            continue
+        if not _matches_filter(company, company_val):
+            continue
+        if not _matches_filter(city, city_val):
+            continue
+        if not _matches_filter(created_by, created_by_val):
+            continue
+        if not _matches_filter(location_type, loc_val):
+            continue
+        if not semantic_scores and product_service and not _matches_filter(product_service, product_val):
+            continue
+        if semantic_scores and score is not None and score < 0.45:
+            continue
+
+        fn = (p.get("first_name") or "").strip() or (name_val.split() or [""])[0]
+        ln = (p.get("last_name") or "").strip() or (" ".join(name_val.split()[1:]) if name_val else "")
+        results.append(
+            {
+                "id": profile_id,
+                "name": name_val,
+                "first_name": fn,
+                "last_name": ln,
+                "linkedin": p.get("linkedin"),
+                "email": p.get("email") or "",
+                "phone": p.get("phone") or p.get("mobile_phone") or "",
+                "response": p.get("response", ""),
+                "notes": p.get("notes", ""),
+                "title": title_val,
+                "company": company_val,
+                "product_service": product_val,
+                "city": city_val,
+                "location_type": loc_val,
+                "total_experience_years": round(float(exp_val), 1) if exp_val else 0,
+                "avg_tenure_years": round(float(stability_val), 1) if stability_val else 0,
+                "status": status_val,
+                "created_by": created_by_val,
+                "li_status": p.get("li_status") or "",
+                "li_response_text": p.get("li_response_text") or "",
+                "heyreach_campaign_id": p.get("heyreach_campaign_id") or "",
+                "email_campaign_id": p.get("email_campaign_id") or "",
+                "message_sent_count": p.get("message_sent_count") or 0,
+                "li_sent_count": p.get("li_sent_count") or 0,
+                "headline": p.get("headline") or "",
+                "match_score": round(score * 100, 1) if score is not None else None,
+                "owner_user_id": p.get("owner_user_id"),
+                "pool_source": p.get("pool_source"),
+                "is_master_row": p.get("owner_user_id") is None,
+                "raw_fields": p.get("raw_fields") if isinstance(p.get("raw_fields"), dict) else {},
+            }
+        )
+
+    if min_exp is not None:
+        results = [r for r in results if r["total_experience_years"] >= min_exp]
+    if max_exp is not None:
+        results = [r for r in results if r["total_experience_years"] <= max_exp]
+    if min_avg_tenure is not None:
+        results = [r for r in results if r["avg_tenure_years"] >= min_avg_tenure]
+
+    status_counts = {}
+    for r in results:
+        s = (r.get("status") or "").strip()
+        if s:
+            status_counts[s] = status_counts.get(s, 0) + 1
+        else:
+            status_counts["To be started"] = status_counts.get("To be started", 0) + 1
+
+    if status and status.strip():
+        status_vals = [s.strip().lower() for s in status.split(",") if s.strip()]
+        if status_vals:
+            results = [
+                r
+                for r in results
+                if (r.get("status") or "To be started").strip().lower() in status_vals
+            ]
+
+    if semantic_scores:
+        results.sort(key=lambda x: x.get("match_score") or 0, reverse=True)
+    else:
+        sort_key_map = {
+            "name": "name",
+            "title": "title",
+            "company": "company",
+            "city": "city",
+            "exp": "total_experience_years",
+            "tenure": "avg_tenure_years",
+        }
+        key = sort_key_map.get(sort_by, "name")
+        results.sort(key=lambda x: (x.get(key) or ""), reverse=(sort_dir == "desc"))
+
+    return {
+        "candidates": results,
+        "status_counts": status_counts,
+        "is_semantic_search": bool(semantic_scores),
+        "effective_scope": effective_scope,
+        "effective_recruiter": effective_recruiter,
+    }
+
+
 @router.get("/candidates/browse")
 async def browse_candidates(
+    current_user: schemas.User = Depends(deps.get_current_user),
+    view_scope: Optional[str] = Query(
+        None,
+        description="admin: master | recruiter_pools | all_recruiter_pools",
+    ),
+    recruiter_filter_id: Optional[int] = Query(
+        None,
+        description="admin + recruiter_pools: which recruiter's pool",
+    ),
     # Pagination
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=5, le=5000),
@@ -60,18 +371,29 @@ async def browse_candidates(
     min_exp: Optional[float] = None,
     max_exp: Optional[float] = None,
     min_avg_tenure: Optional[float] = None, # stability
+    role_id: Optional[int] = None,
     # Sort
     sort_by: Optional[str] = "name",
     sort_dir: Optional[str] = "asc",
 ):
-    """Browse all candidates with filtering, search, and pagination"""
+    """Browse candidates with role-based pool scope."""
+    effective_scope, effective_recruiter = resolve_browse_scope(
+        current_user,
+        view_scope,
+        recruiter_filter_id,
+    )
 
     # ── Cache key from all params ───────────────────────────────────
     cache_key_src = json.dumps({
+        "uid": current_user.id,
+        "role": current_user.role,
+        "view_scope": effective_scope,
+        "recruiter_filter_id": effective_recruiter,
         "page": page, "page_size": page_size, "q": q, "title": title,
         "company": company, "city": city, "location_type": location_type,
         "product_service": product_service, "status": status, "created_by": created_by,
         "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
+        "role_id": role_id,
         "sort_by": sort_by, "sort_dir": sort_dir,
     }, sort_keys=True)
     cache_key = hashlib.md5(cache_key_src.encode()).hexdigest()
@@ -81,147 +403,28 @@ async def browse_candidates(
     if cached and (time.monotonic() - cached["ts"]) < _BROWSE_CACHE_TTL:
         return cached["result"]
 
-    all_profiles = list(PROFILES_BY_ID.values())
-
-    # --- Semantic Search for Expertise ---
-    semantic_scores = {}
-    if product_service and product_service.strip():
-        from backend.pipeline.query import get_semantic_scores
-        semantic_scores = await get_semantic_scores(product_service)
-
-    results = []
-    for p in all_profiles:
-        profile_id = p.get("id")
-        score = semantic_scores.get(profile_id, 0.0) if semantic_scores else None
-
-        primary_role = (p.get("roles") or [{}])[0]
-        city_val = (p.get("location") or "").split(",")[0].strip()
-        loc_val = p.get("work_preference") or p.get("location_type") or ""
-        company_product = (primary_role.get("company_details") or {}).get("product_service") or ""
-        extracted_prod = p.get("extracted_industry") or ""
-        cand_services = p.get("candidate_services") or ""
-        
-        product_val = extracted_prod or cand_services or company_product or primary_role.get("industry") or ""
-        
-        if not product_val:
-            search_text = f"{p.get('headline') or ''} {p.get('about') or ''}"
-            found = []
-            for kw in INDUSTRY_KEYWORDS:
-                if kw.lower() in search_text.lower():
-                    found.append(kw)
-            if found:
-                product_val = ", ".join(list(set(found))[:3])
-        
-        exp_val = p.get("total_experience_years") or 0
-        stability_val = p.get("avg_years_in_company") or 0
-        status_val = p.get("status") or ""
-        created_by_val = p.get("created_by") or ""
-        name_val = p.get("name") or ""
-        title_val = primary_role.get("title") or p.get("headline") or ""
-        company_val = primary_role.get("company") or ""
-
-        # --- Filter logic ---
-        if q:
-            ql = q.lower()
-            searchable = f"{name_val} {title_val} {company_val} {city_val}".lower()
-            if ql not in searchable:
-                continue
-
-        # Multi-value filter helper
-        def matches_filter(filter_str, target_val, field_name=""):
-            if not filter_str: return True
-            filter_vals = [v.strip().lower() for v in filter_str.split(",") if v.strip()]
-            if not filter_vals: return True
-            if not target_val: return False
-            tv_lower = str(target_val).lower()
-            return any(v in tv_lower for v in filter_vals)
-
-        if not matches_filter(title, title_val, "title"):
-            continue
-        if not matches_filter(company, company_val, "company"):
-            continue
-        if not matches_filter(city, city_val, "city"):
-            continue
-        if not matches_filter(created_by, created_by_val, "created_by"):
-            continue
-        if not matches_filter(location_type, loc_val):
-            continue
-        
-        # If semantic scores are NOT present, fallback to traditional substring match
-        if not semantic_scores and product_service and not matches_filter(product_service, product_val):
-            continue
-        
-        # If semantic scores ARE present, only keep those with a decent score (e.g., > 0.4)
-        if semantic_scores and score is not None and score < 0.45:
-            continue
-
-        results.append({
-            "id": profile_id,
-            "name": name_val,
-            "first_name": (name_val.split() or [""])[0],
-            "last_name": (" ".join(name_val.split()[1:]) or ""),
-            "linkedin": p.get("linkedin"),
-            "email": p.get("email") or "",
-            "phone": p.get("phone") or p.get("mobile_phone") or "",
-            "response": p.get("response", ""),
-            "notes": p.get("notes", ""),
-            "title": title_val,
-            "company": company_val,
-            "product_service": product_val,
-            "city": city_val,
-            "location_type": loc_val,
-            "total_experience_years": round(float(exp_val), 1) if exp_val else 0,
-            "avg_tenure_years": round(float(stability_val), 1) if stability_val else 0,
-            "status": status_val,
-            "created_by": created_by_val,
-            "li_status": p.get("li_status") or "",
-            "li_response_text": p.get("li_response_text") or "",
-            "heyreach_campaign_id": p.get("heyreach_campaign_id") or "",
-            "email_campaign_id": p.get("email_campaign_id") or "",
-            "message_sent_count": p.get("message_sent_count") or 0,
-            "li_sent_count": p.get("li_sent_count") or 0,
-            "headline": p.get("headline") or "",
-            "match_score": round(score * 100, 1) if score is not None else None,
-        })
-
-    # Filter by experience
-    if min_exp is not None:
-        results = [r for r in results if r["total_experience_years"] >= min_exp]
-    if max_exp is not None:
-        results = [r for r in results if r["total_experience_years"] <= max_exp]
-    if min_avg_tenure is not None:
-        results = [r for r in results if r["avg_tenure_years"] >= min_avg_tenure]
-
-    # --- Status counts for tabs (calculate BEFORE status filter) ---
-    status_counts = {}
-    for r in results:
-        s = (r.get("status") or "").strip()
-        if s:
-            status_counts[s] = status_counts.get(s, 0) + 1
-        else:
-            status_counts["To be started"] = status_counts.get("To be started", 0) + 1
-
-    # Filter by status
-    if status and status.strip():
-        status_vals = [s.strip().lower() for s in status.split(",") if s.strip()]
-        if status_vals:
-            results = [r for r in results if (r.get("status") or "To be started").strip().lower() in status_vals]
-
-    # --- Sorting ---
-    if semantic_scores:
-        # Default to match score if semantic search is active
-        results.sort(key=lambda x: x.get("match_score") or 0, reverse=True)
-    else:
-        sort_key_map = {
-            "name": "name",
-            "title": "title",
-            "company": "company",
-            "city": "city",
-            "exp": "total_experience_years",
-            "tenure": "avg_tenure_years",
-        }
-        key = sort_key_map.get(sort_by, "name")
-        results.sort(key=lambda x: (x.get(key) or ""), reverse=(sort_dir == "desc"))
+    browse_payload = await build_browse_candidate_rows(
+        current_user=current_user,
+        view_scope=view_scope,
+        recruiter_filter_id=recruiter_filter_id,
+        q=q,
+        title=title,
+        company=company,
+        city=city,
+        location_type=location_type,
+        product_service=product_service,
+        status=status,
+        created_by=created_by,
+        min_exp=min_exp,
+        max_exp=max_exp,
+        min_avg_tenure=min_avg_tenure,
+        role_id=role_id,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    results = browse_payload["candidates"]
+    status_counts = browse_payload["status_counts"]
+    is_semantic_search = browse_payload["is_semantic_search"]
 
     # --- Pagination ---
     total = len(results)
@@ -236,7 +439,7 @@ async def browse_candidates(
         "page_size": page_size,
         "total_pages": total_pages,
         "status_counts": status_counts,
-        "is_semantic_search": bool(semantic_scores),
+        "is_semantic_search": is_semantic_search,
     }
     # Store in cache
     _browse_cache[cache_key] = {"result": result, "ts": time.monotonic()}
@@ -244,15 +447,50 @@ async def browse_candidates(
 
 
 @router.get("/candidates/browse/meta")
-async def browse_metadata():
-    """Return unique filter values (for dropdowns)"""
-    all_profiles = list(PROFILES_BY_ID.values())
+async def browse_metadata(
+    current_user: schemas.User = Depends(deps.get_current_user),
+    view_scope: Optional[str] = Query(None),
+    recruiter_filter_id: Optional[int] = Query(None),
+    role_id: Optional[int] = Query(None),
+):
+    """Return unique filter values (for dropdowns) scoped like browse."""
+    if (current_user.role or "").strip().lower() != "admin":
+        effective_scope = VIEW_SCOPE_RECRUITER_POOLS
+        effective_recruiter = current_user.id
+    else:
+        effective_scope = view_scope or VIEW_SCOPE_MASTER
+        effective_recruiter = recruiter_filter_id
+        if effective_scope == VIEW_SCOPE_RECRUITER_POOLS and not effective_recruiter:
+            raise HTTPException(
+                status_code=400,
+                detail="recruiter_filter_id is required when view_scope=recruiter_pools",
+            )
+
+    role_candidate_ids = _role_candidate_id_set(
+        current_user,
+        role_id=role_id,
+        view_scope=effective_scope,
+        recruiter_filter_id=effective_recruiter,
+    )
+    all_profiles = [
+        p
+        for p in PROFILES_BY_ID.values()
+        if role_candidate_ids is None or int(p.get("id") or 0) in role_candidate_ids
+        if profile_passes_scope(
+            p,
+            user_role=(current_user.role or "").strip().lower(),
+            user_id=current_user.id,
+            view_scope=effective_scope,
+            recruiter_filter_id=effective_recruiter,
+        )
+    ]
 
     companies, cities, titles, products, locations, statuses, recruiters = set(), set(), set(), set(), set(), set(), set()
     for p in all_profiles:
         primary_role = (p.get("roles") or [{}])[0]
         if c := primary_role.get("company"): companies.add(c)
-        if ci := (p.get("location") or "").split(",")[0].strip(): cities.add(ci)
+        if ci := ((p.get("city") or "").strip() or (p.get("location") or "").split(",")[0].strip()):
+            cities.add(ci)
         if t := (primary_role.get("title") or p.get("headline") or ""): titles.add(t)
         if recruiter := (p.get("created_by") or "").strip(): recruiters.add(recruiter)
         
@@ -288,16 +526,41 @@ async def browse_metadata():
     }
 
 @router.post("/candidates/{candidate_id}/status")
-async def update_status(candidate_id: int, update: StatusUpdate):
+async def update_status(
+    candidate_id: int,
+    update: StatusUpdate,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    prof = PROFILES_BY_ID.get(candidate_id)
+    if not prof:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:
+        raise HTTPException(status_code=403, detail="Master library rows are read-only")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
     success = update_candidate_status(candidate_id, update.status)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")
+    _invalidate_browse_cache()
     return {"message": "Status updated successfully"}
 
 @router.patch("/candidates/{candidate_id}/notes")
-async def update_notes(candidate_id: int, update: NotesUpdate):
+async def update_notes(
+    candidate_id: int,
+    update: NotesUpdate,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
     from backend.pipeline.query import update_candidate_notes
+
+    prof = PROFILES_BY_ID.get(candidate_id)
+    if not prof:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:
+        raise HTTPException(status_code=403, detail="Master library rows are read-only")
+    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
     success = update_candidate_notes(candidate_id, update.notes)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update notes")
+    _invalidate_browse_cache()
     return {"message": "Notes updated successfully"}

@@ -4,6 +4,7 @@ import { useAppStore } from '../store/useAppStore'
 import { Lock, Mail, ArrowRight, CheckCircle, Loader2, User, Phone, Eye, EyeOff, TrendingUp, Users, BarChart3 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useShallow } from 'zustand/react/shallow'
+import HayasaBrand from '../components/HayasaBrand'
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || ''
 
@@ -335,11 +336,10 @@ function Login() {
         <div style={{ position: 'absolute', bottom: '-10%', left: '-10%', width: '350px', height: '350px', borderRadius: '50%', background: 'rgba(124,92,47,0.28)', filter: 'blur(80px)', pointerEvents: 'none' }} />
 
         {/* Logo */}
-        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ width: '42px', height: '42px', background: 'white', borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 20px rgba(0,0,0,0.22)' }}>
-            <span style={{ color: '#8b6b44', fontWeight: 900, fontSize: '22px' }}>G</span>
+        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '14px' }}>
+          <div style={{ maxWidth: '100%', padding: '12px 14px', borderRadius: '14px', border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.08)', boxShadow: '0 14px 32px rgba(0,0,0,0.16)' }}>
+            <HayasaBrand size="hero" tone="dark" />
           </div>
-          <span style={{ fontSize: '22px', fontWeight: 800, letterSpacing: '-0.5px' }}>Growton</span>
         </div>
 
         {/* Hero Text */}
@@ -366,7 +366,7 @@ function Login() {
 
         {/* Footer */}
         <div style={{ position: 'relative', opacity: 0.45, fontSize: '12px' }}>
-          © {currentYear} Growton · Talent Intelligence
+          © {currentYear} Hayasa.ai · a growton.co product
         </div>
       </div>
 
@@ -382,8 +382,8 @@ function Login() {
               {mode === 'verify' && 'Check your email'}
             </h2>
             <p style={{ color: '#64748b', fontSize: '15px', lineHeight: 1.5 }}>
-              {mode === 'login' && 'Sign in to your Growton workspace'}
-              {mode === 'register' && 'Join thousands of recruiters using Growton'}
+              {mode === 'login' && 'Sign in to your Hayasa.ai workspace'}
+              {mode === 'register' && 'Join recruiters using Hayasa.ai'}
               {mode === 'verify' && `We sent a code to ${formData.email}`}
             </p>
           </div>
@@ -412,7 +412,7 @@ function Login() {
               </div>
 
               <p style={styles.switchText}>
-                New to Growton?{' '}
+                New to Hayasa.ai?{' '}
                 <button type="button" onClick={() => setMode('register')} style={styles.switchLink}>Create account</button>
               </p>
             </form>

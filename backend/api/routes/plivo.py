@@ -1,7 +1,7 @@
 import logging
 import os
 import asyncio
-from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
 from fastapi.responses import Response
 from backend.integrations import plivo_service
 
@@ -58,9 +58,22 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
 
 @router.get("/credentials")
 async def get_credentials():
+    result = await plivo_service.setup_plivo()
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": result.get("code") or "plivo_unavailable",
+                "message": result.get("error") or "Unable to prepare Plivo softphone credentials",
+                "metadata": {
+                    "public_url": plivo_service.endpoint_public_url or None,
+                },
+            },
+        )
     return {
         "username": plivo_service.endpoint_username,
-        "password": plivo_service.endpoint_password
+        "password": plivo_service.endpoint_password,
+        "public_url": plivo_service.endpoint_public_url or None,
     }
 
 @router.get("/recording/{call_uuid}")

@@ -289,10 +289,18 @@ export function VoIPProvider({ children }) {
       setVoipStatus('connecting');
       setVoipCallEvent(null);
 
-      const res = await fetch(`${API_BASE}/plivo/credentials`).then(r => r.json()).catch(() => ({}));
+      const credentialsResponse = await fetch(`${API_BASE}/plivo/credentials`).catch(() => null);
+      const res = credentialsResponse ? await credentialsResponse.json().catch(() => ({})) : {};
+      if (!credentialsResponse?.ok) {
+        const detail = res?.detail;
+        const message = (detail && typeof detail === 'object' ? detail.message : '') || 'Unable to prepare Plivo softphone';
+        setVoipStatus('error');
+        setVoipError(message);
+        return;
+      }
       if (!res.username || !res.password) {
         setVoipStatus('error');
-        setVoipError('Missing Plivo credentials');
+        setVoipError('Plivo softphone credentials are missing');
         return;
       }
       setAgentEmail(res.username);

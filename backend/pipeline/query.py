@@ -215,31 +215,109 @@ def load_all_company_names_from_db():
         if conn:
             return_db_connection(conn)
 
-def load_all_profiles_from_db():
-    logger.info("Loading all profiles from the database into cache...")
-    conn = get_db_connection()
-    if not conn:
-        return []
-    try:
-        cur = conn.cursor()
-        # Fetch candidates with their Talent Pool (NULL role_id) outreach status
-        # Use DISTINCT ON to get the most recent outreach record for each candidate.
-        cur.execute("""
+
+def _roles_by_candidate_from_roles_raw(roles_raw: List[Any]) -> Dict[int, List[Dict[str, Any]]]:
+    roles_by_candidate: Dict[int, List[Dict[str, Any]]] = {}
+    for role in roles_raw:
+        candidate_id = role[0]
+        if candidate_id not in roles_by_candidate:
+            roles_by_candidate[candidate_id] = []
+
+        company_details = {
+            "funding_stage": role[5],
+            "revenue": role[6],
+            "business_model": role[7],
+            "product_service": role[8],
+            "customer_segment": role[9] if role[9] is not None else [],
+            "customer_presence": role[10] if role[10] is not None else [],
+            "culture_type": role[11],
+            "headquarters": role[12],
+            "industry": role[8] or "",
+        }
+
+        roles_by_candidate[candidate_id].append(
+            {
+                "company": role[1],
+                "title": role[2],
+                "details": role[3],
+                "duration_years": float(role[4]) if role[4] is not None else 0.0,
+                "company_details": company_details,
+            }
+        )
+    return roles_by_candidate
+
+
+def _profile_dicts_from_candidates_and_roles(
+    candidates_raw: List[Any], roles_by_candidate: Dict[int, List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    profiles: List[Dict[str, Any]] = []
+    for cand in candidates_raw:
+        candidate_id = cand[0]
+        fn = cand[7] or ""
+        ln = cand[8] or ""
+        display_name = cand[1] or ""
+        if fn or ln:
+            display_name = (f"{fn} {ln}").strip() or display_name
+        city_col = cand[4] or ""
+        profiles.append(
+            {
+                "id": candidate_id,
+                "name": display_name,
+                "linkedin": cand[2],
+                "location": cand[3],
+                "city": city_col,
+                "headline": cand[5],
+                "about": cand[6],
+                "first_name": fn,
+                "last_name": ln,
+                "total_experience_years": float(cand[9]) if cand[9] is not None else 0.0,
+                "max_people_managed": cand[10] or 0,
+                "avg_years_in_company": float(cand[11]) if cand[11] is not None else 0.0,
+                "candidate_services": cand[12] or "",
+                "extracted_industry": cand[13] or "",
+                "raw_fields": json.loads(cand[16]) if isinstance(cand[16], str) and cand[16] else (cand[16] if isinstance(cand[16], dict) else {}),
+                "embedding": cand[14],
+                "created_by": cand[15] or "System",
+                "email": cand[17] or "",
+                "phone": cand[18] or "",
+                "mobile_phone": cand[18] or "",
+                "response": cand[19] or "",
+                "notes": cand[20] or "",
+                "status": cand[21] or "To be started",
+                "heyreach_campaign_id": cand[22],
+                "li_status": cand[23],
+                "email_campaign_id": cand[24],
+                "email_outreach_status": cand[25],
+                "li_sent_count": cand[26] or 0,
+                "message_sent_count": cand[27] or 0,
+                "owner_user_id": cand[28],
+                "pool_source": cand[29],
+                "normalized_linkedin": cand[30],
+                "source_master_candidate_id": cand[31],
+                "is_archived": bool(cand[32]),
+                "roles": roles_by_candidate.get(candidate_id, []),
+            }
+        )
+    return profiles
+
+
+_CANDIDATE_SELECT_BODY = """
             SELECT DISTINCT ON (c.id)
-                c.id, c.name, c.linkedin, c.location, c.headline, c.about, 
-                c.total_experience_years, c.max_people_managed, c.avg_years_in_company, 
-                c.raw_fields->>'services', c.raw_fields->>'extracted_industry', 
+                c.id, c.name, c.linkedin, c.location, c.city, c.headline, c.about,
+                c.first_name, c.last_name,
+                c.total_experience_years, c.max_people_managed, c.avg_years_in_company,
+                c.raw_fields->>'services', c.raw_fields->>'extracted_industry',
                 c.embedding, c.created_by, c.raw_fields, c.email, COALESCE(c.mobile_phone, c.phone),
-                c.response, c.notes, c.status, 
+                c.response, c.notes, c.status,
                 co.heyreach_campaign_id, co.li_status, co.campaign_id, co.status as email_outreach_status,
-                co.li_sent_count, co.message_sent_count
+                co.li_sent_count, co.message_sent_count,
+                c.owner_user_id, c.pool_source, c.normalized_linkedin, c.source_master_candidate_id,
+                c.is_archived
             FROM candidates c
             LEFT JOIN candidate_outreach co ON c.id = co.candidate_id AND co.recruitment_role_id IS NULL
-            ORDER BY c.id, co.updated_at DESC
-        """)
-        candidates_raw = cur.fetchall()
+"""
 
-        cur.execute("""
+_ROLES_SELECT_BODY = """
             SELECT
                 r.candidate_id,
                 c.name as company_name,
@@ -256,72 +334,78 @@ def load_all_profiles_from_db():
                 c.headquarters
             FROM roles r
             JOIN companies c ON r.company_id = c.id
-        """)
+"""
+
+
+def load_all_profiles_from_db():
+    logger.info("Loading all profiles from the database into cache...")
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            _CANDIDATE_SELECT_BODY
+            + """
+            ORDER BY c.id, co.updated_at DESC
+        """
+        )
+        candidates_raw = cur.fetchall()
+
+        cur.execute(_ROLES_SELECT_BODY)
         roles_raw = cur.fetchall()
-        roles_by_candidate = {}
-        for role in roles_raw:
-            candidate_id = role[0]
-            if candidate_id not in roles_by_candidate:
-                roles_by_candidate[candidate_id] = []
+        roles_by_candidate = _roles_by_candidate_from_roles_raw(roles_raw)
+        profiles = _profile_dicts_from_candidates_and_roles(candidates_raw, roles_by_candidate)
 
-            company_details = {
-                "funding_stage": role[5],
-                "revenue": role[6],
-                "business_model": role[7],
-                "product_service": role[8],
-                "customer_segment": role[9] if role[9] is not None else [],
-                "customer_presence": role[10] if role[10] is not None else [],
-                "culture_type": role[11],
-                "headquarters": role[12],
-                "industry": role[8] or ""
-            }
-
-            roles_by_candidate[candidate_id].append({
-                "company": role[1],
-                "title": role[2],
-                "details": role[3],
-                "duration_years": float(role[4]) if role[4] is not None else 0.0,
-                "company_details": company_details
-            })
-
-        profiles = []
-        for cand in candidates_raw:
-            candidate_id = cand[0]
-            profiles.append({
-                "id": candidate_id,
-                "name": cand[1],
-                "linkedin": cand[2],
-                "location": cand[3],
-                "headline": cand[4],
-                "about": cand[5],
-                "total_experience_years": float(cand[6]) if cand[6] is not None else 0.0,
-                "max_people_managed": cand[7] or 0,
-                "avg_years_in_company": float(cand[8]) if cand[8] is not None else 0.0,
-                "candidate_services": cand[9] or "",
-                "extracted_industry": cand[10] or "",
-                "raw_fields": cand[13] or "{}",
-                "embedding": cand[11],
-                "created_by": cand[12] or "System",
-                "email": cand[14] or "",
-                "phone": cand[15] or "",
-                "mobile_phone": cand[15] or "",
-                "response": cand[16] or "",
-                "notes": cand[17] or "",
-                "status": cand[18] or "To be started",
-                "heyreach_campaign_id": cand[19],
-                "li_status": cand[20],
-                "email_campaign_id": cand[21],
-                "email_outreach_status": cand[22],
-                "li_sent_count": cand[23] or 0,
-                "message_sent_count": cand[24] or 0,
-                "roles": roles_by_candidate.get(candidate_id, [])
-            })
-        
         logger.info(f"Successfully loaded and cached {len(profiles)} profiles.")
         return profiles
     except Exception as e:
         logger.error(f"Failed to load profiles: {e}")
         return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+
+def refresh_profiles_in_cache(candidate_ids: List[int]) -> int:
+    """Reload specific candidates (and their roles) from DB into PROFILES_BY_ID. Returns rows merged."""
+    global PROFILES_BY_ID
+    ids = sorted({int(i) for i in candidate_ids if i is not None})
+    if not ids:
+        return 0
+    conn = get_db_connection()
+    if not conn:
+        logger.error("refresh_profiles_in_cache: no database connection")
+        return 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            _CANDIDATE_SELECT_BODY
+            + """
+            WHERE c.id = ANY(%s)
+            ORDER BY c.id, co.updated_at DESC
+        """,
+            (ids,),
+        )
+        candidates_raw = cur.fetchall()
+
+        cur.execute(
+            _ROLES_SELECT_BODY
+            + """
+            WHERE r.candidate_id = ANY(%s)
+        """,
+            (ids,),
+        )
+        roles_raw = cur.fetchall()
+        roles_by_candidate = _roles_by_candidate_from_roles_raw(roles_raw)
+        profiles = _profile_dicts_from_candidates_and_roles(candidates_raw, roles_by_candidate)
+        for p in profiles:
+            PROFILES_BY_ID[p["id"]] = p
+        logger.info("Refreshed %s profile(s) in cache (subset of %s id(s)).", len(profiles), len(ids))
+        return len(profiles)
+    except Exception as e:
+        logger.error("refresh_profiles_in_cache failed: %s", e)
+        raise
     finally:
         if conn:
             return_db_connection(conn)
@@ -334,10 +418,10 @@ def initialize_cache():
         ALL_COMPANY_NAMES.clear()
         PROFILES_BY_ID.update({p['id']: p for p in profiles})
         _PROFILES_CACHE = profiles
-        
+
         companies = load_all_company_names_from_db()
         ALL_COMPANY_NAMES.extend(companies)
-        
+
         logger.info(f"Cache initialized with {len(PROFILES_BY_ID)} profiles and {len(ALL_COMPANY_NAMES)} companies.")
     except Exception as e:
         logger.error(f"Failed to initialize cache: {e}")
@@ -899,12 +983,20 @@ async def generate_reasoning_for_profile(profile: Dict[str, Any], original_crite
     tracker.add_usage(specialist_llm.model_name, formatted_prompt, response.content, "Reasoning")
     return content
 
-async def process_query_main(query: str, session_id: str, tracker: TokenCostTracker) -> AsyncIterator[Any]:
+async def process_query_main(
+    query: str,
+    session_id: str,
+    tracker: TokenCostTracker,
+    *,
+    screening_user_id: Optional[int] = None,
+    screening_role: Optional[str] = None,
+) -> AsyncIterator[Any]:
     
     # Ensure cache is initialized
     if not PROFILES_BY_ID:
         logger.info("Cache empty, initializing on demand...")
         initialize_cache()
+    screening_r = (screening_role or "").strip().lower()
     normalized_query = normalize_query_with_llm(query)
     normalized_query_lower = normalized_query.lower()
 
@@ -974,6 +1066,25 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
         return
 
     original_criteria = copy.deepcopy(criteria)
+
+    def _pool_scope_ids():
+        if screening_r == "recruiter" and screening_user_id is not None:
+            return [
+                pid
+                for pid, p in PROFILES_BY_ID.items()
+                if not p.get("is_archived") and p.get("owner_user_id") == screening_user_id
+            ]
+        return None
+
+    def _scoped_build(ids_override: Optional[List[int]] = None):
+        scope = _pool_scope_ids()
+        if scope is not None:
+            if ids_override is not None:
+                allowed = set(scope)
+                merged = [i for i in ids_override if i in allowed]
+                return build_candidate_pool(merged if merged else scope)
+            return build_candidate_pool(scope)
+        return build_candidate_pool(ids_override)
     
     # 3. SEMANTIC SEARCH (Vector Retrieval)
     yield "Searching database..."
@@ -1001,28 +1112,66 @@ async def process_query_main(query: str, session_id: str, tracker: TokenCostTrac
             if conn:
                 try:
                     with conn.cursor() as cur:
-                       # Use pgvector cosine distance <=>
-                       cur.execute("SELECT id FROM candidates ORDER BY embedding <=> %s::vector LIMIT 500", (query_embedding,))
-                       ids = [row[0] for row in cur.fetchall()]
+                        if screening_r == "recruiter" and screening_user_id is not None:
+                            cur.execute(
+                                """
+                                SELECT id FROM candidates
+                                WHERE COALESCE(is_archived, FALSE) = FALSE
+                                  AND owner_user_id = %s
+                                  AND embedding IS NOT NULL
+                                ORDER BY embedding <=> %s::vector
+                                LIMIT 500
+                                """,
+                                (screening_user_id, query_embedding),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT id FROM candidates
+                                WHERE COALESCE(is_archived, FALSE) = FALSE
+                                  AND embedding IS NOT NULL
+                                ORDER BY embedding <=> %s::vector
+                                LIMIT 500
+                                """,
+                                (query_embedding,),
+                            )
+                        ids = [row[0] for row in cur.fetchall()]
+                        if (
+                            not ids
+                            and screening_r == "recruiter"
+                            and screening_user_id is not None
+                        ):
+                            cur.execute(
+                                """
+                                SELECT id FROM candidates
+                                WHERE COALESCE(is_archived, FALSE) = FALSE
+                                  AND owner_user_id = %s
+                                LIMIT 2000
+                                """,
+                                (screening_user_id,),
+                            )
+                            ids = [row[0] for row in cur.fetchall()]
                 finally:
                     return_db_connection(conn)
-                initial_candidate_pool = build_candidate_pool(ids)
+                initial_candidate_pool = _scoped_build(ids)
                 used_vector_shortlist = True
                 logger.info(f"Vector search returned {len(initial_candidate_pool)} candidates.")
             else:
-                initial_candidate_pool = build_candidate_pool()
+                initial_candidate_pool = _scoped_build()
         except Exception as e:
             logger.error(f"Vector search failed: {e}. Falling back to full scan.")
-            initial_candidate_pool = build_candidate_pool()
+            initial_candidate_pool = _scoped_build()
     else:
-        initial_candidate_pool = build_candidate_pool()
+        initial_candidate_pool = _scoped_build()
     
     # 4. Filter Candidates
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
-    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < len(PROFILES_BY_ID):
-        logger.info("Vector shortlist returned no matches after filtering. Retrying against full cache.")
-        final_candidates = await filter_candidates_by_criteria(build_candidate_pool(), criteria)
+    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < len(
+        [p for p in PROFILES_BY_ID.values() if not p.get("is_archived")]
+    ):
+        logger.info("Vector shortlist returned no matches after filtering. Retrying scoped full cache.")
+        final_candidates = await filter_candidates_by_criteria(_scoped_build(), criteria)
     
     if not final_candidates:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -1085,27 +1234,19 @@ def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
         df.to_excel(writer, index=False)
     return out.getvalue()
 
-async def get_analytics_summary(user_email: str = None, role: str = "recruiter") -> Dict[str, Any]:
+async def get_analytics_summary(user_email: str = None, role: str = "recruiter", user_id: int = None) -> Dict[str, Any]:
     """
     Generate pipeline and recruiter performance statistics.
+    Admins see org-wide (non-archived) candidates; recruiters see only their pool
+    (owner_user_id = their user id — uploads and admin-assigned copies).
     """
-    all_profiles = list(PROFILES_BY_ID.values())
-    
-    # 1. Pipeline Breakdown (Always team-wide for summary, but we'll keep individual stats available)
-    team_pipeline_stats = {}
-    for p in all_profiles:
-        status = p.get("status") or "To be started"
-        team_pipeline_stats[status] = team_pipeline_stats.get(status, 0) + 1
+    role_l = (role or "").strip().lower()
+    is_admin = role_l == "admin"
 
-    # Personal stats if recruiter
-    personal_pipeline_stats = {}
-    personal_profiles = []
-    
-    # We will fetch user_id if needed
-    user_id = None
-    
-    if user_email:
-        conn = get_db_connection()
+    all_profiles = [p for p in PROFILES_BY_ID.values() if not p.get("is_archived")]
+
+    if user_id is None and user_email:
+        conn = get_db_connection(validate=False, register_pgvector=False)
         if conn:
             try:
                 with conn.cursor() as cur:
@@ -1117,78 +1258,88 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter")
                 logger.error(f"Error fetching user id: {e}")
             finally:
                 return_db_connection(conn)
+
+    if is_admin:
+        # Deduplicate to count unique candidates by LinkedIn
+        unique_candidates = {}
+        for p in all_profiles:
+            li = p.get("normalized_linkedin") or p.get("linkedin")
+            if not li:
+                # If no linkedin, use ID as fallback for uniqueness
+                li = f"id_{p.get('id')}"
+            
+            existing = unique_candidates.get(li)
+            if not existing:
+                unique_candidates[li] = p
+            else:
+                # Prefer the row with a more "interesting" status
+                # (Non-'To be started' is better for the global dashboard)
+                st = (p.get("status") or "").strip().lower()
+                est = (existing.get("status") or "").strip().lower()
                 
-    if role != "admin" and user_id:
-        conn = get_db_connection()
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT DISTINCT rc.candidate_id 
-                        FROM recruitment_role_candidates rc
-                        JOIN recruitment_roles r ON rc.role_id = r.id
-                        WHERE r.user_id = %s
-                    """, (user_id,))
-                    sourced_ids = {r[0] for r in cur.fetchall()}
-                    personal_profiles = [p for p in all_profiles if p.get("id") in sourced_ids]
-            except Exception as e:
-                logger.error(f"Error fetching personal sourced candidates: {e}")
-            finally:
-                return_db_connection(conn)
-        
-        for p in personal_profiles:
-            status = p.get("status") or "To be started"
-            personal_pipeline_stats[status] = personal_pipeline_stats.get(status, 0) + 1
-    elif role != "admin" and user_email:
-        # Fallback
-        personal_profiles = [p for p in all_profiles if p.get("created_by") == user_email]
-        for p in personal_profiles:
-            status = p.get("status") or "To be started"
-            personal_pipeline_stats[status] = personal_pipeline_stats.get(status, 0) + 1
+                # Heuristic: If existing is "To be started" or empty, and new one has a real status, swap it.
+                if st and st != "to be started" and (not est or est == "to be started"):
+                    unique_candidates[li] = p
+                # Also prefer rows that are NOT master rows if we already have a status match
+                # (since recruiter rows are more likely to have updated notes/activity)
+                elif p.get("owner_user_id") is not None and existing.get("owner_user_id") is None:
+                    if not est or est == "to be started": # Only if we aren't losing a better status
+                        unique_candidates[li] = p
+
+        stats_profiles = list(unique_candidates.values())
+    else:
+        stats_profiles = [
+            p
+            for p in all_profiles
+            if user_id is not None and p.get("owner_user_id") == user_id
+        ]
+
+    team_pipeline_stats = {}
+    for p in stats_profiles:
+        status = p.get("status") or "To be started"
+        team_pipeline_stats[status] = team_pipeline_stats.get(status, 0) + 1
+
+    personal_pipeline_stats = dict(team_pipeline_stats) if not is_admin else {}
+    personal_profiles = list(stats_profiles) if not is_admin else []
 
     # 2. Recruiter Performance (Admin only)
     recruiter_performance = []
-    if role == "admin":
-        recruiter_map = {}
-        conn = get_db_connection()
+    if is_admin:
+        conn = get_db_connection(validate=False, register_pgvector=False)
         if conn:
             try:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        SELECT u.name, rc.candidate_id, c.status
+                        SELECT
+                            COALESCE(NULLIF(u.name, ''), 'Unknown') AS recruiter,
+                            COUNT(DISTINCT rc.candidate_id) AS sourced,
+                            COUNT(DISTINCT rc.candidate_id) FILTER (
+                                WHERE c.status = 'Shortlisted'
+                            ) AS shortlisted,
+                            COUNT(DISTINCT rc.candidate_id) FILTER (
+                                WHERE c.status IN ('Followup / In conversation', 'In Conversation')
+                            ) AS in_conversation
                         FROM recruitment_role_candidates rc
                         JOIN recruitment_roles r ON rc.role_id = r.id
                         JOIN users u ON r.user_id = u.id
                         JOIN candidates c ON rc.candidate_id = c.id
+                        GROUP BY COALESCE(NULLIF(u.name, ''), 'Unknown')
+                        ORDER BY sourced DESC
                     """)
-                    for name, cand_id, status in cur.fetchall():
-                        if not name: name = "Unknown"
-                        if name not in recruiter_map:
-                            recruiter_map[name] = {"sourced": set(), "shortlisted": set(), "in_conversation": set()}
-                        
-                        recruiter_map[name]["sourced"].add(cand_id)
-                        if status == "Shortlisted":
-                            recruiter_map[name]["shortlisted"].add(cand_id)
-                        elif status in ["Followup / In conversation", "In Conversation"]:
-                            recruiter_map[name]["in_conversation"].add(cand_id)
+                    for name, sourced, shortlisted, in_conversation in cur.fetchall():
+                        recruiter_performance.append({
+                            "recruiter": name,
+                            "sourced": int(sourced or 0),
+                            "shortlisted": int(shortlisted or 0),
+                            "in_conversation": int(in_conversation or 0),
+                        })
             except Exception as e:
                 logger.error(f"Error fetching admin recruiter perf: {e}")
             finally:
                 return_db_connection(conn)
-            
-            for name, stats in recruiter_map.items():
-                recruiter_performance.append({
-                    "recruiter": name,
-                    "sourced": len(stats["sourced"]),
-                    "shortlisted": len(stats["shortlisted"]),
-                    "in_conversation": len(stats["in_conversation"])
-                })
-        
-        # Sort by productivity
-        recruiter_performance.sort(key=lambda x: x["sourced"], reverse=True)
 
-    # 3. High-level aggregates (use team stats for main summary)
-    total_sourced = len(all_profiles)
+    # 3. High-level aggregates (scoped: admin = all active; recruiter = own pool)
+    total_sourced = len(stats_profiles)
     
     total_shortlisted = team_pipeline_stats.get("Shortlisted", 0)
     total_in_conversation = team_pipeline_stats.get("Followup / In conversation", 0)
@@ -1215,7 +1366,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter")
         "italy": "Italy", "rome": "Italy", "milan": "Italy"
     }
     
-    for p in all_profiles:
+    for p in stats_profiles:
         location = (p.get("location") or "").strip()
         if not location:
             country = "Unknown"
@@ -1253,7 +1404,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter")
 
     # 5. Industry distribution (from extracted_industry or role industries)
     industry_map = {}
-    for p in all_profiles:
+    for p in stats_profiles:
         industry = (p.get("extracted_industry") or "").strip()
         if not industry:
             # Fallback: try first role's product_service
@@ -1271,30 +1422,35 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter")
 
     # 6. Segment distribution (SMB / Enterprise / Mid-Market etc.)
     segment_map = {}
-    for p in all_profiles:
-        found_segs = set()
-        for role in p.get("roles", []):
-            segs = role.get("company_details", {}).get("customer_segment", [])
-            if isinstance(segs, list):
-                for s in segs:
-                    if s:
-                        # Normalize via synonym map
-                        s_lower = s.lower().strip()
-                        normalized = s_lower
-                        for canonical, synonyms in SEGMENT_SYNONYMS.items():
-                            if s_lower in synonyms or s_lower == canonical:
-                                normalized = canonical.upper()
-                                break
-                        found_segs.add(normalized.capitalize() if normalized == s_lower else normalized)
-        if not found_segs:
-            found_segs = {"Unknown"}
-        for seg in found_segs:
-            segment_map[seg] = segment_map.get(seg, 0) + 1
+    for p in stats_profiles:
+        found_seg = "Unknown"
+        for rrow in p.get("roles", []):
+            segs = rrow.get("company_details", {}).get("customer_segment", [])
+            if isinstance(segs, list) and segs:
+                s_lower = str(segs[0]).lower().strip()
+                normalized = s_lower
+                for canonical, synonyms in SEGMENT_SYNONYMS.items():
+                    if s_lower in synonyms or s_lower == canonical:
+                        normalized = canonical.upper()
+                        break
+                found_seg = normalized.capitalize() if normalized == s_lower else normalized
+                break
+            elif isinstance(segs, str) and segs.strip():
+                s_lower = segs.lower().strip()
+                normalized = s_lower
+                for canonical, synonyms in SEGMENT_SYNONYMS.items():
+                    if s_lower in synonyms or s_lower == canonical:
+                        normalized = canonical.upper()
+                        break
+                found_seg = normalized.capitalize() if normalized == s_lower else normalized
+                break
+                
+        segment_map[found_seg] = segment_map.get(found_seg, 0) + 1
 
     segment_distribution = [{"name": k, "value": v} for k, v in sorted(segment_map.items(), key=lambda x: -x[1]) if v > 0][:8]
     # 7. Functional distribution (using existing data fields)
     functional_map = {}
-    for p in all_profiles:
+    for p in stats_profiles:
         found_func = None
 
         raw = p.get("raw_fields", {})
@@ -1338,8 +1494,8 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter")
             "total_sourced": len(personal_profiles),
             "shortlisted": personal_pipeline_stats.get("Shortlisted", 0),
             "pipeline_health": personal_pipeline_stats
-        } if role != "admin" else None,
-        "recruiter_performance": recruiter_performance if role == "admin" else []
+        } if not is_admin else None,
+        "recruiter_performance": recruiter_performance if is_admin else []
     }
 
 async def get_recruiter_list() -> List[str]:
@@ -1422,12 +1578,29 @@ def update_candidate_notes(candidate_id: int, notes: str) -> bool:
     finally:
         return_db_connection(conn)
 
-def update_candidate_contact(linkedin_url: str, email: str, phone: str) -> None:
-    """Updates candidate email and phone in the cache based on LinkedIn URL"""
+def update_candidate_contact(
+    linkedin_url: str,
+    email: Optional[str],
+    phone: Optional[str],
+    normalized_linkedin: Optional[str] = None,
+) -> None:
+    """Refresh email/phone in cache for all profiles matching normalized or raw LinkedIn."""
+    from backend.services.linkedin_normalize import normalize_linkedin as _norm_li
+
+    target_norm = normalized_linkedin or _norm_li(linkedin_url)
     for candidate_id, profile in PROFILES_BY_ID.items():
-        if profile.get("linkedin") == linkedin_url:
-            profile["email"] = email or profile.get("email")
-            profile["phone"] = phone or profile.get("phone")
-            profile["enrichment_finished"] = True
-            logger.info(f"Updated contact info for candidate {candidate_id} in cache. (Enrichment Finished)")
-            break
+        pn = profile.get("normalized_linkedin") or _norm_li(profile.get("linkedin"))
+        raw_match = linkedin_url and profile.get("linkedin") == linkedin_url
+        norm_match = target_norm and pn and pn == target_norm
+        if not (raw_match or norm_match):
+            continue
+        if email:
+            profile["email"] = email
+        if phone:
+            profile["phone"] = phone
+            profile["mobile_phone"] = phone
+        profile["enrichment_finished"] = True
+        logger.info(
+            "Updated contact info for candidate %s in cache (enrichment fan-out).",
+            candidate_id,
+        )

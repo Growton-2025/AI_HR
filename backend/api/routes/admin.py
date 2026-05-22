@@ -1,16 +1,23 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List
+from typing import List, Set
+from pydantic import BaseModel, Field
+
 from backend.api import schemas, deps
 from backend.db.connection import get_db_connection, return_db_connection
 from backend.core.security import get_password_hash
+from backend.services.candidate_pool import assign_master_to_recruiter
+from backend.pipeline import query
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_recruiters_cache: tuple[float, List[schemas.User]] | None = None
+_RECRUITERS_CACHE_TTL = 60
 
 def check_admin(current_user: schemas.User = Depends(deps.get_current_user)):
-    if current_user.role != "admin":
+    if (current_user.role or "").strip().lower() != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can perform this action"
@@ -19,23 +26,34 @@ def check_admin(current_user: schemas.User = Depends(deps.get_current_user)):
 
 @router.get("/recruiters", response_model=List[schemas.User], dependencies=[Depends(check_admin)])
 async def list_recruiters():
-    conn = get_db_connection()
+    global _recruiters_cache
+    if _recruiters_cache and time.monotonic() - _recruiters_cache[0] < _RECRUITERS_CACHE_TTL:
+        return _recruiters_cache[1]
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, email, role, permissions FROM users WHERE role = 'recruiter'")
+            cur.execute(
+                """
+                SELECT id, name, email, role, permissions FROM users
+                WHERE role = 'recruiter' AND archived_at IS NULL
+                """
+            )
             recruiters = cur.fetchall()
-            return [
+            users = [
                 schemas.User(id=r[0], full_name=r[1], email=r[2], username=r[2], role=r[3], permissions=r[4] or {})
                 for r in recruiters
             ]
+            _recruiters_cache = (time.monotonic(), users)
+            return users
     finally:
         return_db_connection(conn)
 
 @router.post("/recruiters", response_model=schemas.User, dependencies=[Depends(check_admin)])
 async def create_recruiter(request: schemas.RegisterRequest):
-    conn = get_db_connection()
+    global _recruiters_cache
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
@@ -52,13 +70,15 @@ async def create_recruiter(request: schemas.RegisterRequest):
             """, (request.name, request.email, request.phone, hashed_pw))
             user = cur.fetchone()
             conn.commit()
+            _recruiters_cache = None
             return schemas.User(id=user[0], full_name=user[1], email=user[2], username=user[2], role=user[3], permissions=user[4] or {})
     finally:
         return_db_connection(conn)
 
 @router.patch("/recruiters/{user_id}/permissions", response_model=schemas.User, dependencies=[Depends(check_admin)])
 async def update_permissions(user_id: int, permissions: dict):
-    conn = get_db_connection()
+    global _recruiters_cache
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
@@ -74,6 +94,7 @@ async def update_permissions(user_id: int, permissions: dict):
             if not user:
                 raise HTTPException(status_code=404, detail="Recruiter not found")
             conn.commit()
+            _recruiters_cache = None
             return schemas.User(id=user[0], full_name=user[1], email=user[2], username=user[2], role=user[3], permissions=user[4] or {})
     finally:
         return_db_connection(conn)
@@ -92,17 +113,143 @@ async def warm_all_data(current_user: schemas.User = Depends(deps.get_current_us
     return {"status": "warming", "message": "Global cache warming triggered"}
 
 
-@router.delete("/recruiters/{user_id}", dependencies=[Depends(check_admin)])
-async def delete_recruiter(user_id: int):
-    conn = get_db_connection()
+class BulkAssignRequest(BaseModel):
+    master_candidate_ids: List[int] = Field(default_factory=list)
+    recruiter_user_id: int
+
+
+@router.post("/candidates/assign-to-recruiter", dependencies=[Depends(check_admin)])
+async def bulk_assign_master_to_recruiter(
+    body: BulkAssignRequest,
+    admin: schemas.User = Depends(check_admin),
+):
+    if not body.master_candidate_ids:
+        raise HTTPException(status_code=400, detail="No candidate ids provided")
+    try:
+        parsed_ids = [int(x) for x in body.master_candidate_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="master_candidate_ids must be integers",
+        )
+    seen: Set[int] = set()
+    ordered_unique: List[int] = []
+    for x in parsed_ids:
+        if x not in seen:
+            seen.add(x)
+            ordered_unique.append(x)
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
+    results = []
     try:
+        conn.rollback()
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM users WHERE id = %s AND role = 'recruiter'", (user_id,))
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Recruiter not found")
-            conn.commit()
-            return {"message": "Recruiter deleted successfully"}
+            cur.execute(
+                "SELECT id FROM users WHERE id = %s AND role = 'recruiter' AND archived_at IS NULL",
+                (body.recruiter_user_id,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Recruiter not found or archived")
+            for idx, mid in enumerate(ordered_unique, start=1):
+                sp = f"bulk_assign_{idx}"
+                try:
+                    cur.execute(f"SAVEPOINT {sp}")
+                    cid, op = assign_master_to_recruiter(
+                        cur,
+                        master_id=mid,
+                        recruiter_user_id=body.recruiter_user_id,
+                        admin_user_id=admin.id,
+                    )
+                    cur.execute(f"RELEASE SAVEPOINT {sp}")
+                    results.append(
+                        {"master_id": mid, "recruiter_candidate_id": cid, "op": op}
+                    )
+                except ValueError as ve:
+                    try:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    results.append({"master_id": mid, "error": str(ve)})
+                except Exception as row_exc:
+                    try:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    logger.warning("assign master_id=%s failed: %s", mid, row_exc)
+                    results.append({"master_id": mid, "error": str(row_exc)})
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("bulk assign failed")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         return_db_connection(conn)
+
+    try:
+        from backend.api.routes import browse as browse_mod
+
+        browse_mod._invalidate_browse_cache()
+    except Exception:
+        pass
+    query.initialize_cache()
+    return {"results": results}
+
+
+@router.delete("/recruiters/{user_id}", dependencies=[Depends(check_admin)])
+async def archive_recruiter(user_id: int):
+    global _recruiters_cache
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    deleted_pool = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users SET archived_at = NOW()
+                WHERE id = %s AND role = 'recruiter' AND archived_at IS NULL
+                RETURNING id
+                """,
+                (user_id,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Recruiter not found")
+            # Pool copies are rows with owner_user_id set; master library stays (owner_user_id IS NULL).
+            cur.execute(
+                "DELETE FROM candidates WHERE owner_user_id = %s",
+                (user_id,),
+            )
+            deleted_pool = cur.rowcount
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("archive recruiter failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
+
+    try:
+        from backend.api.routes import browse as browse_mod
+
+        browse_mod._invalidate_browse_cache()
+    except Exception:
+        pass
+    try:
+        query.initialize_cache()
+    except Exception:
+        pass
+    _recruiters_cache = None
+    return {
+        "message": "Recruiter archived; their pool copies removed. Master profiles unchanged.",
+        "pool_rows_deleted": deleted_pool,
+    }

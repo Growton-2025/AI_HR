@@ -116,6 +116,7 @@ const needsPostCallArtifacts = (callData) => {
 };
 
 const SOFTPHONE_PREPARING_TIMEOUT_MS = 12000;
+const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
 
 const cleanVoipReasonText = (value) => (
   String(value || '')
@@ -291,7 +292,9 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   }, [candidateId, platform, loadMessages]);
 
   useEffect(() => {
-    const interval = setInterval(() => loadMessages({ silent: true }), 5000);
+    const interval = setInterval(() => {
+      if (isDocumentVisible()) loadMessages({ silent: true });
+    }, 5000);
     return () => clearInterval(interval);
   }, [loadMessages]);
 
@@ -1514,6 +1517,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     let t;
     if (callState === 'review') {
       const fetchReviewData = async () => {
+         if (!isDocumentVisible()) return;
          try {
            // Keep syncing until recording, transcript, and summary are all healthy.
            if (needsPostCallArtifacts(reviewCallData)) {
