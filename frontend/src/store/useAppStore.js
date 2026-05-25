@@ -1217,6 +1217,7 @@ export const useAppStore = create(persist((set, get) => ({
     tpStatusCounts: {},
     tpScopeTotal: null,
     tpScopeStatusCounts: {},
+    tpScopeSummaryIsRefreshing: false,
     tpScopeSummaryRequest: null,
     tpScopeSummaryRequestParamsString: '',
     tpScopeSummaryLastFetchedAt: 0,
@@ -1270,6 +1271,13 @@ export const useAppStore = create(persist((set, get) => ({
     talentPoolRecruiterFilterId: null,
     talentPoolRoleFilterId: '',
 
+    isTalentPoolScopeReady: () => {
+        const u = get().user
+        if (u?.role !== 'admin') return true
+        const vs = get().talentPoolViewScope || 'master'
+        return vs !== 'recruiter_pools' || Boolean(get().talentPoolRecruiterFilterId)
+    },
+
     buildTalentPoolScopeQuery: () => {
         const u = get().user
         const parts = []
@@ -1297,6 +1305,17 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolRecruiterFilterId: recruiterId,
             talentPoolRoleFilterId: '',
             tpAiRunFocus: null,
+            tpCandidates: [],
+            tpTotal: 0,
+            tpTotalPages: 1,
+            tpStatusCounts: {},
+            tpScopeTotal: null,
+            tpScopeStatusCounts: {},
+            tpScopeSummaryIsRefreshing: false,
+            tpScopeSummaryRequest: null,
+            tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryLastFetchedAt: 0,
+            tpScopeSummaryLastParamsString: '',
             talentPoolCache: { data: null, lastParamsString: null },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
@@ -1312,6 +1331,17 @@ export const useAppStore = create(persist((set, get) => ({
         set((state) => ({
             talentPoolRoleFilterId: roleId || '',
             tpAiRunFocus: null,
+            tpCandidates: [],
+            tpTotal: 0,
+            tpTotalPages: 1,
+            tpStatusCounts: {},
+            tpScopeTotal: null,
+            tpScopeStatusCounts: {},
+            tpScopeSummaryIsRefreshing: false,
+            tpScopeSummaryRequest: null,
+            tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryLastFetchedAt: 0,
+            tpScopeSummaryLastParamsString: '',
             talentPoolCache: { data: null, lastParamsString: null },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
@@ -1400,6 +1430,9 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolIndexRequest: null,
             talentPoolIndexRequestParamsString: '',
             talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
+            tpScopeTotal: null,
+            tpScopeStatusCounts: {},
+            tpScopeSummaryIsRefreshing: false,
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
             tpScopeSummaryLastFetchedAt: 0,
@@ -1409,8 +1442,19 @@ export const useAppStore = create(persist((set, get) => ({
     },
 
     fetchTalentPoolSummary: async (options = {}) => {
-        const force = options.force === true
         const freshnessMs = options.freshnessMs ?? 30 * 1000
+        if (!get().isTalentPoolScopeReady()) {
+            set({
+                tpScopeSummaryRequest: null,
+                tpScopeSummaryRequestParamsString: '',
+                tpScopeSummaryIsRefreshing: false,
+                tpScopeTotal: null,
+                tpScopeStatusCounts: {},
+                tpScopeSummaryLastFetchedAt: 0,
+                tpScopeSummaryLastParamsString: '',
+            })
+            return { success: false, blocked: true, error: 'Select a recruiter to load this pool' }
+        }
         const scopeQ = get().buildTalentPoolScopeQuery()
         const paramsString = scopeQ || ''
         const state = get()
@@ -1427,7 +1471,7 @@ export const useAppStore = create(persist((set, get) => ({
             }
         }
 
-        if (!force && state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
+        if (state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
             return state.tpScopeSummaryRequest
         }
 
@@ -1437,11 +1481,35 @@ export const useAppStore = create(persist((set, get) => ({
         const request = axios.get(url, { timeout: 60000 })
             .then(res => {
                 const d = res.data || {}
+                const statusCounts = d.status_counts || {}
+                const latestState = get()
+                const looksLikeColdEmpty =
+                    Number(d.total || 0) === 0 &&
+                    Object.keys(statusCounts).length === 0 &&
+                    latestState.tpScopeSummaryLastParamsString === paramsString &&
+                    Number(latestState.tpScopeTotal || 0) > 0
+                if (looksLikeColdEmpty) {
+                    set({
+                        tpScopeSummaryRequest: null,
+                        tpScopeSummaryRequestParamsString: '',
+                        tpScopeSummaryIsRefreshing: false,
+                    })
+                    return {
+                        success: true,
+                        data: {
+                            total: latestState.tpScopeTotal,
+                            status_counts: latestState.tpScopeStatusCounts || {},
+                        },
+                        cached: true,
+                        staleEmptyIgnored: true,
+                    }
+                }
                 set({
                     tpScopeTotal: d.total ?? 0,
-                    tpScopeStatusCounts: d.status_counts || {},
+                    tpScopeStatusCounts: statusCounts,
                     tpScopeSummaryRequest: null,
                     tpScopeSummaryRequestParamsString: '',
+                    tpScopeSummaryIsRefreshing: false,
                     tpScopeSummaryLastFetchedAt: Date.now(),
                     tpScopeSummaryLastParamsString: paramsString,
                 })
@@ -1449,19 +1517,35 @@ export const useAppStore = create(persist((set, get) => ({
             })
             .catch(error => {
                 console.error('Failed to fetch talent pool summary:', error)
-                set({ tpScopeSummaryRequest: null, tpScopeSummaryRequestParamsString: '' })
+                set({
+                    tpScopeSummaryRequest: null,
+                    tpScopeSummaryRequestParamsString: '',
+                    tpScopeSummaryIsRefreshing: false,
+                })
                 return { success: false, error: getRequestErrorMessage(error, 'Failed to load pipeline counts') }
             })
 
         set({
             tpScopeSummaryRequest: request,
             tpScopeSummaryRequestParamsString: paramsString,
+            tpScopeSummaryIsRefreshing: true,
         })
         return request
     },
 
     fetchTalentPool: async (paramsString, options = {}) => {
         const force = options.force === true
+        if (!get().isTalentPoolScopeReady()) {
+            set({
+                tpCandidates: [],
+                tpTotal: 0,
+                tpTotalPages: 1,
+                tpStatusCounts: {},
+                talentPoolRequest: null,
+                talentPoolRequestParamsString: '',
+            })
+            return { success: false, blocked: true, error: 'Select a recruiter to load this pool' }
+        }
         const state = get()
         const cache = state.talentPoolCache || { data: null, lastParamsString: null }
         const fullParams = get().buildTalentPoolQueryKey(paramsString)
@@ -1551,6 +1635,14 @@ export const useAppStore = create(persist((set, get) => ({
 
     fetchTalentPoolIndex: async (options = {}) => {
         const force = options.force === true
+        if (!get().isTalentPoolScopeReady()) {
+            set({
+                talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
+                talentPoolIndexRequest: null,
+                talentPoolIndexRequestParamsString: '',
+            })
+            return { success: false, blocked: true, error: 'Select a recruiter to load this pool' }
+        }
         const state = get()
         const freshnessMs = 5 * 60 * 1000
         const scopeQ = get().buildTalentPoolScopeQuery()

@@ -389,6 +389,70 @@ def test_browse_summary_uses_unfiltered_scope_counts(monkeypatch):
     assert summary["status_counts"]["To be started"] == 1
 
 
+def test_browse_summary_initializes_empty_profile_cache(monkeypatch):
+    profiles = {}
+    calls = []
+
+    def fake_initialize_cache():
+        calls.append("init")
+        profiles[1] = {
+            "id": 1,
+            "name": "Cold Worker Candidate",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        }
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
+    browse._browse_cache.clear()
+
+    summary = asyncio.run(
+        browse.browse_summary(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+        )
+    )
+
+    assert calls == ["init"]
+    assert summary["total"] == 1
+    assert summary["status_counts"] == {"Shortlisted": 1}
+
+
+def test_browse_meta_initializes_empty_profile_cache(monkeypatch):
+    profiles = {}
+    calls = []
+
+    def fake_initialize_cache():
+        calls.append("init")
+        profiles[1] = {
+            "id": 1,
+            "name": "Cold Meta Candidate",
+            "city": "Bengaluru",
+            "status": "To be started",
+            "owner_user_id": None,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        }
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
+    browse._browse_cache.clear()
+
+    meta = asyncio.run(
+        browse.browse_metadata(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            role_id=None,
+        )
+    )
+
+    assert calls == ["init"]
+    assert "Exotel" in meta["companies"]
+    assert "Bengaluru" in meta["cities"]
+
+
 def test_browse_candidate_ids_preserves_scope_and_order(monkeypatch):
     profiles = {
         1: {
@@ -513,6 +577,31 @@ def test_admin_recruiter_scope_is_strict_to_selected_recruiter(monkeypatch):
     assert result["total"] == 1
     assert [row["id"] for row in result["candidates"]] == [2]
     assert result["status_counts"] == {"Shortlisted": 1}
+
+
+def test_admin_recruiter_scope_without_recruiter_id_is_400(monkeypatch):
+    calls = []
+
+    def fake_initialize_cache():
+        calls.append("init")
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", {})
+    monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
+    browse._browse_cache.clear()
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            browse.browse_candidates(
+                current_user=_user(role="admin"),
+                view_scope="recruiter_pools",
+                recruiter_filter_id=None,
+                page=1,
+                page_size=25,
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert calls == []
 
 
 def test_browse_status_counts_are_before_status_filter_and_total_is_paginated_scope(monkeypatch):

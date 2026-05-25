@@ -26,15 +26,16 @@ const getStatusCount = (counts, statusName) => {
 
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
-    const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
     const fetchTalentPoolSummary = useAppStore(state => state.fetchTalentPoolSummary)
-    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
         setSidebarWidth: state.setSidebarWidth,
         toggleSidebar: state.toggleSidebar,
         tpScopeTotal: state.tpScopeTotal,
         tpScopeStatusCounts: state.tpScopeStatusCounts,
+        tpScopeSummaryLastParamsString: state.tpScopeSummaryLastParamsString,
+        buildTalentPoolScopeQuery: state.buildTalentPoolScopeQuery,
         talentPoolViewScope: state.talentPoolViewScope,
         talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
         talentPoolRoleFilterId: state.talentPoolRoleFilterId,
@@ -45,13 +46,6 @@ function Sidebar() {
     const startX = useRef(0)
     const startWidth = useRef(sidebarWidth)
 
-    useEffect(() => { fetchAnalytics() }, [
-        fetchAnalytics,
-        role,
-        talentPoolViewScope,
-        talentPoolRecruiterFilterId,
-        talentPoolRoleFilterId,
-    ])
     useEffect(() => { fetchTalentPoolSummary() }, [
         fetchTalentPoolSummary,
         role,
@@ -110,8 +104,12 @@ function Sidebar() {
     const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted')
     const analyticsTotal = normalizeCount(analytics?.summary?.total_sourced)
     const analyticsShortlisted = normalizeCount(analytics?.summary?.shortlisted)
-    const sourcedCount = summaryTotal ?? analyticsTotal
-    const shortlistedCount = summaryShortlisted ?? analyticsShortlisted
+    const activeSummaryParams = buildTalentPoolScopeQuery()
+    const summaryMatchesScope = tpScopeSummaryLastParamsString === activeSummaryParams
+    const summaryStatusEmpty = !tpScopeStatusCounts || Object.keys(tpScopeStatusCounts).length === 0
+    const summaryLooksCold = summaryMatchesScope && summaryTotal === 0 && summaryStatusEmpty && Number(analyticsTotal || 0) > 0
+    const sourcedCount = summaryMatchesScope && !summaryLooksCold ? summaryTotal : analyticsTotal
+    const shortlistedCount = summaryMatchesScope && !summaryLooksCold ? summaryShortlisted : analyticsShortlisted
 
     return (
         <aside

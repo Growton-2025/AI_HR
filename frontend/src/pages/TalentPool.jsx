@@ -1683,6 +1683,9 @@ export default function TalentPool() {
   const linkedInPrewarmRef = useRef({ ids: new Set(), signature: '', ts: 0 });
 
   const [isRevalidating, setIsRevalidating] = useState(false);
+  const talentPoolScopeReady = role !== 'admin'
+    || talentPoolViewScope !== 'recruiter_pools'
+    || Boolean(talentPoolRecruiterFilterId);
 
   // Poll Clay/DB updates aggressively for enriching records so contact data appears quickly.
   useEffect(() => {
@@ -1756,8 +1759,24 @@ export default function TalentPool() {
   }, [role, fetchRecruiters]);
 
   useEffect(() => {
+    if (
+      role === 'admin' &&
+      talentPoolViewScope === 'recruiter_pools' &&
+      !talentPoolRecruiterFilterId &&
+      recruiters.length > 0
+    ) {
+      setTalentPoolView('recruiter_pools', recruiters[0].id);
+    }
+  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, recruiters, setTalentPoolView]);
+
+  useEffect(() => {
     let cancelled = false;
     const params = new URLSearchParams();
+    if (role === 'admin' && talentPoolViewScope === 'recruiter_pools' && !talentPoolRecruiterFilterId) {
+      setScopeRoles([]);
+      setTalentPoolRoleFilter('');
+      return undefined;
+    }
     if (role === 'admin' && talentPoolViewScope === 'recruiter_pools' && talentPoolRecruiterFilterId) {
       params.set('owner_user_id', talentPoolRecruiterFilterId);
     }
@@ -1828,6 +1847,11 @@ export default function TalentPool() {
   // Load metadata (dropdown options)
   useEffect(() => {
     let cancelled = false;
+    if (!talentPoolScopeReady) {
+      setMeta({ companies: [], cities: [], products: [], statuses: [], recruiters: [], location_types: [], titles: [] });
+      fetchTalentPoolSummary();
+      return undefined;
+    }
 
     const qs = useAppStore.getState().buildTalentPoolScopeQuery();
     const metaUrl = qs
@@ -1850,13 +1874,12 @@ export default function TalentPool() {
       console.error('Failed to fetch talent pool filter metadata:', error);
     });
 
-    fetchAnalytics();
     fetchTalentPoolSummary();
 
     return () => {
       cancelled = true;
     };
-  }, [fetchAnalytics, fetchTalentPoolSummary, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
+  }, [fetchTalentPoolSummary, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, talentPoolScopeReady]);
 
   useEffect(() => {
     if (role !== 'recruiter') {
@@ -1921,7 +1944,9 @@ export default function TalentPool() {
         }
       }));
       setShortlistCard(d);
-      fetchTalentPoolSummary({ force: true });
+      invalidateTalentPoolCaches();
+      fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+      void fetchCandidates(page);
     } else {
       toast.error(res.error || 'Operation failed');
       setContactInfo(prev => ({
@@ -1957,7 +1982,9 @@ export default function TalentPool() {
           updateTpCandidate(candidateId, { status: 'Shortlisted' });
           toast.success(`Candidate automatically shortlisted`);
           fetchAnalytics();
-          fetchTalentPoolSummary({ force: true });
+          invalidateTalentPoolCaches();
+          fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+          void fetchCandidates(page);
         } catch (err) {
           console.error('Auto-shortlist failed:', err);
         }
@@ -2001,6 +2028,11 @@ export default function TalentPool() {
   const fetchCandidates = useCallback(async (pg = 1) => {
     let requestId = 0;
     try {
+      if (!talentPoolScopeReady) {
+        setLoading(false);
+        setIsRevalidating(false);
+        return;
+      }
       requestId = ++talentPoolRequestSeqRef.current;
       const paramsString = buildTalentPoolParamsString({
         page: isAiRunFocusActive ? 1 : pg,
@@ -2041,12 +2073,16 @@ export default function TalentPool() {
         setIsRevalidating(false);
       }
     }
-  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds]);
+  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds, talentPoolScopeReady]);
 
   fetchCandidatesRef.current = fetchCandidates;
 
   useEffect(() => {
     if (role !== 'admin') return;
+    if (!talentPoolScopeReady) {
+      invalidateTalentPoolCaches({ clearRows: true });
+      return;
+    }
     if (!adminScopeInitRef.current) {
       adminScopeInitRef.current = true;
       return;
@@ -2055,7 +2091,7 @@ export default function TalentPool() {
     setPage(1);
     const run = fetchCandidatesRef.current;
     if (run) void run(1);
-  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, invalidateTalentPoolCaches]);
+  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, invalidateTalentPoolCaches, talentPoolScopeReady]);
 
   useEffect(() => {
     visibleCandidatesRef.current = displayedCandidates;
@@ -2196,6 +2232,11 @@ export default function TalentPool() {
     const requestId = ++aiColumnsRequestSeqRef.current;
     const requestedVisibleIdsKey = aiColumnVisibleIdsKey;
     const previousColumns = useAppStore.getState().aiColumns || [];
+    if (!talentPoolScopeReady || !requestedVisibleIdsKey) {
+      setAiColumns([]);
+      setAiColumnsLoading(false);
+      return;
+    }
     const params = new URLSearchParams();
     if (requestedVisibleIdsKey) params.set('candidate_ids', requestedVisibleIdsKey);
     if (talentPoolViewScope) params.set('view_scope', talentPoolViewScope);
@@ -2222,7 +2263,7 @@ export default function TalentPool() {
         setAiColumnsLoading(false);
       }
     }
-  }, [aiColumnVisibleIdsKey, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
+  }, [aiColumnVisibleIdsKey, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, talentPoolScopeReady]);
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -2409,7 +2450,7 @@ export default function TalentPool() {
         toast.warning(`Some rows had issues: ${warnBody}`);
       }
       invalidateTalentPoolCaches();
-      fetchTalentPoolSummary({ force: true });
+      fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
       await fetchCandidates(1);
       const runIndex = () => {
         void fetchTalentPoolIndex().catch(() => { });
@@ -2468,7 +2509,7 @@ export default function TalentPool() {
       setShowAssignModal(false);
       setSelectedIds(new Set());
       invalidateTalentPoolCaches();
-      fetchTalentPoolSummary({ force: true });
+      fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
       await fetchTalentPoolIndex({ force: true });
       await fetchCandidates(page);
     } catch (e) {
@@ -2930,7 +2971,11 @@ export default function TalentPool() {
 
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
                 <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 700 }}>
-                  {loading && !displayedCandidates.length ? '...' : `${displayedTotal.toLocaleString()} candidates`}
+                  {!talentPoolScopeReady
+                    ? 'Select recruiter'
+                    : loading && !displayedCandidates.length
+                      ? '...'
+                      : `${displayedTotal.toLocaleString()} candidates`}
                 </span>
                 {isRevalidating ? (
                   <span style={{ fontSize: 10, color: '#64748b', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -3198,8 +3243,12 @@ export default function TalentPool() {
                         <div style={{ width: 56, height: 56, background: '#f8fafc', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           <User size={24} color="#cbd5e1" />
                         </div>
-                        <p style={{ color: '#64748b', fontWeight: 600, fontSize: 15, margin: 0 }}>No candidates found</p>
-                        <p style={{ color: '#cbd5e1', fontSize: 13, margin: 0 }}>Try adjusting your filters or search query</p>
+                        <p style={{ color: '#64748b', fontWeight: 600, fontSize: 15, margin: 0 }}>
+                          {talentPoolScopeReady ? 'No candidates found' : 'Select a recruiter to load this pool'}
+                        </p>
+                        <p style={{ color: '#cbd5e1', fontSize: 13, margin: 0 }}>
+                          {talentPoolScopeReady ? 'Try adjusting your filters or search query' : 'Recruiter-scoped totals load after a recruiter is selected'}
+                        </p>
                         {hasFilters && <button onClick={clearFilters} style={{ padding: '8px 16px', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, color: '#334155', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>Clear Filters</button>}
                       </div>
                     </td>
@@ -3305,7 +3354,9 @@ export default function TalentPool() {
                         disabled={poolReadOnly}
                         onUpdate={(id, newStatus) => {
                           updateTpCandidate(id, { status: newStatus });
-                          fetchTalentPoolSummary({ force: true });
+                          invalidateTalentPoolCaches();
+                          fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+                          void fetchCandidates(page);
                         }}
                         onShortlisted={handleShortlisted}
                       />

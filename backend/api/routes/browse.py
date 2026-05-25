@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, List, Any
 from pydantic import BaseModel
-from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID
+from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID, initialize_cache
 from backend.api import deps, schemas
 from backend.services.candidate_pool import (
     profile_passes_scope,
@@ -10,11 +10,15 @@ from backend.services.candidate_pool import (
     VIEW_SCOPE_ALL_RECRUITER_POOLS,
 )
 from backend.db.connection import get_db_connection, return_db_connection
+import asyncio
+import logging
 import time
 import hashlib
 import json
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+_profile_cache_init_lock = asyncio.Lock()
 
 @router.get("/candidates/sample")
 async def get_sample_candidate(
@@ -65,6 +69,52 @@ def _invalidate_browse_cache():
     global _browse_cache
     _browse_cache.clear()
 # ──────────────────────────────────────────────────────────────
+
+
+async def _ensure_profiles_loaded() -> bool:
+    """Load the per-worker profile cache before browse reads it.
+
+    Azure/Gunicorn workers do not share process memory. A cold worker can otherwise
+    answer browse/summary/meta from an empty cache and briefly poison frontend totals.
+    """
+    if PROFILES_BY_ID:
+        return False
+    async with _profile_cache_init_lock:
+        if PROFILES_BY_ID:
+            return False
+        started = time.monotonic()
+        await asyncio.to_thread(initialize_cache)
+        _invalidate_browse_cache()
+        logger.warning(
+            "browse profile cache initialized duration_ms=%.1f profiles=%s",
+            (time.monotonic() - started) * 1000,
+            len(PROFILES_BY_ID),
+        )
+        return True
+
+
+def _log_browse_timing(
+    name: str,
+    started: float,
+    *,
+    status: str = "ok",
+    total: Optional[int] = None,
+    page_size: Optional[int] = None,
+    scope: Optional[str] = None,
+    recruiter_id: Optional[int] = None,
+) -> None:
+    duration_ms = (time.monotonic() - started) * 1000
+    log = logger.warning if duration_ms > 500 or status != "ok" else logger.info
+    log(
+        "browse %s status=%s duration_ms=%.1f total=%s page_size=%s scope=%s recruiter_id=%s",
+        name,
+        status,
+        duration_ms,
+        total,
+        page_size,
+        scope,
+        recruiter_id,
+    )
 
 class StatusUpdate(BaseModel):
     status: str
@@ -200,6 +250,7 @@ async def build_browse_candidate_rows(
         view_scope,
         recruiter_filter_id,
     )
+    await _ensure_profiles_loaded()
     role_candidate_ids = _role_candidate_id_set(
         current_user,
         role_id=role_id,
@@ -379,20 +430,33 @@ async def browse_summary(
     role_id: Optional[int] = None,
 ):
     """Return unfiltered Talent Pool counts for the current scope."""
-    payload = await build_browse_candidate_rows(
-        current_user=current_user,
-        view_scope=view_scope,
-        recruiter_filter_id=recruiter_filter_id,
-        role_id=role_id,
-        sort_by="name",
-        sort_dir="asc",
-    )
-    return {
-        "total": len(payload.get("candidates", [])),
-        "status_counts": payload.get("status_counts", {}),
-        "effective_scope": payload.get("effective_scope"),
-        "effective_recruiter": payload.get("effective_recruiter"),
-    }
+    started = time.monotonic()
+    try:
+        payload = await build_browse_candidate_rows(
+            current_user=current_user,
+            view_scope=view_scope,
+            recruiter_filter_id=recruiter_filter_id,
+            role_id=role_id,
+            sort_by="name",
+            sort_dir="asc",
+        )
+        result = {
+            "total": len(payload.get("candidates", [])),
+            "status_counts": payload.get("status_counts", {}),
+            "effective_scope": payload.get("effective_scope"),
+            "effective_recruiter": payload.get("effective_recruiter"),
+        }
+        _log_browse_timing(
+            "summary",
+            started,
+            total=result["total"],
+            scope=result["effective_scope"],
+            recruiter_id=result["effective_recruiter"],
+        )
+        return result
+    except Exception:
+        _log_browse_timing("summary", started, status="error")
+        raise
 
 
 @router.get("/candidates/browse")
@@ -429,11 +493,13 @@ async def browse_candidates(
     sort_dir: Optional[str] = "asc",
 ):
     """Browse candidates with role-based pool scope."""
+    started = time.monotonic()
     effective_scope, effective_recruiter = resolve_browse_scope(
         current_user,
         view_scope,
         recruiter_filter_id,
     )
+    await _ensure_profiles_loaded()
     candidate_id_list = _parse_candidate_ids(candidate_ids)
 
     # ── Cache key from all params ───────────────────────────────────
@@ -455,6 +521,15 @@ async def browse_candidates(
     # Serve from cache if fresh
     cached = _browse_cache.get(cache_key)
     if cached and (time.monotonic() - cached["ts"]) < _BROWSE_CACHE_TTL:
+        cached_result = cached["result"]
+        _log_browse_timing(
+            "rows",
+            started,
+            total=cached_result.get("total"),
+            page_size=page_size,
+            scope=effective_scope,
+            recruiter_id=effective_recruiter,
+        )
         return cached["result"]
 
     browse_payload = await build_browse_candidate_rows(
@@ -498,6 +573,14 @@ async def browse_candidates(
     }
     # Store in cache
     _browse_cache[cache_key] = {"result": result, "ts": time.monotonic()}
+    _log_browse_timing(
+        "rows",
+        started,
+        total=total,
+        page_size=page_size,
+        scope=effective_scope,
+        recruiter_id=effective_recruiter,
+    )
     return result
 
 
@@ -509,6 +592,7 @@ async def browse_metadata(
     role_id: Optional[int] = Query(None),
 ):
     """Return unique filter values (for dropdowns) scoped like browse."""
+    started = time.monotonic()
     if (current_user.role or "").strip().lower() != "admin":
         effective_scope = VIEW_SCOPE_RECRUITER_POOLS
         effective_recruiter = current_user.id
@@ -520,6 +604,7 @@ async def browse_metadata(
                 status_code=400,
                 detail="recruiter_filter_id is required when view_scope=recruiter_pools",
             )
+    await _ensure_profiles_loaded()
 
     role_candidate_ids = _role_candidate_id_set(
         current_user,
@@ -570,7 +655,7 @@ async def browse_metadata(
     for s in RECRUITMENT_STAGES:
         statuses.add(s)
 
-    return {
+    result = {
         "companies": sorted(companies)[:100],
         "cities": sorted(cities)[:100],
         "titles": sorted(titles)[:100],
@@ -579,6 +664,14 @@ async def browse_metadata(
         "statuses": sorted(statuses),
         "recruiters": sorted(recruiters),
     }
+    _log_browse_timing(
+        "meta",
+        started,
+        total=len(all_profiles),
+        scope=effective_scope,
+        recruiter_id=effective_recruiter,
+    )
+    return result
 
 @router.post("/candidates/{candidate_id}/status")
 async def update_status(
