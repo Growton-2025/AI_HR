@@ -429,7 +429,7 @@ function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange
 }
 
 function SelectFilter({ label, value, onChange, options, placeholder }) {
-  const opts = Array.isArray(options) ? options : [];
+  const opts = [...new Set((Array.isArray(options) ? options : []).map(o => String(o || '').trim()).filter(Boolean))];
   return (
     <div style={{ marginBottom: 14 }}>
       <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>
@@ -466,6 +466,24 @@ function SelectFilter({ label, value, onChange, options, placeholder }) {
       </div>
     </div>
   );
+}
+
+function uniqueSortedOptions(...groups) {
+  const seen = new Map();
+  for (const group of groups) {
+    const values = Array.isArray(group)
+      ? group
+      : group && typeof group === 'object'
+        ? Object.keys(group)
+        : [];
+    for (const value of values) {
+      const text = String(value || '').trim();
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (!seen.has(key)) seen.set(key, text);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 }
 
 function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
@@ -1943,9 +1961,20 @@ export default function TalentPool() {
       : `${API_BASE}/candidates/browse/meta`;
     axios.get(metaUrl).then(r => {
       if (!cancelled) {
-        setMeta(r.data);
+        const data = r.data || {};
+        setMeta({
+          companies: Array.isArray(data.companies) ? data.companies : [],
+          cities: Array.isArray(data.cities) ? data.cities : [],
+          titles: Array.isArray(data.titles) ? data.titles : [],
+          products: Array.isArray(data.products) ? data.products : [],
+          statuses: Array.isArray(data.statuses) ? data.statuses : [],
+          recruiters: Array.isArray(data.recruiters) ? data.recruiters : [],
+          location_types: Array.isArray(data.location_types) ? data.location_types : [],
+        });
       }
-    }).catch(() => { });
+    }).catch(error => {
+      console.error('Failed to fetch talent pool filter metadata:', error);
+    });
 
     fetchAnalytics();
     fetchTalentPoolSummary();
@@ -2118,6 +2147,18 @@ export default function TalentPool() {
   const displayedTotalPages = localTalentPoolView?.totalPages ?? totalPages;
   const displayedStatusCounts = localTalentPoolView?.statusCounts || statusCounts;
   const allVisibleSelected = displayedCandidates.length > 0 && displayedCandidates.every((candidate) => selectedIds.has(candidate.id));
+  const statusFilterOptions = useMemo(() => uniqueSortedOptions(
+    RECRUITMENT_STAGES,
+    meta.statuses,
+    scopeStatusCounts,
+    statusCounts,
+    displayedCandidates.map(candidate => candidate?.status || 'To be started'),
+  ), [meta.statuses, scopeStatusCounts, statusCounts, displayedCandidates]);
+  const recruiterFilterOptions = useMemo(() => uniqueSortedOptions(
+    meta.recruiters,
+    talentPoolIndex?.rows?.map(candidate => candidate?.created_by),
+    displayedCandidates.map(candidate => candidate?.created_by),
+  ), [meta.recruiters, talentPoolIndex?.rows, displayedCandidates]);
 
   // Stable across new array instances with the same visible ids — avoids hammering GET /ai-columns.
   const aiColumnVisibleIdsKey = (isAiRunFocusActive ? focusCandidateIds : displayedCandidates.map((c) => c.id))
@@ -2308,7 +2349,13 @@ export default function TalentPool() {
   }, [syncOutreachResponses, fetchTalentPoolIndex]);
 
 
-  const setFilter = (key, val) => setFilters(prev => ({ ...prev, [key]: val }));
+  const setFilter = (key, val) => {
+    if (key === 'status') {
+      setActiveStatusTab('');
+    }
+    setFilters(prev => ({ ...prev, [key]: val }));
+    setTpPagination(1, pageSize);
+  };
   const clearFilters = () => {
     startTransition(() => {
       setFilters(() => ({
@@ -2804,12 +2851,12 @@ export default function TalentPool() {
             label="Recruiter"
             value={filters?.created_by || ''}
             onChange={v => setFilter('created_by', v)}
-            options={meta.recruiters || []}
+            options={recruiterFilterOptions}
             placeholder="All Recruiters"
           />
         )}
 
-        <SelectFilter label="Status" value={filters?.status || ''} onChange={v => setFilter('status', v)} options={meta.statuses || []} placeholder="All Statuses" />
+        <SelectFilter label="Status" value={filters?.status || ''} onChange={v => setFilter('status', v)} options={statusFilterOptions} placeholder="All Statuses" />
 
         {scopeRoles.length > 0 && (
           <div style={{ marginBottom: 18 }}>
@@ -3126,6 +3173,7 @@ export default function TalentPool() {
                 role={role}
                 onStatClick={(status) => {
                   startTransition(() => {
+                    setFilters(prev => ({ ...prev, status: '' }));
                     setActiveStatusTab(status);
                   });
                   setPage(1);
@@ -3194,6 +3242,7 @@ export default function TalentPool() {
                 <button key={tab || 'all'}
                   onClick={() => {
                     startTransition(() => {
+                      setFilters(prev => ({ ...prev, status: '' }));
                       setActiveStatusTab(tab);
                     });
                     setPage(1);
