@@ -604,6 +604,110 @@ def test_admin_recruiter_scope_without_recruiter_id_is_400(monkeypatch):
     assert calls == []
 
 
+def test_admin_master_role_filter_accepts_recruiter_owned_role(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Master Row",
+            "status": "To be started",
+            "owner_user_id": None,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Recruiter Role Row",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+    }
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            pass
+
+        def fetchone(self):
+            return (7,)
+
+        def fetchall(self):
+            return [(2,)]
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    monkeypatch.setattr(browse, "get_db_connection", lambda **_kwargs: Conn())
+    monkeypatch.setattr(browse, "return_db_connection", lambda _conn: None)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            role_id=58,
+            page=1,
+            page_size=25,
+        )
+    )
+
+    assert result["total"] == 1
+    assert [row["id"] for row in result["candidates"]] == [2]
+
+
+def test_stale_role_filter_returns_empty_result_not_http_error(monkeypatch):
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            pass
+
+        def fetchone(self):
+            return None
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", {
+        1: {
+            "id": 1,
+            "name": "Visible Candidate",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+    })
+    monkeypatch.setattr(browse, "get_db_connection", lambda **_kwargs: Conn())
+    monkeypatch.setattr(browse, "return_db_connection", lambda _conn: None)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            role_id=999,
+            page=1,
+            page_size=25,
+        )
+    )
+
+    assert result["total"] == 0
+    assert result["candidates"] == []
+
+
 def test_browse_status_counts_are_before_status_filter_and_total_is_paginated_scope(monkeypatch):
     profiles = {
         1: {

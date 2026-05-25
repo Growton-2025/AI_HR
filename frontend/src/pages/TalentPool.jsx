@@ -1777,7 +1777,11 @@ export default function TalentPool() {
       setTalentPoolRoleFilter('');
       return undefined;
     }
+    if (role === 'admin' && talentPoolViewScope === 'master') {
+      params.set('view_scope', 'master');
+    }
     if (role === 'admin' && talentPoolViewScope === 'recruiter_pools' && talentPoolRecruiterFilterId) {
+      params.set('view_scope', 'recruiter_pools');
       params.set('owner_user_id', talentPoolRecruiterFilterId);
     }
     if (role === 'admin' && talentPoolViewScope === 'all_recruiter_pools') {

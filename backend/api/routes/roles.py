@@ -146,6 +146,7 @@ def _role_owner_id(current_user: schemas.User, owner_user_id: Optional[int]) -> 
 async def get_roles(
     current_user: schemas.User = Depends(deps.get_current_user),
     owner_user_id: Optional[int] = Query(None),
+    view_scope: Optional[str] = Query(None),
 ):
     """Get all roles for the current user with candidate counts"""
     conn = get_db_connection()
@@ -155,23 +156,36 @@ async def get_roles(
     roles_list = []
     try:
         with conn.cursor() as cur:
-            # Fetch roles created by current user
-            target_user_id = _role_owner_id(current_user, owner_user_id)
-            logger.info(f"Fetching roles for user_id: {target_user_id}")
-            cur.execute("""
-                SELECT r.id, r.name, r.job_description, COUNT(DISTINCT rc.candidate_id) as candidate_count,
-                       COUNT(DISTINCT cu.id) as upload_count,
-                       MAX(cu.completed_at) as latest_upload_at
-                FROM recruitment_roles r
-                LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
-                LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
-                WHERE r.user_id = %s
-                GROUP BY r.id, r.name, r.job_description
-                ORDER BY r.created_at DESC
-            """, (target_user_id,))
+            user_role = (current_user.role or "").strip().lower()
+            if user_role == "admin" and (view_scope or "").strip().lower() in {"master", "all_recruiter_pools"}:
+                logger.info("Fetching roles for admin scope: %s", view_scope)
+                cur.execute("""
+                    SELECT r.id, r.name, r.job_description, COUNT(DISTINCT rc.candidate_id) as candidate_count,
+                           COUNT(DISTINCT cu.id) as upload_count,
+                           MAX(cu.completed_at) as latest_upload_at
+                    FROM recruitment_roles r
+                    LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
+                    LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
+                    GROUP BY r.id, r.name, r.job_description
+                    ORDER BY r.created_at DESC
+                """)
+            else:
+                target_user_id = _role_owner_id(current_user, owner_user_id)
+                logger.info(f"Fetching roles for user_id: {target_user_id}")
+                cur.execute("""
+                    SELECT r.id, r.name, r.job_description, COUNT(DISTINCT rc.candidate_id) as candidate_count,
+                           COUNT(DISTINCT cu.id) as upload_count,
+                           MAX(cu.completed_at) as latest_upload_at
+                    FROM recruitment_roles r
+                    LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
+                    LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
+                    WHERE r.user_id = %s
+                    GROUP BY r.id, r.name, r.job_description
+                    ORDER BY r.created_at DESC
+                """, (target_user_id,))
             
             rows = cur.fetchall()
-            logger.info(f"Found {len(rows)} roles for user_id: {target_user_id}")
+            logger.info("Found %s roles", len(rows))
             for row in rows:
                 logger.info(f"  Role: {row[1]}, candidate_count: {row[3]}")
                 roles_list.append({

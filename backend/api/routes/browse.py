@@ -193,11 +193,11 @@ def _role_candidate_id_set(
 ) -> Optional[set[int]]:
     if not role_id:
         return None
-    owner_id = current_user.id
+    owner_id: Optional[int] = current_user.id
     if (current_user.role or "").strip().lower() == "admin":
         if view_scope == VIEW_SCOPE_RECRUITER_POOLS and recruiter_filter_id:
             owner_id = recruiter_filter_id
-        elif view_scope == VIEW_SCOPE_ALL_RECRUITER_POOLS:
+        elif view_scope in (VIEW_SCOPE_MASTER, VIEW_SCOPE_ALL_RECRUITER_POOLS):
             owner_id = None
 
     conn = get_db_connection(validate=False, register_pgvector=False)
@@ -214,7 +214,14 @@ def _role_candidate_id_set(
                 )
             role = cur.fetchone()
             if not role:
-                raise HTTPException(status_code=404, detail="Role not found for current scope")
+                logger.warning(
+                    "browse role filter ignored missing role_id=%s scope=%s recruiter_id=%s user_id=%s",
+                    role_id,
+                    view_scope,
+                    recruiter_filter_id,
+                    current_user.id,
+                )
+                return set()
             cur.execute(
                 "SELECT candidate_id FROM recruitment_role_candidates WHERE role_id = %s",
                 (role_id,),
