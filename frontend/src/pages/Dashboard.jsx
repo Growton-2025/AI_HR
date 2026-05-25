@@ -97,13 +97,34 @@ const CustomTooltip = ({ active, payload }) => {
 
 const CHART_MODES = ['Geography', 'Industry', 'Segment'];
 
+const normalizeCount = (value) => {
+  if (value == null || value === '') return null;
+  const count = Number(value);
+  return Number.isFinite(count) ? count : null;
+};
+
+const getStatusCount = (counts, statusName) => {
+  if (!counts || typeof counts !== 'object') return null;
+  if (counts[statusName] != null) return normalizeCount(counts[statusName]);
+
+  const normalizedStatus = statusName.trim().toLowerCase();
+  const matchedKey = Object.keys(counts).find(key => key.trim().toLowerCase() === normalizedStatus);
+  return matchedKey ? normalizeCount(counts[matchedKey]) : null;
+};
+
 const Dashboard = () => {
-  const { user, analytics, fetchAnalytics, callStats, fetchCallStats } = useAppStore(useShallow((state) => ({
+  const { user, analytics, fetchAnalytics, callStats, fetchCallStats, fetchTalentPoolSummary, tpScopeTotal, tpScopeStatusCounts, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
     user: state.user,
     analytics: state.analytics,
     fetchAnalytics: state.fetchAnalytics,
     callStats: state.callStats,
     fetchCallStats: state.fetchCallStats,
+    fetchTalentPoolSummary: state.fetchTalentPoolSummary,
+    tpScopeTotal: state.tpScopeTotal,
+    tpScopeStatusCounts: state.tpScopeStatusCounts,
+    talentPoolViewScope: state.talentPoolViewScope,
+    talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
+    talentPoolRoleFilterId: state.talentPoolRoleFilterId,
   })));
   const [activeMode, setActiveMode] = useState(0);
   const [isRevalidating, setIsRevalidating] = useState(false);
@@ -114,17 +135,29 @@ const Dashboard = () => {
       if (hasLoadedRef.current) {
         setIsRevalidating(true);
       }
-      await Promise.allSettled([fetchAnalytics({ force: true }), fetchCallStats()]);
+      await Promise.allSettled([
+        fetchAnalytics({ force: true }),
+        fetchCallStats(),
+        fetchTalentPoolSummary({ force: true }),
+      ]);
       hasLoadedRef.current = true;
       setIsRevalidating(false);
     };
     run();
-  }, [fetchAnalytics, fetchCallStats]);
+  }, [fetchAnalytics, fetchCallStats, fetchTalentPoolSummary, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
 
   const isAdmin = user?.role === 'admin';
 
-  // Use team-wide summary for all users so the top cards match the charts below
-  const displayMetrics = analytics?.summary || { total_sourced: 0, shortlisted: 0, in_conversation: 0 };
+  const summaryTotal = normalizeCount(tpScopeTotal);
+  const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted');
+  const summaryFollowUp = getStatusCount(tpScopeStatusCounts, 'Followup / In conversation');
+  const analyticsMetrics = analytics?.summary || {};
+  const displayMetrics = {
+    ...analyticsMetrics,
+    total_sourced: summaryTotal ?? normalizeCount(analyticsMetrics.total_sourced) ?? 0,
+    shortlisted: summaryShortlisted ?? normalizeCount(analyticsMetrics.shortlisted) ?? 0,
+    in_conversation: summaryFollowUp ?? normalizeCount(analyticsMetrics.in_conversation) ?? 0,
+  };
     
   // If personal pipeline health, compute in_conversation dynamically if not preset
   let inConv = displayMetrics.in_conversation || 0;

@@ -582,10 +582,6 @@ const OUTREACH_REPLY_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const OUTREACH_REPLY_SYNC_MAX_BACKOFF_MS = 10 * 60 * 1000;
 const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
 
-function normalizeTalentPoolText(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
 function normalizeContactValue(value) {
   const text = String(value || '').trim();
   if (!text) return '';
@@ -610,13 +606,6 @@ function splitTalentPoolFilterValues(values = [], inputValue = '') {
     .flatMap((value) => String(value || '').split(','))
     .map((value) => value.trim())
     .filter(Boolean);
-}
-
-function matchesTalentPoolFilters(filterValues, targetValue) {
-  if (!filterValues.length) return true;
-  const normalizedTarget = normalizeTalentPoolText(targetValue);
-  if (!normalizedTarget) return false;
-  return filterValues.some((value) => normalizedTarget.includes(normalizeTalentPoolText(value)));
 }
 
 function buildTalentPoolParamsString({
@@ -664,118 +653,6 @@ function buildTalentPoolParamsString({
   params.set('sort_dir', sortDir);
 
   return params.toString();
-}
-
-function buildLocalTalentPoolView(rows = [], {
-  globalSearch = '',
-  filters = {},
-  activeStatusTab = '',
-  sortBy = 'name',
-  sortDir = 'asc',
-  page = 1,
-  pageSize = 25,
-}) {
-  const titleFilters = splitTalentPoolFilterValues(filters?.title, filters?.titleInput);
-  const companyFilters = splitTalentPoolFilterValues(filters?.company, filters?.companyInput);
-  const cityFilters = splitTalentPoolFilterValues(filters?.city, filters?.cityInput);
-  const productFilters = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput);
-  const recruiterFilters = splitTalentPoolFilterValues([], filters?.created_by);
-  const normalizedSearch = normalizeTalentPoolText(globalSearch);
-  const effectiveStatus = activeStatusTab || filters?.status || '';
-  const normalizedStatus = normalizeTalentPoolText(effectiveStatus);
-  const minExp = Number(filters?.min_exp ?? 0);
-  const maxExp = Number(filters?.max_exp ?? 40);
-
-  const filteredRows = rows.filter((row) => {
-    const title = row?.title || row?.headline || '';
-    const company = row?.company || '';
-    const city = row?.city || '';
-    const product = row?.product_service || '';
-    const recruiter = row?.created_by || '';
-    const status = row?.status || 'To be started';
-    const totalExperience = Number(row?.total_experience_years || 0);
-
-    if (normalizedSearch) {
-      const searchable = [
-        row?.name,
-        row?.first_name,
-        row?.last_name,
-        title,
-        company,
-        city,
-        product,
-        recruiter,
-        row?.email,
-        row?.phone,
-        row?.mobile_phone,
-        status,
-      ].map(normalizeTalentPoolText).join(' ');
-
-      if (!searchable.includes(normalizedSearch)) return false;
-    }
-
-    if (!matchesTalentPoolFilters(titleFilters, title)) return false;
-    if (!matchesTalentPoolFilters(companyFilters, company)) return false;
-    if (!matchesTalentPoolFilters(cityFilters, city)) return false;
-    if (!matchesTalentPoolFilters(recruiterFilters, recruiter)) return false;
-    if (productFilters.length && !matchesTalentPoolFilters(productFilters, product)) return false;
-    if (totalExperience < minExp || totalExperience > maxExp) return false;
-
-    return true;
-  });
-
-  const statusCounts = {};
-  for (const row of filteredRows) {
-    const status = String(row?.status ?? 'To be started').trim();
-    statusCounts[status] = (statusCounts[status] || 0) + 1;
-  }
-
-  let finalRows = filteredRows;
-  if (normalizedStatus) {
-    finalRows = filteredRows.filter((row) => normalizeTalentPoolText(row?.status || 'To be started') === normalizedStatus);
-  }
-
-  const getSortValue = (row) => {
-    switch (sortBy) {
-      case 'title':
-        return row?.title || row?.headline || '';
-      case 'company':
-        return row?.company || '';
-      case 'city':
-        return row?.city || '';
-      case 'exp':
-        return Number(row?.total_experience_years || 0);
-      case 'tenure':
-        return Number(row?.avg_tenure_years || 0);
-      case 'name':
-      default:
-        return row?.name || `${row?.first_name || ''} ${row?.last_name || ''}`.trim();
-    }
-  };
-
-  finalRows = [...finalRows].sort((a, b) => {
-    const left = getSortValue(a);
-    const right = getSortValue(b);
-
-    if (typeof left === 'number' || typeof right === 'number') {
-      return sortDir === 'desc' ? Number(right) - Number(left) : Number(left) - Number(right);
-    }
-
-    const result = String(left).localeCompare(String(right), undefined, { sensitivity: 'base' });
-    return sortDir === 'desc' ? -result : result;
-  });
-
-  const total = finalRows.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const safePage = Math.min(page, totalPages);
-  const start = (safePage - 1) * pageSize;
-
-  return {
-    candidates: finalRows.slice(start, start + pageSize),
-    total,
-    totalPages,
-    statusCounts,
-  };
 }
 
 function summarizeAiRun(run) {
@@ -830,7 +707,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
   if (!summary || typeof summary !== 'object') return null;
 
   // Filters should narrow the table and status tabs, not rewrite the global sourced KPI.
-  const displayTotal = summary.total_sourced != null ? summary.total_sourced : tpTotal;
+  const displayTotal = tpTotal != null ? tpTotal : summary.total_sourced;
   const displayShortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted;
   const displayPipeline = tpStatusCounts || summary.pipeline_health || {};
 
@@ -946,7 +823,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
 
 function CompactMetricsStrip({ analytics, tpTotal, tpStatusCounts, expanded, onToggle }) {
   const summary = analytics?.summary || {};
-  const totalSourced = summary.total_sourced != null ? summary.total_sourced : tpTotal;
+  const totalSourced = tpTotal != null ? tpTotal : summary.total_sourced;
   const shortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted || 0;
   const followUp = (tpStatusCounts || summary.pipeline_health || {})['Followup / In conversation'] || 0;
   const conversion = totalSourced > 0 ? Math.round((shortlisted / totalSourced) * 100) : 0;
@@ -1800,7 +1677,6 @@ export default function TalentPool() {
   const talentPoolRequestSeqRef = useRef(0);
   const aiColumnsRequestSeqRef = useRef(0);
   const visibleCandidatesRef = useRef(candidates);
-  const canUseInstantLocalFilteringRef = useRef(false);
   /** Latest fetchCandidates — avoids admin scope effect re-running when this callback identity changes after each fetch. */
   const fetchCandidatesRef = useRef(null);
   const aiColumnDeleteInFlightRef = useRef(null);
@@ -1952,8 +1828,6 @@ export default function TalentPool() {
   // Load metadata (dropdown options)
   useEffect(() => {
     let cancelled = false;
-    let idleId = null;
-    let timeoutId = null;
 
     const qs = useAppStore.getState().buildTalentPoolScopeQuery();
     const metaUrl = qs
@@ -1979,28 +1853,10 @@ export default function TalentPool() {
     fetchAnalytics();
     fetchTalentPoolSummary();
 
-    const prefetchTalentPoolIndex = () => {
-      if (!cancelled) {
-        void fetchTalentPoolIndex();
-      }
-    };
-
-    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
-      idleId = window.requestIdleCallback(prefetchTalentPoolIndex, { timeout: 1200 });
-    } else {
-      timeoutId = window.setTimeout(prefetchTalentPoolIndex, 250);
-    }
-
     return () => {
       cancelled = true;
-      if (idleId !== null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
-        window.cancelIdleCallback(idleId);
-      }
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
     };
-  }, [fetchAnalytics, fetchTalentPoolSummary, fetchTalentPoolIndex, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
+  }, [fetchAnalytics, fetchTalentPoolSummary, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
 
   useEffect(() => {
     if (role !== 'recruiter') {
@@ -2110,10 +1966,6 @@ export default function TalentPool() {
     return res;
   };
 
-  const hasSemanticProductFilter = splitTalentPoolFilterValues(
-    filters?.product_service,
-    filters?.productInput,
-  ).length > 0;
   const focusCandidateIds = useMemo(
     () => Array.isArray(tpAiRunFocus?.candidateIds)
       ? tpAiRunFocus.candidateIds.map(Number).filter(Number.isFinite)
@@ -2121,31 +1973,10 @@ export default function TalentPool() {
     [tpAiRunFocus],
   );
   const isAiRunFocusActive = focusCandidateIds.length > 0;
-  const canUseInstantLocalFiltering = Boolean(
-    !isAiRunFocusActive &&
-    !hasSemanticProductFilter &&
-    Array.isArray(talentPoolIndex?.rows) &&
-    talentPoolIndex.rows.length > 0
-  );
-  const localTalentPoolView = canUseInstantLocalFiltering
-    ? buildLocalTalentPoolView(talentPoolIndex.rows, {
-      globalSearch,
-      filters,
-      activeStatusTab,
-      sortBy,
-      sortDir,
-      page,
-      pageSize,
-    })
-    : null;
-  const displayedCandidates = Array.isArray(localTalentPoolView?.candidates)
-    ? localTalentPoolView.candidates
-    : Array.isArray(candidates)
-      ? candidates
-      : [];
-  const displayedTotal = localTalentPoolView?.total ?? total;
-  const displayedTotalPages = localTalentPoolView?.totalPages ?? totalPages;
-  const displayedStatusCounts = localTalentPoolView?.statusCounts || statusCounts;
+  const displayedCandidates = Array.isArray(candidates) ? candidates : [];
+  const displayedTotal = total;
+  const displayedTotalPages = totalPages;
+  const displayedStatusCounts = statusCounts;
   const allVisibleSelected = displayedCandidates.length > 0 && displayedCandidates.every((candidate) => selectedIds.has(candidate.id));
   const statusFilterOptions = useMemo(() => uniqueSortedOptions(
     RECRUITMENT_STAGES,
@@ -2222,23 +2053,13 @@ export default function TalentPool() {
     }
     invalidateTalentPoolCaches();
     setPage(1);
-    void fetchTalentPoolIndex({ force: true });
     const run = fetchCandidatesRef.current;
     if (run) void run(1);
-  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, invalidateTalentPoolCaches, fetchTalentPoolIndex]);
+  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, invalidateTalentPoolCaches]);
 
   useEffect(() => {
     visibleCandidatesRef.current = displayedCandidates;
-    canUseInstantLocalFilteringRef.current = canUseInstantLocalFiltering;
-  }, [displayedCandidates, canUseInstantLocalFiltering]);
-
-  useEffect(() => {
-    if (canUseInstantLocalFiltering) {
-      setIsSemanticSearch(false);
-      setLoading(false);
-      setIsRevalidating(false);
-    }
-  }, [canUseInstantLocalFiltering]);
+  }, [displayedCandidates]);
 
   useEffect(() => {
     if (page > displayedTotalPages) {
@@ -2278,12 +2099,6 @@ export default function TalentPool() {
       return;
     }
     clearTimeout(debounceRef.current);
-    if (canUseInstantLocalFiltering) {
-      if (page !== 1) {
-        setPage(1);
-      }
-      return () => clearTimeout(debounceRef.current);
-    }
     debounceRef.current = setTimeout(() => {
       if (page !== 1) {
         setPage(1);
@@ -2292,13 +2107,11 @@ export default function TalentPool() {
       fetchCandidates(1);
     }, 120);
     return () => clearTimeout(debounceRef.current);
-  }, [fetchCandidates, canUseInstantLocalFiltering]);
+  }, [fetchCandidates]);
 
   useEffect(() => {
-    if (!canUseInstantLocalFiltering) {
-      fetchCandidates(page);
-    }
-  }, [page, canUseInstantLocalFiltering, fetchCandidates]);
+    fetchCandidates(page);
+  }, [page, fetchCandidates]);
 
   // Store fetchCandidates and page in refs to avoid dependency cycles in the sync interval
   const fetchRef = useRef(fetchCandidates);
@@ -2325,11 +2138,7 @@ export default function TalentPool() {
       }
 
       if (res?.success && updatedCount > 0) {
-        if (canUseInstantLocalFilteringRef.current) {
-          await fetchTalentPoolIndex({ force: true });
-        } else {
-          fetchRef.current(pageRef.current);
-        }
+        fetchRef.current(pageRef.current);
       }
 
       nextDelayMs = res?.success
@@ -2346,7 +2155,7 @@ export default function TalentPool() {
         clearTimeout(timeoutId);
       }
     };
-  }, [syncOutreachResponses, fetchTalentPoolIndex]);
+  }, [syncOutreachResponses]);
 
 
   const setFilter = (key, val) => {
@@ -3134,18 +2943,6 @@ export default function TalentPool() {
                 )}
               </div>
               <button onClick={async () => {
-                if (canUseInstantLocalFiltering) {
-                  setIsRevalidating(true);
-                  try {
-                    const result = await fetchTalentPoolIndex({ force: true });
-                    if (!result?.success) {
-                      toast.error(result?.error || 'Failed to refresh candidates');
-                    }
-                  } finally {
-                    setIsRevalidating(false);
-                  }
-                  return;
-                }
                 await fetchCandidates(page);
               }}
                 style={{ width: 38, height: 38, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 12, cursor: 'pointer', color: '#64748b', boxShadow: '0 10px 24px rgba(15,23,42,0.05)' }}>

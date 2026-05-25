@@ -430,6 +430,188 @@ def test_browse_candidate_ids_preserves_scope_and_order(monkeypatch):
     assert result["status_counts"]["Shortlisted"] == 1
 
 
+def test_admin_master_browse_includes_master_and_recruiter_rows(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Master Row",
+            "status": "To be started",
+            "owner_user_id": None,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Recruiter A Row",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+        3: {
+            "id": 3,
+            "name": "Recruiter B Row",
+            "status": "Rejected",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            page=1,
+            page_size=25,
+        )
+    )
+
+    assert result["total"] == 3
+    assert {row["id"] for row in result["candidates"]} == {1, 2, 3}
+    assert result["status_counts"]["Shortlisted"] == 1
+    assert result["status_counts"]["Rejected"] == 1
+
+
+def test_admin_recruiter_scope_is_strict_to_selected_recruiter(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Master Row",
+            "status": "Shortlisted",
+            "owner_user_id": None,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Recruiter A Row",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+        3: {
+            "id": 3,
+            "name": "Recruiter B Row",
+            "status": "To be started",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="recruiter_pools",
+            recruiter_filter_id=7,
+            page=1,
+            page_size=25,
+        )
+    )
+
+    assert result["total"] == 1
+    assert [row["id"] for row in result["candidates"]] == [2]
+    assert result["status_counts"] == {"Shortlisted": 1}
+
+
+def test_browse_status_counts_are_before_status_filter_and_total_is_paginated_scope(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Bengaluru Shortlisted A",
+            "city": "Bengaluru",
+            "status": "Shortlisted",
+            "owner_user_id": None,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Bengaluru Shortlisted B",
+            "city": "Bengaluru",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+        3: {
+            "id": 3,
+            "name": "Bengaluru Rejected",
+            "city": "Bengaluru",
+            "status": "Rejected",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+        4: {
+            "id": 4,
+            "name": "Delhi Shortlisted",
+            "city": "Delhi",
+            "status": "Shortlisted",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            city="bengaluru",
+            status="Shortlisted",
+            page=1,
+            page_size=1,
+            sort_by="name",
+            sort_dir="asc",
+        )
+    )
+
+    assert result["total"] == 2
+    assert result["total_pages"] == 2
+    assert len(result["candidates"]) == 1
+    assert result["status_counts"] == {"Shortlisted": 2, "Rejected": 1}
+
+
+def test_admin_master_totals_are_not_capped_at_5000(monkeypatch):
+    profiles = {
+        i: {
+            "id": i,
+            "name": f"Candidate {i:05d}",
+            "status": "Shortlisted" if i % 2 == 0 else "To be started",
+            "owner_user_id": None if i % 3 == 0 else 7,
+            "roles": [{"title": "Account Executive", "company": "Acme"}],
+        }
+        for i in range(1, 5006)
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+            page=2,
+            page_size=25,
+            sort_by="name",
+            sort_dir="asc",
+        )
+    )
+    summary = asyncio.run(
+        browse.browse_summary(
+            current_user=_user(role="admin"),
+            view_scope="master",
+            recruiter_filter_id=None,
+        )
+    )
+
+    assert result["total"] == 5005
+    assert result["total_pages"] == 201
+    assert len(result["candidates"]) == 25
+    assert summary["total"] == 5005
+
+
 def test_generate_config_defaults_to_auto_without_explicit_web(monkeypatch):
     def fake_openai(*args, **kwargs):
         return {

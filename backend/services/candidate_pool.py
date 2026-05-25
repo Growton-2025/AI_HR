@@ -92,7 +92,7 @@ def profile_passes_scope(
     if r == "admin":
         scope = view_scope or VIEW_SCOPE_MASTER
         if scope == VIEW_SCOPE_MASTER:
-            return oid is None
+            return True
         if scope == VIEW_SCOPE_RECRUITER_POOLS:
             return oid is not None and (
                 recruiter_filter_id is None or oid == recruiter_filter_id

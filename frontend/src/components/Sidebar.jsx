@@ -110,16 +110,8 @@ function Sidebar() {
     const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted')
     const analyticsTotal = normalizeCount(analytics?.summary?.total_sourced)
     const analyticsShortlisted = normalizeCount(analytics?.summary?.shortlisted)
-    const isDefaultAdminMasterScope = role === 'admin'
-        && (!talentPoolViewScope || talentPoolViewScope === 'master')
-        && !talentPoolRecruiterFilterId
-        && !talentPoolRoleFilterId
-    const sourcedCount = isDefaultAdminMasterScope
-        ? (analyticsTotal ?? summaryTotal)
-        : (summaryTotal ?? analyticsTotal)
-    const shortlistedCount = isDefaultAdminMasterScope
-        ? (analyticsShortlisted ?? summaryShortlisted)
-        : (summaryShortlisted ?? analyticsShortlisted)
+    const sourcedCount = summaryTotal ?? analyticsTotal
+    const shortlistedCount = summaryShortlisted ?? analyticsShortlisted
 
     return (
         <aside
