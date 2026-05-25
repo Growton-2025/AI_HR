@@ -596,7 +596,9 @@ async def update_status(
     success = update_candidate_status(candidate_id, update.status)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")
-    _invalidate_browse_cache()
+    from backend.api.routes.candidates import invalidate_candidate_count_caches
+
+    invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
     return {"message": "Status updated successfully"}
 
 @router.patch("/candidates/{candidate_id}/notes")

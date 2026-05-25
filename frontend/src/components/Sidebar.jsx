@@ -45,8 +45,14 @@ function Sidebar() {
     const startX = useRef(0)
     const startWidth = useRef(sidebarWidth)
 
-    useEffect(() => { fetchAnalytics() }, [fetchAnalytics])
-    useEffect(() => { fetchTalentPoolSummary() }, [
+    useEffect(() => { fetchAnalytics({ force: true }) }, [
+        fetchAnalytics,
+        role,
+        talentPoolViewScope,
+        talentPoolRecruiterFilterId,
+        talentPoolRoleFilterId,
+    ])
+    useEffect(() => { fetchTalentPoolSummary({ force: true }) }, [
         fetchTalentPoolSummary,
         role,
         talentPoolViewScope,
@@ -102,8 +108,18 @@ function Sidebar() {
     const iconMr  = isIconOnly ? 0 : '9px'
     const summaryTotal = normalizeCount(tpScopeTotal)
     const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted')
-    const sourcedCount = summaryTotal ?? normalizeCount(analytics?.summary?.total_sourced)
-    const shortlistedCount = summaryShortlisted ?? normalizeCount(analytics?.summary?.shortlisted)
+    const analyticsTotal = normalizeCount(analytics?.summary?.total_sourced)
+    const analyticsShortlisted = normalizeCount(analytics?.summary?.shortlisted)
+    const isDefaultAdminMasterScope = role === 'admin'
+        && (!talentPoolViewScope || talentPoolViewScope === 'master')
+        && !talentPoolRecruiterFilterId
+        && !talentPoolRoleFilterId
+    const sourcedCount = isDefaultAdminMasterScope
+        ? (analyticsTotal ?? summaryTotal)
+        : (summaryTotal ?? analyticsTotal)
+    const shortlistedCount = isDefaultAdminMasterScope
+        ? (analyticsShortlisted ?? summaryShortlisted)
+        : (summaryShortlisted ?? analyticsShortlisted)
 
     return (
         <aside

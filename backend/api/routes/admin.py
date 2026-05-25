@@ -192,13 +192,9 @@ async def bulk_assign_master_to_recruiter(
     finally:
         return_db_connection(conn)
 
-    try:
-        from backend.api.routes import browse as browse_mod
+    from backend.api.routes.candidates import invalidate_candidate_count_caches
 
-        browse_mod._invalidate_browse_cache()
-    except Exception:
-        pass
-    query.initialize_cache()
+    invalidate_candidate_count_caches(reload_profiles=True)
     return {"results": results}
 
 
@@ -238,16 +234,9 @@ async def archive_recruiter(user_id: int):
     finally:
         return_db_connection(conn)
 
-    try:
-        from backend.api.routes import browse as browse_mod
+    from backend.api.routes.candidates import invalidate_candidate_count_caches
 
-        browse_mod._invalidate_browse_cache()
-    except Exception:
-        pass
-    try:
-        query.initialize_cache()
-    except Exception:
-        pass
+    invalidate_candidate_count_caches(reload_profiles=True)
     _recruiters_cache = None
     return {
         "message": "Recruiter archived; their pool copies removed. Master profiles unchanged.",

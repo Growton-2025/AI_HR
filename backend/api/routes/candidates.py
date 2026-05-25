@@ -31,6 +31,46 @@ router = APIRouter()
 _analytics_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ANALYTICS_CACHE_TTL = 60
 
+
+def invalidate_candidate_analytics_cache() -> None:
+    """Clear cached analytics summaries after candidate counts/statuses change."""
+    _analytics_cache.clear()
+
+
+def invalidate_candidate_count_caches(
+    *,
+    refresh_profile_ids: Optional[List[int]] = None,
+    reload_profiles: bool = False,
+) -> None:
+    """Invalidate count-bearing caches and optionally refresh the in-memory profile cache."""
+    invalidate_candidate_analytics_cache()
+    try:
+        from backend.api.routes import browse as browse_mod
+
+        browse_mod._invalidate_browse_cache()
+    except Exception:
+        pass
+
+    if reload_profiles:
+        try:
+            from backend.pipeline import query
+
+            query.initialize_cache()
+        except Exception:
+            pass
+        return
+
+    if refresh_profile_ids:
+        try:
+            from backend.pipeline import query
+
+            query.refresh_profiles_in_cache(refresh_profile_ids)
+        except Exception:
+            try:
+                query.initialize_cache()
+            except Exception:
+                pass
+
 @router.get("/candidates")
 async def get_candidates(
     limit: int = 100,
@@ -324,8 +364,7 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
             # Handle alias
             if field == 'phone': profile['mobile_phone'] = value
         PROFILES_BY_ID[candidate_id] = profile
-    from backend.api.routes.browse import _invalidate_browse_cache
-    _invalidate_browse_cache()
+    invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
 
     return {"success": True, "data": data}
 

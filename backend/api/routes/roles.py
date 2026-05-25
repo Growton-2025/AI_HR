@@ -449,12 +449,9 @@ async def assign_candidates(role_name: str, assignment: schemas.CandidateAssignm
                      logger.error(f"Error assigning candidate {item.candidate_id}: {e}")
             
             conn.commit()
-            try:
-                from backend.api.routes import browse as browse_mod
+            from backend.api.routes.candidates import invalidate_candidate_count_caches
 
-                browse_mod._invalidate_browse_cache()
-            except Exception:
-                pass
+            invalidate_candidate_count_caches()
             
             return {
                 "message": f"Assigned {len(assigned_ids)} candidates to '{role_name}'",
@@ -515,12 +512,9 @@ async def remove_candidate_from_role(role_name: str, candidate_id: int, current_
             """, (role_id, candidate_id))
             
             conn.commit()
-            try:
-                from backend.api.routes import browse as browse_mod
+            from backend.api.routes.candidates import invalidate_candidate_count_caches
 
-                browse_mod._invalidate_browse_cache()
-            except Exception:
-                pass
+            invalidate_candidate_count_caches()
             return {"message": "Candidate removed from role"}
     finally:
         return_db_connection(conn)

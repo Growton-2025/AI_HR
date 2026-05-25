@@ -423,26 +423,13 @@ def _mark_upload_failed(upload_id: int, message: str) -> None:
 
 def _refresh_import_caches(touched_ids: List[int]) -> None:
     started = perf_counter()
-    try:
-        from backend.api.routes import browse as browse_mod
-
-        browse_mod._invalidate_browse_cache()
-    except Exception:
-        logger.exception("candidate upload could not invalidate browse cache")
-
     unique_touched = sorted({int(item) for item in touched_ids if item is not None})
-    if unique_touched:
-        try:
-            merged = query.refresh_profiles_in_cache(unique_touched)
-            if merged < len(unique_touched):
-                logger.warning(
-                    "candidate upload refreshed %s/%s touched profiles without a full cache reload",
-                    merged,
-                    len(unique_touched),
-                )
-        except Exception:
-            logger.exception("candidate upload targeted cache refresh failed; reloading cache")
-            query.initialize_cache()
+    try:
+        from backend.api.routes.candidates import invalidate_candidate_count_caches
+
+        invalidate_candidate_count_caches(refresh_profile_ids=unique_touched)
+    except Exception:
+        logger.exception("candidate upload could not invalidate count caches")
     logger.info(
         "candidate upload cache refresh touched=%s duration_ms=%s",
         len(unique_touched),

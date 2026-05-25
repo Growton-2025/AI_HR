@@ -1400,7 +1400,25 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
                         
         geo_map[country] = geo_map.get(country, 0) + 1
     
-    geo_distribution = [{"name": k, "value": v} for k, v in sorted(geo_map.items(), key=lambda x: -x[1]) if v > 0][:8]
+    def top_distribution_with_other(counts: Dict[str, int], limit: int = 8) -> List[Dict[str, Any]]:
+        """Return top buckets while preserving the full total in a rolled-up Other bucket."""
+        buckets = [(k, v) for k, v in sorted(counts.items(), key=lambda x: -x[1]) if v > 0]
+        if len(buckets) <= limit:
+            return [{"name": k, "value": v} for k, v in buckets]
+
+        top = buckets[: max(0, limit - 1)]
+        omitted_total = sum(v for _, v in buckets[max(0, limit - 1):])
+        distribution = [{"name": k, "value": v} for k, v in top]
+
+        for item in distribution:
+            if item["name"] == "Other":
+                item["value"] += omitted_total
+                break
+        else:
+            distribution.append({"name": "Other", "value": omitted_total})
+        return distribution
+
+    geo_distribution = top_distribution_with_other(geo_map)
 
     # 5. Industry distribution (from extracted_industry or role industries)
     industry_map = {}
@@ -1418,7 +1436,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
             industry = industry[:23] + "…"
         industry_map[industry] = industry_map.get(industry, 0) + 1
     
-    industry_distribution = [{"name": k, "value": v} for k, v in sorted(industry_map.items(), key=lambda x: -x[1]) if v > 0][:8]
+    industry_distribution = top_distribution_with_other(industry_map)
 
     # 6. Segment distribution (SMB / Enterprise / Mid-Market etc.)
     segment_map = {}
@@ -1447,7 +1465,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
                 
         segment_map[found_seg] = segment_map.get(found_seg, 0) + 1
 
-    segment_distribution = [{"name": k, "value": v} for k, v in sorted(segment_map.items(), key=lambda x: -x[1]) if v > 0][:8]
+    segment_distribution = top_distribution_with_other(segment_map)
     # 7. Functional distribution (using existing data fields)
     functional_map = {}
     for p in stats_profiles:
@@ -1475,7 +1493,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
 
         functional_map[found_func] = functional_map.get(found_func, 0) + 1
 
-    functional_distribution = [{"name": k, "value": v} for k, v in sorted(functional_map.items(), key=lambda x: -x[1]) if v > 0][:8]
+    functional_distribution = top_distribution_with_other(functional_map)
 
     return {
         "summary": {
