@@ -1175,6 +1175,10 @@ export const useAppStore = create(persist((set, get) => ({
     tpTotal: 0,
     tpTotalPages: 1,
     tpStatusCounts: {},
+    tpScopeTotal: null,
+    tpScopeStatusCounts: {},
+    tpScopeSummaryRequest: null,
+    tpScopeSummaryRequestParamsString: '',
     tpFilters: {
         title: [], titleInput: '',
         company: [], companyInput: '',
@@ -1189,6 +1193,7 @@ export const useAppStore = create(persist((set, get) => ({
     tpPage: 1,
     tpPageSize: 25,
     tpGlobalSearch: '',
+    tpAiRunFocus: null,
 
     setTpFilters: (updater) => set((state) => ({
         tpFilters: typeof updater === 'function' ? updater(state.tpFilters) : updater
@@ -1199,6 +1204,10 @@ export const useAppStore = create(persist((set, get) => ({
     setTpGlobalSearch: (q) => set({ tpGlobalSearch: q }),
     setTpCandidates: (candidates) => set({ tpCandidates: candidates || [] }),
     setTpStatusCounts: (counts) => set({ tpStatusCounts: counts || {} }),
+    setTpScopeSummary: (summary = {}) => set({
+        tpScopeTotal: summary.total ?? null,
+        tpScopeStatusCounts: summary.status_counts || {},
+    }),
     updateTpCandidate: (candidateId, data) => set(state => ({
         tpCandidates: (state.tpCandidates || []).map(c => c.id === candidateId ? { ...c, ...data } : c),
         talentPoolIndex: {
@@ -1245,6 +1254,7 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolViewScope: viewScope,
             talentPoolRecruiterFilterId: recruiterId,
             talentPoolRoleFilterId: '',
+            tpAiRunFocus: null,
             talentPoolCache: { data: null, lastParamsString: null },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
@@ -1259,6 +1269,7 @@ export const useAppStore = create(persist((set, get) => ({
     setTalentPoolRoleFilter: (roleId = '') => {
         set((state) => ({
             talentPoolRoleFilterId: roleId || '',
+            tpAiRunFocus: null,
             talentPoolCache: { data: null, lastParamsString: null },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
@@ -1268,6 +1279,64 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolIndexRequestParamsString: '',
             talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
         }))
+    },
+
+    startTpAiRunFocus: (payload = {}) => {
+        const state = get()
+        const candidateIds = Array.isArray(payload.candidateIds)
+            ? [...new Set(payload.candidateIds.map(Number).filter(Number.isFinite))]
+            : []
+        if (!candidateIds.length) return
+        set({
+            tpAiRunFocus: {
+                runId: payload.runId || null,
+                columnDefinitionId: payload.columnDefinitionId || null,
+                columnName: payload.columnName || 'Smart Column',
+                candidateIds,
+                startedAt: new Date().toISOString(),
+                previousView: {
+                    filters: state.tpFilters,
+                    activeStatusTab: state.tpActiveStatusTab,
+                    sortBy: state.tpSortBy,
+                    sortDir: state.tpSortDir,
+                    page: state.tpPage,
+                    pageSize: state.tpPageSize,
+                    globalSearch: state.tpGlobalSearch,
+                    viewScope: state.talentPoolViewScope,
+                    recruiterFilterId: state.talentPoolRecruiterFilterId,
+                    roleFilterId: state.talentPoolRoleFilterId,
+                },
+            },
+            tpPage: 1,
+            tpCandidates: [],
+            tpTotal: candidateIds.length,
+            tpTotalPages: 1,
+            tpStatusCounts: {},
+            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+        })
+    },
+
+    exitTpAiRunFocus: () => {
+        const focus = get().tpAiRunFocus
+        const previousView = focus?.previousView || {}
+        set({
+            tpAiRunFocus: null,
+            tpFilters: previousView.filters || get().tpFilters,
+            tpActiveStatusTab: previousView.activeStatusTab || '',
+            tpSortBy: previousView.sortBy || get().tpSortBy,
+            tpSortDir: previousView.sortDir || get().tpSortDir,
+            tpPage: previousView.page || 1,
+            tpPageSize: previousView.pageSize || get().tpPageSize,
+            tpGlobalSearch: previousView.globalSearch || '',
+            talentPoolViewScope: previousView.viewScope || get().talentPoolViewScope,
+            talentPoolRecruiterFilterId: previousView.recruiterFilterId || null,
+            talentPoolRoleFilterId: previousView.roleFilterId || '',
+            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+        })
     },
 
     invalidateTalentPoolCaches: (options = {}) => {
@@ -1289,10 +1358,47 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolIndexRequest: null,
             talentPoolIndexRequestParamsString: '',
             talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
-            analytics: null,
-            analyticsLastFetchedAt: 0,
+            tpScopeSummaryRequest: null,
+            tpScopeSummaryRequestParamsString: '',
             analyticsRequest: null,
         }))
+    },
+
+    fetchTalentPoolSummary: async (options = {}) => {
+        const force = options.force === true
+        const scopeQ = get().buildTalentPoolScopeQuery()
+        const paramsString = scopeQ || ''
+        const state = get()
+
+        if (!force && state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
+            return state.tpScopeSummaryRequest
+        }
+
+        const url = paramsString
+            ? `${API_BASE}/candidates/browse/summary?${paramsString}`
+            : `${API_BASE}/candidates/browse/summary`
+        const request = axios.get(url, { timeout: 60000 })
+            .then(res => {
+                const d = res.data || {}
+                set({
+                    tpScopeTotal: d.total ?? 0,
+                    tpScopeStatusCounts: d.status_counts || {},
+                    tpScopeSummaryRequest: null,
+                    tpScopeSummaryRequestParamsString: '',
+                })
+                return { success: true, data: d, cached: false }
+            })
+            .catch(error => {
+                console.error('Failed to fetch talent pool summary:', error)
+                set({ tpScopeSummaryRequest: null, tpScopeSummaryRequestParamsString: '' })
+                return { success: false, error: getRequestErrorMessage(error, 'Failed to load pipeline counts') }
+            })
+
+        set({
+            tpScopeSummaryRequest: request,
+            tpScopeSummaryRequestParamsString: paramsString,
+        })
+        return request
     },
 
     fetchTalentPool: async (paramsString, options = {}) => {
@@ -2046,6 +2152,9 @@ export const useAppStore = create(persist((set, get) => ({
         tpCandidates: state.tpCandidates,
         tpTotal: state.tpTotal,
         tpStatusCounts: state.tpStatusCounts,
+        tpScopeTotal: state.tpScopeTotal,
+        tpScopeStatusCounts: state.tpScopeStatusCounts,
+        tpAiRunFocus: state.tpAiRunFocus,
         talentPoolCache: state.talentPoolCache,
         searchResults: state.searchResults,
         searchQuery: state.searchQuery
@@ -2068,6 +2177,12 @@ export const useAppStore = create(persist((set, get) => ({
             callsRequest: null,
             callsRequestQueryKey: '',
             callStatsRequest: null,
+            tpScopeSummaryRequest: null,
+            tpScopeSummaryRequestParamsString: '',
+            talentPoolRequest: null,
+            talentPoolRequestParamsString: '',
+            talentPoolIndexRequest: null,
+            talentPoolIndexRequestParamsString: '',
             callListsBackoffUntil: 0,
             callStatsBackoffUntil: 0,
             callsBackoffUntilByQuery: {},

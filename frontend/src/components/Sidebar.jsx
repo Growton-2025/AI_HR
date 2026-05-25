@@ -27,15 +27,17 @@ const getStatusCount = (counts, statusName) => {
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
     const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
-    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpCandidates, tpTotal, tpStatusCounts, talentPoolCache } = useAppStore(useShallow((state) => ({
+    const fetchTalentPoolSummary = useAppStore(state => state.fetchTalentPoolSummary)
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
         setSidebarWidth: state.setSidebarWidth,
         toggleSidebar: state.toggleSidebar,
-        tpCandidates: state.tpCandidates,
-        tpTotal: state.tpTotal,
-        tpStatusCounts: state.tpStatusCounts,
-        talentPoolCache: state.talentPoolCache,
+        tpScopeTotal: state.tpScopeTotal,
+        tpScopeStatusCounts: state.tpScopeStatusCounts,
+        talentPoolViewScope: state.talentPoolViewScope,
+        talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
+        talentPoolRoleFilterId: state.talentPoolRoleFilterId,
     })))
     const role = user?.role
     const permissions = user?.permissions || {}
@@ -44,6 +46,13 @@ function Sidebar() {
     const startWidth = useRef(sidebarWidth)
 
     useEffect(() => { fetchAnalytics() }, [fetchAnalytics])
+    useEffect(() => { fetchTalentPoolSummary() }, [
+        fetchTalentPoolSummary,
+        role,
+        talentPoolViewScope,
+        talentPoolRecruiterFilterId,
+        talentPoolRoleFilterId,
+    ])
 
     const isIconOnly = sidebarWidth < ICON_THRESHOLD
 
@@ -91,16 +100,10 @@ function Sidebar() {
     const navPad = isIconOnly ? '8px 8px' : '4px 10px'
     const itemPad = isIconOnly ? '12px 0' : '9px 12px'
     const iconMr  = isIconOnly ? 0 : '9px'
-    const hasTalentPoolSnapshot = Boolean(
-        talentPoolCache?.data ||
-        (Array.isArray(tpCandidates) && tpCandidates.length > 0) ||
-        normalizeCount(tpTotal) > 0 ||
-        (tpStatusCounts && Object.keys(tpStatusCounts).length > 0)
-    )
-    const browseShortlisted = hasTalentPoolSnapshot ? getStatusCount(tpStatusCounts, 'Shortlisted') : null
-    // Total sourced is a global KPI; filtered Talent Pool totals should not rewrite it.
-    const sourcedCount = normalizeCount(analytics?.summary?.total_sourced)
-    const shortlistedCount = normalizeCount(analytics?.summary?.shortlisted) ?? browseShortlisted
+    const summaryTotal = normalizeCount(tpScopeTotal)
+    const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted')
+    const sourcedCount = summaryTotal ?? normalizeCount(analytics?.summary?.total_sourced)
+    const shortlistedCount = summaryShortlisted ?? normalizeCount(analytics?.summary?.shortlisted)
 
     return (
         <aside

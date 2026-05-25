@@ -1,5 +1,18 @@
 import React from 'react';
-import { ExternalLink, ListChecks, ShieldCheck, X } from 'lucide-react';
+import { Clock3, ExternalLink, ListChecks, ShieldCheck, X } from 'lucide-react';
+
+function formatDateTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
 
 export default function AiColumnCellDrawer({ open, loading, detail, title, onClose }) {
   if (!open) return null;
@@ -8,6 +21,12 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
   const details = detail?.details || {};
   const steps = Array.isArray(details.steps) ? details.steps : [];
   const sources = Array.isArray(details.sources) ? details.sources : [];
+  const searchedAt = details.searched_at || detail?.completed_at || detail?.updated_at;
+  const freshnessMeta = [
+    details.web_search_tool,
+    details.web_search_context_size ? `${details.web_search_context_size} context` : '',
+    details.model,
+  ].filter(Boolean).join(' · ');
 
   return (
     <div
@@ -55,6 +74,21 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
               <div style={{ fontSize: 14, color: '#0f172a', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
                 {detail.primary_output || '—'}
               </div>
+            </div>
+
+            <div style={sectionStyle}>
+              <div style={{ ...sectionLabelStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Clock3 size={14} />
+                Freshness
+              </div>
+              <div style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.65 }}>
+                Last searched/updated: {formatDateTime(searchedAt)}
+              </div>
+              {freshnessMeta && (
+                <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                  {freshnessMeta}
+                </div>
+              )}
             </div>
 
             <div style={sectionStyle}>

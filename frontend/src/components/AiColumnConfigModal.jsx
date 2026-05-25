@@ -361,7 +361,7 @@ export default function AiColumnConfigModal({
       const saveRes = await aiColumnAxios.post(`${API_BASE}/ai-columns`, {
         name: resolvedName,
         prompt_template: prompt.trim(),
-        mode: useWebSearch ? 'web_research' : 'content',
+        mode: useWebSearch ? 'web_research' : 'auto',
         output_schema: outputSchema,
         required_fields: requiredFields,
         only_run_if: {
@@ -374,7 +374,7 @@ export default function AiColumnConfigModal({
       }, { timeout: AI_RUN_TIMEOUT_MS });
 
       const definition = saveRes.data || {};
-      await aiColumnAxios.post(`${API_BASE}/ai-columns/run`, {
+      const runRes = await aiColumnAxios.post(`${API_BASE}/ai-columns/run`, {
         column_definition_id: definition.id,
         selection_mode: 'selected_ids',
         selected_ids: selectedIdArray,
@@ -384,7 +384,13 @@ export default function AiColumnConfigModal({
       }, { timeout: AI_RUN_TIMEOUT_MS });
 
       toast.success(`Running "${definition.name || resolvedName}" on ${selectedCount} row${selectedCount === 1 ? '' : 's'}`);
-      onColumnsCreated?.(definition.name || resolvedName, 'selected_ids');
+      onColumnsCreated?.({
+        columnName: definition.name || resolvedName,
+        columnDefinitionId: definition.id,
+        runId: runRes.data?.run_id,
+        candidateIds: selectedIdArray,
+        selectionMode: 'selected_ids',
+      });
       onClose?.();
     } catch (error) {
       toast.error(getRequestErrorMessage(error, 'Failed to start smart column run'));
@@ -689,7 +695,7 @@ export default function AiColumnConfigModal({
             <span style={{ fontSize: 13, color: '#334155', lineHeight: 1.55 }}>
               <span style={{ fontWeight: 800, color: '#0f172a' }}>Use web search</span>
               <span style={{ display: 'block', marginTop: 4, fontSize: 12, color: '#64748b' }}>
-                Off uses only the full row data. On adds live web research for each selected row.
+                Auto uses row data when possible and adds web only for public or time-sensitive prompts. On forces live web research.
               </span>
             </span>
           </label>

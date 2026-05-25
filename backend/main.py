@@ -85,7 +85,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"CRITICAL: Background warmup task scheduling failed: {e}")
 
+    try:
+        ai_columns.start_daily_ai_column_refresh_scheduler()
+    except Exception as e:
+        print(f"AI COLUMN DAILY REFRESH SCHEDULER FAILED TO START: {e}")
+
     yield
+
+    try:
+        ai_columns.stop_daily_ai_column_refresh_scheduler()
+    except Exception:
+        pass
 
     try:
         from backend.db.connection import close_all_connections

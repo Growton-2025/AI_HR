@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,6 +21,9 @@ from backend.pipeline import query
 from backend.services.ai_columns import (
     build_candidate_context,
     build_field_catalog,
+    career_facts_to_text,
+    classify_ai_column_prompt,
+    compute_career_facts,
     default_output_schema,
     evaluate_required_fields,
     extract_prompt_tokens,
@@ -26,6 +31,7 @@ from backend.services.ai_columns import (
     get_profiles_for_scope,
     labelize_key,
     map_raw_outputs_to_schema_keys,
+    map_career_facts_to_outputs,
     normalize_output_key,
     normalize_output_schema,
     safe_json,
@@ -49,10 +55,19 @@ _MAX_PROFILES_FOR_FIELD_CATALOG = int(os.getenv("AI_COLUMN_FIELD_CATALOG_PROFILE
 _MAX_CANDIDATE_IDS_PER_AI_COLUMNS_LIST = int(os.getenv("AI_COLUMN_LIST_CANDIDATE_ID_CAP", "400"))
 # Active runs older than this are usually left behind by a crashed/restarted dev worker.
 _STALE_ACTIVE_RUN_AFTER_MINUTES = int(os.getenv("AI_COLUMN_STALE_ACTIVE_RUN_MINUTES", "240"))
+_AI_COLUMN_OPENAI_MODEL = os.getenv("AI_COLUMN_OPENAI_MODEL", "gpt-4o-mini")
+_AI_COLUMN_WEB_SEARCH_TOOL = os.getenv("AI_COLUMN_WEB_SEARCH_TOOL", "web_search")
+_AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE = os.getenv("AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE", "high")
+_AI_COLUMN_DAILY_REFRESH_ENABLED = os.getenv("AI_COLUMN_DAILY_REFRESH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+_AI_COLUMN_DAILY_REFRESH_TIME = os.getenv("AI_COLUMN_DAILY_REFRESH_TIME", "02:00")
+_AI_COLUMN_DAILY_REFRESH_TIMEZONE = os.getenv("AI_COLUMN_DAILY_REFRESH_TIMEZONE", "Asia/Kolkata")
+_AI_COLUMN_DAILY_REFRESH_MAX_CELLS = int(os.getenv("AI_COLUMN_DAILY_REFRESH_MAX_CELLS", "0") or "0")
 
 _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 _run_threads: dict[int, threading.Thread] = {}
 _run_threads_lock = threading.Lock()
+_daily_refresh_thread: Optional[threading.Thread] = None
+_daily_refresh_stop = threading.Event()
 _list_cache: dict[tuple[Any, ...], tuple[float, List[Dict[str, Any]]]] = {}
 _LIST_CACHE_TTL_SECONDS = 2.0
 
@@ -463,21 +478,157 @@ def _json_block_to_dict(text: str) -> Dict[str, Any]:
             return {}
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _web_search_tool_config(tool_type: Optional[str] = None) -> Dict[str, Any]:
+    normalized_tool = (tool_type or _AI_COLUMN_WEB_SEARCH_TOOL or "web_search").strip()
+    if normalized_tool == "web_search_preview":
+        return {"type": "web_search_preview", "search_context_size": _AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE}
+    return {
+        "type": "web_search",
+        "search_context_size": _AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE,
+    }
+
+
+def _to_plain_openai(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_to_plain_openai(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_plain_openai(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _to_plain_openai(v) for k, v in value.items()}
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _to_plain_openai(model_dump())
+        except Exception:
+            pass
+    as_dict = getattr(value, "dict", None)
+    if callable(as_dict):
+        try:
+            return _to_plain_openai(as_dict())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _collect_response_sources(value: Any) -> List[Dict[str, str]]:
+    plain = _to_plain_openai(value)
+    found: List[Dict[str, str]] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            url = node.get("url")
+            title = node.get("title") or node.get("name")
+            if isinstance(url, str) and url.strip():
+                found.append(
+                    {
+                        "url": url.strip(),
+                        "title": str(title or url).strip(),
+                        "note": str(node.get("note") or node.get("snippet") or "").strip(),
+                    }
+                )
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(plain)
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for source in found:
+        url = source.get("url") or ""
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(source)
+        if len(deduped) >= 8:
+            break
+    return deduped
+
+
+def _linkedin_profile_slug(url: str) -> str:
+    text = str(url or "").strip().lower()
+    match = re.search(r"linkedin\.com/in/([^/?#\s]+)", text)
+    if not match:
+        return ""
+    return re.sub(r"[^a-z0-9\-]", "", match.group(1).strip("/"))
+
+
+def _context_linkedin_slug(context: Dict[str, str]) -> str:
+    for key in ("candidate.linkedin", "Linkedin Profile", "LinkedIn Profile", "linkedin profile"):
+        slug = _linkedin_profile_slug((context or {}).get(key, ""))
+        if slug:
+            return slug
+    return ""
+
+
+def _sources_include_linkedin_slug(sources: List[Dict[str, Any]], expected_slug: str) -> bool:
+    if not expected_slug:
+        return False
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        if _linkedin_profile_slug(str(source.get("url") or "")) == expected_slug:
+            return True
+    return False
+
+
 def _call_openai_for_json(system_prompt: str, user_prompt: str, *, use_web: bool = False) -> Dict[str, Any]:
     if not _openai_client:
         return {}
     try:
         request_timeout = 75.0 if use_web else 35.0
         if use_web:
-            response = _openai_client.responses.create(
-                model="gpt-4o-mini",
-                tools=[{"type": "web_search_preview"}],
-                input=f"{system_prompt}\n\n{user_prompt}",
-                timeout=request_timeout,
+            searched_at = _utc_now_iso()
+            dated_user_prompt = (
+                f"Freshness requirement: perform live web research now. Today is {searched_at[:10]} "
+                f"(UTC timestamp {searched_at}). Prefer current official/company/news sources, "
+                "ignore stale snippets when newer source dates conflict, and include source URLs. "
+                "Every cited source must directly support the target person/company/event in the answer; "
+                "do not cite unrelated industry examples as evidence for the target. If no directly relevant "
+                "current source is found, say no verified current source was found and leave source URLs blank. "
+                "For LinkedIn profile or post activity checks, use only public evidence; if the LinkedIn page, "
+                "posts, or activity cannot be publicly verified, return Not publicly verifiable with low confidence.\n\n"
+                f"{user_prompt}"
             )
-            return _json_block_to_dict(response.output_text or "")
+            tool_config = _web_search_tool_config()
+            try:
+                response = _openai_client.responses.create(
+                    model=_AI_COLUMN_OPENAI_MODEL,
+                    tools=[tool_config],
+                    input=f"{system_prompt}\n\n{dated_user_prompt}",
+                    timeout=request_timeout,
+                )
+            except Exception:
+                if tool_config.get("type") == "web_search_preview":
+                    raise
+                logger.warning(
+                    "AI columns web_search failed; retrying with web_search_preview",
+                    exc_info=True,
+                )
+                tool_config = _web_search_tool_config("web_search_preview")
+                response = _openai_client.responses.create(
+                    model=_AI_COLUMN_OPENAI_MODEL,
+                    tools=[tool_config],
+                    input=f"{system_prompt}\n\n{dated_user_prompt}",
+                    timeout=request_timeout,
+                )
+            parsed = _json_block_to_dict(response.output_text or "")
+            parsed.setdefault("sources", _collect_response_sources(response))
+            parsed["searched_at"] = searched_at
+            parsed["freshness_date"] = searched_at[:10]
+            parsed["web_search_tool"] = tool_config.get("type") or ""
+            parsed["web_search_context_size"] = tool_config.get("search_context_size") or ""
+            parsed["model"] = _AI_COLUMN_OPENAI_MODEL
+            return parsed
         response = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=_AI_COLUMN_OPENAI_MODEL,
             temperature=0.2,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -558,8 +709,19 @@ def _generate_config(
         "recent news",
         "company website",
         "website research",
+        "posted content",
+        "layoff",
+        "layoffs",
+        "restructuring",
+        "enterprise segment",
+        "saas company",
+        "link to jd",
+        "jd url",
     )
     if mode == "web_research" and not any(term in goal_l for term in explicit_web_terms):
+        mode = "auto"
+    smart_route = classify_ai_column_prompt(trimmed_goal)
+    if smart_route.get("data_source") in {"web", "hybrid"}:
         mode = "auto"
     if prefer_web_search:
         mode = "web_research"
@@ -591,6 +753,59 @@ def _run_ai_task(
     full_row_context = _format_full_row_context(context)
     normalized_outputs = normalize_output_schema(output_schema)
     primary_output_key = next((item["key"] for item in normalized_outputs if item.get("primary")), normalized_outputs[0]["key"])
+    routing = classify_ai_column_prompt(rendered_prompt or prompt_template)
+    data_source = routing.get("data_source") or ("web" if mode == "web_research" else "row")
+    web_required_reason = routing.get("web_required_reason") or ""
+    career_facts = compute_career_facts(context)
+    career_outputs = map_career_facts_to_outputs(rendered_prompt or prompt_template, normalized_outputs, career_facts)
+    career_context_text = career_facts_to_text(career_facts)
+
+    def build_result_from_outputs(
+        values: Dict[str, Any],
+        *,
+        reasoning: str,
+        confidence: str = "high",
+        source_kind: str = "row",
+        steps: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        normalized_values = {item["key"]: str(values.get(item["key"]) or "") for item in normalized_outputs}
+        primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
+        details = {
+            "response": primary_output,
+            "outputs": normalized_values,
+            "reasoning": reasoning,
+            "confidence": confidence,
+            "steps": steps or [],
+            "sources": [],
+            "data_source": source_kind,
+            "web_required_reason": "",
+            "source_verification_status": "row_context",
+            "searched_at": "",
+            "freshness_date": "",
+            "web_search_tool": "",
+            "web_search_context_size": "",
+            "model": _AI_COLUMN_OPENAI_MODEL,
+            "rendered_prompt": rendered_prompt,
+            "row_context_keys": list((context or {}).keys()),
+            "career_facts": career_facts,
+            "raw_model_output": {"outputs": normalized_values},
+        }
+        return {
+            "primary_output": primary_output,
+            "outputs": normalized_values,
+            "details": details,
+        }
+
+    if mode in {"auto", "content"} and routing.get("data_source") == "row" and career_outputs:
+        return build_result_from_outputs(
+            career_outputs,
+            reasoning=(
+                "Computed from structured row role history. Multiple roles at the same company were counted as one "
+                "company, and community/membership roles were excluded where identifiable."
+            ),
+            source_kind="row",
+            steps=["Parsed row role history", "Collapsed same-company roles", "Computed career metrics"],
+        )
 
     if not _openai_client:
         fallback_outputs = {item["key"]: "" for item in normalized_outputs}
@@ -605,8 +820,12 @@ def _run_ai_task(
                 "confidence": "low",
                 "steps": [],
                 "sources": [],
+                "data_source": data_source,
+                "web_required_reason": web_required_reason,
+                "source_verification_status": "not_configured",
                 "rendered_prompt": rendered_prompt,
                 "row_context_keys": list((context or {}).keys()),
+                "career_facts": career_facts,
                 "raw_model_output": {},
             },
         }
@@ -631,16 +850,31 @@ def _run_ai_task(
         f"Full row context JSON:\n{full_row_context}\n\n"
         f"User prompt:\n{rendered_prompt or prompt_template}"
     )
+    if career_context_text:
+        user_prompt = (
+            f"{user_prompt}\n\n{career_context_text}\n"
+            "Use these deterministic career facts for tenure, city-count, total-experience, and AE-experience calculations."
+        )
+
     if mode == "web_research":
+        data_source = "hybrid" if routing.get("data_source") == "hybrid" else "web"
         structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
     elif mode == "content":
+        data_source = "row"
         structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
     else:
-        structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
-        auto_outputs = structured.get("outputs") if isinstance(structured.get("outputs"), dict) else {}
-        has_row_answer = any(str(auto_outputs.get(item["key"]) or "").strip() for item in normalized_outputs)
-        if not has_row_answer:
+        if routing.get("data_source") in {"web", "hybrid"}:
+            data_source = routing.get("data_source") or "web"
+            web_required_reason = web_required_reason or "classified_public_or_fresh_prompt"
             structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
+        else:
+            structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
+            auto_outputs = structured.get("outputs") if isinstance(structured.get("outputs"), dict) else {}
+            has_row_answer = any(str(auto_outputs.get(item["key"]) or "").strip() for item in normalized_outputs)
+            if not has_row_answer:
+                data_source = "web"
+                web_required_reason = web_required_reason or "row_context_insufficient"
+                structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
 
     outputs = structured.get("outputs")
     if not isinstance(outputs, dict):
@@ -656,15 +890,44 @@ def _run_ai_task(
             normalized_values[item["key"]] = fb
 
     primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
+    sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
+    verification_status = "verified" if sources else ("not_publicly_verifiable" if data_source in {"web", "hybrid"} else "row_context")
+    expected_linkedin_slug = _context_linkedin_slug(context)
+    prompt_l = (rendered_prompt or prompt_template or "").lower()
+    requires_direct_linkedin_source = (
+        expected_linkedin_slug
+        and "linkedin" in prompt_l
+        and (
+            web_required_reason == "public_linkedin_recent_activity"
+            or "linkedin url as the starting point" in prompt_l
+            or "candidate:" in prompt_l
+        )
+    )
+    if requires_direct_linkedin_source and not _sources_include_linkedin_slug(sources, expected_linkedin_slug):
+        sources = []
+        verification_status = "not_publicly_verifiable"
+    if web_required_reason == "public_linkedin_recent_activity" and verification_status == "not_publicly_verifiable":
+        for key in normalized_values:
+            normalized_values[key] = "Not publicly verifiable" if key == primary_output_key or key in {"result", "summary", "activity", "posted"} else ""
+        primary_output = normalized_values.get(primary_output_key) or "Not publicly verifiable"
     details = {
         "response": primary_output,
         "outputs": normalized_values,
         "reasoning": str(structured.get("reasoning") or "").strip(),
         "confidence": str(structured.get("confidence") or "medium").strip().lower(),
         "steps": structured.get("steps") if isinstance(structured.get("steps"), list) else [],
-        "sources": structured.get("sources") if isinstance(structured.get("sources"), list) else [],
+        "sources": sources,
+        "data_source": data_source,
+        "web_required_reason": web_required_reason,
+        "source_verification_status": verification_status,
+        "searched_at": str(structured.get("searched_at") or "").strip(),
+        "freshness_date": str(structured.get("freshness_date") or "").strip(),
+        "web_search_tool": str(structured.get("web_search_tool") or "").strip(),
+        "web_search_context_size": str(structured.get("web_search_context_size") or "").strip(),
+        "model": str(structured.get("model") or _AI_COLUMN_OPENAI_MODEL).strip(),
         "rendered_prompt": rendered_prompt,
         "row_context_keys": list((context or {}).keys()),
+        "career_facts": career_facts,
         "raw_model_output": structured,
     }
     return {
@@ -1133,6 +1396,172 @@ def _spawn_run_thread(
     with _run_threads_lock:
         _run_threads[run_id] = worker
     worker.start()
+
+
+def _parse_daily_refresh_time(value: str) -> tuple[int, int]:
+    try:
+        hour_s, minute_s = (value or "02:00").split(":", 1)
+        hour = min(23, max(0, int(hour_s)))
+        minute = min(59, max(0, int(minute_s)))
+        return hour, minute
+    except Exception:
+        return 2, 0
+
+
+def _seconds_until_next_daily_refresh(now: Optional[datetime] = None) -> float:
+    tz = ZoneInfo(_AI_COLUMN_DAILY_REFRESH_TIMEZONE)
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    hour, minute = _parse_daily_refresh_time(_AI_COLUMN_DAILY_REFRESH_TIME)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(1.0, (target - now).total_seconds())
+
+
+def _user_from_db_row(row: Any) -> schemas.User:
+    return schemas.User(
+        id=int(row[0]),
+        username=row[1] or row[2] or f"user-{row[0]}",
+        email=row[2] or row[1] or f"user-{row[0]}@local",
+        full_name=row[3] or row[1] or "",
+        role=row[4] or "recruiter",
+        permissions={},
+    )
+
+
+def _fetch_daily_refresh_groups(max_cells: int = 0) -> List[Dict[str, Any]]:
+    limit_sql = "LIMIT %s" if max_cells and max_cells > 0 else ""
+    params: List[Any] = []
+    if limit_sql:
+        params.append(max_cells)
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            return []
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH stale_cells AS (
+                    SELECT c.column_definition_id, c.candidate_id
+                    FROM ai_column_cells c
+                    JOIN ai_column_definitions d ON d.id = c.column_definition_id
+                    WHERE COALESCE(d.is_archived, FALSE) = FALSE
+                      AND c.status = 'completed'
+                      AND COALESCE(c.completed_at, c.updated_at, c.created_at) < NOW() - INTERVAL '24 hours'
+                      AND (
+                        d.mode = 'web_research'
+                        OR COALESCE(c.details->>'data_source', '') IN ('web', 'hybrid')
+                      )
+                    ORDER BY COALESCE(c.completed_at, c.updated_at, c.created_at) ASC
+                    {limit_sql}
+                )
+                SELECT d.id,
+                       d.owner_user_id,
+                       u.email,
+                       u.name,
+                       u.role,
+                       COALESCE(array_agg(sc.candidate_id ORDER BY sc.candidate_id), '{{}}'::int[]) AS candidate_ids
+                FROM stale_cells sc
+                JOIN ai_column_definitions d ON d.id = sc.column_definition_id
+                LEFT JOIN users u ON u.id = d.owner_user_id
+                GROUP BY d.id, d.owner_user_id, u.email, u.name, u.role
+                ORDER BY d.id
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    groups = []
+    for row in rows:
+        if not row[1]:
+            logger.warning("Skipping daily AI refresh for definition %s without owner_user_id", row[0])
+            continue
+        groups.append(
+            {
+                "definition_id": int(row[0]),
+                "user": _user_from_db_row((row[1], row[2], row[2], row[3], row[4])),
+                "candidate_ids": [int(cid) for cid in (row[5] or [])],
+            }
+        )
+    return groups
+
+
+def _create_internal_refresh_run(column_definition_id: int, candidate_ids: List[int]) -> Optional[int]:
+    if not candidate_ids:
+        return None
+    payload = {
+        "selection_mode": "daily_stale_refresh",
+        "selected_ids": candidate_ids,
+        "reason": "Refresh existing stale web/hybrid AI-column cells older than 24 hours.",
+    }
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            return None
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ai_column_runs (
+                    column_definition_id, selection_mode, selection_payload, total,
+                    completed, failed, skipped, status, created_at, updated_at
+                )
+                VALUES (%s, 'daily_stale_refresh', %s::jsonb, %s, 0, 0, 0, 'queued', NOW(), NOW())
+                RETURNING id
+                """,
+                (column_definition_id, json.dumps(payload, ensure_ascii=False), len(candidate_ids)),
+            )
+            run_id = int(cur.fetchone()[0])
+            conn.commit()
+            return run_id
+
+
+def refresh_stale_web_ai_columns_once(*, max_cells: Optional[int] = None) -> Dict[str, Any]:
+    max_count = _AI_COLUMN_DAILY_REFRESH_MAX_CELLS if max_cells is None else int(max_cells or 0)
+    groups = _fetch_daily_refresh_groups(max_count)
+    refreshed = 0
+    runs = []
+    for group in groups:
+        candidate_ids = group["candidate_ids"]
+        run_id = _create_internal_refresh_run(group["definition_id"], candidate_ids)
+        if not run_id:
+            continue
+        runs.append(run_id)
+        logger.info(
+            "Daily AI-column stale refresh starting run_id=%s definition_id=%s candidates=%s",
+            run_id,
+            group["definition_id"],
+            len(candidate_ids),
+        )
+        _process_ai_run(run_id, group["user"], candidate_ids, group["definition_id"], role_id=None)
+        refreshed += len(candidate_ids)
+    if refreshed:
+        _clear_list_cache()
+    return {"groups": len(groups), "runs": runs, "cells": refreshed}
+
+
+def start_daily_ai_column_refresh_scheduler() -> None:
+    global _daily_refresh_thread
+    if not _AI_COLUMN_DAILY_REFRESH_ENABLED:
+        logger.info("AI-column daily stale refresh disabled")
+        return
+    if _daily_refresh_thread and _daily_refresh_thread.is_alive():
+        return
+    _daily_refresh_stop.clear()
+
+    def _loop() -> None:
+        while not _daily_refresh_stop.is_set():
+            wait_s = _seconds_until_next_daily_refresh()
+            if _daily_refresh_stop.wait(wait_s):
+                break
+            try:
+                result = refresh_stale_web_ai_columns_once()
+                logger.info("AI-column daily stale refresh completed: %s", result)
+            except Exception:
+                logger.exception("AI-column daily stale refresh failed")
+
+    _daily_refresh_thread = threading.Thread(target=_loop, daemon=True, name="ai-column-daily-refresh")
+    _daily_refresh_thread.start()
+
+
+def stop_daily_ai_column_refresh_scheduler() -> None:
+    _daily_refresh_stop.set()
 
 
 def _parse_candidate_ids_query(raw: Optional[str]) -> List[int]:

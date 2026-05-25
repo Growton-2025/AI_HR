@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from backend.services.candidate_pool import profile_passes_scope
@@ -82,7 +83,34 @@ COLUMN_CONTEXT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
 )
 
 TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
+URL_PATTERN = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
 MAX_IMPORTED_FIELDS = 120
+COMMUNITY_MEMBERSHIP_TERMS = (
+    "revgenuis",
+    "revgenius",
+    "community",
+    "member",
+    "membership",
+    "mentor",
+    "advisor",
+    "volunteer",
+)
+WEB_FRESHNESS_TERMS = (
+    "recent",
+    "latest",
+    "last 30 days",
+    "last thirty days",
+    "today",
+    "current news",
+    "layoff",
+    "layoffs",
+    "restructuring",
+    "downsizing",
+    "funding",
+    "acquisition",
+    "posted content",
+    "posted on linkedin",
+)
 
 
 def _context_value_is_empty(value: Any) -> bool:
@@ -287,6 +315,339 @@ def stringify_context_value(value: Any) -> str:
         except Exception:
             return ""
     return str(value).strip()
+
+
+def extract_urls(text: str) -> List[str]:
+    return [match.group(0).rstrip(".,;") for match in URL_PATTERN.finditer(text or "")]
+
+
+def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
+    """Decide whether an AI-column prompt should use row data, web, or both."""
+    prompt = (prompt_template or "").strip()
+    lower = prompt.lower()
+    urls = extract_urls(prompt)
+
+    linkedin_activity = (
+        "linkedin" in lower
+        and (
+            "posted" in lower
+            or "post " in lower
+            or "posts" in lower
+            or "content" in lower
+            or "activity" in lower
+        )
+        and ("last 30" in lower or "30 days" in lower or "recent" in lower)
+    )
+    if linkedin_activity:
+        return {
+            "data_source": "web",
+            "web_required_reason": "public_linkedin_recent_activity",
+            "routing_mode": "web_research",
+        }
+
+    if urls and ("jd" in lower or "job description" in lower or "score" in lower or "fit" in lower):
+        return {
+            "data_source": "hybrid",
+            "web_required_reason": "jd_url_or_public_fit_evidence",
+            "routing_mode": "web_research",
+        }
+
+    if any(term in lower for term in ("score", "fit score", "against this jd", "job description", "paste jd")):
+        return {
+            "data_source": "hybrid",
+            "web_required_reason": "jd_fit_requires_public_verification",
+            "routing_mode": "web_research",
+        }
+
+    if "account executive" in lower and (
+        "enterprise" in lower or "saas" in lower or "10+" in lower or "overall experience" in lower
+    ):
+        return {
+            "data_source": "hybrid",
+            "web_required_reason": "ae_experience_and_employer_segment_verification",
+            "routing_mode": "web_research",
+        }
+
+    if "enterprise" in lower and "saas" in lower and ("currently working" in lower or "current" in lower):
+        return {
+            "data_source": "hybrid",
+            "web_required_reason": "current_employer_enterprise_saas_verification",
+            "routing_mode": "web_research",
+        }
+
+    if any(term in lower for term in WEB_FRESHNESS_TERMS) or any(
+        term in lower for term in ("public evidence", "publicly", "web", "website", "news")
+    ):
+        return {
+            "data_source": "web",
+            "web_required_reason": "fresh_or_public_web_evidence_requested",
+            "routing_mode": "web_research",
+        }
+
+    if any(
+        term in lower
+        for term in (
+            "average tenure",
+            "current job",
+            "time spent",
+            "overall experience",
+            "total years",
+            "number of cities",
+            "cities the person has worked",
+            "unique companies",
+        )
+    ):
+        return {
+            "data_source": "row",
+            "web_required_reason": "",
+            "routing_mode": "content",
+        }
+
+    return {
+        "data_source": "row",
+        "web_required_reason": "",
+        "routing_mode": "content",
+    }
+
+
+def _parse_role_context_entries(context: Dict[str, str]) -> List[Dict[str, str]]:
+    grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
+    for key, value in (context or {}).items():
+        match = re.match(r"row\.roles\.(\d+)\.(.+)", str(key))
+        if not match:
+            continue
+        text = stringify_context_value(value)
+        if text:
+            grouped[int(match.group(1))][match.group(2)] = text
+    entries = [grouped[idx] for idx in sorted(grouped)]
+    if not entries and (context.get("role.current_company") or context.get("role.current_title")):
+        entries.append(
+            {
+                "company": context.get("role.current_company", ""),
+                "title": context.get("role.current_title", ""),
+                "start_date": context.get("role.start_date", ""),
+                "end_date": context.get("role.end_date", ""),
+                "industry": context.get("role.current_industry", ""),
+            }
+        )
+    return entries
+
+
+def _normalize_company_name(company: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", (company or "").lower()).strip()
+    text = re.sub(r"\b(private|pvt|ltd|limited|inc|corp|corporation|llc|plc|company|co)\b", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _role_is_community_membership(role: Dict[str, str]) -> bool:
+    combined = " ".join(
+        stringify_context_value(role.get(key))
+        for key in ("title", "company", "headline", "description", "summary")
+    ).lower()
+    if "revgenuis" in combined:
+        combined = combined.replace("revgenuis", "revgenius")
+    return any(term in combined for term in COMMUNITY_MEMBERSHIP_TERMS)
+
+
+def _parse_role_date(value: str, *, default_current: bool = False) -> Optional[datetime]:
+    text = stringify_context_value(value).strip()
+    if not text:
+        return datetime.now(timezone.utc) if default_current else None
+    lower = text.lower()
+    if lower in {"present", "current", "now", "till date", "ongoing"}:
+        return datetime.now(timezone.utc)
+    patterns = (
+        "%Y-%m-%d",
+        "%Y-%m",
+        "%Y",
+        "%b %Y",
+        "%B %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+    )
+    normalized = text.replace(",", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for pattern in patterns:
+        try:
+            parsed = datetime.strptime(normalized, pattern)
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    year_match = re.search(r"\b(19|20)\d{2}\b", normalized)
+    if year_match:
+        return datetime(int(year_match.group(0)), 1, 1, tzinfo=timezone.utc)
+    return None
+
+
+def _months_between(start: Optional[datetime], end: Optional[datetime]) -> int:
+    if not start:
+        return 0
+    end = end or datetime.now(timezone.utc)
+    if end < start:
+        return 0
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if end.day >= start.day:
+        months += 1
+    return max(0, months)
+
+
+def _float_context(context: Dict[str, str], key: str) -> float:
+    try:
+        return float(stringify_context_value(context.get(key)).replace(",", ""))
+    except Exception:
+        return 0.0
+
+
+def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
+    roles = [role for role in _parse_role_context_entries(context) if not _role_is_community_membership(role)]
+    companies: Dict[str, Dict[str, Any]] = {}
+    cities = set()
+    ae_months = 0
+
+    for idx, role in enumerate(roles):
+        company = stringify_context_value(role.get("company"))
+        normalized_company = _normalize_company_name(company)
+        if not normalized_company:
+            continue
+        start = _parse_role_date(role.get("start_date") or role.get("starts_at") or role.get("start"))
+        end = _parse_role_date(role.get("end_date") or role.get("ends_at") or role.get("end"), default_current=idx == 0)
+        months = _months_between(start, end)
+        title = stringify_context_value(role.get("title"))
+        location = stringify_context_value(role.get("city") or role.get("location"))
+        if location:
+            cities.add(location.lower())
+        bucket = companies.setdefault(
+            normalized_company,
+            {"company": company, "months": 0, "starts": [], "ends": [], "titles": []},
+        )
+        bucket["months"] += months
+        if start:
+            bucket["starts"].append(start)
+        if end:
+            bucket["ends"].append(end)
+        if title:
+            bucket["titles"].append(title)
+        if "account executive" in title.lower():
+            ae_months += months
+
+    for company in companies.values():
+        starts = company.get("starts") or []
+        ends = company.get("ends") or []
+        if starts:
+            company["months"] = _months_between(min(starts), max(ends) if ends else None)
+
+    total_months_from_roles = sum(int(company.get("months") or 0) for company in companies.values())
+    total_exp_years = _float_context(context, "candidate.total_experience_years")
+    total_months = total_months_from_roles or int(round(total_exp_years * 12))
+    unique_company_count = len(companies)
+    average_tenure_months = int(round(total_months / unique_company_count)) if unique_company_count else 0
+
+    current_role = roles[0] if roles else {}
+    current_start = _parse_role_date(
+        current_role.get("start_date") or current_role.get("starts_at") or current_role.get("start")
+    )
+    current_end = _parse_role_date(
+        current_role.get("end_date") or current_role.get("ends_at") or current_role.get("end"),
+        default_current=True,
+    )
+    current_job_months = _months_between(current_start, current_end)
+    if context.get("candidate.city"):
+        cities.add(context["candidate.city"].lower())
+
+    return {
+        "total_experience_months": total_months,
+        "total_experience_years": round(total_months / 12, 1) if total_months else total_exp_years,
+        "unique_company_count": unique_company_count,
+        "average_tenure_months": average_tenure_months,
+        "current_job_months": current_job_months,
+        "ae_experience_months": ae_months,
+        "ae_experience_years": round(ae_months / 12, 1),
+        "career_city_count": len(cities),
+        "career_cities": sorted(cities),
+        "companies": [company["company"] for company in companies.values()],
+    }
+
+
+def career_facts_to_text(facts: Dict[str, Any]) -> str:
+    if not facts:
+        return ""
+    return (
+        "Deterministic row-derived career facts:\n"
+        f"- total_experience_months: {facts.get('total_experience_months') or 0}\n"
+        f"- total_experience_years: {facts.get('total_experience_years') or 0}\n"
+        f"- unique_company_count: {facts.get('unique_company_count') or 0}\n"
+        f"- average_tenure_months: {facts.get('average_tenure_months') or 0}\n"
+        f"- current_job_months: {facts.get('current_job_months') or 0}\n"
+        f"- ae_experience_months: {facts.get('ae_experience_months') or 0}\n"
+        f"- career_city_count: {facts.get('career_city_count') or 0}\n"
+        f"- companies_counted: {', '.join(facts.get('companies') or []) or 'unknown'}"
+    )
+
+
+def map_career_facts_to_outputs(
+    prompt_template: str,
+    output_schema: Sequence[Dict[str, Any]],
+    facts: Dict[str, Any],
+) -> Dict[str, str]:
+    prompt_l = (prompt_template or "").lower()
+    wants_career = any(
+        term in prompt_l
+        for term in (
+            "average tenure",
+            "current job",
+            "time spent",
+            "number of cities",
+            "cities the person has worked",
+            "total years",
+            "overall experience",
+            "unique companies",
+        )
+    )
+    if not wants_career or not facts:
+        return {}
+
+    outputs: Dict[str, str] = {}
+    yes_no = ""
+    if "10+" in prompt_l or "10 plus" in prompt_l or "minimum 5+" in prompt_l:
+        qualified = (
+            float(facts.get("total_experience_months") or 0) >= 120
+            and float(facts.get("ae_experience_months") or 0) >= 60
+        )
+        yes_no = "Yes" if qualified else "No"
+
+    summary = (
+        f"Average tenure: {facts.get('average_tenure_months') or 0} months. "
+        f"Current job tenure: {facts.get('current_job_months') or 0} months. "
+        f"Unique companies counted: {facts.get('unique_company_count') or 0}. "
+        f"Career cities counted: {facts.get('career_city_count') or 0}."
+    )
+    if yes_no:
+        summary += f" Qualification from row experience only: {yes_no}."
+
+    for item in normalize_output_schema(output_schema):
+        key = item["key"]
+        label = f"{key} {item.get('label', '')}".lower()
+        if "average" in label and "tenure" in label:
+            outputs[key] = str(facts.get("average_tenure_months") or 0)
+        elif "current" in label and ("job" in label or "tenure" in label or "role" in label):
+            outputs[key] = str(facts.get("current_job_months") or 0)
+        elif "city" in label and "count" in label:
+            outputs[key] = str(facts.get("career_city_count") or 0)
+        elif "cities" in label:
+            outputs[key] = ", ".join(facts.get("career_cities") or [])
+        elif "company" in label and "count" in label:
+            outputs[key] = str(facts.get("unique_company_count") or 0)
+        elif "total" in label and ("experience" in label or "month" in label):
+            outputs[key] = str(facts.get("total_experience_months") or 0)
+        elif "ae" in label or "account_executive" in label or "account executive" in label:
+            outputs[key] = str(facts.get("ae_experience_months") or 0)
+        elif "qualified" in label or "qualification" in label or "eligible" in label:
+            outputs[key] = yes_no or "Needs web verification"
+        elif key in {"result", "summary", "reasoning"}:
+            outputs[key] = summary
+        else:
+            outputs[key] = summary
+    return outputs
 
 
 def extract_prompt_tokens(prompt_template: str) -> List[str]:

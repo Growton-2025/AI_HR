@@ -609,31 +609,38 @@ function buildTalentPoolParamsString({
   activeStatusTab = '',
   sortBy = 'name',
   sortDir = 'asc',
+  candidateIds = [],
 }) {
   const params = new URLSearchParams();
-  params.set('page', page);
-  params.set('page_size', pageSize || 25);
+  const normalizedCandidateIds = Array.isArray(candidateIds)
+    ? candidateIds.map(Number).filter(Number.isFinite)
+    : [];
+  params.set('page', normalizedCandidateIds.length ? 1 : page);
+  params.set('page_size', normalizedCandidateIds.length ? Math.min(5000, Math.max(pageSize || 25, normalizedCandidateIds.length)) : (pageSize || 25));
+  if (normalizedCandidateIds.length) {
+    params.set('candidate_ids', normalizedCandidateIds.join(','));
+  }
 
-  if (globalSearch) params.set('q', globalSearch);
+  if (!normalizedCandidateIds.length && globalSearch) params.set('q', globalSearch);
 
   const titleSearch = splitTalentPoolFilterValues(filters?.title, filters?.titleInput).join(',');
-  if (titleSearch) params.set('title', titleSearch);
+  if (!normalizedCandidateIds.length && titleSearch) params.set('title', titleSearch);
 
   const companySearch = splitTalentPoolFilterValues(filters?.company, filters?.companyInput).join(',');
-  if (companySearch) params.set('company', companySearch);
+  if (!normalizedCandidateIds.length && companySearch) params.set('company', companySearch);
 
   const citySearch = splitTalentPoolFilterValues(filters?.city, filters?.cityInput).join(',');
-  if (citySearch) params.set('city', citySearch);
+  if (!normalizedCandidateIds.length && citySearch) params.set('city', citySearch);
 
   const productSearch = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput).join(',');
-  if (productSearch) params.set('product_service', productSearch);
+  if (!normalizedCandidateIds.length && productSearch) params.set('product_service', productSearch);
 
-  if (activeStatusTab) params.set('status', activeStatusTab);
-  else if (filters?.status) params.set('status', filters.status);
+  if (!normalizedCandidateIds.length && activeStatusTab) params.set('status', activeStatusTab);
+  else if (!normalizedCandidateIds.length && filters?.status) params.set('status', filters.status);
 
-  if (filters?.min_exp !== undefined && filters?.min_exp !== '') params.set('min_exp', filters.min_exp);
-  if (filters?.max_exp !== undefined && filters?.max_exp !== '') params.set('max_exp', filters.max_exp);
-  if (filters?.created_by) params.set('created_by', filters.created_by);
+  if (!normalizedCandidateIds.length && filters?.min_exp !== undefined && filters?.min_exp !== '') params.set('min_exp', filters.min_exp);
+  if (!normalizedCandidateIds.length && filters?.max_exp !== undefined && filters?.max_exp !== '') params.set('max_exp', filters.max_exp);
+  if (!normalizedCandidateIds.length && filters?.created_by) params.set('created_by', filters.created_by);
 
   params.set('sort_by', sortBy);
   params.set('sort_dir', sortDir);
@@ -766,6 +773,27 @@ function summarizeAiRun(run) {
   return base;
 }
 
+const AI_CELL_STALE_MS = 24 * 60 * 60 * 1000;
+
+function formatAiCellTimestamp(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function isAiCellStale(value) {
+  if (!value) return false;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  return Date.now() - date.getTime() > AI_CELL_STALE_MS;
+}
+
 const readPersistedContactInfo = () => {
   if (typeof window === 'undefined') return {};
   try {
@@ -894,6 +922,64 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function CompactMetricsStrip({ analytics, tpTotal, tpStatusCounts, expanded, onToggle }) {
+  const summary = analytics?.summary || {};
+  const totalSourced = summary.total_sourced != null ? summary.total_sourced : tpTotal;
+  const shortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted || 0;
+  const followUp = (tpStatusCounts || summary.pipeline_health || {})['Followup / In conversation'] || 0;
+  const conversion = totalSourced > 0 ? Math.round((shortlisted / totalSourced) * 100) : 0;
+  const items = [
+    ['Total sourced', totalSourced],
+    ['Shortlisted', shortlisted],
+    ['Conversion', `${conversion}%`],
+    ['Follow up', followUp],
+  ];
+
+  return (
+    <div style={{
+      padding: '9px 20px',
+      borderTop: `1px solid rgba(226, 232, 240, 0.9)`,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 14,
+      flexWrap: 'wrap',
+      background: 'rgba(248,250,252,0.72)',
+    }}>
+      {items.map(([label, value]) => (
+        <div key={label} style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 }}>
+          <span style={{ fontSize: 11, color: '#64748b', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            {label}
+          </span>
+          <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 850 }}>
+            {typeof value === 'number' ? value.toLocaleString() : value}
+          </span>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={onToggle}
+        style={{
+          marginLeft: 'auto',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          border: '1px solid rgba(203, 213, 225, 0.9)',
+          background: '#fff',
+          color: '#334155',
+          borderRadius: 10,
+          padding: '6px 10px',
+          fontSize: 11.5,
+          fontWeight: 800,
+          cursor: 'pointer',
+        }}
+      >
+        {expanded ? 'Hide metrics' : 'Show metrics'}
+        {expanded ? <ChevronLeft size={13} style={{ transform: 'rotate(90deg)' }} /> : <ChevronRight size={13} style={{ transform: 'rotate(90deg)' }} />}
+      </button>
     </div>
   );
 }
@@ -1579,6 +1665,8 @@ export default function TalentPool() {
   const total = useAppStore(state => state.tpTotal);
   const totalPages = useAppStore(state => state.tpTotalPages);
   const statusCounts = useAppStore(state => state.tpStatusCounts);
+  const scopeTotal = useAppStore(state => state.tpScopeTotal);
+  const scopeStatusCounts = useAppStore(state => state.tpScopeStatusCounts);
   const filters = useAppStore(state => state.tpFilters);
   const activeStatusTab = useAppStore(state => state.tpActiveStatusTab);
   const sortBy = useAppStore(state => state.tpSortBy);
@@ -1593,6 +1681,7 @@ export default function TalentPool() {
   const setTpSort = useAppStore(state => state.setTpSort);
   const setGlobalSearch = useAppStore(state => state.setTpGlobalSearch);
   const fetchTalentPool = useAppStore(state => state.fetchTalentPool);
+  const fetchTalentPoolSummary = useAppStore(state => state.fetchTalentPoolSummary);
   const fetchTalentPoolIndex = useAppStore(state => state.fetchTalentPoolIndex);
   const buildTalentPoolQueryKey = useAppStore(state => state.buildTalentPoolQueryKey);
   const talentPoolCache = useAppStore(state => state.talentPoolCache);
@@ -1606,6 +1695,9 @@ export default function TalentPool() {
   const invalidateTalentPoolCaches = useAppStore(state => state.invalidateTalentPoolCaches);
   const fetchRecruiters = useAppStore(state => state.fetchRecruiters);
   const recruiters = useAppStore(state => state.recruiters);
+  const tpAiRunFocus = useAppStore(state => state.tpAiRunFocus);
+  const startTpAiRunFocus = useAppStore(state => state.startTpAiRunFocus);
+  const exitTpAiRunFocus = useAppStore(state => state.exitTpAiRunFocus);
 
   // Master Library should remain fully editable for admins too.
   const poolReadOnly = false;
@@ -1636,6 +1728,7 @@ export default function TalentPool() {
   const [isFilterCollapsed, setIsFilterCollapsed] = useState(() => {
     return localStorage.getItem('tp-filter-collapsed') === 'true';
   });
+  const [metricsExpanded, setMetricsExpanded] = useState(false);
 
   const toggleFilterSidebar = () => {
     setIsFilterCollapsed(prev => {
@@ -1855,6 +1948,7 @@ export default function TalentPool() {
     }).catch(() => { });
 
     fetchAnalytics();
+    fetchTalentPoolSummary();
 
     const prefetchTalentPoolIndex = () => {
       if (!cancelled) {
@@ -1877,7 +1971,7 @@ export default function TalentPool() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [fetchAnalytics, fetchTalentPoolIndex, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
+  }, [fetchAnalytics, fetchTalentPoolSummary, fetchTalentPoolIndex, role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
 
   useEffect(() => {
     if (role !== 'recruiter') {
@@ -1942,6 +2036,7 @@ export default function TalentPool() {
         }
       }));
       setShortlistCard(d);
+      fetchTalentPoolSummary({ force: true });
     } else {
       toast.error(res.error || 'Operation failed');
       setContactInfo(prev => ({
@@ -1977,6 +2072,7 @@ export default function TalentPool() {
           updateTpCandidate(candidateId, { status: 'Shortlisted' });
           toast.success(`Candidate automatically shortlisted`);
           fetchAnalytics();
+          fetchTalentPoolSummary({ force: true });
         } catch (err) {
           console.error('Auto-shortlist failed:', err);
         }
@@ -1989,7 +2085,15 @@ export default function TalentPool() {
     filters?.product_service,
     filters?.productInput,
   ).length > 0;
+  const focusCandidateIds = useMemo(
+    () => Array.isArray(tpAiRunFocus?.candidateIds)
+      ? tpAiRunFocus.candidateIds.map(Number).filter(Number.isFinite)
+      : [],
+    [tpAiRunFocus],
+  );
+  const isAiRunFocusActive = focusCandidateIds.length > 0;
   const canUseInstantLocalFiltering = Boolean(
+    !isAiRunFocusActive &&
     !hasSemanticProductFilter &&
     Array.isArray(talentPoolIndex?.rows) &&
     talentPoolIndex.rows.length > 0
@@ -2016,8 +2120,7 @@ export default function TalentPool() {
   const allVisibleSelected = displayedCandidates.length > 0 && displayedCandidates.every((candidate) => selectedIds.has(candidate.id));
 
   // Stable across new array instances with the same visible ids — avoids hammering GET /ai-columns.
-  const aiColumnVisibleIdsKey = displayedCandidates
-    .map((c) => c.id)
+  const aiColumnVisibleIdsKey = (isAiRunFocusActive ? focusCandidateIds : displayedCandidates.map((c) => c.id))
     .filter((id) => id != null && id !== '')
     .slice()
     .sort((a, b) => Number(a) - Number(b))
@@ -2028,18 +2131,19 @@ export default function TalentPool() {
     try {
       requestId = ++talentPoolRequestSeqRef.current;
       const paramsString = buildTalentPoolParamsString({
-        page: pg,
+        page: isAiRunFocusActive ? 1 : pg,
         pageSize,
         globalSearch,
         filters,
         activeStatusTab,
         sortBy,
         sortDir,
+        candidateIds: isAiRunFocusActive ? focusCandidateIds : [],
       });
 
       const cache = useAppStore.getState().talentPoolCache || { data: null, lastParamsString: null };
       const cachedData = cache.lastParamsString === buildTalentPoolQueryKey(paramsString) ? cache.data : null;
-      const hasData = visibleCandidatesRef.current.length > 0;
+      const hasData = !isAiRunFocusActive && visibleCandidatesRef.current.length > 0;
 
       if (!cachedData && !hasData) {
         setLoading(true);
@@ -2065,7 +2169,7 @@ export default function TalentPool() {
         setIsRevalidating(false);
       }
     }
-  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey]);
+  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds]);
 
   fetchCandidatesRef.current = fetchCandidates;
 
@@ -2449,6 +2553,7 @@ export default function TalentPool() {
         toast.warning(`Some rows had issues: ${warnBody}`);
       }
       invalidateTalentPoolCaches();
+      fetchTalentPoolSummary({ force: true });
       await fetchCandidates(1);
       const runIndex = () => {
         void fetchTalentPoolIndex().catch(() => { });
@@ -2507,6 +2612,7 @@ export default function TalentPool() {
       setShowAssignModal(false);
       setSelectedIds(new Set());
       invalidateTalentPoolCaches();
+      fetchTalentPoolSummary({ force: true });
       await fetchTalentPoolIndex({ force: true });
       await fetchCandidates(page);
     } catch (e) {
@@ -2597,13 +2703,19 @@ export default function TalentPool() {
       };
     }));
     try {
-      await longOperationAxios.post(`${API_BASE}/ai-columns/run`, {
+      const runRes = await longOperationAxios.post(`${API_BASE}/ai-columns/run`, {
         column_definition_id: definition.id,
         selection_mode: 'selected_ids',
         selected_ids: selectedIdArray,
         view_scope: talentPoolViewScope,
         recruiter_filter_id: talentPoolRecruiterFilterId,
         role_id: talentPoolRoleFilterId || null,
+      });
+      startTpAiRunFocus({
+        runId: runRes.data?.run_id,
+        columnDefinitionId: definition.id,
+        columnName: definition.name,
+        candidateIds: selectedIdArray,
       });
       toast.success(`Running "${definition.name}" on ${selectedIdArray.length} row(s)…`);
       void fetchAiColumns();
@@ -2786,7 +2898,7 @@ export default function TalentPool() {
             alignItems: 'center',
             gap: 14,
             flexWrap: 'wrap',
-            borderBottom: analytics ? `1px solid ${surfaceBorder}` : 'none'
+            borderBottom: 'none'
           }}>
             <button
               onClick={toggleFilterSidebar}
@@ -2996,11 +3108,21 @@ export default function TalentPool() {
           </div>
 
           {analytics && (
-            <div style={{ padding: '18px 20px 20px' }}>
+            <CompactMetricsStrip
+              analytics={analytics}
+              tpTotal={scopeTotal ?? total}
+              tpStatusCounts={scopeStatusCounts || statusCounts}
+              expanded={metricsExpanded}
+              onToggle={() => setMetricsExpanded(prev => !prev)}
+            />
+          )}
+
+          {analytics && metricsExpanded && (
+            <div style={{ padding: '14px 20px 18px', borderTop: `1px solid ${surfaceBorder}` }}>
               <StatisticsDashboard
                 analytics={analytics}
-                tpTotal={total}
-                tpStatusCounts={statusCounts}
+                tpTotal={scopeTotal ?? total}
+                tpStatusCounts={scopeStatusCounts || statusCounts}
                 role={role}
                 onStatClick={(status) => {
                   startTransition(() => {
@@ -3020,7 +3142,48 @@ export default function TalentPool() {
         </div>
 
         <div style={{ ...panelSurface, flex: 1, minHeight: 0, borderRadius: 24, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+          {isAiRunFocusActive && (
+            <div style={{
+              padding: '12px 18px',
+              background: 'linear-gradient(135deg, rgba(239,246,255,0.92), rgba(240,253,244,0.88))',
+              borderBottom: `1px solid ${surfaceBorder}`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: '#0f172a' }}>
+                  Showing {focusCandidateIds.length} profile{focusCandidateIds.length === 1 ? '' : 's'} from Smart Column: {tpAiRunFocus?.columnName || 'Smart Column'}
+                </div>
+                <div style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>
+                  These are the selected rows from the latest run.
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds(new Set())}
+                  style={{ padding: '7px 12px', borderRadius: 10, border: '1px solid rgba(203, 213, 225, 0.9)', background: '#fff', color: '#334155', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+                >
+                  Clear selection
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedIds(new Set());
+                    exitTpAiRunFocus();
+                  }}
+                  style={{ padding: '7px 12px', borderRadius: 10, border: 'none', background: '#0f172a', color: '#fff', fontSize: 12, fontWeight: 800, cursor: 'pointer' }}
+                >
+                  Exit run view
+                </button>
+              </div>
+            </div>
+          )}
           {/* Status tabs */}
+          {!isAiRunFocusActive && (
           <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: `1px solid ${surfaceBorder}`, display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none' }}>
             {['', ...RECRUITMENT_STAGES].map(tab => {
               const isActive = activeStatusTab === tab;
@@ -3075,6 +3238,7 @@ export default function TalentPool() {
               );
             })}
           </div>
+          )}
 
           {/* Table */}
           <div style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
@@ -3295,6 +3459,7 @@ export default function TalentPool() {
                         disabled={poolReadOnly}
                         onUpdate={(id, newStatus) => {
                           updateTpCandidate(id, { status: newStatus });
+                          fetchTalentPoolSummary({ force: true });
                         }}
                         onShortlisted={handleShortlisted}
                       />
@@ -3652,7 +3817,13 @@ export default function TalentPool() {
           recruiterFilterId={talentPoolRecruiterFilterId}
           roleId={talentPoolRoleFilterId}
           onClose={() => setAiColumnModal(false)}
-          onColumnsCreated={() => {
+          onColumnsCreated={(runInfo) => {
+            startTpAiRunFocus({
+              runId: runInfo?.runId,
+              columnDefinitionId: runInfo?.columnDefinitionId,
+              columnName: runInfo?.columnName,
+              candidateIds: runInfo?.candidateIds,
+            });
             setAiColumnModal(false);
             void fetchAiColumns();
           }}

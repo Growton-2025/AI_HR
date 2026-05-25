@@ -119,6 +119,21 @@ def _matches_filter(filter_str: Optional[str], target_val: Any) -> bool:
     return any(v in tv_lower for v in filter_vals)
 
 
+def _parse_candidate_ids(raw: Optional[str]) -> List[int]:
+    if not raw:
+        return []
+    parsed: List[int] = []
+    for piece in str(raw).split(","):
+        value = piece.strip()
+        if not value:
+            continue
+        try:
+            parsed.append(int(value))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid candidate id: {value!r}")
+    return parsed
+
+
 def _role_candidate_id_set(
     current_user: schemas.User,
     *,
@@ -175,6 +190,7 @@ async def build_browse_candidate_rows(
     min_exp: Optional[float] = None,
     max_exp: Optional[float] = None,
     min_avg_tenure: Optional[float] = None,
+    candidate_ids: Optional[List[int]] = None,
     role_id: Optional[int] = None,
     sort_by: Optional[str] = "name",
     sort_dir: Optional[str] = "asc",
@@ -190,10 +206,12 @@ async def build_browse_candidate_rows(
         view_scope=effective_scope,
         recruiter_filter_id=effective_recruiter,
     )
+    candidate_id_filter = {int(cid) for cid in (candidate_ids or []) if cid is not None}
 
     all_profiles = [
         p
         for p in PROFILES_BY_ID.values()
+        if not candidate_id_filter or int(p.get("id") or 0) in candidate_id_filter
         if role_candidate_ids is None or int(p.get("id") or 0) in role_candidate_ids
         if profile_passes_scope(
             p,
@@ -321,7 +339,10 @@ async def build_browse_candidate_rows(
                 if (r.get("status") or "To be started").strip().lower() in status_vals
             ]
 
-    if semantic_scores:
+    if candidate_id_filter:
+        order = {int(cid): idx for idx, cid in enumerate(candidate_ids or [])}
+        results.sort(key=lambda x: order.get(int(x.get("id") or 0), len(order)))
+    elif semantic_scores:
         results.sort(key=lambda x: x.get("match_score") or 0, reverse=True)
     else:
         sort_key_map = {
@@ -341,6 +362,36 @@ async def build_browse_candidate_rows(
         "is_semantic_search": bool(semantic_scores),
         "effective_scope": effective_scope,
         "effective_recruiter": effective_recruiter,
+    }
+
+
+@router.get("/candidates/browse/summary")
+async def browse_summary(
+    current_user: schemas.User = Depends(deps.get_current_user),
+    view_scope: Optional[str] = Query(
+        None,
+        description="admin: master | recruiter_pools | all_recruiter_pools",
+    ),
+    recruiter_filter_id: Optional[int] = Query(
+        None,
+        description="admin + recruiter_pools: which recruiter's pool",
+    ),
+    role_id: Optional[int] = None,
+):
+    """Return unfiltered Talent Pool counts for the current scope."""
+    payload = await build_browse_candidate_rows(
+        current_user=current_user,
+        view_scope=view_scope,
+        recruiter_filter_id=recruiter_filter_id,
+        role_id=role_id,
+        sort_by="name",
+        sort_dir="asc",
+    )
+    return {
+        "total": len(payload.get("candidates", [])),
+        "status_counts": payload.get("status_counts", {}),
+        "effective_scope": payload.get("effective_scope"),
+        "effective_recruiter": payload.get("effective_recruiter"),
     }
 
 
@@ -371,6 +422,7 @@ async def browse_candidates(
     min_exp: Optional[float] = None,
     max_exp: Optional[float] = None,
     min_avg_tenure: Optional[float] = None, # stability
+    candidate_ids: Optional[str] = None,
     role_id: Optional[int] = None,
     # Sort
     sort_by: Optional[str] = "name",
@@ -382,6 +434,7 @@ async def browse_candidates(
         view_scope,
         recruiter_filter_id,
     )
+    candidate_id_list = _parse_candidate_ids(candidate_ids)
 
     # ── Cache key from all params ───────────────────────────────────
     cache_key_src = json.dumps({
@@ -393,6 +446,7 @@ async def browse_candidates(
         "company": company, "city": city, "location_type": location_type,
         "product_service": product_service, "status": status, "created_by": created_by,
         "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
+        "candidate_ids": candidate_id_list,
         "role_id": role_id,
         "sort_by": sort_by, "sort_dir": sort_dir,
     }, sort_keys=True)
@@ -418,6 +472,7 @@ async def browse_candidates(
         min_exp=min_exp,
         max_exp=max_exp,
         min_avg_tenure=min_avg_tenure,
+        candidate_ids=candidate_id_list,
         role_id=role_id,
         sort_by=sort_by,
         sort_dir=sort_dir,

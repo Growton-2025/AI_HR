@@ -287,6 +287,93 @@ PRESETS: List[Dict[str, Any]] = [
         ),
     },
     {
+        "id": "average_current_tenure",
+        "label": "Average And Current Tenure",
+        "category": "Career",
+        "description": "Compute average company tenure and current-job tenure in months from row history.",
+        "required_inputs": ["candidate.linkedin"],
+        "mode": "auto",
+        "prompt_template": (
+            "Calculate the average tenure of the candidate ({Linkedin Profile}). "
+            "Average Tenure = total years of work experience / number of unique companies. "
+            "Count different roles in the same company as one job. "
+            "Do not count community memberships, such as RevGenius. "
+            "Give the output in months. Also give the time spent by the candidate in the current job."
+        ),
+        "output_schema": _schema(
+            ("average_tenure_months", "Average Tenure Months"),
+            ("current_job_months", "Current Job Months"),
+            ("tenure_reasoning", "Tenure Reasoning"),
+        ),
+    },
+    {
+        "id": "ae_enterprise_saas_qualification",
+        "label": "AE Enterprise SaaS Qualification",
+        "category": "Person + Company",
+        "description": "Check 10+ years total experience, 5+ years AE experience, and current enterprise SaaS employer.",
+        "required_inputs": ["candidate.linkedin"],
+        "mode": "auto",
+        "prompt_template": _prompt(
+            "Mark the candidate as Yes if the candidate ({Linkedin Profile}) has 10+ years of overall experience, "
+            "minimum 5+ years of account executive experience, and is currently working in an enterprise-segment-focused SaaS company. "
+            "Use row-derived career facts for experience calculations and public company evidence for the current employer segment.",
+            company=True,
+        ),
+        "output_schema": _schema(
+            ("qualified", "Qualified"),
+            ("qualification_reasoning", "Qualification Reasoning"),
+            ("evidence_summary", "Evidence Summary"),
+        ),
+    },
+    {
+        "id": "jd_fit_score_flexible",
+        "label": "JD Fit Score From Text Or Link",
+        "category": "Person + Company",
+        "description": "Score fit against a saved role JD, pasted JD, or JD URL.",
+        "required_inputs": ["candidate.linkedin"],
+        "mode": "auto",
+        "prompt_template": _prompt(
+            "Score each candidate 1-10 against this JD. Use a pasted JD in the prompt if present, a JD URL if present, "
+            "otherwise use the saved role job description. Return two things: the score and the reasoning.",
+            extra="Saved role job description:\n{role.job_description}",
+        ),
+        "output_schema": _schema(
+            ("fit_score", "Fit Score"),
+            ("reasoning", "Reasoning"),
+        ),
+    },
+    {
+        "id": "career_city_count",
+        "label": "Career City Count",
+        "category": "Career",
+        "description": "Count cities in the person's professional career from row role history.",
+        "required_inputs": ["candidate.linkedin"],
+        "mode": "auto",
+        "prompt_template": "Tell me the number of cities the person has worked in his/her entire professional career.",
+        "output_schema": _schema(
+            ("career_city_count", "Career City Count"),
+            ("career_cities", "Career Cities"),
+        ),
+    },
+    {
+        "id": "linkedin_recent_activity",
+        "label": "LinkedIn Posted In Last 30 Days",
+        "category": "Person",
+        "description": "Check public LinkedIn/web evidence for candidate posting activity in the last 30 days.",
+        "required_inputs": ["candidate.linkedin"],
+        "mode": "web_research",
+        "prompt_template": _prompt(
+            "Has the candidate posted content on LinkedIn in the last 30 days? "
+            "Use only publicly verifiable LinkedIn/profile/post evidence. "
+            "If posts or activity cannot be publicly verified, return Not publicly verifiable."
+        ),
+        "output_schema": _schema(
+            ("posted_last_30_days", "Posted Last 30 Days"),
+            ("activity_reasoning", "Activity Reasoning"),
+            ("source_url", "Source URL"),
+        ),
+    },
+    {
         "id": "personalized_email_opener",
         "label": "Personalized Email Opener",
         "category": "Person + Company",

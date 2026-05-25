@@ -11,10 +11,13 @@ from backend.db.ai_column_migrate import ensure_ai_column_migrations
 from backend.services.ai_columns import (
     build_field_catalog,
     build_candidate_context,
+    classify_ai_column_prompt,
+    compute_career_facts,
     evaluate_required_fields,
     flatten_profile_context,
     fill_prompt_template,
     map_raw_outputs_to_schema_keys,
+    map_career_facts_to_outputs,
 )
 from backend.services.ai_column_presets import list_ai_column_presets
 
@@ -179,6 +182,52 @@ def test_preset_catalog_covers_research_company_fit_and_outreach_packs():
     assert presets["pricing_strategy"]["category"] == "Company"
     assert "role.job_description" in presets["jd_fit_score"]["required_inputs"]
     assert presets["personalized_email_opener"]["context_fields"] == ["pitch_context"]
+    assert presets["average_current_tenure"]["mode"] == "auto"
+    assert presets["linkedin_recent_activity"]["mode"] == "web_research"
+
+
+def test_prompt_classifier_routes_row_web_and_hybrid_queries():
+    assert classify_ai_column_prompt("Calculate the average tenure and current job tenure")["data_source"] == "row"
+    assert classify_ai_column_prompt("Have they posted content on LinkedIn in the last 30 days?") == {
+        "data_source": "web",
+        "web_required_reason": "public_linkedin_recent_activity",
+        "routing_mode": "web_research",
+    }
+    assert classify_ai_column_prompt("Score each candidate 1-10 against this JD: https://example.com/job")["data_source"] == "hybrid"
+    assert classify_ai_column_prompt("Any recent layoffs at the current company?")["data_source"] == "web"
+
+
+def test_career_facts_collapse_company_and_exclude_memberships():
+    profile = {
+        "id": 1,
+        "name": "Sales Candidate",
+        "city": "Bengaluru",
+        "total_experience_years": 12,
+        "roles": [
+            {"title": "Enterprise Account Executive", "company": "Acme SaaS", "start_date": "2020-01", "end_date": "Present", "city": "Bengaluru"},
+            {"title": "Account Executive", "company": "Acme SaaS", "start_date": "2018-01", "end_date": "2019-12", "city": "Bengaluru"},
+            {"title": "Sales Development Representative", "company": "Beta Co", "start_date": "2015", "end_date": "2017", "city": "Mumbai"},
+            {"title": "Member", "company": "RevGenius", "start_date": "2022", "end_date": "Present", "city": "Remote"},
+        ],
+    }
+    context = build_candidate_context(profile)
+    facts = compute_career_facts(context)
+    outputs = map_career_facts_to_outputs(
+        "Calculate average tenure, current job tenure, and number of cities.",
+        [
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "career_city_count", "label": "Career City Count"},
+        ],
+        facts,
+    )
+
+    assert facts["unique_company_count"] == 2
+    assert "RevGenius" not in facts["companies"]
+    assert facts["ae_experience_months"] >= 60
+    assert outputs["average_tenure_months"].isdigit()
+    assert outputs["current_job_months"].isdigit()
+    assert outputs["career_city_count"] == "2"
 
 
 def test_run_ai_task_sends_full_row_context_even_without_tokens(monkeypatch):
@@ -296,6 +345,91 @@ def test_build_browse_candidate_rows_matches_filtered_scope(monkeypatch):
     assert result["status_counts"]["Shortlisted"] == 1
 
 
+def test_browse_summary_uses_unfiltered_scope_counts(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Deepak Basavaraj",
+            "city": "Bengaluru",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Aadarsh Goyal",
+            "city": "Delhi",
+            "status": "To be started",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+        3: {
+            "id": 3,
+            "name": "Other Recruiter",
+            "city": "Mumbai",
+            "status": "Shortlisted",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+
+    filtered = asyncio.run(
+        browse.build_browse_candidate_rows(
+            current_user=_user(),
+            city="bengaluru",
+            status="Shortlisted",
+        )
+    )
+    summary = asyncio.run(browse.browse_summary(current_user=_user()))
+
+    assert len(filtered["candidates"]) == 1
+    assert summary["total"] == 2
+    assert summary["status_counts"]["Shortlisted"] == 1
+    assert summary["status_counts"]["To be started"] == 1
+
+
+def test_browse_candidate_ids_preserves_scope_and_order(monkeypatch):
+    profiles = {
+        1: {
+            "id": 1,
+            "name": "Deepak Basavaraj",
+            "status": "Shortlisted",
+            "owner_user_id": 7,
+            "roles": [{"title": "Account Director", "company": "Exotel"}],
+        },
+        2: {
+            "id": 2,
+            "name": "Aadarsh Goyal",
+            "status": "To be started",
+            "owner_user_id": 7,
+            "roles": [{"title": "Sales Manager", "company": "Acme"}],
+        },
+        3: {
+            "id": 3,
+            "name": "Hidden Recruiter",
+            "status": "Shortlisted",
+            "owner_user_id": 9,
+            "roles": [{"title": "AE", "company": "Other"}],
+        },
+    }
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    browse._browse_cache.clear()
+
+    result = asyncio.run(
+        browse.browse_candidates(
+            current_user=_user(),
+            candidate_ids="2,1,3",
+            page=1,
+            page_size=25,
+        )
+    )
+
+    assert [row["id"] for row in result["candidates"]] == [2, 1]
+    assert result["total"] == 2
+    assert result["status_counts"]["Shortlisted"] == 1
+
+
 def test_generate_config_defaults_to_auto_without_explicit_web(monkeypatch):
     def fake_openai(*args, **kwargs):
         return {
@@ -354,6 +488,54 @@ def test_generate_config_prefer_web_search_keeps_web_research(monkeypatch):
     )
 
     assert result["mode"] == "web_research"
+
+
+def test_web_json_call_uses_ga_search_and_stamps_freshness(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        output_text = '{"outputs":{"result":"fresh"},"confidence":"high"}'
+
+        def model_dump(self):
+            return {
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://example.com/news",
+                                        "title": "Example News",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    monkeypatch.setattr(ai_columns, "_openai_client", FakeClient())
+    monkeypatch.setattr(ai_columns, "_utc_now_iso", lambda: "2026-05-23T10:30:00Z")
+
+    result = ai_columns._call_openai_for_json("system", "user", use_web=True)
+
+    assert captured["model"] == "gpt-4o-mini"
+    assert captured["tools"][0]["type"] == "web_search"
+    assert captured["tools"][0]["search_context_size"] == "high"
+    assert "Today is 2026-05-23" in captured["input"]
+    assert result["searched_at"] == "2026-05-23T10:30:00Z"
+    assert result["freshness_date"] == "2026-05-23"
+    assert result["web_search_tool"] == "web_search"
+    assert result["sources"][0]["url"] == "https://example.com/news"
 
 
 def test_map_raw_outputs_to_schema_keys_aligns_label_style_keys():
@@ -417,6 +599,138 @@ def test_run_ai_task_auto_uses_row_context_before_web(monkeypatch):
 
     assert result["primary_output"] == "Bengaluru"
     assert calls == [False]
+
+
+def test_run_ai_task_auto_computes_tenure_without_openai(monkeypatch):
+    monkeypatch.setattr(ai_columns, "_openai_client", None)
+    context = build_candidate_context(
+        {
+            "id": 1,
+            "name": "Tenure Candidate",
+            "roles": [
+                {"title": "Account Executive", "company": "Acme", "start_date": "2021-01", "end_date": "Present"},
+                {"title": "Senior Account Executive", "company": "Acme", "start_date": "2019-01", "end_date": "2020-12"},
+                {"title": "Member", "company": "RevGenius", "start_date": "2022", "end_date": "Present"},
+            ],
+        }
+    )
+
+    result = ai_columns._run_ai_task(
+        prompt_template="Calculate the average tenure and current job tenure in months.",
+        mode="auto",
+        output_schema=[
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+        ],
+        context=context,
+    )
+
+    assert result["details"]["data_source"] == "row"
+    assert result["outputs"]["average_tenure_months"].isdigit()
+    assert result["outputs"]["current_job_months"].isdigit()
+
+
+def test_run_ai_task_auto_forces_web_for_linkedin_activity(monkeypatch):
+    calls = []
+
+    def fake_openai(system_prompt, user_prompt, *, use_web=False):
+        calls.append(use_web)
+        return {
+            "outputs": {"posted_last_30_days": "Yes", "activity_reasoning": "Public post found."},
+            "reasoning": "Used public LinkedIn evidence.",
+            "confidence": "high",
+            "steps": ["Searched web"],
+            "sources": [{"title": "LinkedIn post", "url": "https://www.linkedin.com/in/example/recent-activity/all/"}],
+            "searched_at": "2026-05-23T10:00:00Z",
+        }
+
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Has the candidate posted content on LinkedIn in the last 30 days?",
+        mode="auto",
+        output_schema=[{"key": "posted_last_30_days", "label": "Posted Last 30 Days", "primary": True}],
+        context={"candidate.linkedin": "https://linkedin.com/in/example"},
+    )
+
+    assert calls == [True]
+    assert result["details"]["data_source"] == "web"
+    assert result["details"]["web_required_reason"] == "public_linkedin_recent_activity"
+    assert result["details"]["source_verification_status"] == "verified"
+
+
+def test_run_ai_task_linkedin_activity_without_sources_is_unverified(monkeypatch):
+    def fake_openai(*args, **kwargs):
+        return {
+            "outputs": {"posted_last_30_days": "Yes", "activity_reasoning": "No public source."},
+            "confidence": "medium",
+            "sources": [],
+        }
+
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Has the candidate posted content on LinkedIn in the last 30 days?",
+        mode="auto",
+        output_schema=[{"key": "posted_last_30_days", "label": "Posted Last 30 Days", "primary": True}],
+        context={"candidate.linkedin": "https://linkedin.com/in/example"},
+    )
+
+    assert result["primary_output"] == "Not publicly verifiable"
+    assert result["details"]["source_verification_status"] == "not_publicly_verifiable"
+
+
+def test_run_ai_task_linkedin_activity_rejects_same_name_profile_sources(monkeypatch):
+    def fake_openai(*args, **kwargs):
+        return {
+            "outputs": {"posted_last_30_days": "Yes", "activity_reasoning": "Same-name source."},
+            "confidence": "medium",
+            "sources": [{"url": "https://www.linkedin.com/in/different-person"}],
+        }
+
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Has the candidate posted content on LinkedIn in the last 30 days? Candidate: {Linkedin Profile}",
+        mode="auto",
+        output_schema=[{"key": "posted_last_30_days", "label": "Posted Last 30 Days", "primary": True}],
+        context={"Linkedin Profile": "https://www.linkedin.com/in/example"},
+    )
+
+    assert result["primary_output"] == "Not publicly verifiable"
+    assert result["details"]["sources"] == []
+    assert result["details"]["source_verification_status"] == "not_publicly_verifiable"
+
+
+def test_daily_refresh_group_query_targets_existing_stale_web_cells(monkeypatch):
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = mock_cur
+    cm.__exit__.return_value = False
+    mock_conn.cursor.return_value = cm
+    mock_cur.fetchall.return_value = [
+        (9, 7, "recruiter@example.com", "Recruiter", "recruiter", [101, 102])
+    ]
+
+    class ConnCM:
+        def __enter__(self):
+            return mock_conn
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ai_columns, "get_db_connection_context", lambda **kwargs: ConnCM())
+
+    groups = ai_columns._fetch_daily_refresh_groups(max_cells=10)
+    sql = mock_cur.execute.call_args[0][0]
+
+    assert "c.status = 'completed'" in sql
+    assert "d.mode = 'web_research'" in sql
+    assert "details->>'data_source'" in sql
+    assert "COALESCE(d.is_archived, FALSE) = FALSE" in sql
+    assert groups[0]["candidate_ids"] == [101, 102]
+    assert groups[0]["user"].id == 7
 
 
 def test_run_ai_task_auto_falls_back_to_web_when_row_context_is_insufficient(monkeypatch):
