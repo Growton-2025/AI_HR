@@ -19,6 +19,8 @@ DB_USER = os.getenv("DB_USER", "growton")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
 DB_HOST = os.getenv("DB_HOST", "growton-2026.postgres.database.azure.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))
 
 # Connection pool (initialized on first use)
 _connection_pool = None
@@ -55,6 +57,9 @@ def _get_connection_pool_state():
         return f"available={available}, used={used}, min={minconn}, max={maxconn}"
     except Exception as e:
         return f"unavailable ({e})"
+
+def get_connection_pool_state():
+    return _get_connection_pool_state()
 
 def _discard_broken_connection(conn, reason="broken connection"):
     """Remove a bad connection from the pool's bookkeeping."""
@@ -129,8 +134,8 @@ def _initialize_pool():
         try:
             logger.info("Initializing database connection pool...")
             _connection_pool = pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=30,
+                minconn=DB_POOL_MIN,
+                maxconn=DB_POOL_MAX,
                 **get_db_connection_params()
             )
             logger.info("Database connection pool initialized successfully")

@@ -1,16 +1,21 @@
 #!/bin/bash
 
-# Update the database schema and bulk load if needed
-# (Optional: can be done via a separate migration step, but here for convenience)
-# python -m backend.create_indexes
-
 # Start the application using Gunicorn with Uvicorn workers
 # We use port 8000 as configured in the Azure portal, or default to 8080
 PORT=${PORT:-8000}
-echo "Starting backend on port $PORT..."
+WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
+PYTHON_EXEC=${PYTHON_EXEC:-python}
+RUN_STARTUP_MIGRATIONS=${RUN_STARTUP_MIGRATIONS:-true}
+
+echo "Starting backend on port $PORT with $WEB_CONCURRENCY worker(s)..."
+
+if [ "$RUN_STARTUP_MIGRATIONS" = "true" ] || [ "$RUN_STARTUP_MIGRATIONS" = "1" ]; then
+    echo "Running startup migrations once before Gunicorn workers start..."
+    $PYTHON_EXEC -c "from backend.db.connection import get_db_connection, return_db_connection; from backend.db.ai_column_migrate import ensure_ai_column_migrations; from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations; conn = get_db_connection(validate=False, register_pgvector=False); assert conn is not None, 'Database connection failed'; ensure_candidate_pool_migrations(conn); ensure_ai_column_migrations(conn); return_db_connection(conn)"
+fi
 
 gunicorn --bind 0.0.0.0:$PORT \
-         --workers 4 \
+         --workers $WEB_CONCURRENCY \
          --worker-class uvicorn.workers.UvicornWorker \
          --timeout 600 \
          --access-logfile - \

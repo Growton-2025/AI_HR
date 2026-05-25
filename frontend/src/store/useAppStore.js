@@ -5,6 +5,24 @@ import { toast } from 'sonner'
 const REQUEST_TIMEOUT_MS = 15000
 const CALL_REQUEST_TIMEOUT_MS = 15000
 const CALL_RETRY_BACKOFF_MS = 3000
+const RATE_LIMIT_DEFAULT_RETRY_MS = 5000
+const RATE_LIMIT_MAX_RETRY_MS = 30000
+let rateLimitUntilMs = 0
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+function parseRetryAfterMs(value) {
+    if (!value) return RATE_LIMIT_DEFAULT_RETRY_MS
+    const seconds = Number(value)
+    if (Number.isFinite(seconds)) {
+        return Math.min(RATE_LIMIT_MAX_RETRY_MS, Math.max(1000, seconds * 1000))
+    }
+    const dateMs = new Date(value).getTime()
+    if (Number.isFinite(dateMs)) {
+        return Math.min(RATE_LIMIT_MAX_RETRY_MS, Math.max(1000, dateMs - Date.now()))
+    }
+    return RATE_LIMIT_DEFAULT_RETRY_MS
+}
 
 axios.defaults.timeout = REQUEST_TIMEOUT_MS
 
@@ -12,14 +30,32 @@ axios.interceptors.response.use(
     (response) => response,
     async (error) => {
         const config = error?.config || {}
+        const status = error?.response?.status
 
-        if (!error?.response && !config._retry && config.method?.toLowerCase() === 'get') {
-            config._retry = true
-            await new Promise(resolve => setTimeout(resolve, 1500))
+        if (status === 429) {
+            const retryAfterMs = parseRetryAfterMs(error?.response?.headers?.['retry-after'])
+            rateLimitUntilMs = Math.max(rateLimitUntilMs, Date.now() + retryAfterMs)
+            toast.warning(`Server is rate limiting requests. Retrying shortly.`, { id: 'api-rate-limit' })
+            if (!config._rateLimitRetry && config.method?.toLowerCase() === 'get') {
+                config._rateLimitRetry = true
+                await sleep(retryAfterMs)
+                return axios(config)
+            }
+        }
+
+        if (status !== 429 && rateLimitUntilMs > Date.now() && !config._rateLimitWaited && config.method?.toLowerCase() === 'get') {
+            config._rateLimitWaited = true
+            await sleep(Math.min(RATE_LIMIT_MAX_RETRY_MS, rateLimitUntilMs - Date.now()))
             return axios(config)
         }
 
-        if (error?.response?.status === 401 && localStorage.getItem('token')) {
+        if (!error?.response && !config._retry && config.method?.toLowerCase() === 'get') {
+            config._retry = true
+            await sleep(1500)
+            return axios(config)
+        }
+
+        if (status === 401 && localStorage.getItem('token')) {
             localStorage.removeItem('token')
             delete axios.defaults.headers.common['Authorization']
             if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
@@ -69,6 +105,10 @@ export function getRequestErrorMessage(error, fallbackMessage) {
     }
     if (status === 404) {
         return 'API endpoint not found — check API URL / proxy configuration'
+    }
+    if (status === 429) {
+        const retryAfterMs = parseRetryAfterMs(error.response?.headers?.['retry-after'])
+        return `Server is busy. Please retry in about ${Math.ceil(retryAfterMs / 1000)} seconds`
     }
     if (status) {
         return `${fallbackMessage} (HTTP ${status})`
@@ -1179,6 +1219,8 @@ export const useAppStore = create(persist((set, get) => ({
     tpScopeStatusCounts: {},
     tpScopeSummaryRequest: null,
     tpScopeSummaryRequestParamsString: '',
+    tpScopeSummaryLastFetchedAt: 0,
+    tpScopeSummaryLastParamsString: '',
     tpFilters: {
         title: [], titleInput: '',
         company: [], companyInput: '',
@@ -1360,15 +1402,30 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolIndexRequestSeq: (state.talentPoolIndexRequestSeq || 0) + 1,
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryLastFetchedAt: 0,
+            tpScopeSummaryLastParamsString: '',
             analyticsRequest: null,
         }))
     },
 
     fetchTalentPoolSummary: async (options = {}) => {
         const force = options.force === true
+        const freshnessMs = options.freshnessMs ?? 30 * 1000
         const scopeQ = get().buildTalentPoolScopeQuery()
         const paramsString = scopeQ || ''
         const state = get()
+        const hasCachedSummary = state.tpScopeTotal != null && state.tpScopeSummaryLastParamsString === paramsString
+
+        if (hasCachedSummary && state.tpScopeSummaryLastFetchedAt && Date.now() - state.tpScopeSummaryLastFetchedAt < freshnessMs) {
+            return {
+                success: true,
+                cached: true,
+                data: {
+                    total: state.tpScopeTotal,
+                    status_counts: state.tpScopeStatusCounts || {},
+                },
+            }
+        }
 
         if (!force && state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
             return state.tpScopeSummaryRequest
@@ -1385,6 +1442,8 @@ export const useAppStore = create(persist((set, get) => ({
                     tpScopeStatusCounts: d.status_counts || {},
                     tpScopeSummaryRequest: null,
                     tpScopeSummaryRequestParamsString: '',
+                    tpScopeSummaryLastFetchedAt: Date.now(),
+                    tpScopeSummaryLastParamsString: paramsString,
                 })
                 return { success: true, data: d, cached: false }
             })

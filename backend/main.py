@@ -1,5 +1,6 @@
 
 import os
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +12,11 @@ from backend.api.routes import auth, roles, candidates, stats, outreach, admin, 
 from contextlib import asynccontextmanager
 import asyncio
 from backend.pipeline import query
-from backend.db.connection import get_db_connection_context
+from backend.db.connection import get_db_connection_context, get_connection_pool_state
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _apply_pool_migrations_blocking() -> None:
@@ -67,23 +72,30 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"STARTUP MIGRATION FAILED (non-fatal, will retry on next request): {e}")
 
-    asyncio.create_task(_run_migrations_bg())
+    if _env_flag("ENABLE_STARTUP_MIGRATIONS", "false"):
+        asyncio.create_task(_run_migrations_bg())
+    else:
+        print("Startup migrations skipped in worker lifespan.")
 
     # Initialize Plivo background endpoint logic
-    try:
-        from backend.integrations import plivo_service
-        asyncio.create_task(plivo_service.setup_plivo())
-    except Exception as e:
-        print(f"Failed to kick off Plivo setup: {e}")
+    if _env_flag("ENABLE_PLIVO_SETUP", "false"):
+        try:
+            from backend.integrations import plivo_service
+            asyncio.create_task(plivo_service.setup_plivo())
+        except Exception as e:
+            print(f"Failed to kick off Plivo setup: {e}")
 
     # Run warmup tasks in the background so they don't block the application
     # from starting and responding to health checks.
     # We use a try-except here to catch any immediate setup errors.
-    try:
-        # Schedule a single warmup task so DB-heavy cold-start work stays sequential.
-        asyncio.create_task(warm_backend_caches())
-    except Exception as e:
-        print(f"CRITICAL: Background warmup task scheduling failed: {e}")
+    if _env_flag("ENABLE_STARTUP_CACHE_WARMUP", "false"):
+        try:
+            # Schedule a single warmup task so DB-heavy cold-start work stays sequential.
+            asyncio.create_task(warm_backend_caches())
+        except Exception as e:
+            print(f"CRITICAL: Background warmup task scheduling failed: {e}")
+    else:
+        print("Startup cache warmup skipped; caches will load lazily.")
 
     try:
         ai_columns.start_daily_ai_column_refresh_scheduler()
@@ -131,6 +143,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_DIAGNOSTIC_PATHS = {
+    "/api/health",
+    "/api/candidates/analytics",
+    "/api/candidates/browse",
+    "/api/candidates/browse/summary",
+}
+
+
+@app.middleware("http")
+async def diagnostic_timing_middleware(request, call_next):
+    start = time.monotonic()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        if request.url.path in _DIAGNOSTIC_PATHS:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            status_code = getattr(response, "status_code", "error")
+            print(f"DIAG request path={request.url.path} status={status_code} duration_ms={elapsed_ms} pool={get_connection_pool_state()}")
+
 @app.get("/")
 def read_root():
     return {"message": "Hayasa.ai Backend is running"}
@@ -148,6 +181,7 @@ async def debug_db():
     from backend.pipeline.query import redis_client
 
     results = {"db": "testing...", "redis": "testing..."}
+    results["pool"] = get_connection_pool_state()
 
     # Test DB
     try:

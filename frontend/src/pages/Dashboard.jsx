@@ -136,9 +136,9 @@ const Dashboard = () => {
         setIsRevalidating(true);
       }
       await Promise.allSettled([
-        fetchAnalytics({ force: true }),
+        fetchAnalytics(),
         fetchCallStats(),
-        fetchTalentPoolSummary({ force: true }),
+        fetchTalentPoolSummary(),
       ]);
       hasLoadedRef.current = true;
       setIsRevalidating(false);

@@ -45,14 +45,14 @@ function Sidebar() {
     const startX = useRef(0)
     const startWidth = useRef(sidebarWidth)
 
-    useEffect(() => { fetchAnalytics({ force: true }) }, [
+    useEffect(() => { fetchAnalytics() }, [
         fetchAnalytics,
         role,
         talentPoolViewScope,
         talentPoolRecruiterFilterId,
         talentPoolRoleFilterId,
     ])
-    useEffect(() => { fetchTalentPoolSummary({ force: true }) }, [
+    useEffect(() => { fetchTalentPoolSummary() }, [
         fetchTalentPoolSummary,
         role,
         talentPoolViewScope,
