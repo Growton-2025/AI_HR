@@ -27,6 +27,7 @@ const getStatusCount = (counts, statusName) => {
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
     const fetchTalentPoolSummary = useAppStore(state => state.fetchTalentPoolSummary)
+    const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
     const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
@@ -46,8 +47,12 @@ function Sidebar() {
     const startX = useRef(0)
     const startWidth = useRef(sidebarWidth)
 
-    useEffect(() => { fetchTalentPoolSummary() }, [
+    useEffect(() => {
+        fetchTalentPoolSummary()
+        fetchAnalytics()
+    }, [
         fetchTalentPoolSummary,
+        fetchAnalytics,
         role,
         talentPoolViewScope,
         talentPoolRecruiterFilterId,
@@ -108,8 +113,11 @@ function Sidebar() {
     const summaryMatchesScope = tpScopeSummaryLastParamsString === activeSummaryParams
     const summaryStatusEmpty = !tpScopeStatusCounts || Object.keys(tpScopeStatusCounts).length === 0
     const summaryLooksCold = summaryMatchesScope && summaryTotal === 0 && summaryStatusEmpty && Number(analyticsTotal || 0) > 0
-    const sourcedCount = summaryMatchesScope && !summaryLooksCold ? summaryTotal : analyticsTotal
-    const shortlistedCount = summaryMatchesScope && !summaryLooksCold ? summaryShortlisted : analyticsShortlisted
+    const scopedSummaryReady = summaryMatchesScope && !summaryLooksCold && summaryTotal != null
+    const sourcedCount = scopedSummaryReady ? summaryTotal : (analyticsTotal ?? summaryTotal ?? 0)
+    const shortlistedCount = scopedSummaryReady
+        ? (summaryShortlisted ?? 0)
+        : (analyticsShortlisted ?? summaryShortlisted ?? 0)
 
     return (
         <aside

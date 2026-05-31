@@ -401,6 +401,7 @@ async def role_upload_commit(
     role_name: str,
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
+    enrichment_mode: str = Form("none"),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     conn = get_db_connection(validate=False, register_pgvector=False)
@@ -422,6 +423,7 @@ async def role_upload_commit(
     result = await commit_upload_file(
         file=file,
         mapping_json=mapping_json,
+        enrichment_mode=enrichment_mode,
         current_user=current_user,
         role_id=role_id,
     )

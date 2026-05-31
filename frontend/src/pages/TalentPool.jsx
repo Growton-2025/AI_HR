@@ -1663,6 +1663,7 @@ export default function TalentPool() {
   const [uploadCommitBusy, setUploadCommitBusy] = useState(false);
   const [uploadRowCount, setUploadRowCount] = useState(0);
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [uploadEnrichmentMode, setUploadEnrichmentMode] = useState('none');
   const [recentUploads, setRecentUploads] = useState([]);
   const [scopeRoles, setScopeRoles] = useState([]);
   const [contactInfo, setContactInfo] = useState(readPersistedContactInfo); // { [candidateId]: { email, phone, enriching } }
@@ -2379,6 +2380,7 @@ export default function TalentPool() {
       setUploadTargetOptions(res.data.target_options || []);
       setUploadRowCount(Number(res.data.row_count) || 0);
       setUploadProgress(null);
+      setUploadEnrichmentMode('none');
       const init = {};
       for (const h of headers) {
         init[h] = sm[h] || 'ignore';
@@ -2417,6 +2419,7 @@ export default function TalentPool() {
     const fd = new FormData();
     fd.append('file', uploadFile);
     fd.append('mapping_json', JSON.stringify(uploadMapping));
+    fd.append('enrichment_mode', uploadEnrichmentMode || 'none');
     setUploadCommitBusy(true);
     try {
       const res = await axios.post(`${API_BASE}/candidates/upload/commit`, fd, {
@@ -3483,13 +3486,32 @@ export default function TalentPool() {
                           ) : (
                             <div style={{
                               fontSize: 12, color: '#1e1b4b', lineHeight: 1.55,
-                              maxHeight: 72, overflowY: 'auto',
+                              minHeight: 64,
                               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                               background: 'linear-gradient(135deg, #faf5ff, #eff6ff)',
                               border: '1px solid #e0e7ff',
-                              borderRadius: 8, padding: '6px 10px',
+                              borderRadius: 8, padding: '8px 10px',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 6,
                             }}>
-                              {String(aiVal)}
+                              <div style={{
+                                display: '-webkit-box',
+                                WebkitLineClamp: 4,
+                                WebkitBoxOrient: 'vertical',
+                                overflow: 'hidden',
+                              }}>
+                                {String(aiVal)}
+                              </div>
+                              <div style={{
+                                fontSize: 10,
+                                color: '#6366f1',
+                                fontWeight: 800,
+                                textTransform: 'uppercase',
+                                letterSpacing: '0.06em',
+                              }}>
+                                Click for full answer
+                              </div>
                             </div>
                           )}
                         </td>
@@ -3657,9 +3679,11 @@ export default function TalentPool() {
           targetOptions={uploadTargetOptions}
           rowCount={uploadRowCount}
           progress={uploadProgress}
+          enrichmentMode={uploadEnrichmentMode}
           busy={uploadCommitBusy}
+          onEnrichmentModeChange={setUploadEnrichmentMode}
           onChange={(header, value) => setUploadMapping(prev => ({ ...prev, [header]: value }))}
-          onCancel={() => { setUploadOpen(false); setUploadFile(null); setUploadMappingDetails({}); setUploadProgress(null); setUploadRowCount(0); }}
+          onCancel={() => { setUploadOpen(false); setUploadFile(null); setUploadMappingDetails({}); setUploadProgress(null); setUploadRowCount(0); setUploadEnrichmentMode('none'); }}
           onImport={commitUpload}
         />
       )}

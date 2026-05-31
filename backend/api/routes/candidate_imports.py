@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from time import perf_counter
@@ -78,6 +79,41 @@ def _row_values(
     return out, raw
 
 
+def _normalized_header_key(header: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(header or "").strip().lower()).strip()
+
+
+def _is_history_upload_header(header: str, all_headers: Optional[List[str]] = None) -> bool:
+    """Columns that should stay raw/custom for verified profile enrichment."""
+    key = _normalized_header_key(header)
+    headers_keyed = {_normalized_header_key(item) for item in (all_headers or [])}
+    has_explicit_current_title = bool(
+        headers_keyed
+        & {
+            "current role",
+            "current title",
+            "current job title",
+            "job title",
+            "designation",
+        }
+    )
+    if re.fullmatch(r"company \d+ name", key) or re.fullmatch(r"company \d+", key):
+        return True
+    if re.fullmatch(r"education \d+ college name", key) or " college name" in key:
+        return True
+    if re.fullmatch(r"(start date|end date|details|degree name)( \d+)?", key):
+        return True
+    # Pandas de-duplicates repeated headers as Title.1 / Start date.1; after key normalization
+    # they appear as "title 1", "start date 1", etc.
+    if re.fullmatch(r"(title|start date|end date|details|degree name) \d+", key):
+        return True
+    # In Apify/LinkedIn-style sheets, bare "Title" is often Company 1 role history. If the
+    # file also has an explicit current-role field, keep bare Title raw for enrichment.
+    if key == "title" and has_explicit_current_title:
+        return True
+    return False
+
+
 def _validate_mapping(mapping: Dict[str, Any]) -> Dict[str, str]:
     if not isinstance(mapping, dict):
         raise HTTPException(status_code=400, detail="mapping must be an object")
@@ -139,11 +175,14 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
     suggested: Dict[str, str] = {}
     mapping_details: Dict[str, Dict[str, Any]] = {}
     for header in headers:
-        alias_target = deterministic.get(header)
+        force_history_custom = _is_history_upload_header(header, headers)
+        alias_target = "custom" if force_history_custom else deterministic.get(header)
         model_item = model_raw.get(header)
         model_target = None
         confidence = 0.0
         reason = ""
+        if force_history_custom:
+            model_item = None
         if isinstance(model_item, dict):
             raw_target = str(model_item.get("target") or "")
             if raw_target in IMPORT_TARGETS:
@@ -158,13 +197,17 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
             confidence = 0.7
 
         target = model_target or alias_target or "ignore"
-        source = "model" if model_target else "alias" if alias_target else "manual"
+        source = "history" if force_history_custom else "model" if model_target else "alias" if alias_target else "manual"
         suggested[header] = target
         mapping_details[header] = {
             "target": target,
             "source": source,
-            "confidence": confidence if model_target else (0.95 if alias_target else 0),
-            "reason": reason or ("Matched known header alias" if alias_target else "No confident match"),
+            "confidence": 1.0 if force_history_custom else confidence if model_target else (0.95 if alias_target else 0),
+            "reason": (
+                "Kept as custom/raw work-history data for verified enrichment"
+                if force_history_custom
+                else reason or ("Matched known header alias" if alias_target else "No confident match")
+            ),
             "sample_values": [_clean(row.get(header)) or "" for row in sample[:4]],
         }
 
@@ -537,6 +580,10 @@ def _fast_new_import_rows(
     return fast, fallback
 
 
+def _is_verified_enrichment_mode(enrichment_mode: Optional[str]) -> bool:
+    return str(enrichment_mode or "none").strip().lower() == "verified_profile"
+
+
 def _bulk_insert_new_import_rows(
     cur,
     *,
@@ -667,10 +714,12 @@ def _process_upload_rows(
     owner_user_id: int,
     user_role: str,
     role_id: Optional[int],
+    enrichment_mode: str = "none",
 ) -> None:
     inserted = updated = skipped = role_assigned_count = 0
     processed_count = 0
     errors: List[str] = []
+    enrichment_errors: List[str] = []
     touched_ids: List[int] = []
     batch_size = 10
     import_started = perf_counter()
@@ -924,7 +973,33 @@ def _process_upload_rows(
         return_db_connection(conn)
 
     _refresh_import_caches(touched_ids)
+    if _is_verified_enrichment_mode(enrichment_mode):
+        conn = get_db_connection(validate=False, register_pgvector=False)
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    _write_upload_progress(
+                        cur,
+                        upload_id,
+                        status="enriching",
+                        error_message="\n".join((errors + enrichment_errors)[:20]) if (errors or enrichment_errors) else None,
+                    )
+                conn.commit()
+            finally:
+                return_db_connection(conn)
+        try:
+            from backend.services.import_enrichment import enrich_candidate_profiles
+
+            enrichment_result = enrich_candidate_profiles(touched_ids, allow_web=True)
+            enrichment_errors.extend(enrichment_result.get("errors") or [])
+        except Exception as enrich_exc:
+            logger.exception("candidate upload enrichment failed upload_id=%s", upload_id)
+            enrichment_errors.append(f"enrichment: {enrich_exc}")
+        _refresh_import_caches(touched_ids)
+
     final_status = "completed_with_errors" if errors else "completed"
+    if enrichment_errors:
+        final_status = "completed_with_errors"
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         _mark_upload_failed(upload_id, "Database connection failed while finalizing import")
@@ -941,7 +1016,7 @@ def _process_upload_rows(
                 role_assigned_count=role_assigned_count,
                 status=final_status,
                 completed_at=datetime.now(timezone.utc),
-                error_message="\n".join(errors[:20]) if errors else None,
+                error_message="\n".join((errors + enrichment_errors)[:20]) if (errors or enrichment_errors) else None,
             )
         conn.commit()
         logger.info(
@@ -962,6 +1037,7 @@ def _spawn_upload_thread(
     owner_user_id: int,
     user_role: str,
     role_id: Optional[int],
+    enrichment_mode: str = "none",
 ) -> None:
     def run() -> None:
         try:
@@ -972,6 +1048,7 @@ def _spawn_upload_thread(
                 owner_user_id=owner_user_id,
                 user_role=user_role,
                 role_id=role_id,
+                enrichment_mode=enrichment_mode,
             )
         finally:
             with _upload_threads_lock:
@@ -1035,6 +1112,7 @@ async def suggest_mapping_llm(
 async def commit_upload_file(
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
+    enrichment_mode: str = Form("none"),
     current_user: schemas.User = None,
     role_id: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1046,6 +1124,7 @@ async def commit_upload_file(
         raise HTTPException(status_code=400, detail="Invalid mapping JSON")
 
     mapping = _validate_mapping(mapping)
+    enrichment_mode = "verified_profile" if _is_verified_enrichment_mode(enrichment_mode) else "none"
 
     parse_started = perf_counter()
     raw = await file.read()
@@ -1105,6 +1184,7 @@ async def commit_upload_file(
         owner_user_id=int(current_user.id),
         user_role=(current_user.role or "").strip().lower(),
         role_id=role_id,
+        enrichment_mode=enrichment_mode,
     )
 
     return {
@@ -1116,6 +1196,7 @@ async def commit_upload_file(
         "skipped": 0,
         "role_assigned_count": 0,
         "status": "processing",
+        "enrichment_mode": enrichment_mode,
         "errors": [],
     }
 
@@ -1124,11 +1205,17 @@ async def commit_upload_file(
 async def upload_commit(
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
+    enrichment_mode: str = Form("none"),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     if current_user.role == "admin":
         raise HTTPException(status_code=403, detail="Recruiter only")
-    return await commit_upload_file(file=file, mapping_json=mapping_json, current_user=current_user)
+    return await commit_upload_file(
+        file=file,
+        mapping_json=mapping_json,
+        enrichment_mode=enrichment_mode,
+        current_user=current_user,
+    )
 
 
 @router.get("/candidates/uploads")

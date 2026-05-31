@@ -20,7 +20,9 @@ from backend.db.connection import get_db_connection_context
 from backend.pipeline import query
 from backend.services.ai_columns import (
     build_candidate_context,
+    build_candidate_context_pack,
     build_field_catalog,
+    build_query_plan,
     career_facts_to_text,
     classify_ai_column_prompt,
     compute_career_facts,
@@ -34,8 +36,10 @@ from backend.services.ai_columns import (
     map_career_facts_to_outputs,
     normalize_output_key,
     normalize_output_schema,
+    run_candidate_query_tools,
     safe_json,
     summarize_only_run_if,
+    verify_smart_column_outputs,
 )
 from backend.services.candidate_pool import (
     VIEW_SCOPE_MASTER,
@@ -759,6 +763,9 @@ def _run_ai_task(
     career_facts = compute_career_facts(context)
     career_outputs = map_career_facts_to_outputs(rendered_prompt or prompt_template, normalized_outputs, career_facts)
     career_context_text = career_facts_to_text(career_facts)
+    query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing)
+    tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
+    context_pack = build_candidate_context_pack(context, career_facts)
 
     def build_result_from_outputs(
         values: Dict[str, Any],
@@ -770,6 +777,13 @@ def _run_ai_task(
     ) -> Dict[str, Any]:
         normalized_values = {item["key"]: str(values.get(item["key"]) or "") for item in normalized_outputs}
         primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
+        verification = verify_smart_column_outputs(
+            rendered_prompt or prompt_template,
+            normalized_values,
+            data_source=source_kind,
+            sources=[],
+            tool_results=tool_results,
+        )
         details = {
             "response": primary_output,
             "outputs": normalized_values,
@@ -788,6 +802,10 @@ def _run_ai_task(
             "rendered_prompt": rendered_prompt,
             "row_context_keys": list((context or {}).keys()),
             "career_facts": career_facts,
+            "candidate_context_pack": context_pack,
+            "query_plan": query_plan,
+            "tool_results": tool_results,
+            **verification,
             "raw_model_output": {"outputs": normalized_values},
         }
         return {
@@ -796,7 +814,7 @@ def _run_ai_task(
             "details": details,
         }
 
-    if mode in {"auto", "content"} and routing.get("data_source") == "row" and career_outputs:
+    if mode in {"auto", "content"} and career_outputs and not query_plan.get("web_needed"):
         return build_result_from_outputs(
             career_outputs,
             reasoning=(
@@ -826,16 +844,24 @@ def _run_ai_task(
                 "rendered_prompt": rendered_prompt,
                 "row_context_keys": list((context or {}).keys()),
                 "career_facts": career_facts,
+                "candidate_context_pack": context_pack,
+                "query_plan": query_plan,
+                "tool_results": tool_results,
+                "verification_status": "failed",
+                "verification_errors": ["AI service is not configured and deterministic tools could not fully answer this query."],
+                "unknown_reasons": ["AI service is not configured."],
                 "raw_model_output": {},
             },
         }
 
     system_prompt = (
         "You are an expert recruiter operations analyst. Return valid JSON only with keys "
-        "outputs, reasoning, confidence, steps, sources. "
+        "outputs, reasoning, confidence, steps, sources, query_plan, unknown_reasons. "
         "outputs must be an object whose keys exactly match the requested output keys. "
         "confidence must be one of low, medium, high. steps must be an array of short strings. "
-        "sources must be an array of objects with optional title, url, note."
+        "sources must be an array of objects with optional title, url, note. "
+        "Use deterministic tool_results for numeric calculations and tenure. Never invent missing data; "
+        "return Unknown or Needs verification when evidence is insufficient."
     )
     content_first_system_prompt = (
         f"{system_prompt} "
@@ -845,8 +871,12 @@ def _run_ai_task(
     output_hint = ", ".join([f"{item['key']} ({item['label']})" for item in normalized_outputs])
     user_prompt = (
         f"Requested outputs: {output_hint}\n"
-        "Use the full row context as the source of truth for this candidate. "
-        "The user prompt may mention only part of the row; use any relevant row data when answering.\n\n"
+        "Use the candidate context pack and deterministic tool results as the source of truth for this candidate. "
+        "The user prompt may mention only part of the row; use any relevant enriched profile data when answering. "
+        "Do not create SQL or make unsupported assumptions.\n\n"
+        f"Query plan JSON:\n{json.dumps(query_plan, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Candidate context pack JSON:\n{json.dumps(context_pack, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Deterministic tool results JSON:\n{json.dumps(tool_results, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Full row context JSON:\n{full_row_context}\n\n"
         f"User prompt:\n{rendered_prompt or prompt_template}"
     )
@@ -863,11 +893,12 @@ def _run_ai_task(
         data_source = "row"
         structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
     else:
-        if routing.get("data_source") in {"web", "hybrid"}:
+        if query_plan.get("web_needed"):
             data_source = routing.get("data_source") or "web"
             web_required_reason = web_required_reason or "classified_public_or_fresh_prompt"
             structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
         else:
+            data_source = "row"
             structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
             auto_outputs = structured.get("outputs") if isinstance(structured.get("outputs"), dict) else {}
             has_row_answer = any(str(auto_outputs.get(item["key"]) or "").strip() for item in normalized_outputs)
@@ -880,6 +911,11 @@ def _run_ai_task(
     if not isinstance(outputs, dict):
         outputs = {}
 
+    model_plan = structured.get("query_plan")
+    if isinstance(model_plan, dict) and model_plan:
+        query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing, model_plan)
+        tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
+
     schema_keys = [item["key"] for item in normalized_outputs]
     normalized_values = map_raw_outputs_to_schema_keys(outputs, schema_keys)
 
@@ -891,7 +927,8 @@ def _run_ai_task(
 
     primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
     sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
-    verification_status = "verified" if sources else ("not_publicly_verifiable" if data_source in {"web", "hybrid"} else "row_context")
+    has_source_url = any(isinstance(source, dict) and str(source.get("url") or "").strip() for source in sources)
+    verification_status = "verified" if has_source_url else ("not_publicly_verifiable" if data_source in {"web", "hybrid"} else "row_context")
     expected_linkedin_slug = _context_linkedin_slug(context)
     prompt_l = (rendered_prompt or prompt_template or "").lower()
     requires_direct_linkedin_source = (
@@ -910,6 +947,22 @@ def _run_ai_task(
         for key in normalized_values:
             normalized_values[key] = "Not publicly verifiable" if key == primary_output_key or key in {"result", "summary", "activity", "posted"} else ""
         primary_output = normalized_values.get(primary_output_key) or "Not publicly verifiable"
+    verification = verify_smart_column_outputs(
+        rendered_prompt or prompt_template,
+        normalized_values,
+        data_source=data_source,
+        sources=sources,
+        tool_results=tool_results,
+    )
+    if (
+        data_source in {"web", "hybrid"}
+        and verification["verification_status"] != "passed"
+        and not has_source_url
+        and web_required_reason != "public_linkedin_recent_activity"
+        and not any(str(value or "").strip() for value in normalized_values.values())
+    ):
+        normalized_values[primary_output_key] = "Needs verification"
+        primary_output = "Needs verification"
     details = {
         "response": primary_output,
         "outputs": normalized_values,
@@ -928,6 +981,10 @@ def _run_ai_task(
         "rendered_prompt": rendered_prompt,
         "row_context_keys": list((context or {}).keys()),
         "career_facts": career_facts,
+        "candidate_context_pack": context_pack,
+        "query_plan": query_plan,
+        "tool_results": tool_results,
+        **verification,
         "raw_model_output": structured,
     }
     return {

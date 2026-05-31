@@ -21,6 +21,10 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
   const details = detail?.details || {};
   const steps = Array.isArray(details.steps) ? details.steps : [];
   const sources = Array.isArray(details.sources) ? details.sources : [];
+  const unknownReasons = Array.isArray(details.unknown_reasons) ? details.unknown_reasons : [];
+  const verificationErrors = Array.isArray(details.verification_errors) ? details.verification_errors : [];
+  const queryPlan = details.query_plan && typeof details.query_plan === 'object' ? details.query_plan : null;
+  const toolResults = details.tool_results && typeof details.tool_results === 'object' ? details.tool_results : null;
   const searchedAt = details.searched_at || detail?.completed_at || detail?.updated_at;
   const freshnessMeta = [
     details.web_search_tool,
@@ -77,6 +81,31 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
             </div>
 
             <div style={sectionStyle}>
+              <div style={sectionLabelStyle}>Verification</div>
+              <div style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.65, textTransform: 'capitalize' }}>
+                {details.verification_status || details.source_verification_status || 'row_context'}
+              </div>
+              {unknownReasons.length > 0 && (
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {unknownReasons.map((reason, index) => (
+                    <div key={`${reason}-${index}`} style={{ fontSize: 12, color: '#92400e', lineHeight: 1.5 }}>
+                      {reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {verificationErrors.length > 0 && (
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {verificationErrors.map((error, index) => (
+                    <div key={`${error}-${index}`} style={{ fontSize: 12, color: '#b91c1c', lineHeight: 1.5 }}>
+                      {error}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={sectionStyle}>
               <div style={{ ...sectionLabelStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
                 <Clock3 size={14} />
                 Freshness
@@ -110,6 +139,36 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
                 {details.reasoning || detail.error_message || 'No reasoning captured.'}
               </div>
             </div>
+
+            {queryPlan && (
+              <div style={sectionStyle}>
+                <div style={sectionLabelStyle}>Query Plan</div>
+                <div style={{ fontSize: 12, color: '#334155', lineHeight: 1.7 }}>
+                  <div><strong>Tools:</strong> {Array.isArray(queryPlan.tool_calls) ? queryPlan.tool_calls.join(', ') : '—'}</div>
+                  <div><strong>Web needed:</strong> {queryPlan.web_needed ? 'Yes' : 'No'}</div>
+                  <div><strong>Strictness:</strong> {queryPlan.strictness || 'unknown_instead_of_guess'}</div>
+                </div>
+              </div>
+            )}
+
+            {toolResults && (
+              <div style={sectionStyle}>
+                <div style={sectionLabelStyle}>Tool Results</div>
+                <pre style={{
+                  margin: 0,
+                  padding: 12,
+                  borderRadius: 12,
+                  background: '#0f172a',
+                  color: '#e2e8f0',
+                  fontSize: 11,
+                  lineHeight: 1.55,
+                  overflowX: 'auto',
+                  whiteSpace: 'pre-wrap',
+                }}>
+                  {JSON.stringify(toolResults, null, 2)}
+                </pre>
+              </div>
+            )}
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div style={sectionStyle}>

@@ -22,7 +22,9 @@ function Roles() {
         fetchOutreachStatus,
         triggerHeyReachOutreach,
         removeCandidateFromRole,
-        invalidateTalentPoolCaches
+        invalidateTalentPoolCaches,
+        fetchTalentPoolSummary,
+        fetchAnalytics
     } = useAppStore(useShallow((state) => ({
         roles: state.roles,
         fetchRoles: state.fetchRoles,
@@ -37,6 +39,8 @@ function Roles() {
         triggerHeyReachOutreach: state.triggerHeyReachOutreach,
         removeCandidateFromRole: state.removeCandidateFromRole,
         invalidateTalentPoolCaches: state.invalidateTalentPoolCaches,
+        fetchTalentPoolSummary: state.fetchTalentPoolSummary,
+        fetchAnalytics: state.fetchAnalytics,
     })))
 
     const [newRoleName, setNewRoleName] = useState('')
@@ -54,6 +58,7 @@ function Roles() {
     const [uploadCommitBusy, setUploadCommitBusy] = useState(false)
     const [uploadRowCount, setUploadRowCount] = useState(0)
     const [uploadProgress, setUploadProgress] = useState(null)
+    const [uploadEnrichmentMode, setUploadEnrichmentMode] = useState('none')
     const uploadFileRef = useRef(null)
 
     // Derived state for instant access
@@ -387,6 +392,7 @@ function Roles() {
             setUploadTargetOptions(res.data.target_options || [])
             setUploadRowCount(Number(res.data.row_count) || 0)
             setUploadProgress(null)
+            setUploadEnrichmentMode('none')
         } catch (e) {
             toast.error(e.response?.data?.detail || 'Preview failed')
         } finally {
@@ -412,6 +418,7 @@ function Roles() {
         const fd = new FormData()
         fd.append('file', uploadFile)
         fd.append('mapping_json', JSON.stringify(uploadMapping))
+        fd.append('enrichment_mode', uploadEnrichmentMode || 'none')
         setUploadCommitBusy(true)
         try {
             const res = await axios.post(`${API_BASE}/roles/${encodeURIComponent(uploadRole.name)}/upload/commit`, fd, {
@@ -433,6 +440,8 @@ function Roles() {
             }
             invalidateTalentPoolCaches()
             await fetchRoles({ force: true })
+            fetchTalentPoolSummary({ force: true, freshnessMs: 0 })
+            fetchAnalytics({ force: true })
             if (viewingRole?.name === uploadRole.name) {
                 await fetchRoleDetails(uploadRole.name)
             }
@@ -540,7 +549,9 @@ function Roles() {
                     targetOptions={uploadTargetOptions}
                     rowCount={uploadRowCount}
                     progress={uploadProgress}
+                    enrichmentMode={uploadEnrichmentMode}
                     busy={uploadCommitBusy}
+                    onEnrichmentModeChange={setUploadEnrichmentMode}
                     onChange={(header, value) => setUploadMapping(prev => ({ ...prev, [header]: value }))}
                     onCancel={() => {
                         setUploadRole(null)
@@ -550,6 +561,7 @@ function Roles() {
                         setUploadMappingDetails({})
                         setUploadProgress(null)
                         setUploadRowCount(0)
+                        setUploadEnrichmentMode('none')
                     }}
                     onImport={commitRoleUpload}
                 />
@@ -903,7 +915,10 @@ function Roles() {
                             </thead>
                             <tbody>
                                 {viewingRole.candidates.map((candidate, idx) => {
-                                    const primaryRole = candidate.roles?.[0] || {}
+                                    const primaryRole = candidate.roles?.[0] || {
+                                        title: candidate.current_title || candidate.title || candidate.headline || '',
+                                        company: candidate.current_company || candidate.company || '',
+                                    }
                                     const summary = candidate.reasoning || candidate.summary || "N/A"
                                     const truncatedSummary = summary.length > 30 ? summary.substring(0, 30) + "..." : summary
                                     const feedback = candidate.feedback || ""

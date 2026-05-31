@@ -9,8 +9,10 @@ from backend.api.routes import ai_columns
 from backend.api.routes import browse
 from backend.db.ai_column_migrate import ensure_ai_column_migrations
 from backend.services.ai_columns import (
+    build_candidate_context_pack,
     build_field_catalog,
     build_candidate_context,
+    build_query_plan,
     classify_ai_column_prompt,
     compute_career_facts,
     evaluate_required_fields,
@@ -18,6 +20,7 @@ from backend.services.ai_columns import (
     fill_prompt_template,
     map_raw_outputs_to_schema_keys,
     map_career_facts_to_outputs,
+    run_candidate_query_tools,
 )
 from backend.services.ai_column_presets import list_ai_column_presets
 
@@ -228,6 +231,145 @@ def test_career_facts_collapse_company_and_exclude_memberships():
     assert outputs["average_tenure_months"].isdigit()
     assert outputs["current_job_months"].isdigit()
     assert outputs["career_city_count"] == "2"
+
+
+def test_career_facts_marks_enterprise_saas_ae_qualification():
+    profile = {
+        "id": 2,
+        "name": "Qualified AE",
+        "roles": [
+            {
+                "title": "Enterprise Account Executive",
+                "company": "Acme SaaS",
+                "start_date": "2021-01",
+                "end_date": "Present",
+                "company_details": {
+                    "product_service": "SaaS platform",
+                    "customer_segment": ["Enterprise"],
+                    "business_model": "B2B subscription",
+                },
+            },
+            {"title": "Senior AE", "company": "Beta SaaS", "start_date": "2017-01", "end_date": "2020-12"},
+            {"title": "Account Executive", "company": "Gamma Cloud", "start_date": "2013-01", "end_date": "2016-12"},
+            {"title": "Member", "company": "RevGenius", "start_date": "2022", "end_date": "Present"},
+        ],
+    }
+    context = build_candidate_context(profile)
+    facts = compute_career_facts(context)
+    outputs = map_career_facts_to_outputs(
+        (
+            "Calculate average tenure in months, current job tenure in months, and mark Yes if "
+            "10+ years overall experience, minimum 5+ years account executive experience, and "
+            "currently working in an enterprise segment focused SaaS company."
+        ),
+        [
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "overall_experience_months", "label": "Total Experience Months"},
+            {"key": "ae_experience_months", "label": "Account Executive Experience Months"},
+            {"key": "current_enterprise_saas", "label": "Current Enterprise SaaS"},
+            {"key": "qualified", "label": "Qualified"},
+        ],
+        facts,
+    )
+
+    assert "RevGenius" not in facts["companies"]
+    assert facts["total_experience_months"] >= 120
+    assert facts["ae_experience_months"] >= 60
+    assert facts["current_company_enterprise_saas"] == "Yes"
+    assert outputs["qualified"] == "Yes"
+    assert outputs["current_enterprise_saas"] == "Yes"
+
+
+def test_career_facts_detect_job_hopping_from_company_windows():
+    profile = {
+        "id": 5,
+        "name": "Frequent Switcher",
+        "roles": [
+            {"title": "Account Executive", "company": "Alpha SaaS", "start_date": "2023-01", "end_date": "2023-10"},
+            {"title": "Senior Account Executive", "company": "Alpha SaaS", "start_date": "2023-11", "end_date": "2024-04"},
+            {"title": "Account Executive", "company": "Beta Cloud", "start_date": "2022-01", "end_date": "2022-10"},
+            {"title": "BDR", "company": "Gamma Tech", "start_date": "2021-01", "end_date": "2021-09"},
+            {"title": "Member", "company": "RevGenius", "start_date": "2021-01", "end_date": "Present"},
+        ],
+    }
+    context = build_candidate_context(profile)
+    facts = compute_career_facts(context)
+    plan = build_query_plan(
+        "Is this candidate a job hopper with too many short stints?",
+        context,
+        [{"key": "job_hopping", "label": "Job Hopping", "primary": True}],
+        classify_ai_column_prompt("Is this candidate a job hopper with too many short stints?"),
+    )
+    tools = run_candidate_query_tools("Is this candidate a job hopper?", context, facts, plan)
+    outputs = map_career_facts_to_outputs(
+        "Is this candidate a job hopper with too many short stints?",
+        [{"key": "job_hopping", "label": "Job Hopping", "primary": True}],
+        facts,
+    )
+
+    assert facts["unique_company_count"] == 3
+    assert facts["short_company_stints_count"] == 3
+    assert facts["job_hopping_status"] == "Yes"
+    assert "RevGenius" not in facts["companies"]
+    assert "job_hopping" in plan["tool_calls"]
+    assert tools["job_hopping"]["status"] == "Yes"
+    assert outputs["job_hopping"] == "Yes"
+
+
+def test_universal_query_plan_and_tools_cover_enriched_profile_dimensions():
+    profile = {
+        "id": 3,
+        "name": "Segment Seller",
+        "headline": "Enterprise SaaS AE across EMEA",
+        "raw_fields": {
+            "enrichment": {
+                "verification_status": "passed",
+                "roles": [
+                    {
+                        "company": "Acme SaaS",
+                        "title": "Enterprise Account Executive",
+                        "start_date": "2020-01-01",
+                        "end_date": "2022-12-01",
+                        "duration_months": 36,
+                        "function": "Hunting",
+                        "product_service": "SaaS",
+                        "industry": "SaaS",
+                        "customer_segment": ["Enterprise", "SMB"],
+                        "business_model": "B2B subscription",
+                        "details": "Closed new logo SMB and enterprise deals across EMEA.",
+                    }
+                ],
+                "profile_claims": {
+                    "segments": ["Enterprise", "SMB"],
+                    "geographies": ["EMEA"],
+                    "functions": [{"function": "Hunting", "reason": "about"}],
+                },
+            }
+        },
+    }
+    context = build_candidate_context(profile)
+    facts = compute_career_facts(context)
+    plan = build_query_plan(
+        "Has 3+ years selling to SMB in EMEA with hunting experience?",
+        context,
+        [{"key": "result", "label": "Result", "primary": True}],
+        classify_ai_column_prompt("Has 3+ years selling to SMB in EMEA with hunting experience?"),
+    )
+    tools = run_candidate_query_tools(
+        "Has 3+ years selling to SMB in EMEA with hunting experience?",
+        context,
+        facts,
+        plan,
+    )
+    pack = build_candidate_context_pack(context, facts)
+
+    assert plan["web_needed"] is False
+    assert {"segment_experience", "geography_experience", "functional_experience"} <= set(plan["tool_calls"])
+    assert tools["segment_experience"]["SMB"]["months"] == 36
+    assert tools["geography_experience"]["EMEA"]["months"] == 36
+    assert tools["functional_experience"]["Hunting"]["months"] == 36
+    assert pack["profile_claims"]
 
 
 def test_run_ai_task_sends_full_row_context_even_without_tokens(monkeypatch):
@@ -1003,6 +1145,76 @@ def test_run_ai_task_auto_computes_tenure_without_openai(monkeypatch):
     assert result["details"]["data_source"] == "row"
     assert result["outputs"]["average_tenure_months"].isdigit()
     assert result["outputs"]["current_job_months"].isdigit()
+    assert result["details"]["query_plan"]["tool_calls"]
+    assert result["details"]["tool_results"]["career_metrics"]["average_tenure_months"]
+    assert result["details"]["verification_status"] == "passed"
+
+
+def test_run_ai_task_uses_enriched_tools_without_static_sql_for_complex_query(monkeypatch):
+    calls = []
+
+    def fake_openai(system_prompt, user_prompt, *, use_web=False):
+        calls.append(use_web)
+        assert "Candidate context pack JSON" in user_prompt
+        assert "Deterministic tool results JSON" in user_prompt
+        return {
+            "outputs": {
+                "result": "Yes",
+                "reasoning": "Tool results show SMB, EMEA and Hunting experience.",
+            },
+            "query_plan": {
+                "intent": "Check segment, geography and function experience.",
+                "tool_calls": ["segment_experience", "geography_experience", "functional_experience"],
+                "web_needed": False,
+            },
+            "reasoning": "Used enriched profile tool results.",
+            "confidence": "high",
+            "steps": ["Read enriched roles", "Used deterministic tools"],
+            "sources": [],
+        }
+
+    context = build_candidate_context(
+        {
+            "id": 4,
+            "name": "Tool Candidate",
+            "raw_fields": {
+                "enrichment": {
+                    "roles": [
+                        {
+                            "company": "Acme SaaS",
+                            "title": "Enterprise Account Executive",
+                            "start_date": "2020-01-01",
+                            "end_date": "2022-12-01",
+                            "duration_months": 36,
+                            "function": "Hunting",
+                            "product_service": "SaaS",
+                            "industry": "SaaS",
+                            "customer_segment": ["SMB"],
+                            "details": "New business in EMEA.",
+                        }
+                    ]
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+
+    result = ai_columns._run_ai_task(
+        prompt_template="Has 3+ years selling to SMB in EMEA with hunting experience?",
+        mode="auto",
+        output_schema=[
+            {"key": "result", "label": "Result", "primary": True},
+            {"key": "reasoning", "label": "Reasoning"},
+        ],
+        context=context,
+    )
+
+    assert calls == [False]
+    assert result["primary_output"] == "Yes"
+    assert result["details"]["query_plan"]["web_needed"] is False
+    assert result["details"]["tool_results"]["segment_experience"]["SMB"]["months"] == 36
+    assert result["details"]["verification_status"] == "passed"
 
 
 def test_run_ai_task_auto_forces_web_for_linkedin_activity(monkeypatch):
@@ -1126,7 +1338,7 @@ def test_run_ai_task_auto_falls_back_to_web_when_row_context_is_insufficient(mon
             "reasoning": "Used the web to find competitors.",
             "confidence": "medium",
             "steps": ["Checked the row context", "Searched the web"],
-            "sources": [{"title": "Search result"}],
+            "sources": [{"title": "Search result", "url": "https://example.com/competitors"}],
         }
 
     monkeypatch.setattr(ai_columns, "_openai_client", object())
@@ -1140,6 +1352,31 @@ def test_run_ai_task_auto_falls_back_to_web_when_row_context_is_insufficient(mon
 
     assert result["primary_output"] == "Acme, BetaCo, GammaInc"
     assert calls == [False, True]
+
+
+def test_run_ai_task_web_without_source_url_keeps_answer_with_verification_warning(monkeypatch):
+    def fake_openai(system_prompt, user_prompt, *, use_web=False):
+        assert use_web is True
+        return {
+            "outputs": {"result": "Yes"},
+            "reasoning": "No direct source URL returned.",
+            "confidence": "medium",
+            "steps": ["Searched the web"],
+            "sources": [{"title": "Unlinked source"}],
+        }
+
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Any recent layoffs at the current company?",
+        mode="auto",
+        output_schema=[{"key": "result", "label": "Result", "primary": True}],
+        context={"role.current_company": "ExampleCo"},
+    )
+
+    assert result["primary_output"] == "Yes"
+    assert result["details"]["verification_status"] == "passed_with_unknowns"
+    assert "Web-derived answer has no source URL." in result["details"]["unknown_reasons"]
 
 
 def test_limit_profiles_for_field_catalog_caps_size(monkeypatch):

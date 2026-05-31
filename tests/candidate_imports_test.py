@@ -77,6 +77,38 @@ def test_preview_prefers_model_mapping_with_details(monkeypatch):
     assert result["missing_required"] == []
 
 
+def test_preview_forces_work_history_columns_to_custom_even_if_model_maps_them(monkeypatch):
+    async def model_mapping(_headers, _sample_rows):
+        return {
+            "Current Role": {"target": "title", "confidence": 0.9, "reason": "Current title."},
+            "Company 2 Name": {"target": "company_name", "confidence": 0.9, "reason": "Company."},
+            "Title.1": {"target": "title", "confidence": 0.9, "reason": "Title."},
+            "Start date.1": {"target": "notes", "confidence": 0.9, "reason": "Date."},
+            "End Date.1": {"target": "notes", "confidence": 0.9, "reason": "Date."},
+            "Details .1": {"target": "notes", "confidence": 0.9, "reason": "Details."},
+        }
+
+    monkeypatch.setattr(candidate_imports, "_model_mapping", model_mapping)
+
+    result = asyncio.run(
+        candidate_imports.build_upload_preview_response(
+            _upload_file(
+                "First Name,Last Name,LinkedIn URL,City,Current Role,Company 2 Name,Title.1,Start date.1,End Date.1,Details .1\n"
+                "Ada,Lovelace,https://linkedin.com/in/ada,London,Founder,Beta,AE,Jan 2020,Present,Sold SaaS\n"
+            ),
+            use_llm=True,
+        )
+    )
+
+    assert result["suggested_mapping"]["Current Role"] == "title"
+    assert result["suggested_mapping"]["Company 2 Name"] == "custom"
+    assert result["suggested_mapping"]["Title.1"] == "custom"
+    assert result["suggested_mapping"]["Start date.1"] == "custom"
+    assert result["suggested_mapping"]["End Date.1"] == "custom"
+    assert result["suggested_mapping"]["Details .1"] == "custom"
+    assert result["mapping_details"]["Start date.1"]["source"] == "history"
+
+
 def test_validate_mapping_requires_core_fields_and_ignores_unknown_targets():
     with pytest.raises(HTTPException) as exc_info:
         candidate_imports._validate_mapping(

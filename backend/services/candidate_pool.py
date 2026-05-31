@@ -40,17 +40,22 @@ HEADER_ALIASES: Dict[str, set] = {
         "linkedin",
         "linkedin url",
         "linkedin profile",
+        "linkedin profile link",
         "profile url",
+        "profile link",
         "li url",
         "person linkedin",
+        "person linkedin url",
     },
     "city": {"city", "metro", "town", "current city"},
     "title": {"title", "role", "job title", "position", "designation"},
     "company_name": {"company", "company name", "employer", "organization"},
     "email": {"email", "email address", "work email"},
-    "phone": {"phone", "mobile", "mobile phone", "phone number"},
-    "location": {"location", "address"},
+    "phone": {"phone", "mobile", "mobile phone", "phone number", "mobile number", "mob number"},
+    "location": {"location", "address", "addresswithcountry", "address with country"},
     "notes": {"notes", "comments", "remarks"},
+    "headline": {"headline"},
+    "about": {"about", "bio", "biography", "summary", "profile summary"},
 }
 
 
@@ -61,6 +66,10 @@ def suggest_header_mapping(headers: List[str]) -> Dict[str, str]:
         if not orig or not str(orig).strip():
             continue
         key = re.sub(r"[^a-z0-9]+", " ", orig.strip().lower()).strip()
+        if re.search(r"\b(company|title|start date|end date|details|degree name|education)\s+\d+\b", key):
+            continue
+        if re.search(r"\b(title|start date|end date|details|degree name)\s+\d+\b", key):
+            continue
         matched = None
         for target, aliases in HEADER_ALIASES.items():
             if key in aliases:
