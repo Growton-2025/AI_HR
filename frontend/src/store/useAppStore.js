@@ -2300,12 +2300,7 @@ export const useAppStore = create(persist((set, get) => ({
         heyreachCampaignId: state.heyreachCampaignId,
         isSidebarCollapsed: state.isSidebarCollapsed,
         // Do not persist analytics: stale zeros (failed fetch / cold cache) overwrite real counts after reload.
-        tpCandidates: state.tpCandidates,
-        tpTotal: state.tpTotal,
-        tpStatusCounts: state.tpStatusCounts,
         tpAiRunFocus: state.tpAiRunFocus,
-        talentPoolCache: state.talentPoolCache,
-        searchResults: state.searchResults,
         searchQuery: state.searchQuery
     }),
     merge: (persistedState, currentState) => {
@@ -2330,6 +2325,11 @@ export const useAppStore = create(persist((set, get) => ({
             tpScopeStatusCounts: {},
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            tpCandidates: currentState.tpCandidates,
+            tpTotal: currentState.tpTotal,
+            tpStatusCounts: currentState.tpStatusCounts,
+            talentPoolCache: currentState.talentPoolCache,
+            searchResults: currentState.searchResults,
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
             talentPoolIndexRequest: null,
