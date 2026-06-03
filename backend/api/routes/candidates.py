@@ -4,6 +4,7 @@ import hashlib
 import base64
 import time
 import asyncio
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -25,12 +26,16 @@ from backend.pipeline.query import (
     CULTURE_TAXONOMY,
     GEOGRAPHY_COUNTRY_TO_REGION_MAP,
     is_cache_initialized,
+    initialize_cache,
+    count_active_candidates_from_db,
 )
 from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 _analytics_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ANALYTICS_CACHE_TTL = 60
+_analytics_profile_cache_init_lock = asyncio.Lock()
 
 
 def invalidate_candidate_analytics_cache() -> None:
@@ -120,10 +125,32 @@ async def get_candidates(
 @router.get("/candidates/analytics")
 async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_current_user)):
     """Get performance analytics for the recruiter/admin"""
-    from backend.pipeline.query import get_analytics_summary, initialize_cache
+    from backend.pipeline.query import get_analytics_summary
 
-    if not is_cache_initialized():
-        await asyncio.to_thread(initialize_cache)
+    if not is_cache_initialized() or not PROFILES_BY_ID:
+        async with _analytics_profile_cache_init_lock:
+            if not is_cache_initialized() or not PROFILES_BY_ID:
+                await asyncio.to_thread(initialize_cache)
+
+    if not PROFILES_BY_ID:
+        active_count = await asyncio.to_thread(count_active_candidates_from_db)
+        if active_count and active_count > 0:
+            logger.error(
+                "analytics profile cache unavailable after reload; active_candidates=%s",
+                active_count,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "profile_cache_unavailable",
+                    "message": "Candidate cache is warming or unavailable. Please retry shortly.",
+                    "metadata": {
+                        "active_candidates": active_count,
+                        "cache_initialized": is_cache_initialized(),
+                        "profile_count": len(PROFILES_BY_ID),
+                    },
+                },
+            )
 
     key = f"{current_user.id}:{current_user.role}"
     cached = _analytics_cache.get(key)

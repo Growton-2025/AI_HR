@@ -829,6 +829,32 @@ def test_browse_summary_initializes_empty_profile_cache(monkeypatch):
     assert summary["status_counts"] == {"Shortlisted": 1}
 
 
+def test_browse_summary_returns_503_when_active_db_cache_stays_empty(monkeypatch):
+    calls = []
+
+    def fake_initialize_cache():
+        calls.append("init")
+
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", {})
+    monkeypatch.setattr(browse, "is_cache_initialized", lambda: True)
+    monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
+    monkeypatch.setattr(browse, "count_active_candidates_from_db", lambda: 4174)
+    browse._browse_cache.clear()
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            browse.browse_summary(
+                current_user=_user(role="admin"),
+                view_scope="master",
+                recruiter_filter_id=None,
+            )
+        )
+
+    assert calls == ["init"]
+    assert exc.value.status_code == 503
+    assert exc.value.detail["code"] == "profile_cache_unavailable"
+
+
 def test_browse_meta_initializes_empty_profile_cache(monkeypatch):
     profiles = {}
     calls = []

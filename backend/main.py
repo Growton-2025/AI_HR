@@ -178,10 +178,18 @@ async def ping_check():
 
 @app.get("/api/debug_db")
 async def debug_db():
-    from backend.pipeline.query import redis_client
+    from backend.pipeline.query import (
+        PROFILES_BY_ID,
+        count_active_candidates_from_db,
+        is_cache_initialized,
+        redis_client,
+    )
 
     results = {"db": "testing...", "redis": "testing..."}
     results["pool"] = get_connection_pool_state()
+    results["cache_initialized"] = is_cache_initialized()
+    results["profile_count"] = len(PROFILES_BY_ID)
+    results["active_candidate_count"] = None
 
     # Test DB
     try:
@@ -198,6 +206,9 @@ async def debug_db():
                 results["db"] = "failed (no connection)"
     except Exception as e:
         results["db"] = f"failed: {str(e)}"
+
+    results["active_candidate_count"] = count_active_candidates_from_db()
+    results["pool"] = get_connection_pool_state()
 
     # Test Redis
     try:

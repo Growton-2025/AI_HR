@@ -1,7 +1,13 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, List, Any
 from pydantic import BaseModel
-from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID, initialize_cache, is_cache_initialized
+from backend.pipeline.query import (
+    update_candidate_status,
+    PROFILES_BY_ID,
+    initialize_cache,
+    is_cache_initialized,
+    count_active_candidates_from_db,
+)
 from backend.api import deps, schemas
 from backend.services.candidate_pool import (
     profile_passes_scope,
@@ -77,10 +83,14 @@ async def _ensure_profiles_loaded() -> bool:
     Azure/Gunicorn workers do not share process memory. A cold worker can otherwise
     answer browse/summary/meta from an empty cache and briefly poison frontend totals.
     """
-    if is_cache_initialized():
+    if is_cache_initialized() and PROFILES_BY_ID:
         return False
+    if is_cache_initialized() and not PROFILES_BY_ID:
+        logger.warning(
+            "browse profile cache marked initialized but empty; forcing reload before serving request"
+        )
     async with _profile_cache_init_lock:
-        if is_cache_initialized():
+        if is_cache_initialized() and PROFILES_BY_ID:
             return False
         started = time.monotonic()
         await asyncio.to_thread(initialize_cache)
@@ -90,6 +100,25 @@ async def _ensure_profiles_loaded() -> bool:
             (time.monotonic() - started) * 1000,
             len(PROFILES_BY_ID),
         )
+        if not PROFILES_BY_ID:
+            active_count = await asyncio.to_thread(count_active_candidates_from_db)
+            if active_count and active_count > 0:
+                logger.error(
+                    "browse profile cache unavailable after reload; active_candidates=%s",
+                    active_count,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "profile_cache_unavailable",
+                        "message": "Candidate cache is warming or unavailable. Please retry shortly.",
+                        "metadata": {
+                            "active_candidates": active_count,
+                            "cache_initialized": is_cache_initialized(),
+                            "profile_count": len(PROFILES_BY_ID),
+                        },
+                    },
+                )
         return True
 
 

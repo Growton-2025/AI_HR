@@ -203,6 +203,30 @@ def is_cache_initialized() -> bool:
     return CACHE_INITIALIZED
 
 
+def count_active_candidates_from_db() -> Optional[int]:
+    """Return active candidate count, or None when the DB cannot be checked."""
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        logger.error("Could not count active candidates: no database connection")
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM candidates
+                WHERE COALESCE(is_archived, FALSE) = FALSE
+                """
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as e:
+        logger.error("Failed to count active candidates: %s", e, exc_info=True)
+        return None
+    finally:
+        return_db_connection(conn)
+
+
 def load_all_company_names_from_db():
     logger.info("Loading all unique company names from the database into cache...")
     conn = get_db_connection()
@@ -361,6 +385,7 @@ def load_all_profiles_from_db():
     logger.info("Loading all profiles from the database into cache...")
     conn = get_db_connection()
     if not conn:
+        logger.error("Failed to load profiles: no database connection")
         return []
     try:
         cur = conn.cursor()
@@ -380,7 +405,7 @@ def load_all_profiles_from_db():
         logger.info(f"Successfully loaded and cached {len(profiles)} profiles.")
         return profiles
     except Exception as e:
-        logger.error(f"Failed to load profiles: {e}")
+        logger.error("Failed to load profiles: %s", e, exc_info=True)
         return []
     finally:
         if conn:
@@ -434,18 +459,46 @@ def initialize_cache():
     global PROFILES_BY_ID, ALL_COMPANY_NAMES, _PROFILES_CACHE, CACHE_INITIALIZED
     try:
         profiles = load_all_profiles_from_db()
-        PROFILES_BY_ID.clear()
-        ALL_COMPANY_NAMES.clear()
-        PROFILES_BY_ID.update({p['id']: p for p in profiles})
-        _PROFILES_CACHE = profiles
 
+        if not profiles:
+            active_count = count_active_candidates_from_db()
+            if active_count is None:
+                CACHE_INITIALIZED = bool(PROFILES_BY_ID)
+                logger.error(
+                    "Profile cache refresh returned zero rows and active DB count is unavailable; "
+                    "preserving existing cache profiles=%s initialized=%s",
+                    len(PROFILES_BY_ID),
+                    CACHE_INITIALIZED,
+                )
+                return False
+
+            if active_count > 0:
+                CACHE_INITIALIZED = bool(PROFILES_BY_ID)
+                logger.error(
+                    "Profile cache refresh returned zero rows while DB has %s active candidates; "
+                    "preserving existing cache profiles=%s initialized=%s",
+                    active_count,
+                    len(PROFILES_BY_ID),
+                    CACHE_INITIALIZED,
+                )
+                return False
+
+        next_profiles_by_id = {p["id"]: p for p in profiles}
         companies = load_all_company_names_from_db()
+
+        PROFILES_BY_ID.clear()
+        PROFILES_BY_ID.update(next_profiles_by_id)
+        _PROFILES_CACHE = profiles
+        ALL_COMPANY_NAMES.clear()
         ALL_COMPANY_NAMES.extend(companies)
 
         CACHE_INITIALIZED = True
         logger.info(f"Cache initialized with {len(PROFILES_BY_ID)} profiles and {len(ALL_COMPANY_NAMES)} companies.")
+        return True
     except Exception as e:
-        logger.error(f"Failed to initialize cache: {e}")
+        CACHE_INITIALIZED = bool(PROFILES_BY_ID)
+        logger.error("Failed to initialize cache: %s", e, exc_info=True)
+        return False
 
 def update_profile_cache(candidate_id: int, data: Dict[str, Any]):
     """Update a specific profile in the global cache"""
