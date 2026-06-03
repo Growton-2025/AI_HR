@@ -7,7 +7,7 @@ load_dotenv('/Users/nethranand/Downloads/AI_HR/backend/.env')
 DB_NAME = os.getenv("DB_NAME", "growton")
 DB_USER = os.getenv("DB_USER", "growton")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
-DB_HOST = os.getenv("DB_HOST", "growton-2026.postgres.database.azure.com")
+DB_HOST = os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
 conn = psycopg2.connect(

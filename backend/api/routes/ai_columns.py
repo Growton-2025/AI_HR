@@ -169,13 +169,15 @@ def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 220, 
             return (0, key)
         if key.startswith("role."):
             return (1, key)
-        if key.startswith("raw."):
+        if key.startswith("extra."):
             return (2, key)
-        if key.startswith("ai."):
+        if key.startswith("raw."):
             return (3, key)
-        if key.startswith("row."):
+        if key.startswith("ai."):
             return (4, key)
-        return (5, key)
+        if key.startswith("row."):
+            return (5, key)
+        return (6, key)
 
     payload: Dict[str, str] = {}
     for key, raw_value in sorted((context or {}).items(), key=priority):
@@ -434,8 +436,23 @@ def _fetch_visible_definitions(
 
 def _fetch_profile(candidate_id: int) -> Optional[Dict[str, Any]]:
     profile = query.PROFILES_BY_ID.get(candidate_id)
+    if profile and profile.get("roles"):
+        return profile
+
+    # Newly ingested/uploaded rows may not be present in the worker-local cache yet.
+    # Refreshing the single profile uses backend.pipeline.query's full candidate +
+    # roles loader, including start/end dates stored in roles.details JSON.
+    try:
+        query.refresh_profiles_in_cache([candidate_id])
+        refreshed = query.PROFILES_BY_ID.get(candidate_id)
+        if refreshed:
+            return refreshed
+    except Exception:
+        logger.exception("Failed to refresh AI-column profile cache for candidate %s", candidate_id)
+
     if profile:
         return profile
+
     from backend.api.routes.enrichment import _fetch_profile_from_db
 
     return _fetch_profile_from_db(candidate_id)
@@ -920,7 +937,7 @@ def _run_ai_task(
     normalized_values = map_raw_outputs_to_schema_keys(outputs, schema_keys)
 
     if not any(normalized_values.values()):
-        fallback_text = structured.get("result") or structured.get("response") or "No structured response returned."
+        fallback_text = structured.get("result") or structured.get("response") or structured.get("reasoning") or "No structured response returned."
         fb = str(fallback_text).strip()
         for item in normalized_outputs:
             normalized_values[item["key"]] = fb
@@ -1430,9 +1447,18 @@ def _process_ai_run(
         )
     finally:
         try:
-            query.initialize_cache()
+            refresh_started = time.monotonic()
+            refreshed = query.refresh_profiles_in_cache(candidate_ids)
+            _clear_list_cache()
+            logger.info(
+                "AI column run cache refresh run_id=%s candidates=%s refreshed=%s duration_ms=%s",
+                run_id,
+                len(candidate_ids),
+                refreshed,
+                round((time.monotonic() - refresh_started) * 1000),
+            )
         except Exception:
-            pass
+            logger.exception("AI column run targeted cache refresh failed run_id=%s", run_id)
         with _run_threads_lock:
             _run_threads.pop(run_id, None)
 

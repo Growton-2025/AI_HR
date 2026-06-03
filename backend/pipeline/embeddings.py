@@ -1,23 +1,53 @@
 
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain.docstore.document import Document
 import os
 
+def _parse_profile_date(value: str):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.lower() in {"present", "current", "now", "till date", "ongoing"}:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+    normalized = " ".join(text.replace(",", " ").split())
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m-%Y",
+        "%m/%Y",
+        "%Y-%m",
+        "%Y/%m",
+        "%Y",
+        "%b %Y",
+        "%B %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    year_match = re.search(r"\b(19|20)\d{2}\b", normalized)
+    if year_match:
+        return datetime(int(year_match.group(0)), 1, 1)
+    return None
+
+
 # Function to calculate years
-def calculate_years(start_date: str, end_date: str, current_date: str = "2025-08-06") -> float:
+def calculate_years(start_date: str, end_date: str, current_date: str = None) -> float:
     try:
-        date_formats = ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%m/%d/%Y"]
-        start, end = None, None
-        for fmt in date_formats:
-            try:
-                start = datetime.strptime(start_date, fmt)
-                end = datetime.strptime(end_date, fmt) if end_date and end_date.lower() != "present" else datetime.strptime(current_date, "%Y-%m-%d")
-                break
-            except ValueError:
-                continue
+        start = _parse_profile_date(start_date)
+        end = _parse_profile_date(end_date)
+        if not end and current_date:
+            end = _parse_profile_date(current_date)
+        end = end or datetime.now(timezone.utc).replace(tzinfo=None)
         if not start or not end:
             raise ValueError("No valid date format")
         return round((end - start).days / 365.25, 2)

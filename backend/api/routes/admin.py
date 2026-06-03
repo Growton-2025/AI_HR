@@ -118,6 +118,78 @@ class BulkAssignRequest(BaseModel):
     recruiter_user_id: int
 
 
+class RecruiterUpdateRequest(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    password: str | None = None
+
+
+@router.patch("/recruiters/{user_id}", response_model=schemas.User, dependencies=[Depends(check_admin)])
+async def update_recruiter(user_id: int, request: RecruiterUpdateRequest):
+    """Update a recruiter's login identity without moving their owned candidates."""
+    global _recruiters_cache
+    name = (request.name or "").strip() or None
+    email = (request.email or "").strip().lower() or None
+    password = request.password or None
+    if not any([name, email, password]):
+        raise HTTPException(status_code=400, detail="Provide name, email, or password to update")
+    if password is not None and len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM users
+                WHERE id = %s AND role = 'recruiter' AND archived_at IS NULL
+                """,
+                (user_id,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Recruiter not found")
+            if email:
+                cur.execute(
+                    """
+                    SELECT id FROM users
+                    WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s)) AND id <> %s
+                    """,
+                    (email, user_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=400, detail="Email is already in use")
+
+            hashed_pw = get_password_hash(password) if password else None
+            cur.execute(
+                """
+                UPDATE users
+                SET
+                  name = COALESCE(%s, name),
+                  email = COALESCE(%s, email),
+                  hashed_password = COALESCE(%s, hashed_password),
+                  is_verified = TRUE
+                WHERE id = %s AND role = 'recruiter' AND archived_at IS NULL
+                RETURNING id, name, email, role, permissions
+                """,
+                (name, email, hashed_pw, user_id),
+            )
+            user = cur.fetchone()
+            conn.commit()
+            _recruiters_cache = None
+            return schemas.User(id=user[0], full_name=user[1], email=user[2], username=user[2], role=user[3], permissions=user[4] or {})
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("update recruiter failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
+
+
 @router.post("/candidates/assign-to-recruiter", dependencies=[Depends(check_admin)])
 async def bulk_assign_master_to_recruiter(
     body: BulkAssignRequest,

@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from backend.services.candidate_pool import profile_passes_scope
+from backend.services.imported_fields import (
+    IMPORTED_EXTRA_FIELDS_KEY,
+    iter_imported_extra_fields,
+)
 
 
 DEFAULT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
@@ -92,7 +96,6 @@ COMMUNITY_MEMBERSHIP_TERMS = (
     "member",
     "membership",
     "mentor",
-    "advisor",
     "volunteer",
 )
 WEB_FRESHNESS_TERMS = (
@@ -172,6 +175,8 @@ def flatten_raw_fields(raw_fields: Any, prefix: str = "raw") -> List[Dict[str, A
         value = _normalize_context_container(value)
         if isinstance(value, dict):
             for k, child in value.items():
+                if prefix == "raw" and len(parts) == 1 and str(k) == IMPORTED_EXTRA_FIELDS_KEY:
+                    continue
                 walk(child, parts + [str(k)])
             return
         if isinstance(value, list):
@@ -203,6 +208,29 @@ def flatten_raw_fields(raw_fields: Any, prefix: str = "raw") -> List[Dict[str, A
         )
 
     walk(raw, [prefix])
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for item in out:
+        dedup[item["key"]] = item
+    return list(dedup.values())
+
+
+def flatten_imported_extra_fields(raw_fields: Any) -> List[Dict[str, Any]]:
+    raw = safe_json(raw_fields)
+    out: List[Dict[str, Any]] = []
+    for key, meta in iter_imported_extra_fields(raw):
+        label = str(meta.get("label") or labelize_key(key)).strip() or labelize_key(key)
+        value = stringify_context_value(meta.get("value"))
+        source_header = str(meta.get("source_header") or "").strip()
+        out.append(
+            {
+                "key": f"extra.{key}",
+                "label": label,
+                "group": "Imported Extra Fields",
+                "path": (IMPORTED_EXTRA_FIELDS_KEY, key, "value"),
+                "sample": value[:180],
+                "source_header": source_header,
+            }
+        )
     dedup: Dict[str, Dict[str, Any]] = {}
     for item in out:
         dedup[item["key"]] = item
@@ -244,6 +272,9 @@ def build_candidate_context(
         ctx[alias] = linkedin_value
     for imported in flatten_raw_fields(profile.get("raw_fields")):
         raw_value = _get_nested_value(profile.get("raw_fields") or {}, imported["path"][1:])
+        ctx[imported["key"]] = stringify_context_value(raw_value)
+    for imported in flatten_imported_extra_fields(profile.get("raw_fields")):
+        raw_value = _get_nested_value(profile.get("raw_fields") or {}, imported["path"])
         ctx[imported["key"]] = stringify_context_value(raw_value)
     for key, value in flatten_profile_context(profile).items():
         ctx.setdefault(key, value)
@@ -411,16 +442,23 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
 
 
 def _parse_role_context_entries(context: Dict[str, str]) -> List[Dict[str, str]]:
-    grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
+    enriched_grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
+    db_grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
     for key, value in (context or {}).items():
-        match = re.match(r"row\.roles\.(\d+)\.(.+)", str(key))
-        if not match:
-            match = re.match(r"row\.raw_fields\.enrichment\.roles\.(\d+)\.(.+)", str(key))
+        enriched_match = re.match(r"row\.raw_fields\.enrichment\.roles\.(\d+)\.(.+)", str(key))
+        db_match = re.match(r"row\.roles\.(\d+)\.(.+)", str(key))
+        match = enriched_match or db_match
         if not match:
             continue
         text = stringify_context_value(value)
-        if text:
-            grouped[int(match.group(1))][match.group(2)] = text
+        if not text:
+            continue
+        target = enriched_grouped if enriched_match else db_grouped
+        target[int(match.group(1))][match.group(2)] = text
+
+    # Verified import enrichment keeps original role dates/details in raw_fields.
+    # Prefer that source for tenure so DB roles without dates cannot erase it.
+    grouped = enriched_grouped if enriched_grouped else db_grouped
     entries = [grouped[idx] for idx in sorted(grouped)]
     if not entries and (context.get("role.current_company") or context.get("role.current_title")):
         entries.append(
@@ -448,7 +486,13 @@ def _role_is_community_membership(role: Dict[str, str]) -> bool:
     ).lower()
     if "revgenuis" in combined:
         combined = combined.replace("revgenuis", "revgenius")
-    return any(term in combined for term in COMMUNITY_MEMBERSHIP_TERMS)
+    if re.search(r"\b(member|mentor|volunteer)\b", combined):
+        return True
+    return any(
+        re.search(rf"\b{re.escape(term)}\b", combined)
+        for term in COMMUNITY_MEMBERSHIP_TERMS
+        if term not in {"member", "mentor", "volunteer"}
+    )
 
 
 def _parse_role_date(value: str, *, default_current: bool = False) -> Optional[datetime]:
@@ -460,7 +504,14 @@ def _parse_role_date(value: str, *, default_current: bool = False) -> Optional[d
         return datetime.now(timezone.utc)
     patterns = (
         "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m-%Y",
+        "%m/%Y",
         "%Y-%m",
+        "%Y/%m",
         "%Y",
         "%b %Y",
         "%B %Y",
@@ -519,6 +570,24 @@ def _role_is_account_executive(role: Dict[str, str]) -> bool:
     return "account executive" in title or re.search(r"\bae\b", title) is not None
 
 
+def _role_duration_months(role: Dict[str, str]) -> int:
+    for key in ("duration_months", "months"):
+        try:
+            value = int(float(stringify_context_value(role.get(key)).replace(",", "")))
+            if value > 0:
+                return value
+        except Exception:
+            continue
+    for key in ("duration_years", "years"):
+        try:
+            value = float(stringify_context_value(role.get(key)).replace(",", ""))
+            if value > 0:
+                return int(round(value * 12))
+        except Exception:
+            continue
+    return 0
+
+
 def _current_company_enterprise_saas_status(context: Dict[str, str], current_role: Dict[str, str]) -> Tuple[str, List[str]]:
     fields = {
         "current role product/service": current_role.get("product_service") or context.get("role.company_product_service"),
@@ -545,11 +614,36 @@ def _current_company_enterprise_saas_status(context: Dict[str, str], current_rol
     return "Needs web verification", evidence
 
 
+def _city_from_location(value: Any) -> str:
+    text = stringify_context_value(value)
+    if not text:
+        return ""
+    first = re.split(r"[,|/]", text, maxsplit=1)[0].strip().lower()
+    if not first:
+        return ""
+    non_city_terms = {
+        "remote",
+        "hybrid",
+        "onsite",
+        "apac",
+        "emea",
+        "latam",
+        "americas",
+        "india",
+        "australia",
+        "usa",
+        "united states",
+        "canada",
+    }
+    return "" if first in non_city_terms else first
+
+
 def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     roles = [role for role in _parse_role_context_entries(context) if not _role_is_community_membership(role)]
     companies: Dict[str, Dict[str, Any]] = {}
     cities = set()
     ae_months = 0
+    undated_duration_months = 0
     role_tenures: List[Dict[str, Any]] = []
     all_intervals: List[Tuple[datetime, datetime]] = []
 
@@ -560,7 +654,7 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
             continue
         start = _parse_role_date(role.get("start_date") or role.get("starts_at") or role.get("start"))
         end = _parse_role_date(role.get("end_date") or role.get("ends_at") or role.get("end"), default_current=idx == 0)
-        months = _months_between(start, end)
+        months = _months_between(start, end) or _role_duration_months(role)
         title = stringify_context_value(role.get("title"))
         location = stringify_context_value(role.get("city") or role.get("location"))
         role_tenures.append(
@@ -570,38 +664,41 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
                 "start_date": start.date().isoformat() if start else "",
                 "end_date": end.date().isoformat() if end else "",
                 "months": months,
-                "years": round(months / 12, 1) if months else 0,
+                "years": round(months / 12, 2) if months else 0,
             }
         )
-        if location:
-            cities.add(location.lower())
+        city = _city_from_location(location)
+        if city:
+            cities.add(city)
         bucket = companies.setdefault(
             normalized_company,
-            {"company": company, "months": 0, "starts": [], "ends": [], "titles": []},
+            {"company": company, "months": 0, "intervals": [], "undated_months": 0, "titles": []},
         )
         bucket["months"] += months
-        if start:
-            bucket["starts"].append(start)
-        if end:
-            bucket["ends"].append(end)
         if start and end:
             all_intervals.append((start, end))
+            bucket["intervals"].append((start, end))
+        elif months:
+            undated_duration_months += months
+            bucket["undated_months"] += months
         if title:
             bucket["titles"].append(title)
         if _role_is_account_executive(role):
             ae_months += months
 
     for company in companies.values():
-        starts = company.get("starts") or []
-        ends = company.get("ends") or []
-        if starts:
-            company["months"] = _months_between(min(starts), max(ends) if ends else None)
+        intervals = company.get("intervals") or []
+        if intervals:
+            company["months"] = sum(
+                _months_between(start, end)
+                for start, end in _merge_intervals(intervals)
+            ) + int(company.get("undated_months") or 0)
 
     company_tenures = [
         {
             "company": company.get("company") or "",
             "months": int(company.get("months") or 0),
-            "years": round(int(company.get("months") or 0) / 12, 1) if company.get("months") else 0,
+            "years": round(int(company.get("months") or 0) / 12, 2) if company.get("months") else 0,
             "titles": company.get("titles") or [],
         }
         for company in companies.values()
@@ -616,10 +713,17 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     ]
     merged_all_intervals = _merge_intervals(all_intervals)
     total_months_from_roles = sum(_months_between(start, end) for start, end in merged_all_intervals)
+    total_months_from_durations = sum(int(role.get("months") or 0) for role in role_tenures)
     total_exp_years = _float_context(context, "candidate.total_experience_years")
-    total_months = total_months_from_roles or int(round(total_exp_years * 12))
+    total_months = (
+        (total_months_from_roles + undated_duration_months)
+        if total_months_from_roles
+        else total_months_from_durations
+        or int(round(total_exp_years * 12))
+    )
     unique_company_count = len(companies)
-    average_tenure_months = int(round(total_months / unique_company_count)) if unique_company_count else 0
+    company_months_sum = sum(int(company.get("months") or 0) for company in company_tenures)
+    average_tenure_months = int(round(company_months_sum / unique_company_count)) if unique_company_count else 0
     job_hopping_flag = (
         len(very_short_company_stints) >= 2
         or len(short_company_stints) >= 3
@@ -650,8 +754,9 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         default_current=True,
     )
     current_job_months = _months_between(current_start, current_end)
-    if context.get("candidate.city"):
-        cities.add(context["candidate.city"].lower())
+    candidate_city = _city_from_location(context.get("candidate.city"))
+    if candidate_city:
+        cities.add(candidate_city)
     current_company_enterprise_saas, current_company_evidence = _current_company_enterprise_saas_status(context, current_role)
 
     return {
@@ -836,6 +941,7 @@ def build_candidate_context_pack(context: Dict[str, str], facts: Optional[Dict[s
             "email": stringify_context_value(context.get("candidate.email")),
             "phone": stringify_context_value(context.get("candidate.mobile_phone") or context.get("candidate.phone")),
         },
+        "imported_extra_fields": _flat_context_section(context, "extra"),
         "current_role": work_roles[0] if work_roles else {},
         "roles": work_roles[:12],
         "community_roles_excluded": [role for role in roles if _role_is_community_membership(role)][:8],
@@ -882,30 +988,87 @@ SEGMENT_QUERY_TERMS: Dict[str, Sequence[str]] = {
 }
 FUNCTION_QUERY_TERMS: Dict[str, Sequence[str]] = {
     "Account Executive": ("account executive", "enterprise account executive", "ae"),
+    "Account Development": ("account development", "account development representative", "adr"),
+    "Channel Sales": ("channel sales", "channel partner", "partner sales", "reseller", "alliances"),
     "Hunting": ("hunting", "new business", "new logo"),
+    "Inside Sales": ("inside sales", "inbound sales", "remote sales"),
     "Farming": ("farming", "account management", "expansion", "renewal"),
-    "SDR/BDR": ("sdr", "bdr", "sales development", "business development representative"),
+    "Sales Development": ("sdr", "bdr", "sales development", "business development representative"),
     "Customer Success": ("customer success", "csm", "customer success manager"),
     "Partnerships": ("partner", "channel", "alliances"),
 }
 GEOGRAPHY_QUERY_TERMS: Dict[str, Sequence[str]] = {
     "EMEA": ("emea", "europe", "middle east", "africa"),
-    "APAC": ("apac", "asia pacific", "india", "singapore", "australia"),
+    "APAC": ("apac", "asia pacific", "asia-pacific"),
     "LATAM": ("latam", "latin america", "brazil", "mexico"),
     "Americas": ("americas", "north america", "usa", "united states", "canada"),
     "India": ("india", "mumbai", "bengaluru", "bangalore", "delhi"),
+    "Singapore": ("singapore",),
+    "Australia": ("australia", "sydney", "melbourne"),
 }
 INDUSTRY_QUERY_TERMS: Dict[str, Sequence[str]] = {
     "SaaS": ("saas", "software", "cloud platform", "subscription"),
+    "Customer Engagement": (
+        "customer engagement",
+        "clevertap",
+        "moengage",
+        "webengage",
+        "braze",
+        "customer.io",
+        "customer io",
+        "retention platform",
+        "lifecycle engagement",
+        "marketing automation",
+        "crm",
+    ),
     "Fintech": ("fintech", "payments", "banking", "lending"),
     "HRTech": ("hrtech", "hr tech", "recruiting", "talent"),
     "BPO": ("bpo", "business process outsourcing"),
     "Analytics": ("analytics", "data platform", "business intelligence"),
 }
+REGION_COUNTRIES: Dict[str, Sequence[str]] = {
+    "APAC": (
+        "india",
+        "singapore",
+        "australia",
+        "japan",
+        "indonesia",
+        "malaysia",
+        "philippines",
+        "thailand",
+        "vietnam",
+        "new zealand",
+    ),
+    "EMEA": ("united kingdom", "uk", "germany", "france", "uae", "dubai", "south africa"),
+    "LATAM": ("brazil", "mexico", "argentina", "chile", "colombia"),
+    "Americas": ("usa", "united states", "canada", "mexico", "brazil"),
+}
+COUNTRY_TO_REGIONS = {
+    country: region
+    for region, countries in REGION_COUNTRIES.items()
+    for country in countries
+}
+COMPETITOR_QUERY_TARGETS: Dict[str, Sequence[str]] = {
+    "CleverTap": ("clevertap", "clever tap"),
+}
+COMPETITOR_COMPANIES: Dict[str, Sequence[str]] = {
+    "CleverTap": (
+        "moengage",
+        "webengage",
+        "netcore",
+        "netcore cloud",
+        "braze",
+        "iterable",
+        "customer.io",
+        "customer io",
+        "onesignal",
+        "insider",
+    ),
+}
 
 
 def _role_text(role: Dict[str, Any]) -> str:
-    return " ".join(
+    selected = " ".join(
         stringify_context_value(role.get(key))
         for key in (
             "title",
@@ -918,8 +1081,14 @@ def _role_text(role: Dict[str, Any]) -> str:
             "customer_segment",
             "location",
             "city",
+            "source_location",
+            "company_location",
+            "headquarters",
+            "company_details.headquarters",
         )
-    ).lower()
+    )
+    all_values = " ".join(stringify_context_value(value) for value in (role or {}).values())
+    return f"{selected} {all_values}".lower()
 
 
 def _matched_duration(roles: Sequence[Dict[str, Any]], terms: Sequence[str]) -> Dict[str, Any]:
@@ -944,6 +1113,110 @@ def _matched_duration(roles: Sequence[Dict[str, Any]], terms: Sequence[str]) -> 
             }
         )
     return {"months": total_months, "years": round(total_months / 12, 1), "matches": matches}
+
+
+def _role_months(role: Dict[str, Any]) -> int:
+    months = int(float(role.get("duration_months") or role.get("months") or 0))
+    if months:
+        return months
+    start = _parse_role_date(role.get("start_date") or role.get("start"))
+    end = _parse_role_date(role.get("end_date") or role.get("end"), default_current=False)
+    return _months_between(start, end)
+
+
+def _expanded_geography_terms(term: str) -> List[str]:
+    canonical = stringify_context_value(term)
+    values = [canonical, *GEOGRAPHY_QUERY_TERMS.get(canonical, ())]
+    if canonical in REGION_COUNTRIES:
+        values.extend(REGION_COUNTRIES[canonical])
+    lower_values = {value.lower() for value in values if value}
+    for value in list(lower_values):
+        region = COUNTRY_TO_REGIONS.get(value)
+        if region:
+            lower_values.add(region.lower())
+            lower_values.update(v.lower() for v in GEOGRAPHY_QUERY_TERMS.get(region, ()))
+    return sorted(lower_values)
+
+
+def _matched_geography_duration(
+    roles: Sequence[Dict[str, Any]],
+    term: str,
+    profile_claims: Dict[str, Any],
+) -> Dict[str, Any]:
+    terms = _expanded_geography_terms(term)
+    matches = []
+    total_months = 0
+    for role in roles:
+        role_text = _role_text(role)
+        if not any(re.search(rf"\b{re.escape(value)}\b", role_text) for value in terms if value):
+            continue
+        months = _role_months(role)
+        total_months += months
+        matches.append(
+            {
+                "company": stringify_context_value(role.get("company")),
+                "title": stringify_context_value(role.get("title")),
+                "months": months,
+                "evidence": role_text[:240],
+            }
+        )
+    raw_claim_values = (profile_claims or {}).get("geographies", [])
+    if isinstance(raw_claim_values, str):
+        raw_claim_values = re.split(r"[,;|]", raw_claim_values)
+    claim_values = [stringify_context_value(value) for value in raw_claim_values]
+    claim_text = " ".join(claim_values).lower()
+    profile_claim_match = any(
+        re.search(rf"\b{re.escape(value)}\b", claim_text)
+        for value in terms
+        if value
+    )
+    return {
+        "months": total_months,
+        "years": round(total_months / 12, 1),
+        "matches": matches,
+        "profile_claim_match": bool(profile_claim_match),
+        "profile_claims": claim_values,
+        "expanded_terms": terms,
+    }
+
+
+def _prompt_competitor_targets(prompt: str) -> List[str]:
+    lower = (prompt or "").lower()
+    if "competitor" not in lower and "competitors" not in lower:
+        return []
+    found: List[str] = []
+    for target, aliases in COMPETITOR_QUERY_TARGETS.items():
+        if any(re.search(rf"\b{re.escape(alias)}\b", lower) for alias in aliases):
+            found.append(target)
+    return found
+
+
+def _competitor_match(roles: Sequence[Dict[str, Any]], target: str) -> Dict[str, Any]:
+    competitors = [_normalize_company_name(value) for value in COMPETITOR_COMPANIES.get(target, ())]
+    if not competitors:
+        return {"status": "Needs competitor taxonomy", "target": target, "matches": []}
+    current_role = roles[0] if roles else {}
+    current_company_norm = _normalize_company_name(stringify_context_value(current_role.get("company")))
+    is_current_match = current_company_norm in competitors
+    matches = []
+    for idx, role in enumerate(roles):
+        company = stringify_context_value(role.get("company"))
+        if _normalize_company_name(company) in competitors:
+            matches.append(
+                {
+                    "company": company,
+                    "title": stringify_context_value(role.get("title")),
+                    "is_current": idx == 0,
+                    "months": _role_months(role),
+                }
+            )
+    return {
+        "status": "Yes" if is_current_match else "No",
+        "target": target,
+        "current_company": stringify_context_value(current_role.get("company")),
+        "competitors": list(COMPETITOR_COMPANIES.get(target, ())),
+        "matches": matches,
+    }
 
 
 def build_query_plan(
@@ -997,6 +1270,8 @@ def build_query_plan(
         tool_calls.append("geography_experience")
     if _prompt_terms(prompt, INDUSTRY_QUERY_TERMS) or _prompt_has_any(prompt, ("industry", "product", "service")):
         tool_calls.append("industry_experience")
+    if _prompt_competitor_targets(prompt):
+        tool_calls.append("competitor_match")
     if _prompt_has_any(prompt, ("company", "currently working", "current employer", "public", "recent", "latest", "layoff")):
         tool_calls.append("company_verification")
     if not tool_calls:
@@ -1049,6 +1324,8 @@ def run_candidate_query_tools(
     function_terms = _prompt_terms(prompt, FUNCTION_QUERY_TERMS)
     geography_terms = _prompt_terms(prompt, GEOGRAPHY_QUERY_TERMS)
     industry_terms = _prompt_terms(prompt, INDUSTRY_QUERY_TERMS)
+    competitor_targets = _prompt_competitor_targets(prompt)
+    profile_claims = context_pack.get("profile_claims") if isinstance(context_pack.get("profile_claims"), dict) else {}
 
     return {
         "context_pack": context_pack,
@@ -1076,12 +1353,16 @@ def run_candidate_query_tools(
             for term in function_terms
         },
         "geography_experience": {
-            term: _matched_duration(roles, [term, *GEOGRAPHY_QUERY_TERMS.get(term, ())])
+            term: _matched_geography_duration(roles, term, profile_claims)
             for term in geography_terms
         },
         "industry_experience": {
             term: _matched_duration(roles, [term, *INDUSTRY_QUERY_TERMS.get(term, ())])
             for term in industry_terms
+        },
+        "competitor_match": {
+            target: _competitor_match(roles, target)
+            for target in competitor_targets
         },
         "company_verification": {
             "current_company_enterprise_saas": facts.get("current_company_enterprise_saas"),
@@ -1295,6 +1576,15 @@ def build_field_catalog(
                 "token": f"{{{imported['key']}}}",
                 "sample": imported.get("sample", ""),
             }
+        for imported in flatten_imported_extra_fields(profile.get("raw_fields")):
+            grouped["Imported Extra Fields"][imported["key"]] = {
+                "key": imported["key"],
+                "label": imported["label"],
+                "group": "Imported Extra Fields",
+                "token": f"{{{imported['key']}}}",
+                "sample": imported.get("sample", ""),
+                "source_header": imported.get("source_header", ""),
+            }
     for column in ai_columns or []:
         slug = column.get("slug") or normalize_output_key(column.get("name"))
         outputs = normalize_output_schema(column.get("output_schema"))
@@ -1313,6 +1603,7 @@ def build_field_catalog(
         "Role Fields",
         "Role Context",
         "Column Context",
+        "Imported Extra Fields",
         "Imported Fields",
         "AI Columns",
     ]

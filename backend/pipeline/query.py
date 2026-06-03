@@ -196,6 +196,12 @@ GEOGRAPHY_COUNTRY_TO_REGION_MAP = STATIC_GEOGRAPHY_MAP
 PROFILES_BY_ID = {}
 ALL_COMPANY_NAMES = []
 _PROFILES_CACHE = []
+CACHE_INITIALIZED = False
+
+def is_cache_initialized() -> bool:
+    global CACHE_INITIALIZED
+    return CACHE_INITIALIZED
+
 
 def load_all_company_names_from_db():
     logger.info("Loading all unique company names from the database into cache...")
@@ -235,13 +241,27 @@ def _roles_by_candidate_from_roles_raw(roles_raw: List[Any]) -> Dict[int, List[D
             "industry": role[8] or "",
         }
 
+        start_date = None
+        end_date = None
+        details_text = role[3] or ""
+        if details_text.strip().startswith('{'):
+            try:
+                parsed = json.loads(details_text)
+                start_date = parsed.get("start_date")
+                end_date = parsed.get("end_date")
+                details_text = parsed.get("details") or ""
+            except Exception:
+                pass
+
         roles_by_candidate[candidate_id].append(
             {
                 "company": role[1],
                 "title": role[2],
-                "details": role[3],
+                "details": details_text,
                 "duration_years": float(role[4]) if role[4] is not None else 0.0,
                 "company_details": company_details,
+                "start_date": start_date,
+                "end_date": end_date,
             }
         )
     return roles_by_candidate
@@ -411,7 +431,7 @@ def refresh_profiles_in_cache(candidate_ids: List[int]) -> int:
             return_db_connection(conn)
 
 def initialize_cache():
-    global PROFILES_BY_ID, ALL_COMPANY_NAMES, _PROFILES_CACHE
+    global PROFILES_BY_ID, ALL_COMPANY_NAMES, _PROFILES_CACHE, CACHE_INITIALIZED
     try:
         profiles = load_all_profiles_from_db()
         PROFILES_BY_ID.clear()
@@ -422,6 +442,7 @@ def initialize_cache():
         companies = load_all_company_names_from_db()
         ALL_COMPANY_NAMES.extend(companies)
 
+        CACHE_INITIALIZED = True
         logger.info(f"Cache initialized with {len(PROFILES_BY_ID)} profiles and {len(ALL_COMPANY_NAMES)} companies.")
     except Exception as e:
         logger.error(f"Failed to initialize cache: {e}")
@@ -779,41 +800,107 @@ def check_avg_tenure_in_last_n_roles(profile: Dict[str, Any], criteria: Dict[str
     return is_met
 
 
+def parse_date(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    try:
+        clean_str = date_str.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(clean_str)
+        return dt.replace(tzinfo=None)
+    except Exception:
+        try:
+            date_part = date_str.split('T')[0].split()[0]
+            dt = datetime.strptime(date_part, "%Y-%m-%d")
+            return dt.replace(tzinfo=None)
+        except Exception:
+            return None
+
+def merge_intervals(intervals: List[Tuple[datetime, datetime]]) -> List[Tuple[datetime, datetime]]:
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda x: x[0])
+    merged: List[Tuple[datetime, datetime]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        elif end > merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+    return merged
+
+def calculate_merged_duration_years(matching_roles: List[Dict[str, Any]]) -> float:
+    intervals = []
+    undated_duration_years = 0.0
+    today = datetime.now()
+    
+    for role in matching_roles:
+        start_str = role.get("start_date")
+        end_str = role.get("end_date")
+        
+        start_dt = parse_date(start_str) if start_str else None
+        end_dt = parse_date(end_str) if end_str else None
+        
+        if start_dt:
+            if not end_dt:
+                end_dt = today
+            intervals.append((start_dt, end_dt))
+        else:
+            undated_duration_years += role.get("duration_years", 0.0)
+            
+    merged = merge_intervals(intervals)
+    
+    dated_months = 0
+    for start, end in merged:
+        if end >= start:
+            months = (end.year - start.year) * 12 + (end.month - start.month)
+            if end.day >= start.day:
+                months += 1
+            dated_months += max(months, 0)
+            
+    dated_years = round(dated_months / 12.0, 2)
+    return round(dated_years + undated_duration_years, 2)
+
 # --- DURATION CALCULATIONS ---
 def calculate_functional_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    total_duration = 0.0
-    contributing_roles = []
     if not criteria_obj or not isinstance(criteria_obj, dict): return 0.0, []
-
     req_values = [v.lower() for v in criteria_obj.get("values", [])]
     if not req_values: return 0.0, []
 
+    matching_roles = []
+    contributing_roles = []
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         if any(v in role_text for v in req_values):
-            duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({'company': role.get('company', ''), 'title': role.get('title', ''), 'duration_years': duration})
+            matching_roles.append(role)
+            contributing_roles.append({
+                'company': role.get('company', ''),
+                'title': role.get('title', ''),
+                'duration_years': role.get('duration_years', 0.0) or 0.0
+            })
+            
+    total_duration = calculate_merged_duration_years(matching_roles)
     return total_duration, contributing_roles
 
 def calculate_industry_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    total_duration = 0.0
-    contributing_roles = []
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
 
+    matching_roles = []
+    contributing_roles = []
     for role in profile.get('roles', []):
         company_details = role.get('company_details', {})
         role_text = f"{(role.get('company') or '').lower()} {(company_details.get('industry', '') or '').lower()} {(company_details.get('product_service', '') or '').lower()}"
         if any(v in role_text for v in req_values):
-            duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({'company': role.get('company', ''), 'title': role.get('title', ''), 'duration_years': duration})
+            matching_roles.append(role)
+            contributing_roles.append({
+                'company': role.get('company', ''),
+                'title': role.get('title', ''),
+                'duration_years': role.get('duration_years', 0.0) or 0.0
+            })
+            
+    total_duration = calculate_merged_duration_years(matching_roles)
     return total_duration, contributing_roles
 
 def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    total_duration = 0.0
-    contributing_roles = []
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
 
@@ -821,53 +908,73 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
     for v in req_values:
         all_search_terms[v] = SEGMENT_SYNONYMS.get(v, [v])
 
+    matching_roles = []
+    contributing_roles = []
     for role in profile.get('roles', []):
         company_segments = role.get("company_details", {}).get("customer_segment", [])
         company_segments_lower = ' '.join([cs.lower() for cs in company_segments])
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()} {company_segments_lower}"
 
+        matched = False
         for original_value, synonyms in all_search_terms.items():
             if any(s in role_text for s in synonyms):
-                duration = role.get('duration_years', 0.0) or 0.0
-                total_duration += duration
-                contributing_roles.append({'company': role.get('company', ''), 'title': role.get('title', ''), 'duration_years': duration})
+                matched = True
                 break
+        if matched:
+            matching_roles.append(role)
+            contributing_roles.append({
+                'company': role.get('company', ''),
+                'title': role.get('title', ''),
+                'duration_years': role.get('duration_years', 0.0) or 0.0
+            })
+            
+    total_duration = calculate_merged_duration_years(matching_roles)
     return total_duration, contributing_roles
 
 def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    total_duration = 0.0
-    contributing_roles = []
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
 
     regions_for_req_values = {v: GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(v) for v in req_values}
     regions_to_check = {region for region in regions_for_req_values.values() if region}
 
+    matching_roles = []
+    contributing_roles = []
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         company_details = role.get('company_details', {})
         combined = f"{role_text} {' '.join([x.lower() for x in company_details.get('customer_presence', [])])} {(company_details.get('headquarters') or '').lower()}"
 
         if any(v in combined for v in req_values) or any(r in combined for r in regions_to_check):
-            duration = role.get('duration_years', 0.0) or 0.0
             if not any(cr['company'] == role.get('company', '') for cr in contributing_roles):
-                total_duration += duration
-                contributing_roles.append({'company': role.get('company', ''), 'title': role.get('title', ''), 'duration_years': duration})
+                matching_roles.append(role)
+                contributing_roles.append({
+                    'company': role.get('company', ''),
+                    'title': role.get('title', ''),
+                    'duration_years': role.get('duration_years', 0.0) or 0.0
+                })
+                
+    total_duration = calculate_merged_duration_years(matching_roles)
     return total_duration, contributing_roles
 
 def calculate_company_details_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
-    total_duration = 0.0
-    contributing_roles = []
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
 
+    matching_roles = []
+    contributing_roles = []
     for role in profile.get('roles', []):
         company_details = role.get('company_details', {})
         details_text = f"{(company_details.get('funding_stage') or '').lower()} {(company_details.get('business_model') or '').lower()} {(company_details.get('product_service') or '').lower()}"
         if any(v in details_text for v in req_values):
-            duration = role.get('duration_years', 0.0) or 0.0
-            total_duration += duration
-            contributing_roles.append({'company': role.get('company', ''), 'title': role.get('title', ''), 'duration_years': duration})
+            matching_roles.append(role)
+            contributing_roles.append({
+                'company': role.get('company', ''),
+                'title': role.get('title', ''),
+                'duration_years': role.get('duration_years', 0.0) or 0.0
+            })
+            
+    total_duration = calculate_merged_duration_years(matching_roles)
     return total_duration, contributing_roles
 
 
@@ -993,7 +1100,7 @@ async def process_query_main(
 ) -> AsyncIterator[Any]:
     
     # Ensure cache is initialized
-    if not PROFILES_BY_ID:
+    if not is_cache_initialized():
         logger.info("Cache empty, initializing on demand...")
         initialize_cache()
     screening_r = (screening_role or "").strip().lower()

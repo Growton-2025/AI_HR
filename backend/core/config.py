@@ -10,7 +10,7 @@ class Settings:
     # DB Settings (defaults)
     DB_USER: str = os.getenv("DB_USER", "postgres")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "postgres")
-    DB_HOST: str = os.getenv("DB_HOST", "localhost")
+    DB_HOST: str = os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com")
     DB_PORT: str = os.getenv("DB_PORT", "5432")
     DB_NAME: str = os.getenv("DB_NAME", "ai_hr_db")
 

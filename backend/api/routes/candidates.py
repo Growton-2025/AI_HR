@@ -24,6 +24,7 @@ from backend.pipeline.query import (
     COMPANY_DETAILS_TAXONOMY,
     CULTURE_TAXONOMY,
     GEOGRAPHY_COUNTRY_TO_REGION_MAP,
+    is_cache_initialized,
 )
 from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER
 
@@ -78,6 +79,8 @@ async def get_candidates(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Get paginated list of candidates scoped to the current user (recruiter = own pool only)."""
+    if not is_cache_initialized():
+        await asyncio.to_thread(initialize_cache)
     all_profiles = list(PROFILES_BY_ID.values())
     if (current_user.role or "").strip().lower() == "admin":
         scoped = [p for p in all_profiles if not p.get("is_archived")]
@@ -119,7 +122,7 @@ async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_
     """Get performance analytics for the recruiter/admin"""
     from backend.pipeline.query import get_analytics_summary, initialize_cache
 
-    if not PROFILES_BY_ID:
+    if not is_cache_initialized():
         await asyncio.to_thread(initialize_cache)
 
     key = f"{current_user.id}:{current_user.role}"

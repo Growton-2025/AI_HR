@@ -402,6 +402,7 @@ async def role_upload_commit(
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
     enrichment_mode: str = Form("none"),
+    duplicate_policy: str = Form("upsert_existing"),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     conn = get_db_connection(validate=False, register_pgvector=False)
@@ -424,6 +425,7 @@ async def role_upload_commit(
         file=file,
         mapping_json=mapping_json,
         enrichment_mode=enrichment_mode,
+        duplicate_policy=duplicate_policy,
         current_user=current_user,
         role_id=role_id,
     )

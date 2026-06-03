@@ -1,5 +1,5 @@
-import React, { useMemo } from 'react';
-import { Check, AlertTriangle, Loader2, Wand2 } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Check, AlertTriangle, Loader2, Search, Wand2 } from 'lucide-react';
 
 const DEFAULT_OPTIONS = [
   'ignore',
@@ -35,6 +35,24 @@ const LABELS = {
   custom: 'Custom data',
 };
 
+const GROUP_ORDER = [
+  'Required Fields',
+  'Recommended Fields',
+  'Work History',
+  'Education',
+  'Contact/Compensation',
+  'Other Fields',
+  'Needs Review',
+];
+
+const STATUS_LABELS = {
+  history: 'Preserved for enrichment',
+  custom: 'Preserved',
+  alias: 'Mapped',
+  model: 'Suggested',
+  manual: 'Needs review',
+};
+
 export default function CsvMappingModal({
   title = 'Map columns',
   subtitle = 'Review the suggested mapping before import.',
@@ -52,6 +70,14 @@ export default function CsvMappingModal({
   onCancel,
   onImport,
 }) {
+  const [columnSearch, setColumnSearch] = useState('');
+  const [groupFilter, setGroupFilter] = useState('all');
+
+  const truncateSample = (value) => {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+  };
+
   const missingRequired = useMemo(() => {
     const used = new Set(Object.values(mapping || {}).filter(v => v && v !== 'ignore'));
     return (requiredTargets || []).filter(target => !used.has(target));
@@ -71,6 +97,50 @@ export default function CsvMappingModal({
     Number(progress?.skipped) > 0 ? `${Number(progress.skipped)} skipped` : null,
     Number(progress?.role_assigned_count) > 0 ? `${Number(progress.role_assigned_count)} role assignments` : null,
   ].filter(Boolean);
+
+  const groupedColumns = useMemo(() => {
+    const q = columnSearch.trim().toLowerCase();
+    const groups = new Map();
+    for (const header of headers || []) {
+      const detail = details?.[header] || {};
+      const category = detail.category || 'Other Fields';
+      if (groupFilter !== 'all' && category !== groupFilter) continue;
+      const sampleText = Array.isArray(detail.sample_values) ? detail.sample_values.join(' ') : '';
+      const haystack = [
+        header,
+        detail.friendly_label,
+        detail.reason,
+        detail.preserve_reason,
+        mapping?.[header],
+        sampleText,
+      ].join(' ').toLowerCase();
+      if (q && !haystack.includes(q)) continue;
+      if (!groups.has(category)) groups.set(category, []);
+      groups.get(category).push(header);
+    }
+    const ordered = [];
+    for (const group of GROUP_ORDER) {
+      if (groups.has(group)) ordered.push([group, groups.get(group)]);
+    }
+    for (const [group, items] of groups.entries()) {
+      if (!GROUP_ORDER.includes(group)) ordered.push([group, items]);
+    }
+    return ordered;
+  }, [headers, details, mapping, columnSearch, groupFilter]);
+
+  const groupCounts = useMemo(() => {
+    const counts = {};
+    for (const header of headers || []) {
+      const group = details?.[header]?.category || 'Other Fields';
+      counts[group] = (counts[group] || 0) + 1;
+    }
+    return counts;
+  }, [headers, details]);
+
+  const mappedCount = useMemo(
+    () => Object.values(mapping || {}).filter(value => value && value !== 'ignore').length,
+    [mapping],
+  );
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.65)', zIndex: 10002, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
@@ -160,55 +230,117 @@ export default function CsvMappingModal({
             </div>
           </div>
         ) : (
-        <div style={{ padding: '16px 24px 4px', overflow: 'auto', maxHeight: '58vh' }}>
-          <div style={{ minWidth: 820, border: '1px solid #e2e8f0', borderRadius: 12, overflow: 'hidden' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.6fr 1fr 1.1fr', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontSize: 11, fontWeight: 800, textTransform: 'uppercase' }}>
-              <div style={{ padding: '10px 12px' }}>CSV column</div>
-              <div style={{ padding: '10px 12px' }}>Sample values</div>
-              <div style={{ padding: '10px 12px' }}>Suggested field</div>
-              <div style={{ padding: '10px 12px' }}>Confidence</div>
+        <div style={{ padding: '14px 24px 4px', overflow: 'auto', maxHeight: '58vh' }}>
+          <div style={{ position: 'sticky', top: -14, zIndex: 3, padding: '10px 0 12px', background: '#fff' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 7 }}>
+                {(requiredTargets || []).map(target => {
+                  const ok = !missingRequired.includes(target);
+                  return (
+                    <span key={target} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 8px', borderRadius: 8, border: `1px solid ${ok ? '#bbf7d0' : '#fed7aa'}`, background: ok ? '#f0fdf4' : '#fff7ed', color: ok ? '#166534' : '#9a3412', fontSize: 11, fontWeight: 800 }}>
+                      {ok ? <Check size={12} /> : <AlertTriangle size={12} />}
+                      {LABELS[target] || target}
+                    </span>
+                  );
+                })}
+              </div>
+              <div style={{ color: '#64748b', fontSize: 12, fontWeight: 800 }}>
+                {mappedCount} of {headers.length} columns mapped or preserved
+              </div>
             </div>
-            {headers.map(header => {
-              const detail = details?.[header] || {};
-              const source = detail.source || 'manual';
-              const confidence = Number(detail.confidence || 0);
-              const samples = Array.isArray(detail.sample_values) ? detail.sample_values.filter(Boolean) : [];
-              const isRequiredTarget = requiredTargets.includes(mapping?.[header]);
-              return (
-                <div key={header} style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.6fr 1fr 1.1fr', borderBottom: '1px solid #eef2f7', alignItems: 'stretch' }}>
-                  <div style={{ padding: '12px', fontSize: 13, fontWeight: 800, color: '#0f172a', wordBreak: 'break-word' }}>
-                    {header}
-                  </div>
-                  <div style={{ padding: '12px', fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
-                    {samples.length ? samples.slice(0, 3).join(' | ') : <span style={{ color: '#94a3b8' }}>No sample value</span>}
-                  </div>
-                  <div style={{ padding: '9px 12px' }}>
-                    <select
-                      value={mapping?.[header] || 'ignore'}
-                      disabled={busy}
-                      onChange={(e) => onChange?.(header, e.target.value)}
-                      style={{ width: '100%', padding: '8px 10px', borderRadius: 9, border: `1px solid ${isRequiredTarget ? '#fdba74' : '#cbd5e1'}`, fontSize: 12, background: '#fff', color: '#0f172a', fontWeight: 700 }}
-                    >
-                      {options.map(option => (
-                        <option key={option} value={option}>{LABELS[option] || option}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div style={{ padding: '10px 12px', fontSize: 12, color: '#475569' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
-                      {mapping?.[header] && mapping[header] !== 'ignore'
-                        ? <Check size={14} color="#15803d" />
-                        : <AlertTriangle size={14} color="#94a3b8" />}
-                      <span style={{ fontWeight: 800, color: source === 'model' ? '#6d28d9' : source === 'alias' ? '#0369a1' : '#64748b' }}>
-                        {source === 'model' ? 'Model' : source === 'alias' ? 'Alias' : 'Manual'}
-                        {confidence > 0 ? ` ${Math.round(confidence * 100)}%` : ''}
-                      </span>
-                    </div>
-                    <div style={{ color: '#94a3b8', lineHeight: 1.35 }}>{detail.reason || 'Review manually'}</div>
-                  </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) 220px', gap: 10, marginTop: 11 }}>
+              <label style={{ position: 'relative', display: 'block' }}>
+                <Search size={15} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
+                <input
+                  value={columnSearch}
+                  disabled={busy}
+                  onChange={(e) => setColumnSearch(e.target.value)}
+                  placeholder="Search any column, sample, or reason"
+                  style={{ width: '100%', padding: '9px 10px 9px 32px', borderRadius: 9, border: '1px solid #cbd5e1', fontSize: 12, color: '#0f172a', outline: 'none' }}
+                />
+              </label>
+              <select
+                value={groupFilter}
+                disabled={busy}
+                onChange={(e) => setGroupFilter(e.target.value)}
+                style={{ width: '100%', padding: '9px 10px', borderRadius: 9, border: '1px solid #cbd5e1', fontSize: 12, background: '#fff', color: '#0f172a', fontWeight: 800 }}
+              >
+                <option value="all">All groups ({headers.length})</option>
+                {GROUP_ORDER.filter(group => groupCounts[group]).map(group => (
+                  <option key={group} value={group}>{group} ({groupCounts[group]})</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ minWidth: 940, border: '1px solid #e2e8f0', borderRadius: 12, overflow: 'hidden' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1.25fr 1.45fr 1fr 1.2fr', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontSize: 11, fontWeight: 800, textTransform: 'uppercase' }}>
+              <div style={{ padding: '10px 12px' }}>Column</div>
+              <div style={{ padding: '10px 12px' }}>Sample values</div>
+              <div style={{ padding: '10px 12px' }}>Field / action</div>
+              <div style={{ padding: '10px 12px' }}>Status</div>
+            </div>
+            {groupedColumns.length === 0 && (
+              <div style={{ padding: 22, color: '#64748b', fontSize: 13, fontWeight: 700 }}>
+                No columns match the current filter.
+              </div>
+            )}
+            {groupedColumns.map(([group, groupHeaders]) => (
+              <React.Fragment key={group}>
+                <div style={{ position: 'sticky', top: 91, zIndex: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 12px', background: '#eef2f7', borderBottom: '1px solid #dbe3ee', color: '#334155', fontSize: 12, fontWeight: 900 }}>
+                  <span>{group}</span>
+                  <span>{groupHeaders.length} column{groupHeaders.length === 1 ? '' : 's'}</span>
                 </div>
-              );
-            })}
+                {groupHeaders.map(header => {
+                  const detail = details?.[header] || {};
+                  const source = detail.source || 'manual';
+                  const confidence = Number(detail.confidence || 0);
+                  const samples = Array.isArray(detail.sample_values) ? detail.sample_values.filter(Boolean).map(truncateSample) : [];
+                  const isRequiredTarget = requiredTargets.includes(mapping?.[header]);
+                  const mapped = Boolean(mapping?.[header] && mapping[header] !== 'ignore');
+                  const preserveReason = detail.preserve_reason || (mapping?.[header] === 'custom' ? 'Preserved as imported extra data' : '');
+                  const statusText = preserveReason || STATUS_LABELS[source] || (mapped ? 'Mapped' : 'Needs review');
+                  const statusColor = detail.category === 'Needs Review' || !mapped ? '#9a3412' : source === 'model' ? '#6d28d9' : source === 'history' ? '#166534' : '#0369a1';
+                  return (
+                    <div key={header} style={{ display: 'grid', gridTemplateColumns: '1.25fr 1.45fr 1fr 1.2fr', borderBottom: '1px solid #eef2f7', alignItems: 'stretch' }}>
+                      <div style={{ padding: '12px', fontSize: 13, color: '#0f172a', wordBreak: 'break-word' }}>
+                        <div style={{ fontWeight: 900 }}>{detail.friendly_label || header}</div>
+                        {detail.friendly_label && detail.friendly_label !== header && (
+                          <div style={{ marginTop: 4, color: '#64748b', fontSize: 11, fontWeight: 700 }}>{header}</div>
+                        )}
+                      </div>
+                      <div style={{ padding: '12px', fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
+                        {samples.length ? samples.slice(0, 3).join(' | ') : <span style={{ color: '#94a3b8' }}>No sample value</span>}
+                      </div>
+                      <div style={{ padding: '9px 12px' }}>
+                        <select
+                          value={mapping?.[header] || 'ignore'}
+                          disabled={busy}
+                          onChange={(e) => onChange?.(header, e.target.value)}
+                          style={{ width: '100%', padding: '8px 10px', borderRadius: 9, border: `1px solid ${isRequiredTarget ? '#fdba74' : '#cbd5e1'}`, fontSize: 12, background: '#fff', color: '#0f172a', fontWeight: 700 }}
+                        >
+                          {options.map(option => (
+                            <option key={option} value={option}>{option === 'custom' ? 'Preserve as extra data' : LABELS[option] || option}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div style={{ padding: '10px 12px', fontSize: 12, color: '#475569' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
+                          {mapped
+                            ? <Check size={14} color="#15803d" />
+                            : <AlertTriangle size={14} color="#94a3b8" />}
+                          <span style={{ fontWeight: 900, color: statusColor }}>
+                            {statusText}
+                            {confidence > 0 ? ` ${Math.round(confidence * 100)}%` : ''}
+                          </span>
+                        </div>
+                        <div style={{ color: '#94a3b8', lineHeight: 1.35 }}>{detail.reason || 'Review manually'}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </React.Fragment>
+            ))}
           </div>
         </div>
         )}

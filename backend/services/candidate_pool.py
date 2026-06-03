@@ -47,40 +47,89 @@ HEADER_ALIASES: Dict[str, set] = {
         "person linkedin",
         "person linkedin url",
     },
-    "city": {"city", "metro", "town", "current city"},
+    "city": {"city", "metro", "town", "current city", "addresswithcountry", "address with country"},
     "title": {"title", "role", "job title", "position", "designation"},
     "company_name": {"company", "company name", "employer", "organization"},
     "email": {"email", "email address", "work email"},
     "phone": {"phone", "mobile", "mobile phone", "phone number", "mobile number", "mob number"},
-    "location": {"location", "address", "addresswithcountry", "address with country"},
+    "location": {"location", "address"},
     "notes": {"notes", "comments", "remarks"},
     "headline": {"headline"},
     "about": {"about", "bio", "biography", "summary", "profile summary"},
 }
 
 
+# Headers that are computed/combined fields and must never be mapped to a canonical target.
+_COMPUTED_HEADER_KEYS: frozenset = frozenset({
+    "fullname",
+    "full name",
+    "name",
+    "full",
+})
+
+
 def suggest_header_mapping(headers: List[str]) -> Dict[str, str]:
-    """Map source header -> canonical target (best-effort heuristics)."""
+    """Map source header -> canonical target (best-effort heuristics).
+
+    Matching priority:
+    1. Exact alias match (key == alias).
+    2. Substring match (alias in key, or key in alias) — only for aliases
+       longer than 2 characters and only when the header is not a
+       known computed/combined column (e.g. fullName, fullname).
+    """
     out: Dict[str, str] = {}
     for orig in headers:
         if not orig or not str(orig).strip():
             continue
+        if re.match(r"^experiences/\d+/", str(orig).strip(), flags=re.IGNORECASE):
+            continue
+        if re.match(r"^education[s]?/\d+/", str(orig).strip(), flags=re.IGNORECASE):
+            continue
         key = re.sub(r"[^a-z0-9]+", " ", orig.strip().lower()).strip()
+        if key in {
+            "recruiter summary",
+            "summary double tap",
+            "focused geography",
+            "focused geo",
+            "outbound exp",
+            "outbound experience",
+            "current ctc",
+            "expected ctc",
+            "notice period",
+            "preferred location",
+            "pref location",
+            "shift timings",
+            "targets",
+            "cv",
+            "resume",
+        }:
+            continue
         if re.search(r"\b(company|title|start date|end date|details|degree name|education)\s+\d+\b", key):
             continue
         if re.search(r"\b(title|start date|end date|details|degree name)\s+\d+\b", key):
             continue
+
+        # Skip known computed / combined columns before trying substring matching
+        # so that e.g. fullName is never swallowed by the "ln" alias for last_name.
+        is_computed = key in _COMPUTED_HEADER_KEYS
+
         matched = None
+        # Pass 1: exact alias match (always attempted, even for computed columns)
         for target, aliases in HEADER_ALIASES.items():
             if key in aliases:
                 matched = target
                 break
-            for a in aliases:
-                if len(a) > 2 and (a in key or key in a):
-                    matched = target
+
+        # Pass 2: substring match — skip for computed/combined columns
+        if not matched and not is_computed:
+            for target, aliases in HEADER_ALIASES.items():
+                for a in aliases:
+                    if len(a) > 2 and (a in key or key in a):
+                        matched = target
+                        break
+                if matched:
                     break
-            if matched:
-                break
+
         if matched:
             out[orig] = matched
     return out

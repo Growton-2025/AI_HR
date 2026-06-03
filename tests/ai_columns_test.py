@@ -8,6 +8,7 @@ from backend.api import schemas
 from backend.api.routes import ai_columns
 from backend.api.routes import browse
 from backend.db.ai_column_migrate import ensure_ai_column_migrations
+from backend.services import ai_columns as ai_columns_service
 from backend.services.ai_columns import (
     build_candidate_context_pack,
     build_field_catalog,
@@ -65,6 +66,26 @@ def _user(user_id=7, role="recruiter"):
     )
 
 
+def test_fetch_profile_refreshes_stale_cache_without_roles(monkeypatch):
+    stale_profile = {"id": 123, "name": "Stale Candidate", "roles": []}
+    refreshed_profile = {
+        "id": 123,
+        "name": "Fresh Candidate",
+        "roles": [{"company": "Acme", "title": "Account Executive"}],
+    }
+    profiles_by_id = {123: stale_profile}
+
+    def fake_refresh(candidate_ids):
+        assert candidate_ids == [123]
+        profiles_by_id[123] = refreshed_profile
+        return 1
+
+    monkeypatch.setattr(ai_columns.query, "PROFILES_BY_ID", profiles_by_id)
+    monkeypatch.setattr(ai_columns.query, "refresh_profiles_in_cache", fake_refresh)
+
+    assert ai_columns._fetch_profile(123) is refreshed_profile
+
+
 def test_ai_column_migration_resets_legacy_raw_fields():
     cursor = _FakeCursor()
     conn = _FakeConnection(cursor)
@@ -88,6 +109,14 @@ def test_field_catalog_includes_default_imported_and_ai_columns():
             "raw_fields": {
                 "import_company": "Exotel",
                 "linkedin_url": "https://linkedin.com/in/deepak",
+                "Current CTC": "15 LPA",
+                "imported_extra_fields": {
+                    "current_ctc": {
+                        "label": "Current CTC",
+                        "source_header": "Current CTC",
+                        "value": "15 LPA",
+                    }
+                },
             },
             "roles": [{"title": "Account Director", "company": "Exotel"}],
         }
@@ -106,12 +135,15 @@ def test_field_catalog_includes_default_imported_and_ai_columns():
     groups = {group["group"]: group["items"] for group in catalog}
     default_keys = {item["key"] for item in groups["Default Fields"]}
     imported_keys = {item["key"] for item in groups["Imported Fields"]}
+    extra_keys = {item["key"] for item in groups["Imported Extra Fields"]}
     ai_keys = {item["key"] for item in groups["AI Columns"]}
 
     assert "candidate.linkedin" in default_keys
     assert "candidate.full_name" in default_keys
     assert "raw.import_company" in imported_keys
     assert "ai.company_location.result" in ai_keys
+    assert "extra.current_ctc" in extra_keys
+    assert groups["Imported Extra Fields"][0]["token"].startswith("{extra.")
 
 
 def test_required_fields_and_prompt_fill_use_ai_context():
@@ -122,11 +154,21 @@ def test_required_fields_and_prompt_fill_use_ai_context():
         "last_name": "Basavaraj",
         "linkedin": "https://linkedin.com/in/deepak",
         "roles": [{"title": "Account Director", "company": "Exotel"}],
-        "raw_fields": {"import_company": "Exotel"},
+        "raw_fields": {
+            "import_company": "Exotel",
+            "Current CTC": "15 LPA",
+            "imported_extra_fields": {
+                "current_ctc": {
+                    "label": "Current CTC",
+                    "source_header": "Current CTC",
+                    "value": "15 LPA",
+                }
+            },
+        },
     }
     context = build_candidate_context(profile, ai_values={"ai.company_location.result": "Bengaluru"})
     rendered = fill_prompt_template(
-        "Check {candidate.linkedin} and compare with {ai.company_location.result}",
+        "Check {candidate.linkedin}, {extra.current_ctc}, and compare with {ai.company_location.result}",
         context,
     )
     ok, missing = evaluate_required_fields(
@@ -137,11 +179,15 @@ def test_required_fields_and_prompt_fill_use_ai_context():
     assert ok is True
     assert missing == []
     assert "https://linkedin.com/in/deepak" in rendered
+    assert "15 LPA" in rendered
     assert "Bengaluru" in rendered
     assert context["candidate.full_name"] == "Deepak Basavaraj"
     assert context["candidate.name"] == "Deepak Basavaraj"
     assert context["Linkedin Profile"] == "https://linkedin.com/in/deepak"
     assert context["row.raw_fields.import_company"] == "Exotel"
+    assert context["raw.Current CTC"] == "15 LPA"
+    assert context["extra.current_ctc"] == "15 LPA"
+    assert build_candidate_context_pack(context)["imported_extra_fields"]["current_ctc"] == "15 LPA"
 
 
 def test_candidate_context_exposes_role_and_column_context_inputs():
@@ -231,6 +277,82 @@ def test_career_facts_collapse_company_and_exclude_memberships():
     assert outputs["average_tenure_months"].isdigit()
     assert outputs["current_job_months"].isdigit()
     assert outputs["career_city_count"] == "2"
+
+
+def test_career_facts_parse_month_year_and_use_duration_fallback(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 2, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    context = build_candidate_context(
+        {
+            "id": 44,
+            "name": "Legacy Candidate",
+            "roles": [
+                {
+                    "title": "Sales Development Representative",
+                    "company": "Wayground",
+                    "start_date": "03-2026",
+                    "end_date": "",
+                },
+                {
+                    "title": "Financial Technology Advisor",
+                    "company": "Highradius",
+                    "duration_years": 1.92,
+                },
+            ],
+        }
+    )
+
+    facts = compute_career_facts(context)
+    tenures = {item["company"]: item["months"] for item in facts["company_tenures"]}
+
+    assert facts["unique_company_count"] == 2
+    assert tenures["Wayground"] == 4
+    assert tenures["Highradius"] == 23
+    assert facts["total_experience_months"] == 27
+    assert "Highradius" in facts["companies"]
+
+
+def test_career_facts_merge_same_company_without_counting_gap_months():
+    context = build_candidate_context(
+        {
+            "id": 45,
+            "name": "Repeat Company Candidate",
+            "raw_fields": {
+                "enrichment": {
+                    "roles": [
+                        {
+                            "company": "Highradius",
+                            "title": "HighRadius",
+                            "start_date": "2025-07-01",
+                            "end_date": "2025-11-01",
+                        },
+                        {
+                            "company": "Highradius",
+                            "title": "Business Development Intern",
+                            "start_date": "2023-08-01",
+                            "end_date": "2023-09-01",
+                        },
+                    ]
+                }
+            },
+        }
+    )
+
+    facts = compute_career_facts(context)
+
+    assert facts["total_experience_months"] == 7
+    assert facts["company_tenures"] == [
+        {
+            "company": "Highradius",
+            "months": 7,
+            "years": 0.6,
+            "titles": ["HighRadius", "Business Development Intern"],
+        }
+    ]
 
 
 def test_career_facts_marks_enterprise_saas_ae_qualification():
@@ -370,6 +492,151 @@ def test_universal_query_plan_and_tools_cover_enriched_profile_dimensions():
     assert tools["geography_experience"]["EMEA"]["months"] == 36
     assert tools["functional_experience"]["Hunting"]["months"] == 36
     assert pack["profile_claims"]
+
+
+def test_career_facts_prefer_verified_enrichment_roles_over_db_roles():
+    context = build_candidate_context(
+        {
+            "id": 88,
+            "name": "Verified Over Db",
+            "raw_fields": {
+                "enrichment": {
+                    "roles": [
+                        {
+                            "company": "Acme SaaS",
+                            "title": "Account Executive",
+                            "start_date": "2020-01-01",
+                            "end_date": "2021-12-01",
+                            "duration_months": 24,
+                        }
+                    ]
+                }
+            },
+            "roles": [
+                {
+                    "company": "Wrong DB Co",
+                    "title": "Old Role",
+                    "duration_years": 10,
+                }
+            ],
+        }
+    )
+
+    facts = compute_career_facts(context)
+
+    assert facts["companies"] == ["Acme SaaS"]
+    assert facts["total_experience_months"] == 24
+    assert facts["average_tenure_months"] == 24
+
+
+def test_query_tools_cover_geography_function_industry_and_competitors(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 2, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    profile = {
+        "id": 99,
+        "name": "Query Candidate",
+        "city": "Bengaluru",
+        "raw_fields": {
+            "enrichment": {
+                "roles": [
+                    {
+                        "company": "MoEngage",
+                        "title": "Channel Sales Manager APAC",
+                        "start_date": "2020-01-01",
+                        "end_date": "",
+                        "duration_months": 78,
+                        "function": "Channel Sales",
+                        "industry": "Customer Engagement",
+                        "product_service": "Customer engagement platform",
+                        "location": "Bengaluru, India",
+                        "details": "Built partner and reseller channel sales across APAC.",
+                    },
+                    {
+                        "company": "WebEngage",
+                        "title": "Sales Development Representative",
+                        "start_date": "2014-01-01",
+                        "end_date": "2020-01-01",
+                        "duration_months": 73,
+                        "function": "Sales Development",
+                        "industry": "Customer Engagement",
+                        "product_service": "Lifecycle engagement CRM",
+                        "location": "Singapore",
+                    },
+                    {
+                        "company": "Braze",
+                        "title": "Inside Sales Representative and Account Development",
+                        "duration_months": 72,
+                        "function": "Inside Sales Account Development",
+                        "industry": "Customer Engagement",
+                        "product_service": "Marketing automation",
+                        "location": "APAC",
+                    },
+                ],
+                "profile_claims": {
+                    "geographies": ["APAC"],
+                    "segments": ["Enterprise"],
+                    "functions": [{"function": "Channel Sales", "reason": "profile"}],
+                },
+            }
+        },
+    }
+    context = build_candidate_context(profile)
+    facts = compute_career_facts(context)
+
+    assert facts["career_city_count"] == 2
+    assert facts["average_tenure_months"] > 0
+    assert facts["current_job_months"] >= 77
+
+    channel_prompt = "Candidates who are working for Clevertap competitors and has 5 years in channel sales"
+    channel_tools = run_candidate_query_tools(
+        channel_prompt,
+        context,
+        facts,
+        build_query_plan(
+            channel_prompt,
+            context,
+            [{"key": "result", "label": "Result", "primary": True}],
+            classify_ai_column_prompt(channel_prompt),
+        ),
+    )
+    assert channel_tools["competitor_match"]["CleverTap"]["status"] == "Yes"
+    assert channel_tools["functional_experience"]["Channel Sales"]["months"] >= 60
+
+    apac_prompt = "Candidates who are working for Clevertap competitors and has 5 years in APAC market"
+    apac_tools = run_candidate_query_tools(apac_prompt, context, facts)
+    assert apac_tools["geography_experience"]["APAC"]["months"] >= 60
+
+    singapore_tools = run_candidate_query_tools("Candidates who have Singapore experience", context, facts)
+    assert singapore_tools["geography_experience"]["Singapore"]["profile_claim_match"] is True
+
+    india_tools = run_candidate_query_tools("Candidates who have India experience", context, facts)
+    assert india_tools["geography_experience"]["India"]["months"] >= 60
+
+    sales_dev_tools = run_candidate_query_tools(
+        "Candidates with 6 years of sales development experience and have worked in customer engagement industry",
+        context,
+        facts,
+    )
+    assert sales_dev_tools["functional_experience"]["Sales Development"]["months"] >= 72
+    assert sales_dev_tools["industry_experience"]["Customer Engagement"]["months"] >= 72
+
+    inside_tools = run_candidate_query_tools(
+        "Candidates with 6 years of inside sales experience and have worked in customer engagement industry",
+        context,
+        facts,
+    )
+    assert inside_tools["functional_experience"]["Inside Sales"]["months"] >= 72
+
+    account_dev_tools = run_candidate_query_tools(
+        "Candidates with 5 years of account development experience and have worked in customer engagement industry",
+        context,
+        facts,
+    )
+    assert account_dev_tools["functional_experience"]["Account Development"]["months"] >= 60
 
 
 def test_run_ai_task_sends_full_row_context_even_without_tokens(monkeypatch):

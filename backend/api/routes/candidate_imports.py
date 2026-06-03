@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from backend.services.candidate_pool import (
     fetch_best_contacts_for_normalized_lis,
     POOL_SOURCE_RECRUITER_UPLOAD,
 )
+from backend.services.imported_fields import merge_imported_extra_fields
 from backend.services.linkedin_normalize import normalize_linkedin
 
 router = APIRouter()
@@ -34,6 +36,8 @@ _upload_threads: Dict[int, threading.Thread] = {}
 _upload_threads_lock = threading.Lock()
 
 IMPORT_TARGETS = ("ignore",) + tuple(sorted(REQUIRED_IMPORT_TARGETS)) + tuple(OPTIONAL_IMPORT_TARGETS) + ("custom",)
+NO_MUTATE_EXISTING_POLICY = "no_mutate_existing"
+UPSERT_EXISTING_POLICY = "upsert_existing"
 
 
 class SuggestMappingBody(BaseModel):
@@ -50,6 +54,14 @@ def _clean(val: Any) -> Optional[str]:
             return None
     s = str(val).strip()
     return s if s else None
+
+
+def _compact_header_key(header: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(header or "").strip().lower())
+
+
+def _is_full_location_header(header: str) -> bool:
+    return _compact_header_key(header) in {"addresswithcountry", "addresscountry", "fulllocation"}
 
 
 def _read_frame(file_bytes: bytes, filename: str) -> pd.DataFrame:
@@ -71,21 +83,307 @@ def _row_values(
             continue
         val = row.get(src)
         clean_val = _clean(val)
-        if tgt == "ignore" or tgt == "custom" or not tgt:
+        if (
+            _is_history_upload_header(src)
+            or _detect_education_header(src)
+            or _is_full_location_header(src)
+        ) and clean_val is not None:
+            raw[src] = clean_val
+        if tgt == "ignore" or not tgt:
+            continue
+        if tgt == "custom":
             if clean_val is not None:
                 raw[src] = clean_val
             continue
         out[tgt] = clean_val
-    return out, raw
+        if tgt == "title" and _normalized_header_key(src) == "headline" and clean_val is not None:
+            out.setdefault("headline", clean_val)
+        if tgt == "city" and _is_full_location_header(src) and clean_val is not None:
+            out.setdefault("location", clean_val)
+    return out, merge_imported_extra_fields(raw)
 
 
 def _normalized_header_key(header: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(header or "").strip().lower()).strip()
 
 
+def _split_pandas_suffix(header: str) -> tuple[str, Optional[int]]:
+    match = re.match(r"^(.*)\.(\d+)$", str(header or "").strip())
+    if not match:
+        return str(header or "").strip(), None
+    return match.group(1), int(match.group(2))
+
+
+def _header_field_kind(label: str) -> str:
+    token = _normalized_header_key(label)
+    token = re.sub(r"^(exp|experience|experiences|job|role)\s+", "", token).strip()
+    aliases = {
+        "company": {
+            "company",
+            "company name",
+            "companyname",
+            "organization",
+            "organisation",
+            "employer",
+        },
+        "title": {"title", "role", "designation", "job title", "jobtitle", "position"},
+        "start_date": {
+            "start",
+            "start date",
+            "started on",
+            "startedon",
+            "job started on",
+            "jobstartedon",
+            "from",
+            "started",
+        },
+        "end_date": {
+            "end",
+            "end date",
+            "ended on",
+            "endedon",
+            "job ended on",
+            "jobendedon",
+            "to",
+            "until",
+        },
+        "details": {"details", "description", "job description", "jobdescription", "summary"},
+        "duration_raw": {"duration", "duration months", "duration_months", "tenure", "time spent"},
+        "company_website": {"website", "company website", "companywebsite"},
+        "company_industry": {"industry", "company industry", "companyindustry"},
+        "company_size": {"size", "company size", "companysize"},
+        "location": {"location", "job location", "joblocation", "job location country", "joblocationcountry"},
+    }
+    for kind, values in aliases.items():
+        if token in values:
+            return kind
+    return ""
+
+
+def _detect_work_history_header(header: str) -> Dict[str, Any]:
+    text = str(header or "").strip()
+    if not text:
+        return {}
+
+    apify_match = re.match(r"^experiences/(\d+)/(.+)$", text, flags=re.IGNORECASE)
+    if apify_match:
+        apify_idx = int(apify_match.group(1))
+        tail, suffix = _split_pandas_suffix(apify_match.group(2))
+        kind = _header_field_kind(tail)
+        if not kind:
+            return {}
+        idx = suffix + 1 if apify_idx == 0 and suffix and suffix > 0 else apify_idx + 1
+        return {"index": idx, "kind": kind, "source_pattern": "apify_experiences"}
+
+    base, suffix = _split_pandas_suffix(text)
+    if suffix is not None:
+        kind = _header_field_kind(base)
+        if kind:
+            return {"index": suffix + 1, "kind": kind, "source_pattern": "pandas_repeated_header"}
+
+    token = _normalized_header_key(text)
+    indexed_prefix = re.match(r"^(exp|experience|experiences|job|role)\s+(\d+)\s+(.+)$", token)
+    if indexed_prefix:
+        kind = _header_field_kind(indexed_prefix.group(3))
+        if kind:
+            idx = int(indexed_prefix.group(2))
+            return {"index": idx + 1 if idx == 0 else idx, "kind": kind, "source_pattern": "indexed_history_prefix"}
+
+    indexed_infix = re.match(r"^(.+?)\s+(\d+)\s+(.+)$", token)
+    if indexed_infix:
+        left_kind = _header_field_kind(indexed_infix.group(1))
+        right_kind = _header_field_kind(indexed_infix.group(3))
+        kind = right_kind or left_kind
+        if kind:
+            idx = int(indexed_infix.group(2))
+            return {"index": idx + 1 if idx == 0 else idx, "kind": kind, "source_pattern": "indexed_history_infix"}
+
+    company_match = re.match(r"^(company|organization|organisation|employer)\s+(\d+)(?:\s+name)?$", token)
+    if company_match:
+        idx = int(company_match.group(2))
+        return {"index": idx + 1 if idx == 0 else idx, "kind": "company", "source_pattern": "numbered_company"}
+
+    company_name_match = re.match(r"^company\s+name\s+(\d+)$", token)
+    if company_name_match:
+        idx = int(company_name_match.group(1))
+        return {"index": idx + 1 if idx == 0 else idx, "kind": "company", "source_pattern": "numbered_company_name"}
+
+    trailing_idx_match = re.match(r"^(.+?)\s+(\d+)$", token)
+    if trailing_idx_match:
+        kind = _header_field_kind(trailing_idx_match.group(1))
+        if kind:
+            idx = int(trailing_idx_match.group(2))
+            return {
+                "index": idx + 1 if idx == 0 else idx,
+                "kind": kind,
+                "source_pattern": "numbered_field",
+            }
+
+    compact_match = re.match(
+        r"^(exp|experience|experiences|job|role)(\d+)(company|companyname|title|role|start|startdate|startedon|end|enddate|endedon|duration|details|description|industry|location|website|size)$",
+        re.sub(r"[^a-z0-9]+", "", text.lower()),
+    )
+    if compact_match:
+        kind = _header_field_kind(compact_match.group(3))
+        if kind:
+            idx = int(compact_match.group(2))
+            return {"index": idx + 1 if idx == 0 else idx, "kind": kind, "source_pattern": "compact_history"}
+
+    return {}
+
+
+def _detect_education_header(header: str) -> Dict[str, Any]:
+    text = str(header or "").strip()
+    token = _normalized_header_key(text)
+    if not token:
+        return {}
+
+    edu_path = re.match(r"^education[s]?/(\d+)/(.+)$", text, flags=re.IGNORECASE)
+    if edu_path:
+        tail = _normalized_header_key(edu_path.group(2))
+        kind = "college" if any(x in tail for x in ("school", "college", "university")) else "degree" if "degree" in tail else "details"
+        return {"index": int(edu_path.group(1)) + 1, "kind": kind, "source_pattern": "education_path"}
+
+    college = re.search(r"education\s+(\d+).*(college|school|university).*name", token)
+    if college:
+        return {"index": int(college.group(1)), "kind": "college", "source_pattern": "numbered_education"}
+    if "college name" in token or "school name" in token or "university name" in token:
+        return {"index": 1, "kind": "college", "source_pattern": "education_label"}
+    if "degree name" in token or token == "degree":
+        return {"index": 1, "kind": "degree", "source_pattern": "education_label"}
+    return {}
+
+
+CONTACT_COMPENSATION_KEYS = {
+    "current ctc",
+    "curr ctc",
+    "expected ctc",
+    "notice period",
+    "preferred location",
+    "pref location",
+    "preferred loc",
+    "shift timings",
+    "work email",
+    "email",
+    "mobile",
+    "mobile number",
+    "phone",
+    "phone number",
+}
+
+
+def _sample_has_pattern(sample_values: List[str], pattern: str) -> bool:
+    return any(re.search(pattern, str(value or ""), flags=re.IGNORECASE) for value in sample_values)
+
+
+def _field_group_for_target(target: Optional[str]) -> str:
+    if target in REQUIRED_IMPORT_TARGETS:
+        return "Required Fields"
+    if target in {"company_name", "headline", "about", "location", "notes"}:
+        return "Recommended Fields"
+    if target in {"email", "phone"}:
+        return "Contact/Compensation"
+    return "Other Fields"
+
+
+def _classify_upload_header(
+    header: str,
+    *,
+    target: str,
+    source: str,
+    confidence: float,
+    reason: str,
+    sample_values: List[str],
+    all_headers: List[str],
+) -> Dict[str, Any]:
+    key = _normalized_header_key(header)
+    work = _detect_work_history_header(header)
+    education = _detect_education_header(header)
+    forced_history = _is_history_upload_header(header, all_headers)
+
+    category = _field_group_for_target(target)
+    friendly_label = str(header or "")
+    preserve_reason = ""
+    detected_role_index = None
+    detected_field_kind = ""
+    detected_pattern = ""
+
+    if education:
+        category = "Education"
+        detected_role_index = education.get("index")
+        detected_field_kind = education.get("kind") or ""
+        detected_pattern = education.get("source_pattern") or ""
+        friendly_label = f"Education {detected_role_index} {detected_field_kind.replace('_', ' ').title()}".strip()
+        preserve_reason = "Preserved for education enrichment"
+    elif forced_history and work:
+        category = "Work History"
+        detected_role_index = work.get("index")
+        detected_field_kind = work.get("kind") or ""
+        detected_pattern = work.get("source_pattern") or ""
+        friendly_label = f"Experience {detected_role_index} {detected_field_kind.replace('_', ' ').title()}".strip()
+        preserve_reason = "Preserved for work-history and tenure enrichment"
+    elif key in CONTACT_COMPENSATION_KEYS or any(term in key for term in ("ctc", "salary", "compensation", "notice")):
+        category = "Contact/Compensation"
+        preserve_reason = "Preserved as imported profile data"
+        friendly_label = " ".join(part.capitalize() for part in key.split()) or str(header or "")
+    elif target == "custom":
+        category = "Other Fields"
+        preserve_reason = "Preserved as imported extra data"
+    elif target == "ignore":
+        category = "Needs Review" if any(sample_values) else "Other Fields"
+
+    # Guard against confident but value-incompatible guesses. This keeps model suggestions advisory.
+    validation_notes: List[str] = []
+    if target == "linkedin" and sample_values and not _sample_has_pattern(sample_values, r"linkedin\.com|^https?://"):
+        validation_notes.append("sample values do not look like LinkedIn URLs")
+    if target == "email" and sample_values and not _sample_has_pattern(sample_values, r"^[^@\s]+@[^@\s]+\.[^@\s]+$"):
+        validation_notes.append("sample values do not look like email addresses")
+    if target in {"phone"} and sample_values and not _sample_has_pattern(sample_values, r"\+?\d[\d\s().-]{6,}"):
+        validation_notes.append("sample values do not look like phone numbers")
+    if validation_notes:
+        category = "Needs Review"
+        confidence = min(float(confidence or 0), 0.45)
+        reason = f"{reason} ({'; '.join(validation_notes)})" if reason else "; ".join(validation_notes)
+
+    return {
+        "category": category,
+        "friendly_label": friendly_label,
+        "confidence": round(float(confidence or 0), 3),
+        "source": source,
+        "preserve_reason": preserve_reason,
+        "detected_role_index": detected_role_index,
+        "detected_field_kind": detected_field_kind,
+        "detected_pattern": detected_pattern,
+        "reason": reason,
+    }
+
+
 def _is_history_upload_header(header: str, all_headers: Optional[List[str]] = None) -> bool:
     """Columns that should stay raw/custom for verified profile enrichment."""
+    raw_header = str(header or "").strip()
+    if re.match(r"^experiences/\d+/", raw_header, flags=re.IGNORECASE):
+        return True
+    if _detect_work_history_header(raw_header):
+        return True
     key = _normalized_header_key(header)
+    if key in {
+        "recruiter summary",
+        "summary double tap",
+        "focused geography",
+        "focused geo",
+        "outbound exp",
+        "outbound experience",
+        "current ctc",
+        "expected ctc",
+        "notice period",
+        "preferred location",
+        "pref location",
+        "shift timings",
+        "targets",
+        "cv",
+        "resume",
+    }:
+        return True
     headers_keyed = {_normalized_header_key(item) for item in (all_headers or [])}
     has_explicit_current_title = bool(
         headers_keyed
@@ -112,6 +410,21 @@ def _is_history_upload_header(header: str, all_headers: Optional[List[str]] = No
     if key == "title" and has_explicit_current_title:
         return True
     return False
+
+
+def _is_work_history_upload_header(header: str) -> bool:
+    raw_header = str(header or "").strip()
+    if re.match(r"^experiences/\d+/", raw_header, flags=re.IGNORECASE):
+        return True
+    if _detect_work_history_header(raw_header):
+        return True
+    key = _normalized_header_key(header)
+    return bool(
+        re.fullmatch(r"company \d+ name", key)
+        or re.fullmatch(r"company \d+", key)
+        or re.fullmatch(r"(title|start date|end date|details|degree name) \d+", key)
+        or re.fullmatch(r"(start date|end date|details|degree name)( \d+)?", key)
+    )
 
 
 def _validate_mapping(mapping: Dict[str, Any]) -> Dict[str, str]:
@@ -161,6 +474,7 @@ async def _model_mapping(headers: List[str], sample_rows: List[Dict[str, Any]]) 
 
 
 async def build_upload_preview_response(file: UploadFile, use_llm: bool = False) -> Dict[str, Any]:
+    preview_started = perf_counter()
     raw = await file.read()
     try:
         df = _read_frame(raw, file.filename or "upload.csv")
@@ -174,14 +488,19 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
 
     suggested: Dict[str, str] = {}
     mapping_details: Dict[str, Dict[str, Any]] = {}
+    field_groups: Dict[str, List[str]] = {}
     for header in headers:
+        sample_values = [_clean(row.get(header)) or "" for row in sample[:4]]
+        has_sample_value = any(bool(value) for value in sample_values)
+        force_education_custom = bool(_detect_education_header(header))
         force_history_custom = _is_history_upload_header(header, headers)
-        alias_target = "custom" if force_history_custom else deterministic.get(header)
+        force_preserve_custom = force_history_custom or force_education_custom
+        alias_target = "custom" if force_preserve_custom else deterministic.get(header)
         model_item = model_raw.get(header)
         model_target = None
         confidence = 0.0
         reason = ""
-        if force_history_custom:
+        if force_preserve_custom:
             model_item = None
         if isinstance(model_item, dict):
             raw_target = str(model_item.get("target") or "")
@@ -196,22 +515,100 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
             model_target = model_item
             confidence = 0.7
 
-        target = model_target or alias_target or "ignore"
-        source = "history" if force_history_custom else "model" if model_target else "alias" if alias_target else "manual"
+        target = model_target or alias_target or ("custom" if has_sample_value else "ignore")
+        if model_target == "ignore" and has_sample_value and not alias_target:
+            target = "custom"
+            model_target = None
+        source = (
+            "history"
+            if force_history_custom and _is_work_history_upload_header(header)
+            else "custom"
+            if force_preserve_custom
+            else "model"
+            if model_target
+            else "alias"
+            if alias_target
+            else "custom"
+            if target == "custom"
+            else "manual"
+        )
+        base_confidence = 1.0 if force_preserve_custom else confidence if model_target else (0.95 if alias_target else 0.75 if target == "custom" else 0)
+        base_reason = (
+            "Kept as custom/raw work-history data for verified enrichment"
+            if force_history_custom and _is_work_history_upload_header(header)
+            else "Preserved as imported education data for enrichment"
+            if force_education_custom
+            else "Preserved as imported extra data for verified enrichment"
+            if force_preserve_custom
+            else reason
+            or (
+                "Matched known header alias"
+                if alias_target
+                else "Preserved as imported extra data for AI columns"
+                if target == "custom"
+                else "No confident match"
+            )
+        )
+        meta = _classify_upload_header(
+            header,
+            target=target,
+            source=source,
+            confidence=base_confidence,
+            reason=base_reason,
+            sample_values=sample_values,
+            all_headers=headers,
+        )
+        source = meta.get("source") or source
+        confidence_value = meta.get("confidence", base_confidence)
+        reason_value = meta.get("reason") or base_reason
         suggested[header] = target
         mapping_details[header] = {
             "target": target,
             "source": source,
-            "confidence": 1.0 if force_history_custom else confidence if model_target else (0.95 if alias_target else 0),
-            "reason": (
-                "Kept as custom/raw work-history data for verified enrichment"
-                if force_history_custom
-                else reason or ("Matched known header alias" if alias_target else "No confident match")
-            ),
-            "sample_values": [_clean(row.get(header)) or "" for row in sample[:4]],
+            "confidence": confidence_value,
+            "reason": reason_value,
+            "sample_values": sample_values,
+            "category": meta.get("category") or "Other Fields",
+            "friendly_label": meta.get("friendly_label") or header,
+            "preserve_reason": meta.get("preserve_reason") or "",
+            "detected_role_index": meta.get("detected_role_index"),
+            "detected_field_kind": meta.get("detected_field_kind") or "",
+            "detected_pattern": meta.get("detected_pattern") or "",
         }
+        field_groups.setdefault(mapping_details[header]["category"], []).append(header)
 
     used_targets = {v for v in suggested.values() if v and v != "ignore"}
+    if "title" not in used_targets:
+        headline_header = next((header for header in headers if _normalized_header_key(header) == "headline"), None)
+        if headline_header:
+            suggested[headline_header] = "title"
+            detail = mapping_details.get(headline_header, {})
+            detail.update(
+                {
+                    "target": "title",
+                    "source": "alias",
+                    "confidence": 0.95,
+                    "reason": "Used profile headline as the required title while preserving work-history columns for enrichment.",
+                    "category": "Required Fields",
+                    "friendly_label": "Title",
+                    "preserve_reason": "",
+                }
+            )
+            mapping_details[headline_header] = detail
+            for group_headers in field_groups.values():
+                if headline_header in group_headers:
+                    group_headers.remove(headline_header)
+            field_groups.setdefault("Required Fields", []).append(headline_header)
+
+    used_targets = {v for v in suggested.values() if v and v != "ignore"}
+    logger.info(
+        "candidate upload preview filename=%s rows=%s columns=%s duration_ms=%s groups=%s",
+        file.filename,
+        len(df.index),
+        len(headers),
+        round((perf_counter() - preview_started) * 1000),
+        {group: len(items) for group, items in field_groups.items()},
+    )
     return {
         "filename": file.filename,
         "row_count": int(len(df.index)),
@@ -220,6 +617,7 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
         "suggested_mapping": suggested,
         "deterministic_mapping": deterministic,
         "mapping_details": mapping_details,
+        "field_groups": field_groups,
         "required_targets": sorted(REQUIRED_IMPORT_TARGETS),
         "optional_targets": list(OPTIONAL_IMPORT_TARGETS),
         "target_options": list(IMPORT_TARGETS),
@@ -307,7 +705,7 @@ def _prepare_import_rows(df: pd.DataFrame, mapping: Dict[str, str]) -> List[Dict
                 "source_index": source_index,
                 "vals": vals,
                 "raw_vals": raw_vals,
-                "normalized_li": normalize_linkedin(linkedin) if linkedin else "",
+                "normalized_li": normalize_linkedin(linkedin) if linkedin else None,
             }
         )
     return prepared
@@ -505,10 +903,10 @@ def _raw_fields_for_import(
     company_name: Optional[str], raw_fields_extra: Optional[Dict[str, Any]]
 ) -> str:
     raw_fields: Dict[str, Any] = {}
+    if raw_fields_extra:
+        raw_fields.update(merge_imported_extra_fields(raw_fields_extra))
     if company_name:
         raw_fields["import_company"] = company_name
-    if raw_fields_extra:
-        raw_fields.update(raw_fields_extra)
     return json.dumps(raw_fields) if raw_fields else "{}"
 
 
@@ -582,6 +980,13 @@ def _fast_new_import_rows(
 
 def _is_verified_enrichment_mode(enrichment_mode: Optional[str]) -> bool:
     return str(enrichment_mode or "none").strip().lower() == "verified_profile"
+
+
+def _normalize_duplicate_policy(policy: Optional[str]) -> str:
+    value = str(policy or UPSERT_EXISTING_POLICY).strip().lower()
+    if value in {NO_MUTATE_EXISTING_POLICY, "skip_existing", "no_mutate", "preserve_existing"}:
+        return NO_MUTATE_EXISTING_POLICY
+    return UPSERT_EXISTING_POLICY
 
 
 def _bulk_insert_new_import_rows(
@@ -715,6 +1120,7 @@ def _process_upload_rows(
     user_role: str,
     role_id: Optional[int],
     enrichment_mode: str = "none",
+    duplicate_policy: str = UPSERT_EXISTING_POLICY,
 ) -> None:
     inserted = updated = skipped = role_assigned_count = 0
     processed_count = 0
@@ -723,6 +1129,7 @@ def _process_upload_rows(
     touched_ids: List[int] = []
     batch_size = 10
     import_started = perf_counter()
+    duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         _mark_upload_failed(upload_id, "Database connection failed")
@@ -827,59 +1234,37 @@ def _process_upload_rows(
                 if not norm and not email and not _identity_key(fn, ln, company_name):
                     skipped += 1
                 else:
-                    savepoint = f"imp_row_{sequence}"
-                    try:
-                        # One bad row must not abort rows already processed for this import.
-                        cur.execute(f"SAVEPOINT {savepoint}")
-                        master_existing_id = _cached_match_id(
-                            master_matches,
+                    master_existing_id = _cached_match_id(
+                        master_matches,
+                        normalized_li=norm,
+                        email=email,
+                        first_name=fn,
+                        last_name=ln,
+                        company_name=company_name,
+                    )
+                    recruiter_existing_id = (
+                        _cached_match_id(
+                            recruiter_matches,
                             normalized_li=norm,
                             email=email,
                             first_name=fn,
                             last_name=ln,
                             company_name=company_name,
                         )
-                        mid = upsert_master_catalog_row(
-                            cur,
-                            normalized_li=norm,
-                            raw_linkedin=li,
-                            first_name=fn,
-                            last_name=ln,
-                            city=vals.get("city"),
-                            title=vals.get("title"),
-                            company_name=company_name,
-                            email=email,
-                            phone=phone,
-                            location=vals.get("location"),
-                            notes=None,
-                            raw_fields_extra=raw_vals,
-                            existing_id=master_existing_id,
-                            lookup_complete=True,
-                        )
-                        _set_cached_match(
-                            master_matches,
-                            int(mid),
-                            normalized_li=norm,
-                            email=email,
-                            first_name=fn,
-                            last_name=ln,
-                            company_name=company_name,
-                        )
-                        cid = mid
-                        op = "updated" if master_existing_id else "inserted"
-                        if user_role != "admin":
-                            recruiter_existing_id = _cached_match_id(
-                                recruiter_matches,
-                                normalized_li=norm,
-                                email=email,
-                                first_name=fn,
-                                last_name=ln,
-                                company_name=company_name,
-                            )
-                            cid, op = upsert_recruiter_pool_row(
+                        if user_role != "admin"
+                        else None
+                    )
+                    if duplicate_policy == NO_MUTATE_EXISTING_POLICY and (
+                        master_existing_id or recruiter_existing_id
+                    ):
+                        updated += 1
+                    else:
+                        savepoint = f"imp_row_{sequence}"
+                        try:
+                            # One bad row must not abort rows already processed for this import.
+                            cur.execute(f"SAVEPOINT {savepoint}")
+                            mid = upsert_master_catalog_row(
                                 cur,
-                                owner_id=owner_user_id,
-                                master_id=mid,
                                 normalized_li=norm,
                                 raw_linkedin=li,
                                 first_name=fn,
@@ -890,44 +1275,75 @@ def _process_upload_rows(
                                 email=email,
                                 phone=phone,
                                 location=vals.get("location"),
-                                notes=vals.get("notes"),
-                                pool_source=POOL_SOURCE_RECRUITER_UPLOAD,
-                                source_upload_id=upload_id,
-                                assigned_by_user_id=None,
+                                notes=None,
                                 raw_fields_extra=raw_vals,
-                                existing_id=recruiter_existing_id,
+                                existing_id=master_existing_id,
                                 lookup_complete=True,
                             )
                             _set_cached_match(
-                                recruiter_matches,
-                                int(cid),
+                                master_matches,
+                                int(mid),
                                 normalized_li=norm,
                                 email=email,
                                 first_name=fn,
                                 last_name=ln,
                                 company_name=company_name,
                             )
-                        if _assign_imported_candidate_to_role(
-                            cur, role_id=role_id, candidate_id=int(cid)
-                        ):
-                            role_assigned_count += 1
-                        touched_ids.extend([int(mid), int(cid)])
-                        if norm:
-                            contacts[norm] = (email, phone)
-                        cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        if op == "inserted":
-                            inserted += 1
-                        else:
-                            updated += 1
-                    except Exception as row_exc:
-                        try:
-                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            cid = mid
+                            op = "updated" if master_existing_id else "inserted"
+                            if user_role != "admin":
+                                cid, op = upsert_recruiter_pool_row(
+                                    cur,
+                                    owner_id=owner_user_id,
+                                    master_id=mid,
+                                    normalized_li=norm,
+                                    raw_linkedin=li,
+                                    first_name=fn,
+                                    last_name=ln,
+                                    city=vals.get("city"),
+                                    title=vals.get("title"),
+                                    company_name=company_name,
+                                    email=email,
+                                    phone=phone,
+                                    location=vals.get("location"),
+                                    notes=vals.get("notes"),
+                                    pool_source=POOL_SOURCE_RECRUITER_UPLOAD,
+                                    source_upload_id=upload_id,
+                                    assigned_by_user_id=None,
+                                    raw_fields_extra=raw_vals,
+                                    existing_id=recruiter_existing_id,
+                                    lookup_complete=True,
+                                )
+                                _set_cached_match(
+                                    recruiter_matches,
+                                    int(cid),
+                                    normalized_li=norm,
+                                    email=email,
+                                    first_name=fn,
+                                    last_name=ln,
+                                    company_name=company_name,
+                                )
+                            if _assign_imported_candidate_to_role(
+                                cur, role_id=role_id, candidate_id=int(cid)
+                            ):
+                                role_assigned_count += 1
+                            touched_ids.extend([int(mid), int(cid)])
+                            if norm:
+                                contacts[norm] = (email, phone)
                             cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-                        except Exception:
-                            conn.rollback()
-                            raise
-                        errors.append(f"row {prepared['source_index']}: {row_exc}")
-                        skipped += 1
+                            if op == "inserted":
+                                inserted += 1
+                            else:
+                                updated += 1
+                        except Exception as row_exc:
+                            try:
+                                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            except Exception:
+                                conn.rollback()
+                                raise
+                            errors.append(f"row {prepared['source_index']}: {row_exc}")
+                            skipped += 1
 
                 if sequence % batch_size == 0 or sequence == len(prepared_rows):
                     _write_upload_progress(
@@ -990,7 +1406,21 @@ def _process_upload_rows(
         try:
             from backend.services.import_enrichment import enrich_candidate_profiles
 
-            enrichment_result = enrich_candidate_profiles(touched_ids, allow_web=True)
+            enrich_started = perf_counter()
+            allow_web = str(os.getenv("IMPORT_ENRICHMENT_IMPORT_ALLOW_WEB", "false")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            enrichment_result = enrich_candidate_profiles(touched_ids, allow_web=allow_web)
+            logger.info(
+                "candidate upload enrichment upload_id=%s candidates=%s allow_web=%s duration_ms=%s result=%s",
+                upload_id,
+                len(set(touched_ids)),
+                allow_web,
+                round((perf_counter() - enrich_started) * 1000),
+                enrichment_result,
+            )
             enrichment_errors.extend(enrichment_result.get("errors") or [])
         except Exception as enrich_exc:
             logger.exception("candidate upload enrichment failed upload_id=%s", upload_id)
@@ -1038,6 +1468,7 @@ def _spawn_upload_thread(
     user_role: str,
     role_id: Optional[int],
     enrichment_mode: str = "none",
+    duplicate_policy: str = UPSERT_EXISTING_POLICY,
 ) -> None:
     def run() -> None:
         try:
@@ -1049,6 +1480,7 @@ def _spawn_upload_thread(
                 user_role=user_role,
                 role_id=role_id,
                 enrichment_mode=enrichment_mode,
+                duplicate_policy=duplicate_policy,
             )
         finally:
             with _upload_threads_lock:
@@ -1106,6 +1538,9 @@ async def suggest_mapping_llm(
                     base[k] = v
     except Exception as e:
         logger.warning("LLM mapping failed: %s", e)
+    for header in headers:
+        if _is_history_upload_header(header, headers) or _detect_education_header(header):
+            base[header] = "custom"
     return {"suggested_mapping": base}
 
 
@@ -1113,6 +1548,7 @@ async def commit_upload_file(
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
     enrichment_mode: str = Form("none"),
+    duplicate_policy: str = Form(UPSERT_EXISTING_POLICY),
     current_user: schemas.User = None,
     role_id: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1125,6 +1561,7 @@ async def commit_upload_file(
 
     mapping = _validate_mapping(mapping)
     enrichment_mode = "verified_profile" if _is_verified_enrichment_mode(enrichment_mode) else "none"
+    duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
 
     parse_started = perf_counter()
     raw = await file.read()
@@ -1185,6 +1622,7 @@ async def commit_upload_file(
         user_role=(current_user.role or "").strip().lower(),
         role_id=role_id,
         enrichment_mode=enrichment_mode,
+        duplicate_policy=duplicate_policy,
     )
 
     return {
@@ -1197,6 +1635,7 @@ async def commit_upload_file(
         "role_assigned_count": 0,
         "status": "processing",
         "enrichment_mode": enrichment_mode,
+        "duplicate_policy": duplicate_policy,
         "errors": [],
     }
 
@@ -1206,6 +1645,7 @@ async def upload_commit(
     file: UploadFile = File(...),
     mapping_json: str = Form(...),
     enrichment_mode: str = Form("none"),
+    duplicate_policy: str = Form(UPSERT_EXISTING_POLICY),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     if current_user.role == "admin":
@@ -1214,6 +1654,7 @@ async def upload_commit(
         file=file,
         mapping_json=mapping_json,
         enrichment_mode=enrichment_mode,
+        duplicate_policy=duplicate_policy,
         current_user=current_user,
     )
 

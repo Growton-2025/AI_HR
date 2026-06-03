@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, List, Any
 from pydantic import BaseModel
-from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID, initialize_cache
+from backend.pipeline.query import update_candidate_status, PROFILES_BY_ID, initialize_cache, is_cache_initialized
 from backend.api import deps, schemas
 from backend.services.candidate_pool import (
     profile_passes_scope,
@@ -77,10 +77,10 @@ async def _ensure_profiles_loaded() -> bool:
     Azure/Gunicorn workers do not share process memory. A cold worker can otherwise
     answer browse/summary/meta from an empty cache and briefly poison frontend totals.
     """
-    if PROFILES_BY_ID:
+    if is_cache_initialized():
         return False
     async with _profile_cache_init_lock:
-        if PROFILES_BY_ID:
+        if is_cache_initialized():
             return False
         started = time.monotonic()
         await asyncio.to_thread(initialize_cache)

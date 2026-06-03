@@ -2364,7 +2364,7 @@ export default function TalentPool() {
     if (!file) return;
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('use_llm', 'true');
+    fd.append('use_llm', 'false');
     setUploadPreviewBusy(true);
     try {
       const res = await axios.post(`${API_BASE}/candidates/upload/preview`, fd, {
@@ -2380,7 +2380,11 @@ export default function TalentPool() {
       setUploadTargetOptions(res.data.target_options || []);
       setUploadRowCount(Number(res.data.row_count) || 0);
       setUploadProgress(null);
-      setUploadEnrichmentMode('none');
+      // Bug-4 fix: auto-enable verified enrichment for Apify/LinkedIn-style CSVs
+      // that already contain structured work-history columns (experiences/*).
+      // The user can still override this in the modal.
+      const hasExperienceCols = headers.some(h => /^experiences\/\d+\//i.test(String(h || '')));
+      setUploadEnrichmentMode(hasExperienceCols ? 'verified_profile' : 'none');
       const init = {};
       for (const h of headers) {
         init[h] = sm[h] || 'ignore';
@@ -2394,6 +2398,7 @@ export default function TalentPool() {
       setUploadPreviewBusy(false);
     }
   };
+
 
   const pollUploadStatus = async (uploadId) => {
     for (let attempt = 0; attempt < 900; attempt += 1) {

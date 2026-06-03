@@ -392,7 +392,11 @@ function Roles() {
             setUploadTargetOptions(res.data.target_options || [])
             setUploadRowCount(Number(res.data.row_count) || 0)
             setUploadProgress(null)
-            setUploadEnrichmentMode('none')
+            // Bug-4 fix: auto-enable verified enrichment for Apify/LinkedIn-style CSVs
+            // that already contain structured work-history columns (experiences/*).
+            // The user can still override this in the modal.
+            const hasExperienceCols = headers.some(h => /^experiences\/\d+\//i.test(String(h || '')))
+            setUploadEnrichmentMode(hasExperienceCols ? 'verified_profile' : 'none')
         } catch (e) {
             toast.error(e.response?.data?.detail || 'Preview failed')
         } finally {

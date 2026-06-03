@@ -383,6 +383,19 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, error: e.response?.data?.detail }
         }
     },
+    updateRecruiter: async (id, data) => {
+        const previousRecruiters = get().recruiters
+        try {
+            const res = await axios.patch(`${API_BASE}/admin/recruiters/${id}`, data)
+            set(state => ({
+                recruiters: state.recruiters.map(r => r.id === id ? res.data : r)
+            }))
+            return { success: true, data: res.data }
+        } catch (e) {
+            set({ recruiters: previousRecruiters })
+            return { success: false, error: e.response?.data?.detail || 'Failed to update recruiter' }
+        }
+    },
     warmAll: async () => {
         try {
             // FIRE AND FORGET - Don't wait for these expensive calls to block UI mount

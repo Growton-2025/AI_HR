@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import {
-  UserPlus, Trash2, X, Mail, User, Lock,
+  UserPlus, Trash2, X, Mail, User, Lock, Pencil,
   ChevronDown, Loader2, Monitor,
   LayoutGrid, MessagesSquare, Mic, Search, RefreshCw,
   Shield, CheckCircle2, Users, BarChart2
@@ -159,14 +159,16 @@ function SkeletonRow() {
 
 // ── Main Component ────────────────────────────────────────────
 const UserManagement = () => {
-  const { recruiters, fetchRecruiters, createRecruiter, updateRecruiterPermissions, deleteRecruiter } = useAppStore(useShallow((state) => ({
+  const { recruiters, fetchRecruiters, createRecruiter, updateRecruiter, updateRecruiterPermissions, deleteRecruiter } = useAppStore(useShallow((state) => ({
     recruiters: state.recruiters,
     fetchRecruiters: state.fetchRecruiters,
     createRecruiter: state.createRecruiter,
+    updateRecruiter: state.updateRecruiter,
     updateRecruiterPermissions: state.updateRecruiterPermissions,
     deleteRecruiter: state.deleteRecruiter,
   })));
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingRecruiter, setEditingRecruiter] = useState(null);
   const [newUser, setNewUser] = useState({ name: '', email: '', password: '' });
   const [loading, setLoading] = useState(false);
   const [isFetching, setIsFetching] = useState(false);
@@ -178,19 +180,42 @@ const UserManagement = () => {
     fetchRecruiters().finally(() => setIsFetching(false));
   }, []);
 
-  const handleAddUser = async (e) => {
+  const openEditRecruiter = (recruiter) => {
+    setEditingRecruiter(recruiter);
+    setNewUser({
+      name: recruiter.full_name || '',
+      email: recruiter.email || '',
+      password: '',
+    });
+    setIsModalOpen(true);
+  };
+
+  const closeModal = () => {
+    setIsModalOpen(false);
+    setEditingRecruiter(null);
+    setNewUser({ name: '', email: '', password: '' });
+  };
+
+  const handleSaveRecruiter = async (e) => {
     e.preventDefault();
-    if (!newUser.name || !newUser.email || !newUser.password) {
-      toast.error('Please fill in all fields.'); return;
+    if (!newUser.name || !newUser.email || (!editingRecruiter && !newUser.password)) {
+      toast.error('Please fill in all required fields.');
+      return;
     }
     setLoading(true);
-    const res = await createRecruiter(newUser);
+    const payload = {
+      name: newUser.name,
+      email: newUser.email,
+      ...(newUser.password ? { password: newUser.password } : {}),
+    };
+    const res = editingRecruiter
+      ? await updateRecruiter(editingRecruiter.id, payload)
+      : await createRecruiter(payload);
     if (res.success) {
-      setIsModalOpen(false);
-      setNewUser({ name: '', email: '', password: '' });
-      toast.success('Recruiter added!');
+      closeModal();
+      toast.success(editingRecruiter ? 'Recruiter updated.' : 'Recruiter added!');
     } else {
-      toast.error(res.error || 'Failed to create recruiter.');
+      toast.error(res.error || (editingRecruiter ? 'Failed to update recruiter.' : 'Failed to create recruiter.'));
     }
     setLoading(false);
   };
@@ -255,7 +280,7 @@ const UserManagement = () => {
             <RefreshCw size={16} style={{ animation: isFetching ? 'spin 1s linear infinite' : 'none' }} />
           </button>
           <button
-            onClick={() => setIsModalOpen(true)}
+            onClick={() => { setEditingRecruiter(null); setNewUser({ name: '', email: '', password: '' }); setIsModalOpen(true); }}
             style={PRIMARY_BUTTON_STYLE}
             onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 16px 28px rgba(15,23,42,0.16)'; }}
             onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = '0 12px 24px rgba(15,23,42,0.12)'; }}
@@ -384,7 +409,7 @@ const UserManagement = () => {
                     </div>
                     <p style={{ color: '#64748b', fontWeight: 600, fontSize: '15px', margin: 0 }}>No recruiters yet</p>
                     <p style={{ color: '#cbd5e1', fontSize: '13px', margin: 0 }}>Add your first team member to get started</p>
-                    <button onClick={() => setIsModalOpen(true)} style={{ marginTop: '4px', padding: '8px 18px', background: '#fff', border: '1px solid rgba(203,213,225,0.9)', borderRadius: '10px', color: '#334155', fontWeight: 700, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+                    <button onClick={() => { setEditingRecruiter(null); setNewUser({ name: '', email: '', password: '' }); setIsModalOpen(true); }} style={{ marginTop: '4px', padding: '8px 18px', background: '#fff', border: '1px solid rgba(203,213,225,0.9)', borderRadius: '10px', color: '#334155', fontWeight: 700, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
                       + Add First Recruiter
                     </button>
                   </div>
@@ -442,8 +467,24 @@ const UserManagement = () => {
                       </div>
                     </td>
 
-                    {/* Delete */}
+                    {/* Actions */}
                     <td style={{ padding: '15px 20px', textAlign: 'right' }}>
+                      <button
+                        title="Edit login"
+                        onClick={e => { e.stopPropagation(); openEditRecruiter(recruiter); }}
+                        style={{
+                          width: '36px', height: '36px',
+                          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                          background: '#f8fafc', border: '1.5px solid #e2e8f0',
+                          borderRadius: '9px', color: '#475569',
+                          cursor: 'pointer', transition: 'all 0.15s',
+                          marginRight: '8px',
+                        }}
+                        onMouseEnter={e => { e.currentTarget.style.background = '#f1f5f9'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = '#f8fafc'; }}
+                      >
+                        <Pencil size={14} />
+                      </button>
                       <button
                         onClick={e => { e.stopPropagation(); handleDelete(recruiter.id, recruiter.full_name); }}
                         disabled={deletingId === recruiter.id}
@@ -517,10 +558,10 @@ const UserManagement = () => {
         </table>
       </div>
 
-      {/* Add Recruiter Modal */}
+      {/* Add/Edit Recruiter Modal */}
       {isModalOpen && (
         <div
-          onClick={e => { if (e.target === e.currentTarget) setIsModalOpen(false); }}
+          onClick={e => { if (e.target === e.currentTarget) closeModal(); }}
           style={{
             position: 'fixed', inset: 0,
             background: 'rgba(15,23,42,0.35)',
@@ -541,30 +582,48 @@ const UserManagement = () => {
             {/* Modal header */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '24px' }}>
               <div>
-                <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '3px' }}>Add New Recruiter</h2>
-                <p style={{ fontSize: '13px', color: '#94a3b8' }}>Create a team member account with login access</p>
+                <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '3px' }}>
+                  {editingRecruiter ? 'Edit Recruiter Login' : 'Add New Recruiter'}
+                </h2>
+                <p style={{ fontSize: '13px', color: '#94a3b8' }}>
+                  {editingRecruiter
+                    ? 'Change name, email, or set a new password without moving their candidates'
+                    : 'Create a team member account with login access'}
+                </p>
               </div>
               <button
-                onClick={() => setIsModalOpen(false)}
+                onClick={closeModal}
                 style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: '8px', cursor: 'pointer', color: '#94a3b8' }}
               >
                 <X size={15} />
               </button>
             </div>
 
-            <form onSubmit={handleAddUser}>
+            <form onSubmit={handleSaveRecruiter}>
               <ModalInput icon={User} label="Full Name" value={newUser.name} onChange={e => setNewUser({ ...newUser, name: e.target.value })} placeholder="Jane Smith" required />
               <ModalInput icon={Mail} label="Email Address" type="email" value={newUser.email} onChange={e => setNewUser({ ...newUser, email: e.target.value })} placeholder="jane@company.com" required />
-              <ModalInput icon={Lock} label="Temporary Password" type="password" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} placeholder="Min. 8 characters" required />
+              <ModalInput
+                icon={Lock}
+                label={editingRecruiter ? 'New Password (optional)' : 'Temporary Password'}
+                type="password"
+                value={newUser.password}
+                onChange={e => setNewUser({ ...newUser, password: e.target.value })}
+                placeholder={editingRecruiter ? 'Leave blank to keep existing' : 'Min. 6 characters'}
+                required={!editingRecruiter}
+              />
 
               <div style={{ display: 'flex', gap: '10px', marginTop: '24px' }}>
-                <button type="button" onClick={() => setIsModalOpen(false)}
+                <button type="button" onClick={closeModal}
                   style={{ ...SECONDARY_BUTTON_STYLE, flex: 1 }}>
                   Cancel
                 </button>
                 <button type="submit" disabled={loading}
                   style={{ ...PRIMARY_BUTTON_STYLE, flex: 1.5, padding: '12px', opacity: loading ? 0.75 : 1, cursor: loading ? 'not-allowed' : 'pointer' }}>
-                  {loading ? <Loader2 size={17} style={{ animation: 'spin 1s linear infinite' }} /> : <><UserPlus size={16} /> Create Recruiter</>}
+                  {loading
+                    ? <Loader2 size={17} style={{ animation: 'spin 1s linear infinite' }} />
+                    : editingRecruiter
+                      ? <><Pencil size={16} /> Save Changes</>
+                      : <><UserPlus size={16} /> Create Recruiter</>}
                 </button>
               </div>
             </form>
