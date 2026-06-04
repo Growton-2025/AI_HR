@@ -295,10 +295,11 @@ PRESETS: List[Dict[str, Any]] = [
         "mode": "auto",
         "prompt_template": (
             "Calculate the average tenure of the candidate ({Linkedin Profile}). "
-            "Average Tenure = total years of work experience / number of unique companies. "
+            "Avg. tenure (completed roles) = total years of work experience excluding the current role "
+            "/ number of unique companies excluding the current company. "
             "Count different roles in the same company as one job. "
             "Do not count community memberships, such as RevGenius. "
-            "Give the output in months. Also give the time spent by the candidate in the current job."
+            "Give the output in months. Also give the time spent by the candidate in the current job separately."
         ),
         "output_schema": _schema(
             ("average_tenure_months", "Average Tenure Months"),

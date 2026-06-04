@@ -935,6 +935,8 @@ def calculate_tenure_metrics(
     the total.
     """
     work_roles = [role for role in roles if not role.duration_unknown and not is_community_role(role)]
+    current_work_role = next((role for role in roles if not is_community_role(role)), None)
+    current_company_norm = normalize_company_name(current_work_role.company) if current_work_role else ""
     company_windows: Dict[str, Dict[str, Any]] = {}
     for role in work_roles:
         norm = normalize_company_name(role.company)
@@ -998,6 +1000,7 @@ def calculate_tenure_metrics(
                 "normalized_company": item["normalized_company"],
                 "months": months,
                 "years": years_from_months(months),
+                "is_current_company": item["normalized_company"] == current_company_norm,
                 "dated_months": dated_months,
                 "undated_duration_months": int(item.get("undated_months") or 0),
                 "date_windows": [
@@ -1038,13 +1041,23 @@ def calculate_tenure_metrics(
         total_months = int(round(raw_total_exp_years * 12))
 
     company_count = len(company_years)
-    avg_months = int(round(total_months / company_count)) if company_count else 0
+    completed_company_tenures = [
+        item for item in company_tenures
+        if not item.get("is_current_company")
+    ]
+    completed_company_count = len(completed_company_tenures)
+    completed_company_months = sum(int(item.get("months") or 0) for item in completed_company_tenures)
+    avg_months = (
+        int(round(completed_company_months / completed_company_count))
+        if completed_company_count
+        else 0
+    )
     current_job_months = 0
-    if roles and not is_community_role(roles[0]):
-        if roles[0].start:
-            current_job_months = months_between(roles[0].start, roles[0].end or datetime.now(timezone.utc))
+    if current_work_role:
+        if current_work_role.start:
+            current_job_months = months_between(current_work_role.start, current_work_role.end or datetime.now(timezone.utc))
         else:
-            current_job_months = roles[0].duration_months
+            current_job_months = current_work_role.duration_months
 
     role_tenures = [
         {
@@ -1086,6 +1099,10 @@ def calculate_tenure_metrics(
         "unique_company_count": company_count,
         "avg_tenure_months": avg_months,
         "avg_tenure_years": years_from_months(avg_months),
+        "completed_company_count": completed_company_count,
+        "completed_company_months": completed_company_months,
+        "completed_company_tenures": completed_company_tenures,
+        "current_company": current_work_role.company if current_work_role else "",
         "current_job_months": current_job_months,
         "date_derived_total_years": date_total_years,
         "undated_duration_months": undated_total_months,

@@ -246,7 +246,13 @@ def test_prompt_classifier_routes_row_web_and_hybrid_queries():
     assert classify_ai_column_prompt("Any recent layoffs at the current company?")["data_source"] == "web"
 
 
-def test_career_facts_collapse_company_and_exclude_memberships():
+def test_career_facts_collapse_company_and_exclude_memberships(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
     profile = {
         "id": 1,
         "name": "Sales Candidate",
@@ -272,11 +278,52 @@ def test_career_facts_collapse_company_and_exclude_memberships():
     )
 
     assert facts["unique_company_count"] == 2
+    assert facts["completed_company_count"] == 1
     assert "RevGenius" not in facts["companies"]
     assert facts["ae_experience_months"] >= 60
-    assert outputs["average_tenure_months"].isdigit()
+    assert outputs["average_tenure_months"] == "25"
     assert outputs["current_job_months"].isdigit()
     assert outputs["career_city_count"] == "2"
+
+
+def test_career_facts_average_tenure_excludes_current_company(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    context = build_candidate_context(
+        {
+            "id": 101,
+            "name": "Completed Tenure Candidate",
+            "roles": [
+                {"title": "Current Role", "company": "C", "start_date": "2025-08-01", "end_date": "Present"},
+                {"title": "Role A", "company": "A", "start_date": "2020-01-01", "end_date": "2021-12-01"},
+                {"title": "Role B", "company": "B", "start_date": "2022-01-01", "end_date": "2024-12-01"},
+                {"title": "Member", "company": "RevGenius", "start_date": "2020-01-01", "end_date": "Present"},
+            ],
+        }
+    )
+
+    facts = compute_career_facts(context)
+    outputs = map_career_facts_to_outputs(
+        "Calculate average tenure and current job tenure in months.",
+        [
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "tenure_reasoning", "label": "Tenure Reasoning"},
+        ],
+        facts,
+    )
+
+    assert facts["completed_company_count"] == 2
+    assert facts["completed_company_months"] == 60
+    assert facts["average_tenure_months"] == 30
+    assert facts["current_job_months"] == 11
+    assert outputs["average_tenure_months"] == "30"
+    assert outputs["current_job_months"] == "11"
+    assert "Average tenure (completed roles): 30 months" in outputs["tenure_reasoning"]
 
 
 def test_career_facts_parse_month_year_and_use_duration_fallback(monkeypatch):
@@ -349,8 +396,9 @@ def test_career_facts_merge_same_company_without_counting_gap_months():
         {
             "company": "Highradius",
             "months": 7,
-            "years": 0.6,
+            "years": 0.58,
             "titles": ["HighRadius", "Business Development Intern"],
+            "is_current_company": True,
         }
     ]
 
@@ -526,7 +574,8 @@ def test_career_facts_prefer_verified_enrichment_roles_over_db_roles():
 
     assert facts["companies"] == ["Acme SaaS"]
     assert facts["total_experience_months"] == 24
-    assert facts["average_tenure_months"] == 24
+    assert facts["average_tenure_months"] == 0
+    assert facts["completed_company_count"] == 0
 
 
 def test_query_tools_cover_geography_function_industry_and_competitors(monkeypatch):
@@ -1380,7 +1429,127 @@ def test_run_ai_task_fills_all_outputs_when_model_returns_empty_dict(monkeypatch
         context={"candidate.full_name": "Jane"},
     )
     assert result["outputs"]["a"] == result["outputs"]["b"]
-    assert "No structured response" in result["outputs"]["a"] or "No structured response" in result["outputs"]["b"]
+    assert result["outputs"]["a"] == "nothing parsed"
+
+
+def test_run_ai_task_uses_deterministic_tenure_when_model_outputs_are_empty(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, tzinfo=tz)
+
+    def fake_openai(*args, **kwargs):
+        return {
+            "outputs": {},
+            "reasoning": (
+                "The completed companies total 60 months across two unique companies. "
+                "The current role is 11 months."
+            ),
+            "confidence": "high",
+            "sources": [],
+        }
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    context = build_candidate_context(
+        {
+            "id": 102,
+            "name": "Structured Fallback Candidate",
+            "linkedin": "https://linkedin.com/in/structured-fallback",
+            "roles": [
+                {"title": "Current Role", "company": "C", "start_date": "2025-08-01", "end_date": "Present"},
+                {"title": "Role A", "company": "A", "start_date": "2020-01-01", "end_date": "2021-12-01"},
+                {"title": "Role B", "company": "B", "start_date": "2022-01-01", "end_date": "2024-12-01"},
+            ],
+        }
+    )
+
+    result = ai_columns._run_ai_task(
+        prompt_template=(
+            "Calculate the average tenure of the candidate ({Linkedin Profile}). "
+            "Also give the time spent by the candidate in the current job."
+        ),
+        mode="web_research",
+        output_schema=[
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "tenure_reasoning", "label": "Tenure Reasoning"},
+        ],
+        context=context,
+    )
+
+    assert result["primary_output"] == "30"
+    assert result["outputs"]["average_tenure_months"] == "30"
+    assert result["outputs"]["current_job_months"] == "11"
+    assert "No structured response" not in result["outputs"]["tenure_reasoning"]
+    assert result["details"]["data_source"] == "row"
+    assert result["details"]["source_verification_status"] == "row_context"
+    assert result["details"]["verification_status"] == "passed"
+
+
+def test_run_ai_task_old_stability_prompt_stays_deterministic(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, tzinfo=tz)
+
+    def fail_openai(*args, **kwargs):
+        raise AssertionError("stability tenure prompt should be answered deterministically")
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fail_openai)
+    context = build_candidate_context(
+        {
+            "id": 103,
+            "name": "Old Stability Prompt Candidate",
+            "linkedin": "https://linkedin.com/in/old-stability",
+            "roles": [
+                {"title": "Current Role", "company": "C", "start_date": "2025-08-01", "end_date": "Present"},
+                {"title": "Role A", "company": "A", "start_date": "2020-01-01", "end_date": "2021-12-01"},
+                {"title": "Role B", "company": "B", "start_date": "2022-01-01", "end_date": "2024-12-01"},
+            ],
+        }
+    )
+
+    result = ai_columns._run_ai_task(
+        prompt_template=(
+            "Calculate the average tenure of the candidate ({Linkedin Profile}). "
+            "Average Tenure = total years of work experience / number of unique companies. "
+            "Count different roles in the same company as one job. "
+            "Do not count community memberships, such as RevGenius. "
+            "Give the output in months. Also give the time spent by the candidate in the current job."
+        ),
+        mode="auto",
+        output_schema=[
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "tenure_reasoning", "label": "Tenure Reasoning"},
+        ],
+        context=context,
+    )
+
+    assert result["outputs"]["average_tenure_months"] == "30"
+    assert result["outputs"]["current_job_months"] == "11"
+    assert result["details"]["query_plan"]["web_needed"] is False
+    assert result["details"]["data_source"] == "row"
+    assert result["details"]["verification_status"] == "passed"
+
+    shorthand_result = ai_columns._run_ai_task(
+        prompt_template="Stability: compute avg tenure completed roles and current role tenure for {candidate.full_name}.",
+        mode="auto",
+        output_schema=[
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months"},
+            {"key": "tenure_reasoning", "label": "Tenure Reasoning"},
+        ],
+        context=context,
+    )
+
+    assert shorthand_result["outputs"]["average_tenure_months"] == "30"
+    assert shorthand_result["outputs"]["current_job_months"] == "11"
+    assert shorthand_result["details"]["query_plan"]["web_needed"] is False
 
 
 def test_run_ai_task_auto_uses_row_context_before_web(monkeypatch):
@@ -1420,6 +1589,7 @@ def test_run_ai_task_auto_computes_tenure_without_openai(monkeypatch):
             "roles": [
                 {"title": "Account Executive", "company": "Acme", "start_date": "2021-01", "end_date": "Present"},
                 {"title": "Senior Account Executive", "company": "Acme", "start_date": "2019-01", "end_date": "2020-12"},
+                {"title": "Sales Development Representative", "company": "Beta", "start_date": "2017-01", "end_date": "2018-12"},
                 {"title": "Member", "company": "RevGenius", "start_date": "2022", "end_date": "Present"},
             ],
         }

@@ -835,8 +835,10 @@ def _run_ai_task(
         return build_result_from_outputs(
             career_outputs,
             reasoning=(
-                "Computed from structured row role history. Multiple roles at the same company were counted as one "
-                "company, and community/membership roles were excluded where identifiable."
+                "Computed from structured row role history. Average tenure uses completed companies only: the current "
+                "company is excluded from both the numerator and denominator, while current-role tenure is reported "
+                "separately. Multiple roles at the same company were counted as one company, and "
+                "community/membership roles were excluded where identifiable."
             ),
             source_kind="row",
             steps=["Parsed row role history", "Collapsed same-company roles", "Computed career metrics"],
@@ -935,15 +937,28 @@ def _run_ai_task(
 
     schema_keys = [item["key"] for item in normalized_outputs]
     normalized_values = map_raw_outputs_to_schema_keys(outputs, schema_keys)
+    deterministic_career_fallback = False
 
     if not any(normalized_values.values()):
-        fallback_text = structured.get("result") or structured.get("response") or structured.get("reasoning") or "No structured response returned."
-        fb = str(fallback_text).strip()
-        for item in normalized_outputs:
-            normalized_values[item["key"]] = fb
+        if career_outputs:
+            normalized_values = {
+                item["key"]: str(career_outputs.get(item["key"]) or "")
+                for item in normalized_outputs
+            }
+            deterministic_career_fallback = any(normalized_values.values())
+            if deterministic_career_fallback:
+                data_source = "row"
+                web_required_reason = ""
+        if not deterministic_career_fallback:
+            fallback_text = structured.get("result") or structured.get("response") or structured.get("reasoning") or "No structured response returned."
+            fb = str(fallback_text).strip()
+            for item in normalized_outputs:
+                normalized_values[item["key"]] = fb
 
     primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
     sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
+    if deterministic_career_fallback:
+        sources = []
     has_source_url = any(isinstance(source, dict) and str(source.get("url") or "").strip() for source in sources)
     verification_status = "verified" if has_source_url else ("not_publicly_verifiable" if data_source in {"web", "hybrid"} else "row_context")
     expected_linkedin_slug = _context_linkedin_slug(context)
@@ -980,10 +995,17 @@ def _run_ai_task(
     ):
         normalized_values[primary_output_key] = "Needs verification"
         primary_output = "Needs verification"
+    deterministic_reasoning = (
+        "Computed from structured row role history. Average tenure uses completed companies only: the current "
+        "company is excluded from both the numerator and denominator, while current-role tenure is reported separately."
+    )
+    reasoning_text = str(structured.get("reasoning") or "").strip()
+    if deterministic_career_fallback and not reasoning_text:
+        reasoning_text = deterministic_reasoning
     details = {
         "response": primary_output,
         "outputs": normalized_values,
-        "reasoning": str(structured.get("reasoning") or "").strip(),
+        "reasoning": reasoning_text,
         "confidence": str(structured.get("confidence") or "medium").strip().lower(),
         "steps": structured.get("steps") if isinstance(structured.get("steps"), list) else [],
         "sources": sources,

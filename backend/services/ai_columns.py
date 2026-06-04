@@ -646,6 +646,9 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     undated_duration_months = 0
     role_tenures: List[Dict[str, Any]] = []
     all_intervals: List[Tuple[datetime, datetime]] = []
+    current_role = roles[0] if roles else {}
+    current_company = stringify_context_value(current_role.get("company"))
+    current_company_norm = _normalize_company_name(current_company)
 
     for idx, role in enumerate(roles):
         company = stringify_context_value(role.get("company"))
@@ -700,8 +703,13 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
             "months": int(company.get("months") or 0),
             "years": round(int(company.get("months") or 0) / 12, 2) if company.get("months") else 0,
             "titles": company.get("titles") or [],
+            "is_current_company": normalized_company == current_company_norm,
         }
-        for company in companies.values()
+        for normalized_company, company in companies.items()
+    ]
+    completed_company_tenures = [
+        tenure for tenure in company_tenures
+        if not tenure.get("is_current_company")
     ]
     short_company_stints = [
         tenure for tenure in company_tenures
@@ -722,30 +730,37 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         or int(round(total_exp_years * 12))
     )
     unique_company_count = len(companies)
-    company_months_sum = sum(int(company.get("months") or 0) for company in company_tenures)
-    average_tenure_months = int(round(company_months_sum / unique_company_count)) if unique_company_count else 0
+    completed_company_count = len(completed_company_tenures)
+    completed_company_months = sum(int(company.get("months") or 0) for company in completed_company_tenures)
+    average_tenure_months = (
+        int(round(completed_company_months / completed_company_count))
+        if completed_company_count
+        else 0
+    )
     job_hopping_flag = (
         len(very_short_company_stints) >= 2
         or len(short_company_stints) >= 3
-        or (unique_company_count >= 3 and 0 < average_tenure_months < 18)
+        or (completed_company_count >= 2 and 0 < average_tenure_months < 18)
     )
     if not unique_company_count:
         job_hopping_status = "Unknown"
         job_hopping_reason = "No dated company tenure available."
+    elif not completed_company_count:
+        job_hopping_status = "Unknown"
+        job_hopping_reason = "No completed company tenure available after excluding the current company."
     elif job_hopping_flag:
         job_hopping_status = "Yes"
         job_hopping_reason = (
             f"{len(short_company_stints)} company stint(s) under 24 months; "
-            f"average company tenure is {average_tenure_months} months."
+            f"average completed-company tenure is {average_tenure_months} months."
         )
     else:
         job_hopping_status = "No"
         job_hopping_reason = (
-            f"Average company tenure is {average_tenure_months} months with "
+            f"Average completed-company tenure is {average_tenure_months} months with "
             f"{len(short_company_stints)} stint(s) under 24 months."
         )
 
-    current_role = roles[0] if roles else {}
     current_start = _parse_role_date(
         current_role.get("start_date") or current_role.get("starts_at") or current_role.get("start")
     )
@@ -753,7 +768,7 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         current_role.get("end_date") or current_role.get("ends_at") or current_role.get("end"),
         default_current=True,
     )
-    current_job_months = _months_between(current_start, current_end)
+    current_job_months = _months_between(current_start, current_end) or _role_duration_months(current_role)
     candidate_city = _city_from_location(context.get("candidate.city"))
     if candidate_city:
         cities.add(candidate_city)
@@ -764,6 +779,18 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         "total_experience_years": round(total_months / 12, 1) if total_months else total_exp_years,
         "unique_company_count": unique_company_count,
         "average_tenure_months": average_tenure_months,
+        "completed_company_count": completed_company_count,
+        "completed_company_months": completed_company_months,
+        "completed_company_tenures": completed_company_tenures,
+        "current_company": current_company,
+        "current_company_tenure_months": next(
+            (
+                int(company.get("months") or 0)
+                for company in company_tenures
+                if company.get("is_current_company")
+            ),
+            0,
+        ),
         "current_job_months": current_job_months,
         "ae_experience_months": ae_months,
         "ae_experience_years": round(ae_months / 12, 1),
@@ -796,7 +823,10 @@ def career_facts_to_text(facts: Dict[str, Any]) -> str:
         f"- total_experience_months: {facts.get('total_experience_months') or 0}\n"
         f"- total_experience_years: {facts.get('total_experience_years') or 0}\n"
         f"- unique_company_count: {facts.get('unique_company_count') or 0}\n"
-        f"- average_tenure_months: {facts.get('average_tenure_months') or 0}\n"
+        f"- completed_company_count: {facts.get('completed_company_count') or 0}\n"
+        f"- completed_company_months: {facts.get('completed_company_months') or 0}\n"
+        f"- average_tenure_months_completed_roles: {facts.get('average_tenure_months') or 0}\n"
+        f"- current_company: {facts.get('current_company') or 'unknown'}\n"
         f"- current_job_months: {facts.get('current_job_months') or 0}\n"
         f"- ae_experience_months: {facts.get('ae_experience_months') or 0}\n"
         f"- current_company_enterprise_saas: {facts.get('current_company_enterprise_saas') or 'Needs web verification'}\n"
@@ -818,7 +848,11 @@ def map_career_facts_to_outputs(
         term in prompt_l
         for term in (
             "average tenure",
+            "avg tenure",
+            "stability",
             "current job",
+            "current role",
+            "completed roles",
             "time spent",
             "number of cities",
             "cities the person has worked",
@@ -847,7 +881,7 @@ def map_career_facts_to_outputs(
         yes_no = "Yes" if qualified else "No"
 
     summary = (
-        f"Average tenure: {facts.get('average_tenure_months') or 0} months. "
+        f"Average tenure (completed roles): {facts.get('average_tenure_months') or 0} months. "
         f"Current job tenure: {facts.get('current_job_months') or 0} months. "
         f"Overall experience: {facts.get('total_experience_months') or 0} months. "
         f"Account executive experience: {facts.get('ae_experience_months') or 0} months. "
@@ -855,6 +889,7 @@ def map_career_facts_to_outputs(
         f"Job hopping: {facts.get('job_hopping_status') or 'Unknown'} "
         f"({facts.get('job_hopping_reason') or 'No reason available'}). "
         f"Unique companies counted: {facts.get('unique_company_count') or 0}. "
+        f"Completed companies counted for average tenure: {facts.get('completed_company_count') or 0}. "
         f"Career cities counted: {facts.get('career_city_count') or 0}."
     )
     if yes_no:
@@ -1230,7 +1265,7 @@ def build_query_plan(
     prompt = prompt_template or ""
     routing = routing or classify_ai_column_prompt(prompt)
     tool_calls: List[str] = []
-    if _prompt_has_any(
+    wants_career_metrics = _prompt_has_any(
         prompt,
         (
             "tenure",
@@ -1245,7 +1280,25 @@ def build_query_plan(
             "work at",
             "time at",
         ),
-    ):
+    )
+    wants_company_verification = _prompt_has_any(
+        prompt,
+        (
+            "currently working",
+            "current employer",
+            "public",
+            "publicly",
+            "recent",
+            "latest",
+            "layoff",
+            "website",
+            "news",
+            "enterprise",
+            "saas",
+            "employer",
+        ),
+    )
+    if wants_career_metrics:
         tool_calls.append("career_metrics")
     if _prompt_has_any(
         prompt,
@@ -1272,7 +1325,7 @@ def build_query_plan(
         tool_calls.append("industry_experience")
     if _prompt_competitor_targets(prompt):
         tool_calls.append("competitor_match")
-    if _prompt_has_any(prompt, ("company", "currently working", "current employer", "public", "recent", "latest", "layoff")):
+    if wants_company_verification:
         tool_calls.append("company_verification")
     if not tool_calls:
         tool_calls.append("profile_lookup")
@@ -1285,9 +1338,7 @@ def build_query_plan(
     web_needed = routing.get("data_source") == "web"
     if routing.get("data_source") == "hybrid":
         web_needed = bool(urls) or _prompt_has_any(prompt, ("public", "latest", "recent", "news", "layoff", "posted"))
-    if current_status == "Needs web verification" and _prompt_has_any(
-        prompt, ("enterprise", "saas", "company", "employer")
-    ):
+    if current_status == "Needs web verification" and _prompt_has_any(prompt, ("enterprise", "saas", "employer")):
         web_needed = True
 
     plan = {

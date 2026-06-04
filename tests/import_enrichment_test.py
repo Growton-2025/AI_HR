@@ -108,7 +108,9 @@ def test_tenure_merges_same_company_and_overlapping_windows():
 
     assert metrics["total_experience_months"] == 60
     assert metrics["total_experience_years"] == 5.0
-    assert metrics["avg_tenure_months"] == 30
+    assert metrics["avg_tenure_months"] == 24
+    assert metrics["completed_company_count"] == 1
+    assert metrics["completed_company_months"] == 24
     assert {row["company"]: row["months"] for row in metrics["company_years"]} == {
         "Acme Inc": 36,
         "Beta Co": 24,
@@ -445,7 +447,7 @@ def test_dynamic_zero_based_work_history_headers_parse_and_store_duration_detail
     assert roles[2].duration_source == "duration_field"
     assert metrics["unique_company_count"] == 3
     assert metrics["total_experience_months"] == 66
-    assert metrics["avg_tenure_months"] == 22
+    assert metrics["avg_tenure_months"] == 21
     tenures = {item["company"]: item for item in metrics["company_tenures"]}
     assert tenures["Acme Engage"]["months"] == 24
     assert tenures["Acme Engage"]["industries"] == ["Customer Engagement"]
@@ -507,7 +509,7 @@ def test_enrichment_payload_matches_db_projection_duration_contract():
 
     assert metrics["company_years"] == [{"company": "Highradius", "months": 14, "years": 1.17}]
     assert payload["metrics"]["unique_company_count"] == 1
-    assert payload["metrics"]["avg_tenure_months"] == 14
+    assert payload["metrics"]["avg_tenure_months"] == 0
     assert payload["metrics"]["company_tenures"][0]["months"] == 14
     assert payload["metrics"]["company_tenures"][0]["titles"] == [
         "Business Development Intern",
