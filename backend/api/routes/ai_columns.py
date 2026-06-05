@@ -1189,8 +1189,18 @@ def _run_ai_task(
         "outputs must be an object whose keys exactly match the requested output keys. "
         "confidence must be one of low, medium, high. steps must be an array of short strings. "
         "sources must be an array of objects with optional title, url, note. "
-        "Use deterministic tool_results for numeric calculations and tenure. Never invent missing data; "
-        "return Unknown or Needs verification when evidence is insufficient."
+        "CRITICAL — TENURE AND EXPERIENCE RULES: "
+        "The task may include a section labelled 'Deterministic row-derived career facts'. "
+        "These numbers were computed by a bug-fixed, overlap-aware algorithm that: "
+        "(1) merges concurrent role intervals to avoid double-counting, "
+        "(2) excludes the current employer from average tenure, "
+        "(3) handles month-precision LinkedIn dates correctly. "
+        "You MUST copy these pre-computed values directly into your outputs. "
+        "Do NOT recalculate tenure, total experience, average tenure, current job months, "
+        "AE experience, or city count from the raw role dates yourself — "
+        "your manual arithmetic on month-only LinkedIn dates will always be off by at least one month per role. "
+        "If the deterministic facts section is absent, return Unknown for any tenure or experience output. "
+        "Never invent missing data; return Unknown or Needs verification when evidence is insufficient."
     )
     content_first_system_prompt = (
         f"{system_prompt} "
@@ -1213,8 +1223,17 @@ def _run_ai_task(
     )
     if career_context_text:
         user_prompt = (
-            f"{user_prompt}\n\n{career_context_text}\n"
-            "Use these deterministic career facts for tenure, city-count, total-experience, and AE-experience calculations."
+            f"{user_prompt}\n\n"
+            "=== AUTHORITATIVE PRE-COMPUTED CAREER FACTS (DO NOT RECALCULATE) ===\n"
+            f"{career_context_text}\n"
+            "IMPORTANT: The numbers above are the ONLY correct values for tenure, total experience, "
+            "average tenure, current job months, AE experience months, and city count. "
+            "Copy them directly into your outputs. "
+            "Do NOT attempt to recount months from role start/end dates — "
+            "LinkedIn dates are month-precision only (day always = 1), so any manual arithmetic "
+            "will be off by ~1 month per role. The pre-computed values already account for this, "
+            "for concurrent role overlap, and for excluding the current employer from average tenure. "
+            "=== END OF AUTHORITATIVE CAREER FACTS ==="
         )
 
     if mode == "web_research":

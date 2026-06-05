@@ -243,6 +243,36 @@ def test_hayasa_row_values_preserve_raw_location_education_and_extra_fields():
     assert raw["imported_extra_fields"]["current_ctc"]["value"] == "15 LPA"
 
 
+def test_row_values_repairs_company_name_mapped_as_profile_title():
+    import pandas as pd
+
+    row = pd.Series(
+        {
+            "firstName": "Aditya",
+            "lastName": "Dhanwar",
+            "headline": "Avalara",
+            "experiences/0/companyName": "Avalara",
+            "experiences/0/title": "Account Executive",
+        }
+    )
+
+    vals, raw = candidate_imports._row_values(
+        row,
+        {
+            "firstName": "first_name",
+            "lastName": "last_name",
+            "headline": "title",
+            "experiences/0/companyName": "custom",
+            "experiences/0/title": "custom",
+        },
+    )
+
+    assert vals["title"] == "Account Executive"
+    assert vals["headline"] == "Account Executive"
+    assert raw["experiences/0/companyName"] == "Avalara"
+    assert raw["experiences/0/title"] == "Account Executive"
+
+
 def test_imported_extra_header_normalization_handles_common_variants():
     assert normalize_imported_field_key("Current CTC") == "current_ctc"
     assert normalize_imported_field_key("curr ctc") == "current_ctc"

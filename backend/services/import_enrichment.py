@@ -37,6 +37,35 @@ COMMUNITY_TERMS = (
     "volunteer",
 )
 
+ROLE_TITLE_TERMS = (
+    "account",
+    "ae",
+    "analyst",
+    "associate",
+    "bd",
+    "bdr",
+    "business development",
+    "consultant",
+    "customer success",
+    "director",
+    "engineer",
+    "executive",
+    "founder",
+    "head",
+    "inside sales",
+    "lead",
+    "manager",
+    "marketing",
+    "presales",
+    "pre-sales",
+    "procurement",
+    "representative",
+    "renewal",
+    "sales",
+    "sdr",
+    "specialist",
+)
+
 
 def _load_json(path: Path, default: Any) -> Any:
     try:
@@ -115,6 +144,90 @@ def normalize_company_name(company: str) -> str:
         text,
     )
     return re.sub(r"\s+", " ", text).strip()
+
+
+def title_matches_company(title: Any, company: Any) -> bool:
+    title_norm = normalize_company_name(clean_text(title))
+    company_norm = normalize_company_name(clean_text(company))
+    return bool(title_norm and company_norm and title_norm == company_norm)
+
+
+def _looks_like_role_title(value: Any) -> bool:
+    text = clean_text(value)
+    if not text or text in {"-", "--"}:
+        return False
+    lower = text.lower()
+    if len(text) > 90:
+        return False
+    return any(term in lower for term in ROLE_TITLE_TERMS)
+
+
+def _clean_inferred_title(value: Any, company: Any) -> str:
+    text = re.sub(r"\s+", " ", clean_text(value)).strip(" -|,;")
+    if not text or title_matches_company(text, company):
+        return ""
+    return text if _looks_like_role_title(text) else ""
+
+
+def infer_title_from_headline(headline: Any, company: Any = "") -> str:
+    """Best-effort title extraction from LinkedIn headline text.
+
+    The import source sometimes places the company name in experiences/N/title.
+    We only infer from concise title-like headline fragments, never from a
+    generic marketing sentence.
+    """
+    text = re.sub(r"\s+", " ", clean_text(headline)).strip()
+    if not text or text in {"-", "--"} or title_matches_company(text, company):
+        return ""
+
+    company_text = clean_text(company)
+    if company_text:
+        escaped = re.escape(company_text)
+        for pattern in (
+            rf"^(.{{2,90}}?)\s+(?:@|at)\s*{escaped}\b",
+            rf"^(.{{2,90}}?)\s+(?:@|at)\s+",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                inferred = _clean_inferred_title(match.group(1), company)
+                if inferred:
+                    return inferred
+
+    for marker in (" @ ", "@", " at "):
+        if marker in text:
+            inferred = _clean_inferred_title(text.split(marker, 1)[0], company)
+            if inferred:
+                return inferred
+
+    for segment in re.split(r"\s*\|\s*|\s+•\s+|\n+", text):
+        inferred = _clean_inferred_title(segment, company)
+        if inferred:
+            return inferred
+    return ""
+
+
+def repair_company_title_value(
+    title: Any,
+    company: Any,
+    *,
+    headline: Any = "",
+    details: Any = "",
+    current_role: bool = False,
+) -> str:
+    """Return a usable role title, or blank when title is actually the company."""
+    title_text = clean_text(title)
+    if not title_matches_company(title_text, company):
+        return title_text
+
+    if current_role:
+        inferred = infer_title_from_headline(headline, company)
+        if inferred:
+            return inferred
+
+    details_text = clean_text(details)
+    if _looks_like_role_title(details_text) and not title_matches_company(details_text, company):
+        return details_text
+    return ""
 
 
 def _raw_get(raw: Dict[str, Any], *keys: str) -> str:
@@ -380,6 +493,14 @@ def parse_roles_from_raw(raw_fields: Dict[str, Any], candidate: Optional[Dict[st
             # the LinkedIn tagline (headline). The headline is a marketing blurb, not a
             # job title. We fall back to headline/title only when no structured title exists.
             title = title or clean_text(candidate.get("title")) or clean_text(candidate.get("headline"))
+
+        title = repair_company_title_value(
+            title,
+            company,
+            headline=candidate.get("headline") or candidate.get("title"),
+            details=details,
+            current_role=idx == 1,
+        )
 
         if not company and not title and not start_raw and not end_raw and not details:
             continue

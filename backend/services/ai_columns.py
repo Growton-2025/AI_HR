@@ -547,6 +547,15 @@ def _parse_role_date(value: str, *, default_current: bool = False) -> Optional[d
     lower = text.lower()
     if lower in {"present", "current", "now", "till date", "ongoing"}:
         return datetime.now(timezone.utc)
+
+    try:
+        clean_str = text.replace('Z', '+00:00')
+        parsed = datetime.fromisoformat(clean_str)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        pass
     patterns = (
         "%Y-%m-%d",
         "%Y-%m-%d %H:%M:%S",
@@ -705,6 +714,20 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     undated_duration_months = 0
     role_tenures: List[Dict[str, Any]] = []
     all_intervals: List[Tuple[datetime, datetime]] = []
+    # Bug-5 fix: ensure the most-recent role is always at index 0 so that
+    # `idx == 0` correctly identifies the current employer when setting
+    # default_current=True on a missing end date.  Sort by end_date descending
+    # with None (still-current) roles first.
+    def _role_sort_key(r: Dict[str, str]) -> tuple:
+        end_raw = r.get("end_date") or r.get("ends_at") or r.get("end") or ""
+        end_text = stringify_context_value(end_raw).lower()
+        if not end_text or end_text in {"present", "current", "now", "till date", "ongoing"}:
+            return (1, datetime.max.replace(tzinfo=timezone.utc))  # current roles sort first
+        parsed = _parse_role_date(end_raw)
+        return (0, parsed) if parsed else (0, datetime.min.replace(tzinfo=timezone.utc))
+
+    roles = sorted(roles, key=_role_sort_key, reverse=True)
+
     current_role = roles[0] if roles else {}
     current_company = stringify_context_value(current_role.get("company"))
     current_company_norm = _normalize_company_name(current_company)
@@ -871,17 +894,22 @@ def career_facts_to_text(facts: Dict[str, Any]) -> str:
             f"{role.get('months') or 0} months"
             f" ({role.get('start_date') or '?'} to {role.get('end_date') or '?'})"
         )
+    avg_months = facts.get('average_tenure_months') or 0
+    avg_years = round(avg_months / 12, 1) if avg_months else 0
     return (
-        "Deterministic row-derived career facts:\n"
+        "Deterministic row-derived career facts (DO NOT RECALCULATE — use these values exactly):\n"
+        "NOTE: These were computed by an overlap-aware algorithm with correct month arithmetic.\n"
+        "Recalculating from raw dates will always be wrong (LinkedIn dates are month-precision, day=1).\n"
         f"- total_experience_months: {facts.get('total_experience_months') or 0}\n"
         f"- total_experience_years: {facts.get('total_experience_years') or 0}\n"
         f"- unique_company_count: {facts.get('unique_company_count') or 0}\n"
-        f"- completed_company_count: {facts.get('completed_company_count') or 0}\n"
+        f"- completed_company_count: {facts.get('completed_company_count') or 0} (current employer excluded)\n"
         f"- completed_company_months: {facts.get('completed_company_months') or 0}\n"
-        f"- average_tenure_months_completed_roles: {facts.get('average_tenure_months') or 0}\n"
+        f"- average_tenure_months_completed_roles: {avg_months} ({avg_years} yrs) — current employer excluded\n"
         f"- current_company: {facts.get('current_company') or 'unknown'}\n"
         f"- current_job_months: {facts.get('current_job_months') or 0}\n"
         f"- ae_experience_months: {facts.get('ae_experience_months') or 0}\n"
+        f"- ae_experience_years: {facts.get('ae_experience_years') or 0}\n"
         f"- current_company_enterprise_saas: {facts.get('current_company_enterprise_saas') or 'Needs web verification'}\n"
         f"- job_hopping_status: {facts.get('job_hopping_status') or 'Unknown'}\n"
         f"- job_hopping_reason: {facts.get('job_hopping_reason') or ''}\n"
@@ -921,6 +949,30 @@ def map_career_facts_to_outputs(
     )
     if not wants_career or not facts:
         return {}
+
+    # Check if all keys in output_schema can be deterministically satisfied.
+    # If any key falls to the 'else' block (i.e. is not a known deterministic field),
+    # we return {} to let the LLM handle it instead of hijacking it with a flat summary.
+    for item in normalize_output_schema(output_schema):
+        key = item["key"]
+        label = f"{key} {item.get('label', '')}".lower()
+        
+        is_supported = (
+            ("average" in label and "tenure" in label)
+            or ("current" in label and ("job" in label or "tenure" in label or "role" in label))
+            or ("city" in label and "count" in label)
+            or ("cities" in label)
+            or ("company" in label and "count" in label)
+            or ("total" in label and ("experience" in label or "month" in label))
+            or ("ae" in label or "account_executive" in label or "account executive" in label)
+            or ("enterprise" in label and "saas" in label)
+            or ("job" in label and ("hop" in label or "switch" in label))
+            or ("short" in label and "stint" in label)
+            or ("qualified" in label or "qualification" in label or "eligible" in label)
+            or (key in {"result", "summary", "reasoning"})
+        )
+        if not is_supported:
+            return {}  # Abort deterministic mapping; LLM is required!
 
     outputs: Dict[str, str] = {}
     yes_no = ""
@@ -1651,7 +1703,7 @@ def default_output_schema(goal: str) -> List[Dict[str, Any]]:
             {"key": "description", "label": "Description", "type": "text", "primary": False},
             {"key": "priority", "label": "Priority", "type": "text", "primary": False},
         ]
-    if "priority" in goal_l or "priorit" in goal_l:
+    if "priority" in goal_l or "priorit" in goal_l: 
         return [
             {"key": "priority", "label": "Priority", "type": "text", "primary": True},
             {"key": "reason", "label": "Reason", "type": "text", "primary": False},

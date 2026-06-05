@@ -319,7 +319,7 @@ PRESETS: List[Dict[str, Any]] = [
             "minimum 5+ years of account executive experience, and is currently working in an enterprise-segment-focused SaaS company. "
             "Use row-derived career facts for experience calculations and public company evidence for the current employer segment.",
             company=True,
-        ),
+        ),       
         "output_schema": _schema(
             ("qualified", "Qualified"),
             ("qualification_reasoning", "Qualification Reasoning"),

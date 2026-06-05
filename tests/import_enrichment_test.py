@@ -423,12 +423,35 @@ def test_anuj_dynamic_apify_headers_map_without_hallucinating(monkeypatch):
     }
     assert metrics["total_experience_months"] == 14
     assert roles[2].function == "Sales Development"
+    assert roles[2].title == ""
     assert roles[0].industry == "E-Learning"
     assert roles[1].industry == "Internet"
     assert roles[2].industry == "Computer Software"
     assert {"Enterprise", "Mid-Market", "SMB"} <= set(claims["segments"])
     assert {"Americas", "APAC"} <= set(claims["geographies"])
     assert payload["claimed_vs_dated_experience"]["mismatch"] is True
+
+
+def test_current_role_title_equal_to_company_uses_headline_title(monkeypatch):
+    monkeypatch.setattr(enrich, "datetime", _FrozenDateTime)
+    raw = {
+        "headline": "Account Executive @ BrowserStack | Driving Sales Growth",
+        "experiences/0/companyName": "Browserstack",
+        "experiences/0/title": "BrowserStack",
+        "experiences/0/jobStartedOn": "01-2026",
+        "experiences/0/jobEndedOn": "",
+        "experiences/1/companyName": "Highradius",
+        "experiences/0/title.1": "HighRadius",
+        "experiences/1/jobStartedOn": "07-2022",
+        "experiences/1/jobEndedOn": "06-2023",
+    }
+
+    roles = enrich.parse_roles_from_raw(raw, {"headline": raw["headline"]})
+
+    assert roles[0].company == "Browserstack"
+    assert roles[0].title == "Account Executive"
+    assert roles[1].company == "Highradius"
+    assert roles[1].title == ""
 
 
 def test_financial_technology_advisor_is_not_filtered_as_community_role():

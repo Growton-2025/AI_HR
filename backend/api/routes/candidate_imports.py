@@ -28,6 +28,7 @@ from backend.services.candidate_pool import (
     POOL_SOURCE_RECRUITER_UPLOAD,
 )
 from backend.services.imported_fields import merge_imported_extra_fields
+from backend.services.import_enrichment import repair_company_title_value
 from backend.services.linkedin_normalize import normalize_linkedin
 
 router = APIRouter()
@@ -100,6 +101,30 @@ def _row_values(
             out.setdefault("headline", clean_val)
         if tgt == "city" and _is_full_location_header(src) and clean_val is not None:
             out.setdefault("location", clean_val)
+    company_for_title = (
+        out.get("company_name")
+        or raw.get("experiences/0/companyName")
+        or raw.get("import_company")
+    )
+    if out.get("title") and company_for_title:
+        repaired_title = repair_company_title_value(
+            out.get("title"),
+            company_for_title,
+            headline=out.get("headline"),
+            current_role=True,
+        )
+        if repaired_title:
+            out["title"] = repaired_title
+            out["headline"] = repaired_title
+        else:
+            raw_title = repair_company_title_value(
+                raw.get("experiences/0/title"),
+                company_for_title,
+                headline=out.get("headline"),
+                current_role=True,
+            )
+            out["title"] = raw_title or None
+            out["headline"] = raw_title or None
     return out, merge_imported_extra_fields(raw)
 
 
