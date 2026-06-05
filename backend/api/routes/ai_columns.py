@@ -66,6 +66,9 @@ _AI_COLUMN_DAILY_REFRESH_ENABLED = os.getenv("AI_COLUMN_DAILY_REFRESH_ENABLED", 
 _AI_COLUMN_DAILY_REFRESH_TIME = os.getenv("AI_COLUMN_DAILY_REFRESH_TIME", "02:00")
 _AI_COLUMN_DAILY_REFRESH_TIMEZONE = os.getenv("AI_COLUMN_DAILY_REFRESH_TIMEZONE", "Asia/Kolkata")
 _AI_COLUMN_DAILY_REFRESH_MAX_CELLS = int(os.getenv("AI_COLUMN_DAILY_REFRESH_MAX_CELLS", "0") or "0")
+_AI_COLUMN_DEFAULT_PRICING_PER_1M = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+}
 
 _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 _run_threads: dict[int, threading.Thread] = {}
@@ -160,6 +163,175 @@ def _model_to_dict(model: Any) -> Dict[str, Any]:
     if hasattr(model, "dict"):
         return model.dict()
     return dict(model)
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%r; expected a number", name, raw)
+        return default
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_to_plain_dict(usage: Any) -> Dict[str, Any]:
+    if not usage:
+        return {}
+    if hasattr(usage, "model_dump"):
+        try:
+            return usage.model_dump()
+        except Exception:
+            pass
+    if hasattr(usage, "dict"):
+        try:
+            return usage.dict()
+        except Exception:
+            pass
+    if isinstance(usage, dict):
+        return dict(usage)
+    plain: Dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens_details",
+        "output_tokens_details",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+    ):
+        if hasattr(usage, key):
+            plain[key] = getattr(usage, key)
+    return plain
+
+
+def _normalize_openai_usage(usage: Any) -> Dict[str, Any]:
+    payload = _usage_to_plain_dict(usage)
+    if not payload:
+        return {
+            "payload_type": "none",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "raw": {},
+        }
+    if "input_tokens" in payload or "output_tokens" in payload:
+        input_tokens = _safe_int(payload.get("input_tokens"))
+        output_tokens = _safe_int(payload.get("output_tokens"))
+        payload_type = "responses_api_usage"
+    else:
+        input_tokens = _safe_int(payload.get("prompt_tokens"))
+        output_tokens = _safe_int(payload.get("completion_tokens"))
+        payload_type = "chat_completions_usage"
+    total_tokens = _safe_int(payload.get("total_tokens")) or input_tokens + output_tokens
+    return {
+        "payload_type": payload_type,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "raw": payload,
+    }
+
+
+def _ai_column_pricing_for_model(model: str) -> Dict[str, float]:
+    model_key = str(model or _AI_COLUMN_OPENAI_MODEL or "").strip()
+    default = _AI_COLUMN_DEFAULT_PRICING_PER_1M.get(model_key, _AI_COLUMN_DEFAULT_PRICING_PER_1M["gpt-4o-mini"])
+    return {
+        "input_per_1m": _safe_float_env("AI_COLUMN_INPUT_PRICE_PER_1M", float(default["input"])),
+        "output_per_1m": _safe_float_env("AI_COLUMN_OUTPUT_PRICE_PER_1M", float(default["output"])),
+    }
+
+
+def _format_ai_credits_usd(value: Any) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount == 0:
+        return "$0.000000"
+    if amount < 0.000001:
+        return "<$0.000001"
+    return f"${amount:.6f}"
+
+
+def _build_ai_credits(model: str, usage: Any) -> Dict[str, Any]:
+    normalized_usage = _normalize_openai_usage(usage)
+    pricing = _ai_column_pricing_for_model(model)
+    usd = (
+        (normalized_usage["input_tokens"] / 1_000_000) * pricing["input_per_1m"]
+        + (normalized_usage["output_tokens"] / 1_000_000) * pricing["output_per_1m"]
+    )
+    usd = round(float(usd), 12)
+    return {
+        "usd": usd,
+        "display": _format_ai_credits_usd(usd),
+        "model": str(model or _AI_COLUMN_OPENAI_MODEL or "").strip(),
+        "input_tokens": normalized_usage["input_tokens"],
+        "output_tokens": normalized_usage["output_tokens"],
+        "total_tokens": normalized_usage["total_tokens"],
+        "usage_payload_type": normalized_usage["payload_type"],
+        "pricing": pricing,
+        "pricing_source": "openai_api_pricing",
+        "usage": normalized_usage["raw"],
+    }
+
+
+def _zero_ai_credits(model: Optional[str] = None) -> Dict[str, Any]:
+    return _build_ai_credits(model or _AI_COLUMN_OPENAI_MODEL, {})
+
+
+def _normalize_ai_credits_from_structured(structured: Dict[str, Any], fallback_model: Optional[str] = None) -> Dict[str, Any]:
+    existing = structured.get("ai_credits") if isinstance(structured, dict) else None
+    if isinstance(existing, dict) and "usd" in existing:
+        return existing
+    usage = None
+    if isinstance(structured, dict):
+        usage = structured.get("openai_usage") or structured.get("usage")
+    return _build_ai_credits(str((structured or {}).get("model") or fallback_model or _AI_COLUMN_OPENAI_MODEL), usage)
+
+
+def _combine_ai_credits(call_credits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    credits = [credit for credit in call_credits if isinstance(credit, dict)]
+    if not credits:
+        return _zero_ai_credits()
+    total_usd = round(sum(float(credit.get("usd") or 0) for credit in credits), 12)
+    input_tokens = sum(_safe_int(credit.get("input_tokens")) for credit in credits)
+    output_tokens = sum(_safe_int(credit.get("output_tokens")) for credit in credits)
+    total_tokens = sum(_safe_int(credit.get("total_tokens")) for credit in credits)
+    models = [str(credit.get("model") or "").strip() for credit in credits if str(credit.get("model") or "").strip()]
+    unique_models = list(dict.fromkeys(models))
+    return {
+        "usd": total_usd,
+        "display": _format_ai_credits_usd(total_usd),
+        "model": unique_models[0] if len(unique_models) == 1 else ", ".join(unique_models),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "usage_payload_type": "combined" if len(credits) > 1 else credits[0].get("usage_payload_type", "none"),
+        "pricing_source": "openai_api_pricing",
+        "calls": credits,
+    }
+
+
+def _ai_credits_summary_from_details(details: Any) -> Dict[str, Any]:
+    data = _parse_jsonish(details, {}) if not isinstance(details, dict) else details
+    credits = data.get("ai_credits") if isinstance(data, dict) else None
+    if not isinstance(credits, dict):
+        return {"ai_credits_usd": None, "ai_credits_display": ""}
+    return {
+        "ai_credits_usd": credits.get("usd"),
+        "ai_credits_display": str(credits.get("display") or _format_ai_credits_usd(credits.get("usd"))),
+    }
 
 
 def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 220, max_value_len: int = 900) -> str:
@@ -374,7 +546,7 @@ def _fetch_visible_definitions(
                 cur.execute(
                     """
                     SELECT c.column_definition_id, c.candidate_id, c.primary_output, c.outputs, c.status,
-                           c.error_message, c.completed_at, c.updated_at
+                           c.error_message, c.completed_at, c.updated_at, c.details
                     FROM ai_column_cells c
                     WHERE c.column_definition_id = ANY(%s) AND c.candidate_id = ANY(%s)
                     """,
@@ -386,6 +558,7 @@ def _fetch_visible_definitions(
     for row in cell_rows:
         def_id = int(row[0])
         candidate_id = int(row[1])
+        ai_credits_summary = _ai_credits_summary_from_details(row[8] if len(row) > 8 else {})
         cells_by_definition.setdefault(def_id, {})[candidate_id] = {
             "candidate_id": candidate_id,
             "primary_output": row[2] or "",
@@ -394,6 +567,7 @@ def _fetch_visible_definitions(
             "error_message": row[5] or "",
             "completed_at": row[6].isoformat() if row[6] else None,
             "updated_at": row[7].isoformat() if row[7] else None,
+            **ai_credits_summary,
         }
 
     definitions = []
@@ -647,6 +821,8 @@ def _call_openai_for_json(system_prompt: str, user_prompt: str, *, use_web: bool
             parsed["web_search_tool"] = tool_config.get("type") or ""
             parsed["web_search_context_size"] = tool_config.get("search_context_size") or ""
             parsed["model"] = _AI_COLUMN_OPENAI_MODEL
+            parsed["openai_usage"] = _normalize_openai_usage(getattr(response, "usage", None))
+            parsed["ai_credits"] = _build_ai_credits(_AI_COLUMN_OPENAI_MODEL, getattr(response, "usage", None))
             return parsed
         response = _openai_client.chat.completions.create(
             model=_AI_COLUMN_OPENAI_MODEL,
@@ -663,7 +839,11 @@ def _call_openai_for_json(system_prompt: str, user_prompt: str, *, use_web: bool
             msg = getattr(choices[0], "message", None)
             if msg is not None:
                 content = getattr(msg, "content", None) or ""
-        return _json_block_to_dict(content)
+        parsed = _json_block_to_dict(content)
+        parsed["model"] = _AI_COLUMN_OPENAI_MODEL
+        parsed["openai_usage"] = _normalize_openai_usage(getattr(response, "usage", None))
+        parsed["ai_credits"] = _build_ai_credits(_AI_COLUMN_OPENAI_MODEL, getattr(response, "usage", None))
+        return parsed
     except Exception as exc:
         logger.warning("AI columns OpenAI JSON call failed: %s", exc)
         return {}
@@ -783,6 +963,14 @@ def _run_ai_task(
     query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing)
     tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
     context_pack = build_candidate_context_pack(context, career_facts)
+    model_call_credits: List[Dict[str, Any]] = []
+
+    def call_model(system: str, user: str, *, use_web: bool = False) -> Dict[str, Any]:
+        structured = _call_openai_for_json(system, user, use_web=use_web)
+        if not isinstance(structured, dict):
+            structured = {}
+        model_call_credits.append(_normalize_ai_credits_from_structured(structured, _AI_COLUMN_OPENAI_MODEL))
+        return structured
 
     def build_result_from_outputs(
         values: Dict[str, Any],
@@ -822,6 +1010,9 @@ def _run_ai_task(
             "candidate_context_pack": context_pack,
             "query_plan": query_plan,
             "tool_results": tool_results,
+            "ai_credits": _zero_ai_credits(_AI_COLUMN_OPENAI_MODEL),
+            "ai_credits_usd": 0.0,
+            "ai_credits_display": "$0.000000",
             **verification,
             "raw_model_output": {"outputs": normalized_values},
         }
@@ -866,6 +1057,9 @@ def _run_ai_task(
                 "candidate_context_pack": context_pack,
                 "query_plan": query_plan,
                 "tool_results": tool_results,
+                "ai_credits": _zero_ai_credits(_AI_COLUMN_OPENAI_MODEL),
+                "ai_credits_usd": 0.0,
+                "ai_credits_display": "$0.000000",
                 "verification_status": "failed",
                 "verification_errors": ["AI service is not configured and deterministic tools could not fully answer this query."],
                 "unknown_reasons": ["AI service is not configured."],
@@ -907,24 +1101,24 @@ def _run_ai_task(
 
     if mode == "web_research":
         data_source = "hybrid" if routing.get("data_source") == "hybrid" else "web"
-        structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
+        structured = call_model(system_prompt, user_prompt, use_web=True)
     elif mode == "content":
         data_source = "row"
-        structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
+        structured = call_model(content_first_system_prompt, user_prompt, use_web=False)
     else:
         if query_plan.get("web_needed"):
             data_source = routing.get("data_source") or "web"
             web_required_reason = web_required_reason or "classified_public_or_fresh_prompt"
-            structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
+            structured = call_model(system_prompt, user_prompt, use_web=True)
         else:
             data_source = "row"
-            structured = _call_openai_for_json(content_first_system_prompt, user_prompt, use_web=False)
+            structured = call_model(content_first_system_prompt, user_prompt, use_web=False)
             auto_outputs = structured.get("outputs") if isinstance(structured.get("outputs"), dict) else {}
             has_row_answer = any(str(auto_outputs.get(item["key"]) or "").strip() for item in normalized_outputs)
             if not has_row_answer:
                 data_source = "web"
                 web_required_reason = web_required_reason or "row_context_insufficient"
-                structured = _call_openai_for_json(system_prompt, user_prompt, use_web=True)
+                structured = call_model(system_prompt, user_prompt, use_web=True)
 
     outputs = structured.get("outputs")
     if not isinstance(outputs, dict):
@@ -1002,6 +1196,7 @@ def _run_ai_task(
     reasoning_text = str(structured.get("reasoning") or "").strip()
     if deterministic_career_fallback and not reasoning_text:
         reasoning_text = deterministic_reasoning
+    ai_credits = _combine_ai_credits(model_call_credits)
     details = {
         "response": primary_output,
         "outputs": normalized_values,
@@ -1023,6 +1218,9 @@ def _run_ai_task(
         "candidate_context_pack": context_pack,
         "query_plan": query_plan,
         "tool_results": tool_results,
+        "ai_credits": ai_credits,
+        "ai_credits_usd": ai_credits.get("usd", 0.0),
+        "ai_credits_display": ai_credits.get("display", "$0.000000"),
         **verification,
         "raw_model_output": structured,
     }

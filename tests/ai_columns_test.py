@@ -1352,8 +1352,14 @@ def test_generate_config_prefer_web_search_keeps_web_research(monkeypatch):
 def test_web_json_call_uses_ga_search_and_stamps_freshness(monkeypatch):
     captured = {}
 
+    class FakeUsage:
+        input_tokens = 2000
+        output_tokens = 1000
+        total_tokens = 3000
+
     class FakeResponse:
         output_text = '{"outputs":{"result":"fresh"},"confidence":"high"}'
+        usage = FakeUsage()
 
         def model_dump(self):
             return {
@@ -1395,6 +1401,48 @@ def test_web_json_call_uses_ga_search_and_stamps_freshness(monkeypatch):
     assert result["freshness_date"] == "2026-05-23"
     assert result["web_search_tool"] == "web_search"
     assert result["sources"][0]["url"] == "https://example.com/news"
+    assert result["openai_usage"]["payload_type"] == "responses_api_usage"
+    assert result["ai_credits"]["input_tokens"] == 2000
+    assert result["ai_credits"]["output_tokens"] == 1000
+    assert result["ai_credits"]["usd"] == pytest.approx(0.0009)
+
+
+def test_chat_json_call_records_dynamic_usage_payload(monkeypatch):
+    class FakeUsage:
+        prompt_tokens = 1000
+        completion_tokens = 500
+        total_tokens = 1500
+
+    class FakeMessage:
+        content = '{"outputs":{"result":"ok"},"confidence":"high"}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(ai_columns, "_AI_COLUMN_OPENAI_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(ai_columns, "_openai_client", FakeClient())
+
+    result = ai_columns._call_openai_for_json("system", "user", use_web=False)
+
+    assert result["outputs"]["result"] == "ok"
+    assert result["openai_usage"]["payload_type"] == "chat_completions_usage"
+    assert result["ai_credits"]["input_tokens"] == 1000
+    assert result["ai_credits"]["output_tokens"] == 500
+    assert result["ai_credits"]["usd"] == pytest.approx(0.00045)
 
 
 def test_map_raw_outputs_to_schema_keys_aligns_label_style_keys():
@@ -1486,6 +1534,8 @@ def test_run_ai_task_uses_deterministic_tenure_when_model_outputs_are_empty(monk
     assert result["details"]["data_source"] == "row"
     assert result["details"]["source_verification_status"] == "row_context"
     assert result["details"]["verification_status"] == "passed"
+    assert result["details"]["ai_credits_display"] == "$0.000000"
+    assert result["details"]["ai_credits"]["usd"] == 0.0
 
 
 def test_run_ai_task_old_stability_prompt_stays_deterministic(monkeypatch):
@@ -1535,6 +1585,7 @@ def test_run_ai_task_old_stability_prompt_stays_deterministic(monkeypatch):
     assert result["details"]["query_plan"]["web_needed"] is False
     assert result["details"]["data_source"] == "row"
     assert result["details"]["verification_status"] == "passed"
+    assert result["details"]["ai_credits_display"] == "$0.000000"
 
     shorthand_result = ai_columns._run_ai_task(
         prompt_template="Stability: compute avg tenure completed roles and current role tenure for {candidate.full_name}.",
@@ -1578,6 +1629,34 @@ def test_run_ai_task_auto_uses_row_context_before_web(monkeypatch):
 
     assert result["primary_output"] == "Bengaluru"
     assert calls == [False]
+
+
+def test_run_ai_task_records_ai_credits_from_openai_usage_payload(monkeypatch):
+    def fake_openai(system_prompt, user_prompt, *, use_web=False):
+        return {
+            "outputs": {"result": "Yes"},
+            "reasoning": "The row supports the answer.",
+            "confidence": "high",
+            "openai_usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+            "model": "gpt-4o-mini",
+        }
+
+    monkeypatch.setattr(ai_columns, "_AI_COLUMN_OPENAI_MODEL", "gpt-4o-mini")
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Does this person have location data? {candidate.location}",
+        mode="content",
+        output_schema=[{"key": "result", "label": "Result", "primary": True}],
+        context={"candidate.location": "Bengaluru"},
+    )
+
+    assert result["primary_output"] == "Yes"
+    assert result["details"]["ai_credits"]["usage_payload_type"] == "chat_completions_usage"
+    assert result["details"]["ai_credits"]["input_tokens"] == 1000
+    assert result["details"]["ai_credits"]["output_tokens"] == 500
+    assert result["details"]["ai_credits"]["usd"] == pytest.approx(0.00045)
+    assert result["details"]["ai_credits_display"] == "$0.000450"
 
 
 def test_run_ai_task_auto_computes_tenure_without_openai(monkeypatch):
@@ -1781,6 +1860,77 @@ def test_daily_refresh_group_query_targets_existing_stale_web_cells(monkeypatch)
     assert "COALESCE(d.is_archived, FALSE) = FALSE" in sql
     assert groups[0]["candidate_ids"] == [101, 102]
     assert groups[0]["user"].id == 7
+
+
+def test_fetch_visible_definitions_includes_compact_ai_credits(monkeypatch):
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = mock_cur
+    cm.__exit__.return_value = False
+    mock_conn.cursor.return_value = cm
+    mock_cur.fetchall.side_effect = [
+        [],
+        [
+            (
+                5,
+                "Fit",
+                "fit",
+                7,
+                "master",
+                None,
+                "Prompt",
+                "content",
+                [{"key": "result", "label": "Result", "primary": True}],
+                [],
+                {},
+                {},
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+            )
+        ],
+        [
+            (
+                5,
+                123,
+                "Yes",
+                {"result": "Yes"},
+                "completed",
+                "",
+                None,
+                None,
+                {"ai_credits": {"usd": 0.00045, "display": "$0.000450"}},
+            )
+        ],
+    ]
+
+    class ConnCM:
+        def __enter__(self):
+            return mock_conn
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ai_columns, "get_db_connection_context", lambda **kwargs: ConnCM())
+
+    definitions = ai_columns._fetch_visible_definitions(
+        _user(role="admin"),
+        view_scope="master",
+        recruiter_filter_id=None,
+        candidate_ids=[123],
+    )
+
+    cell = definitions[0]["cells_by_candidate"][123]
+    assert cell["ai_credits_usd"] == 0.00045
+    assert cell["ai_credits_display"] == "$0.000450"
 
 
 def test_run_ai_task_auto_falls_back_to_web_when_row_context_is_insufficient(monkeypatch):

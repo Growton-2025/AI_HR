@@ -1,5 +1,5 @@
 import React from 'react';
-import { Clock3, ExternalLink, ListChecks, ShieldCheck, X } from 'lucide-react';
+import { Clock3, DollarSign, ExternalLink, ListChecks, ShieldCheck, X } from 'lucide-react';
 
 function formatDateTime(value) {
   if (!value) return '—';
@@ -26,6 +26,15 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
   const queryPlan = details.query_plan && typeof details.query_plan === 'object' ? details.query_plan : null;
   const toolResults = details.tool_results && typeof details.tool_results === 'object' ? details.tool_results : null;
   const searchedAt = details.searched_at || detail?.completed_at || detail?.updated_at;
+  const aiCredits = details.ai_credits && typeof details.ai_credits === 'object' ? details.ai_credits : null;
+  const aiCreditsDisplay = aiCredits?.display || details.ai_credits_display || '—';
+  const aiCreditsMeta = aiCredits
+    ? [
+        aiCredits.model,
+        Number.isFinite(Number(aiCredits.total_tokens)) ? `${Number(aiCredits.total_tokens).toLocaleString()} tokens` : '',
+        aiCredits.usage_payload_type,
+      ].filter(Boolean).join(' · ')
+    : '';
   const freshnessMeta = [
     details.web_search_tool,
     details.web_search_context_size ? `${details.web_search_context_size} context` : '',
@@ -116,6 +125,21 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
               {freshnessMeta && (
                 <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
                   {freshnessMeta}
+                </div>
+              )}
+            </div>
+
+            <div style={sectionStyle}>
+              <div style={{ ...sectionLabelStyle, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <DollarSign size={14} />
+                AI Credits
+              </div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: '#0f172a', lineHeight: 1.4 }}>
+                {aiCreditsDisplay}
+              </div>
+              {aiCreditsMeta && (
+                <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                  {aiCreditsMeta}
                 </div>
               )}
             </div>

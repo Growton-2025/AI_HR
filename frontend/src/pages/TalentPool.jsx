@@ -3449,6 +3449,7 @@ export default function TalentPool() {
                             ? String(cell?.primary_output || '').trim()
                             : '';
                       const st = cell?.status;
+                      const aiCreditsDisplay = cell?.ai_credits_display || '';
                       const isEmpty =
                         !aiVal && st !== 'running' && st !== 'queued';
                       return (
@@ -3509,13 +3510,30 @@ export default function TalentPool() {
                                 {String(aiVal)}
                               </div>
                               <div style={{
-                                fontSize: 10,
-                                color: '#6366f1',
-                                fontWeight: 800,
-                                textTransform: 'uppercase',
-                                letterSpacing: '0.06em',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                gap: 8,
                               }}>
-                                Click for full answer
+                                <span style={{
+                                  fontSize: 10,
+                                  color: '#6366f1',
+                                  fontWeight: 800,
+                                  textTransform: 'uppercase',
+                                  letterSpacing: '0.06em',
+                                }}>
+                                  Click for full answer
+                                </span>
+                                {aiCreditsDisplay && (
+                                  <span style={{
+                                    fontSize: 10,
+                                    color: '#0f766e',
+                                    fontWeight: 800,
+                                    whiteSpace: 'nowrap',
+                                  }}>
+                                    {aiCreditsDisplay}
+                                  </span>
+                                )}
                               </div>
                             </div>
                           )}
