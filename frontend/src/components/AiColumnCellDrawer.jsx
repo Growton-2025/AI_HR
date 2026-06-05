@@ -14,11 +14,122 @@ function formatDateTime(value) {
   }).format(date);
 }
 
+export function parseStructuredValue(val) {
+  if (val == null) return null;
+  if (typeof val === 'object') return val;
+  const trimmed = String(val).trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (e) {
+      try {
+        const fn = new Function(`return (${trimmed});`);
+        const result = fn();
+        if (result && typeof result === 'object') {
+          return result;
+        }
+      } catch (err) {
+        try {
+          const jsonString = trimmed
+            .replace(/'/g, '"')
+            .replace(/True/g, 'true')
+            .replace(/False/g, 'false')
+            .replace(/None/g, 'null');
+          return JSON.parse(jsonString);
+        } catch (err2) {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function formatKey(key) {
+  let label = key.replace(/[_\.]+/g, ' ').trim();
+  if (label.toLowerCase().endsWith(' months')) {
+    label = label.slice(0, -7).trim() + ' (months)';
+  } else if (label.toLowerCase().endsWith(' years')) {
+    label = label.slice(0, -6).trim() + ' (years)';
+  }
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+const EMPTY_AI_RESPONSE_TEXTS = new Set([
+  'no structured response returned',
+  'no structured response returned.',
+  'needs review',
+]);
+
+function isMeaningfulAiValue(value) {
+  const text = String(value ?? '').trim();
+  const lower = text.toLowerCase();
+  return text !== '' && !EMPTY_AI_RESPONSE_TEXTS.has(lower) && !lower.startsWith('needs review:');
+}
+
+function resolveDrawerResponse(detail, details, outputs) {
+  if (isMeaningfulAiValue(detail?.primary_output)) return detail.primary_output;
+  if (isMeaningfulAiValue(details?.response)) return details.response;
+  const firstOutput = Object.values(outputs || {}).find(isMeaningfulAiValue);
+  if (firstOutput != null) return firstOutput;
+  if (isMeaningfulAiValue(details?.reasoning)) return details.reasoning;
+  return detail ? 'No' : '';
+}
+
+export function renderFriendlyAiValue(aiVal) {
+  if (aiVal == null || String(aiVal).trim() === '') {
+    return '—';
+  }
+  const parsed = parseStructuredValue(aiVal);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+        {Object.entries(parsed).map(([k, v]) => {
+          const formattedKey = formatKey(k);
+          const formattedValue = typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—');
+          return (
+            <div key={k} style={{ fontSize: '12px', lineHeight: 1.4, color: '#334155' }}>
+              <span style={{ fontWeight: 700, color: '#1e293b' }}>{formattedKey}:</span>{' '}
+              <span style={{ color: '#475569' }}>{formattedValue}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+  if (parsed && Array.isArray(parsed)) {
+    return (
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: '100%', marginTop: 2 }}>
+        {parsed.map((item, idx) => (
+          <span
+            key={idx}
+            style={{
+              display: 'inline-block',
+              padding: '2px 8px',
+              borderRadius: 6,
+              background: 'rgba(99, 102, 241, 0.06)',
+              color: '#4f46e5',
+              fontSize: '11px',
+              fontWeight: 700,
+              border: '1px solid rgba(99, 102, 241, 0.12)',
+              whiteSpace: 'nowrap'
+            }}
+          >
+            {String(item)}
+          </span>
+        ))}
+      </div>
+    );
+  }
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(aiVal)}</span>;
+}
+
 export default function AiColumnCellDrawer({ open, loading, detail, title, onClose }) {
   if (!open) return null;
 
   const outputs = detail?.outputs || {};
   const details = detail?.details || {};
+  const responseValue = resolveDrawerResponse(detail, details, outputs);
   const steps = Array.isArray(details.steps) ? details.steps : [];
   const sources = Array.isArray(details.sources) ? details.sources : [];
   const unknownReasons = Array.isArray(details.unknown_reasons) ? details.unknown_reasons : [];
@@ -85,7 +196,7 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
             <div style={sectionStyle}>
               <div style={sectionLabelStyle}>Response</div>
               <div style={{ fontSize: 14, color: '#0f172a', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-                {detail.primary_output || '—'}
+                {renderFriendlyAiValue(responseValue)}
               </div>
             </div>
 
@@ -147,11 +258,11 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
             <div style={sectionStyle}>
               <div style={sectionLabelStyle}>Outputs</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {Object.entries(outputs).length === 0 && <div style={{ fontSize: 12, color: '#94a3b8' }}>No structured outputs stored.</div>}
+                {Object.entries(outputs).length === 0 && <div style={{ fontSize: 12, color: '#94a3b8' }}>No saved output fields.</div>}
                 {Object.entries(outputs).map(([key, value]) => (
                   <div key={key} style={{ border: '1px solid #eef2f7', borderRadius: 14, padding: 12, background: '#fff' }}>
                     <div style={{ fontSize: 11, fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', marginBottom: 6 }}>{key}</div>
-                    <div style={{ fontSize: 13, color: '#334155', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{String(value || '—')}</div>
+                    <div style={{ fontSize: 13, color: '#334155', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{renderFriendlyAiValue(value)}</div>
                   </div>
                 ))}
               </div>

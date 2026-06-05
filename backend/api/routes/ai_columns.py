@@ -334,7 +334,7 @@ def _ai_credits_summary_from_details(details: Any) -> Dict[str, Any]:
     }
 
 
-def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 220, max_value_len: int = 900) -> str:
+def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 650, max_value_len: int = 1200) -> str:
     def priority(item: tuple[str, str]) -> tuple[int, str]:
         key, _ = item
         if key.startswith("candidate."):
@@ -362,6 +362,119 @@ def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 220, 
         if len(payload) >= max_fields:
             break
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+_EMPTY_AI_OUTPUT_PLACEHOLDERS = {
+    "",
+    "needs review",
+    "needs review:",
+    "no structured response returned",
+    "no structured response returned.",
+}
+
+
+def _stringify_ai_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str).strip()
+    return str(value).strip()
+
+
+def _is_meaningful_ai_output(value: Any) -> bool:
+    text = _stringify_ai_output(value)
+    lower = text.lower()
+    return (
+        lower not in _EMPTY_AI_OUTPUT_PLACEHOLDERS
+        and not lower.startswith("needs review:")
+    )
+
+
+def _schema_raw_candidates(structured: Dict[str, Any], normalized_outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    raw: Dict[str, Any] = {}
+    outputs = structured.get("outputs")
+    if isinstance(outputs, dict):
+        raw.update(outputs)
+
+    for item in normalized_outputs:
+        key = item["key"]
+        label = item.get("label") or ""
+        for direct_key in (key, label, normalize_output_key(label)):
+            if direct_key and direct_key in structured and _is_meaningful_ai_output(structured.get(direct_key)):
+                raw.setdefault(direct_key, structured.get(direct_key))
+
+    return raw
+
+
+def _top_level_model_text(structured: Dict[str, Any]) -> str:
+    for key in ("result", "response", "answer", "summary", "reasoning"):
+        value = structured.get(key)
+        if _is_meaningful_ai_output(value):
+            return _stringify_ai_output(value)
+    return ""
+
+
+def _top_level_model_answer_text(structured: Dict[str, Any]) -> str:
+    for key in ("result", "response", "answer", "summary"):
+        value = structured.get(key)
+        if _is_meaningful_ai_output(value):
+            return _stringify_ai_output(value)
+    return ""
+
+
+def _has_useful_career_facts(facts: Dict[str, Any]) -> bool:
+    return bool(
+        facts
+        and (
+            facts.get("role_tenures")
+            or facts.get("company_tenures")
+            or int(facts.get("total_experience_months") or 0) > 0
+            or int(facts.get("current_job_months") or 0) > 0
+        )
+    )
+
+
+def _normalize_model_outputs(
+    structured: Dict[str, Any],
+    normalized_outputs: List[Dict[str, Any]],
+    *,
+    career_outputs: Dict[str, str],
+    has_tool_context: bool,
+) -> tuple[Dict[str, str], bool, str]:
+    schema_keys = [item["key"] for item in normalized_outputs]
+    raw_candidates = _schema_raw_candidates(structured, normalized_outputs)
+    normalized_values = map_raw_outputs_to_schema_keys(raw_candidates, schema_keys)
+    normalized_values = {
+        key: (value if _is_meaningful_ai_output(value) else "")
+        for key, value in normalized_values.items()
+    }
+
+    if any(normalized_values.values()):
+        return normalized_values, False, ""
+
+    if career_outputs:
+        career_values = {
+            item["key"]: str(career_outputs.get(item["key"]) or "").strip()
+            for item in normalized_outputs
+        }
+        if any(career_values.values()):
+            return career_values, True, ""
+
+    fallback_text = _top_level_model_text(structured)
+    if not fallback_text:
+        fallback_text = "No"
+    return {item["key"]: fallback_text for item in normalized_outputs}, False, fallback_text
+
+
+def _primary_ai_output(values: Dict[str, Any], primary_key: str) -> str:
+    primary = _stringify_ai_output((values or {}).get(primary_key))
+    if _is_meaningful_ai_output(primary):
+        return primary
+    for value in (values or {}).values():
+        text = _stringify_ai_output(value)
+        if _is_meaningful_ai_output(text):
+            return text
+    return "No"
 
 
 def _slugify(name: str) -> str:
@@ -958,7 +1071,10 @@ def _run_ai_task(
     data_source = routing.get("data_source") or ("web" if mode == "web_research" else "row")
     web_required_reason = routing.get("web_required_reason") or ""
     career_facts = compute_career_facts(context)
+    has_useful_career_facts = _has_useful_career_facts(career_facts)
     career_outputs = map_career_facts_to_outputs(rendered_prompt or prompt_template, normalized_outputs, career_facts)
+    if not has_useful_career_facts:
+        career_outputs = {}
     career_context_text = career_facts_to_text(career_facts)
     query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing)
     tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
@@ -981,7 +1097,7 @@ def _run_ai_task(
         steps: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         normalized_values = {item["key"]: str(values.get(item["key"]) or "") for item in normalized_outputs}
-        primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
+        primary_output = _primary_ai_output(normalized_values, primary_output_key)
         verification = verify_smart_column_outputs(
             rendered_prompt or prompt_template,
             normalized_values,
@@ -1084,8 +1200,10 @@ def _run_ai_task(
     output_hint = ", ".join([f"{item['key']} ({item['label']})" for item in normalized_outputs])
     user_prompt = (
         f"Requested outputs: {output_hint}\n"
-        "Use the candidate context pack and deterministic tool results as the source of truth for this candidate. "
-        "The user prompt may mention only part of the row; use any relevant enriched profile data when answering. "
+        "Before answering, inspect the full candidate profile context, candidate context pack, deterministic tool "
+        "results, raw import fields, structured role history, and any existing enriched company details. "
+        "Use the most complete available profile data as the source of truth for this candidate. "
+        "The user prompt may mention only part of the row; use all relevant enriched and raw profile data when answering. "
         "Do not create SQL or make unsupported assumptions.\n\n"
         f"Query plan JSON:\n{json.dumps(query_plan, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate context pack JSON:\n{json.dumps(context_pack, ensure_ascii=False, indent=2, default=str)}\n\n"
@@ -1113,43 +1231,44 @@ def _run_ai_task(
         else:
             data_source = "row"
             structured = call_model(content_first_system_prompt, user_prompt, use_web=False)
-            auto_outputs = structured.get("outputs") if isinstance(structured.get("outputs"), dict) else {}
-            has_row_answer = any(str(auto_outputs.get(item["key"]) or "").strip() for item in normalized_outputs)
+            auto_values, auto_career_fallback, auto_fallback_text = _normalize_model_outputs(
+                structured,
+                normalized_outputs,
+                career_outputs=career_outputs,
+                has_tool_context=bool(tool_results),
+            )
+            has_row_answer = (
+                auto_career_fallback
+                or bool(_top_level_model_answer_text(structured))
+                or (
+                    not auto_fallback_text
+                    and any(
+                        _is_meaningful_ai_output(auto_values.get(item["key"]))
+                        for item in normalized_outputs
+                    )
+                )
+            )
             if not has_row_answer:
                 data_source = "web"
                 web_required_reason = web_required_reason or "row_context_insufficient"
                 structured = call_model(system_prompt, user_prompt, use_web=True)
-
-    outputs = structured.get("outputs")
-    if not isinstance(outputs, dict):
-        outputs = {}
 
     model_plan = structured.get("query_plan")
     if isinstance(model_plan, dict) and model_plan:
         query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing, model_plan)
         tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
 
-    schema_keys = [item["key"] for item in normalized_outputs]
-    normalized_values = map_raw_outputs_to_schema_keys(outputs, schema_keys)
-    deterministic_career_fallback = False
+    normalized_values, deterministic_career_fallback, fallback_text = _normalize_model_outputs(
+        structured,
+        normalized_outputs,
+        career_outputs=career_outputs,
+        has_tool_context=bool(tool_results),
+    )
+    if deterministic_career_fallback:
+        data_source = "row"
+        web_required_reason = ""
 
-    if not any(normalized_values.values()):
-        if career_outputs:
-            normalized_values = {
-                item["key"]: str(career_outputs.get(item["key"]) or "")
-                for item in normalized_outputs
-            }
-            deterministic_career_fallback = any(normalized_values.values())
-            if deterministic_career_fallback:
-                data_source = "row"
-                web_required_reason = ""
-        if not deterministic_career_fallback:
-            fallback_text = structured.get("result") or structured.get("response") or structured.get("reasoning") or "No structured response returned."
-            fb = str(fallback_text).strip()
-            for item in normalized_outputs:
-                normalized_values[item["key"]] = fb
-
-    primary_output = normalized_values.get(primary_output_key) or next(iter(normalized_values.values()), "")
+    primary_output = _primary_ai_output(normalized_values, primary_output_key)
     sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
     if deterministic_career_fallback:
         sources = []
@@ -1196,6 +1315,8 @@ def _run_ai_task(
     reasoning_text = str(structured.get("reasoning") or "").strip()
     if deterministic_career_fallback and not reasoning_text:
         reasoning_text = deterministic_reasoning
+    elif not reasoning_text and fallback_text:
+        reasoning_text = fallback_text
     ai_credits = _combine_ai_credits(model_call_credits)
     details = {
         "response": primary_output,

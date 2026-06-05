@@ -82,8 +82,8 @@ function App() {
     })))
     const location = useLocation()
     const [isReady, setIsReady] = useState(false)
-    const [isProfileLoaded, setIsProfileLoaded] = useState(false)
     const topAnchorRef = useRef(null)
+    const routeStartedAtRef = useRef(performance.now())
 
     const resetViewportPosition = useCallback(() => {
         if (typeof window === 'undefined') return
@@ -112,6 +112,15 @@ function App() {
 
     // Set up axios interceptor to always use latest token
     useEffect(() => {
+        routeStartedAtRef.current = performance.now()
+        if (import.meta.env.DEV) {
+            window.requestAnimationFrame(() => {
+                console.info(`[route ${Math.round(performance.now() - routeStartedAtRef.current)}ms] ${location.pathname}`)
+            })
+        }
+    }, [location.pathname])
+
+    useEffect(() => {
         if (token) {
             axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
         } else {
@@ -124,29 +133,18 @@ function App() {
     // Load initial data once authenticated and ready
     useEffect(() => {
         if (isAuthenticated && isReady) {
-            let isMounted = true
-            setIsProfileLoaded(false)
-
             const loadData = async () => {
                 try {
                     await fetchProfile()
                 } catch (e) {
                     console.error(e)
-                } finally {
-                    if (isMounted) {
-                        setIsProfileLoaded(true)
-                    }
                 }
             }
 
             loadData()
-
-            return () => {
-                isMounted = false
-            }
         }
 
-        setIsProfileLoaded(false)
+        return undefined
     }, [fetchProfile, isAuthenticated, isReady])
 
     useLayoutEffect(() => {
@@ -160,51 +158,18 @@ function App() {
             window.history.scrollRestoration = 'manual'
         }
 
-        resetViewportPosition()
-
-        let lateRaf = 0
         const initialRaf = window.requestAnimationFrame(() => {
             resetViewportPosition()
-            lateRaf = window.requestAnimationFrame(() => {
-                resetViewportPosition()
-            })
         })
-        const timeoutId = window.setTimeout(() => {
-            resetViewportPosition()
-        }, 180)
 
         return () => {
             window.cancelAnimationFrame(initialRaf)
-            window.cancelAnimationFrame(lateRaf)
-            window.clearTimeout(timeoutId)
 
             if (previousRestoration && 'scrollRestoration' in window.history) {
                 window.history.scrollRestoration = previousRestoration
             }
         }
     }, [location.pathname, resetViewportPosition])
-
-    useEffect(() => {
-        if (!isProfileLoaded) return undefined
-
-        let attempt = 0
-        let timeoutId = 0
-
-        const syncViewport = () => {
-            resetViewportPosition()
-
-            attempt += 1
-            if (attempt < 6) {
-                timeoutId = window.setTimeout(syncViewport, attempt < 2 ? 80 : 180)
-            }
-        }
-
-        timeoutId = window.setTimeout(syncViewport, 0)
-
-        return () => {
-            window.clearTimeout(timeoutId)
-        }
-    }, [isProfileLoaded, location.pathname, resetViewportPosition])
 
     const AppLoadingShell = ({ title, description }) => (
         <div
@@ -314,15 +279,6 @@ function App() {
                     <Route path="*" element={<Navigate to="/login" replace />} />
                 </Routes>
             </Suspense>
-        )
-    }
-
-    if (!isProfileLoaded) {
-        return (
-            <AppLoadingShell
-                title="Loading your profile"
-                description="Pulling your permissions and getting the app ready."
-            />
         )
     }
 

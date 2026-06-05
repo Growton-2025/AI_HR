@@ -7,9 +7,30 @@ const CALL_REQUEST_TIMEOUT_MS = 15000
 const CALL_RETRY_BACKOFF_MS = 3000
 const RATE_LIMIT_DEFAULT_RETRY_MS = 5000
 const RATE_LIMIT_MAX_RETRY_MS = 30000
+const TALENT_POOL_CACHE_FRESH_MS = 30 * 1000
 let rateLimitUntilMs = 0
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+const isDev = import.meta.env.DEV
+
+function shouldLogApiTiming(url = '') {
+    if (!isDev || !url) return false
+    return [
+        '/me',
+        '/candidates/browse',
+        '/candidates/browse/summary',
+        '/candidates/browse/meta',
+        '/ai-columns',
+        '/calls',
+    ].some(path => String(url).includes(path))
+}
+
+function logApiTiming(config = {}, status = 'ERR') {
+    if (!config._timingStart || !shouldLogApiTiming(config.url)) return
+    const elapsedMs = Math.round(performance.now() - config._timingStart)
+    const method = String(config.method || 'GET').toUpperCase()
+    console.info(`[api ${elapsedMs}ms] ${method} ${config.url} ${status}`)
+}
 
 function parseRetryAfterMs(value) {
     if (!value) return RATE_LIMIT_DEFAULT_RETRY_MS
@@ -26,11 +47,22 @@ function parseRetryAfterMs(value) {
 
 axios.defaults.timeout = REQUEST_TIMEOUT_MS
 
+axios.interceptors.request.use((config) => {
+    if (shouldLogApiTiming(config.url)) {
+        config._timingStart = performance.now()
+    }
+    return config
+})
+
 axios.interceptors.response.use(
-    (response) => response,
+    (response) => {
+        logApiTiming(response.config, response.status)
+        return response
+    },
     async (error) => {
         const config = error?.config || {}
         const status = error?.response?.status
+        logApiTiming(config, status || error?.code || 'ERR')
 
         if (status === 429) {
             const retryAfterMs = parseRetryAfterMs(error?.response?.headers?.['retry-after'])
@@ -352,7 +384,7 @@ export const useAppStore = create(persist((set, get) => ({
 
     fetchProfile: async () => {
         try {
-            const res = await axios.get(`${API_BASE}/me`)
+            const res = await axios.get(`${API_BASE}/me`, { timeout: 8000 })
             set({ user: res.data, isAuthenticated: true })
             return { success: true }
         } catch (e) {
@@ -1150,7 +1182,7 @@ export const useAppStore = create(persist((set, get) => ({
             // Invalidate Talent Pool cache because browse reads from backend's in-memory profile cache.
             if (roleId === 0) {
                 set({
-                    talentPoolCache: { data: null, lastParamsString: null }
+                    talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 }
                 })
             }
 
@@ -1233,6 +1265,7 @@ export const useAppStore = create(persist((set, get) => ({
     tpScopeSummaryIsRefreshing: false,
     tpScopeSummaryRequest: null,
     tpScopeSummaryRequestParamsString: '',
+    tpScopeSummaryRequestSeq: 0,
     tpScopeSummaryLastFetchedAt: 0,
     tpScopeSummaryLastParamsString: '',
     tpFilters: {
@@ -1272,7 +1305,7 @@ export const useAppStore = create(persist((set, get) => ({
         }
     })),
 
-    talentPoolCache: { data: null, lastParamsString: null },
+    talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
     talentPoolRequest: null,
     talentPoolRequestParamsString: '',
     talentPoolRequestSeq: 0,
@@ -1327,9 +1360,10 @@ export const useAppStore = create(persist((set, get) => ({
             tpScopeSummaryIsRefreshing: false,
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryRequestSeq: (state.tpScopeSummaryRequestSeq || 0) + 1,
             tpScopeSummaryLastFetchedAt: 0,
             tpScopeSummaryLastParamsString: '',
-            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
@@ -1353,9 +1387,10 @@ export const useAppStore = create(persist((set, get) => ({
             tpScopeSummaryIsRefreshing: false,
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryRequestSeq: (state.tpScopeSummaryRequestSeq || 0) + 1,
             tpScopeSummaryLastFetchedAt: 0,
             tpScopeSummaryLastParamsString: '',
-            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
@@ -1397,7 +1432,7 @@ export const useAppStore = create(persist((set, get) => ({
             tpTotal: candidateIds.length,
             tpTotalPages: 1,
             tpStatusCounts: {},
-            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
         })
@@ -1418,7 +1453,7 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolViewScope: previousView.viewScope || get().talentPoolViewScope,
             talentPoolRecruiterFilterId: previousView.recruiterFilterId || null,
             talentPoolRoleFilterId: previousView.roleFilterId || '',
-            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
         })
@@ -1427,7 +1462,7 @@ export const useAppStore = create(persist((set, get) => ({
     invalidateTalentPoolCaches: (options = {}) => {
         const clearRows = options.clearRows === true
         set((state) => ({
-            talentPoolCache: { data: null, lastParamsString: null },
+            talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
             ...(clearRows
                 ? {
@@ -1448,6 +1483,7 @@ export const useAppStore = create(persist((set, get) => ({
             tpScopeSummaryIsRefreshing: false,
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            tpScopeSummaryRequestSeq: (state.tpScopeSummaryRequestSeq || 0) + 1,
             tpScopeSummaryLastFetchedAt: 0,
             tpScopeSummaryLastParamsString: '',
             analyticsRequest: null,
@@ -1488,6 +1524,7 @@ export const useAppStore = create(persist((set, get) => ({
             return state.tpScopeSummaryRequest
         }
 
+        const requestSeq = (state.tpScopeSummaryRequestSeq || 0) + 1
         const url = paramsString
             ? `${API_BASE}/candidates/browse/summary?${paramsString}`
             : `${API_BASE}/candidates/browse/summary`
@@ -1496,6 +1533,12 @@ export const useAppStore = create(persist((set, get) => ({
                 const d = res.data || {}
                 const statusCounts = d.status_counts || {}
                 const latestState = get()
+                const isLatestRequest =
+                    latestState.tpScopeSummaryRequestSeq === requestSeq &&
+                    latestState.tpScopeSummaryRequestParamsString === paramsString
+                if (!isLatestRequest) {
+                    return { success: false, stale: true, error: 'Ignored stale talent pool summary request' }
+                }
                 const looksLikeColdEmpty =
                     Number(d.total || 0) === 0 &&
                     Object.keys(statusCounts).length === 0 &&
@@ -1530,17 +1573,24 @@ export const useAppStore = create(persist((set, get) => ({
             })
             .catch(error => {
                 console.error('Failed to fetch talent pool summary:', error)
-                set({
-                    tpScopeSummaryRequest: null,
-                    tpScopeSummaryRequestParamsString: '',
-                    tpScopeSummaryIsRefreshing: false,
-                })
+                const latestState = get()
+                if (
+                    latestState.tpScopeSummaryRequestSeq === requestSeq &&
+                    latestState.tpScopeSummaryRequestParamsString === paramsString
+                ) {
+                    set({
+                        tpScopeSummaryRequest: null,
+                        tpScopeSummaryRequestParamsString: '',
+                        tpScopeSummaryIsRefreshing: false,
+                    })
+                }
                 return { success: false, error: getRequestErrorMessage(error, 'Failed to load pipeline counts') }
             })
 
         set({
             tpScopeSummaryRequest: request,
             tpScopeSummaryRequestParamsString: paramsString,
+            tpScopeSummaryRequestSeq: requestSeq,
             tpScopeSummaryIsRefreshing: true,
         })
         return request
@@ -1560,7 +1610,7 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, blocked: true, error: 'Select a recruiter to load this pool' }
         }
         const state = get()
-        const cache = state.talentPoolCache || { data: null, lastParamsString: null }
+        const cache = state.talentPoolCache || { data: null, lastParamsString: null, lastFetchedAt: 0 }
         const fullParams = get().buildTalentPoolQueryKey(paramsString)
 
         if (!force && state.talentPoolRequest && state.talentPoolRequestParamsString === fullParams) {
@@ -1581,8 +1631,9 @@ export const useAppStore = create(persist((set, get) => ({
                     tpStatusCounts: d.status_counts || {}
                 })
             }
-            // If the cache is relatively fresh (less than 1 min), don't even trigger a background fetch
-            // But for now, we'll let the background fetch run to ensure 100% correctness.
+            if (cache.lastFetchedAt && Date.now() - cache.lastFetchedAt < TALENT_POOL_CACHE_FRESH_MS) {
+                return { success: true, data: d, cached: true }
+            }
         }
 
         const requestSeq = (state.talentPoolRequestSeq || 0) + 1
@@ -1599,7 +1650,7 @@ export const useAppStore = create(persist((set, get) => ({
                         tpTotal: d.total || 0,
                         tpTotalPages: d.total_pages || 1,
                         tpStatusCounts: d.status_counts || {},
-                        talentPoolCache: { data: d, lastParamsString: fullParams },
+                        talentPoolCache: { data: d, lastParamsString: fullParams, lastFetchedAt: Date.now() },
                         talentPoolRequest: null,
                         talentPoolRequestParamsString: '',
                     })
@@ -1618,7 +1669,7 @@ export const useAppStore = create(persist((set, get) => ({
                 if (isLatestRequest) {
                     set({ talentPoolRequest: null, talentPoolRequestParamsString: '' })
                 }
-                const latestCache = get().talentPoolCache
+                const latestCache = get().talentPoolCache || { data: null, lastParamsString: null, lastFetchedAt: 0 }
                 if (latestCache.lastParamsString === fullParams && latestCache.data) {
                     const d = latestCache.data;
                     const latestStateAfterError = get()

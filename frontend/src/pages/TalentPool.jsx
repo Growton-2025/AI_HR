@@ -18,6 +18,122 @@ import AiColumnCellDrawer from '../components/AiColumnCellDrawer';
 import CsvMappingModal from '../components/CsvMappingModal';
 import HayasaBrand from '../components/HayasaBrand';
 
+export function parseStructuredValue(val) {
+  if (val == null) return null;
+  if (typeof val === 'object') return val;
+  const trimmed = String(val).trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return JSON.parse(trimmed);
+    } catch (e) {
+      try {
+        const fn = new Function(`return (${trimmed});`);
+        const result = fn();
+        if (result && typeof result === 'object') {
+          return result;
+        }
+      } catch (err) {
+        try {
+          const jsonString = trimmed
+            .replace(/'/g, '"')
+            .replace(/True/g, 'true')
+            .replace(/False/g, 'false')
+            .replace(/None/g, 'null');
+          return JSON.parse(jsonString);
+        } catch (err2) {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function formatKey(key) {
+  let label = key.replace(/[_\.]+/g, ' ').trim();
+  if (label.toLowerCase().endsWith(' months')) {
+    label = label.slice(0, -7).trim() + ' (months)';
+  } else if (label.toLowerCase().endsWith(' years')) {
+    label = label.slice(0, -6).trim() + ' (years)';
+  }
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+const EMPTY_AI_RESPONSE_TEXTS = new Set([
+  'no structured response returned',
+  'no structured response returned.',
+  'needs review',
+]);
+
+function isMeaningfulAiValue(value) {
+  const text = String(value ?? '').trim();
+  const lower = text.toLowerCase();
+  return text !== '' && !EMPTY_AI_RESPONSE_TEXTS.has(lower) && !lower.startsWith('needs review:');
+}
+
+function resolveAiCellValue(cell, outputKey, isPrimaryOutput) {
+  const outputs = cell?.outputs || {};
+  const directOutput = outputs?.[outputKey];
+  if (isMeaningfulAiValue(directOutput)) return String(directOutput).trim();
+
+  if (isPrimaryOutput && isMeaningfulAiValue(cell?.primary_output)) {
+    return String(cell.primary_output).trim();
+  }
+
+  const firstOutput = Object.values(outputs).find(isMeaningfulAiValue);
+  if (firstOutput != null) return String(firstOutput).trim();
+
+  return cell ? 'No' : '';
+}
+
+export function renderFriendlyAiValue(aiVal) {
+  if (aiVal == null || String(aiVal).trim() === '') {
+    return '—';
+  }
+  const parsed = parseStructuredValue(aiVal);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+        {Object.entries(parsed).map(([k, v]) => {
+          const formattedKey = formatKey(k);
+          const formattedValue = typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—');
+          return (
+            <div key={k} style={{ fontSize: '11px', lineHeight: 1.4, color: '#334155' }}>
+              <span style={{ fontWeight: 700, color: '#1e293b' }}>{formattedKey}:</span>{' '}
+              <span style={{ color: '#475569' }}>{formattedValue}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+  if (parsed && Array.isArray(parsed)) {
+    return (
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: '100%', marginTop: 2 }}>
+        {parsed.map((item, idx) => (
+          <span
+            key={idx}
+            style={{
+              display: 'inline-block',
+              padding: '2px 6px',
+              borderRadius: 6,
+              background: 'rgba(99, 102, 241, 0.06)',
+              color: '#4f46e5',
+              fontSize: '10px',
+              fontWeight: 700,
+              border: '1px solid rgba(99, 102, 241, 0.12)',
+              whiteSpace: 'nowrap'
+            }}
+          >
+            {String(item)}
+          </span>
+        ))}
+      </div>
+    );
+  }
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(aiVal)}</span>;
+}
+
 // ── Clickable Editable Cell (renders as <td>) ────────────────
 // Always editable — click to enter edit mode with existing value pre-filled.
 // Pressing Enter or blurring saves. Clearing the value saves empty → renders as NA.
@@ -666,6 +782,67 @@ function summarizeAiRun(run) {
     return `${base} · ${st}`;
   }
   return base;
+}
+
+function buildQueuedAiCells(candidateIds = []) {
+  return candidateIds.reduce((acc, id) => {
+    acc[id] = { status: 'queued', primary_output: '', outputs: {} };
+    return acc;
+  }, {});
+}
+
+function createOptimisticAiColumn(definition = {}, candidateIds = [], runId = null) {
+  return {
+    ...definition,
+    id: definition.id,
+    name: definition.name || 'Smart Column',
+    output_schema: Array.isArray(definition.output_schema) ? definition.output_schema : [],
+    cells_by_candidate: {
+      ...(definition.cells_by_candidate || {}),
+      ...buildQueuedAiCells(candidateIds),
+    },
+    latest_run: {
+      ...(definition.latest_run || {}),
+      id: runId || definition.latest_run?.id || null,
+      run_id: runId || definition.latest_run?.run_id || null,
+      status: 'queued',
+      total: candidateIds.length,
+      completed: 0,
+      failed: 0,
+      skipped: 0,
+    },
+    __optimistic: true,
+  };
+}
+
+function mergeAiColumnDefinitions(previous = [], incoming = []) {
+  const previousById = new Map((previous || []).map(col => [String(col.id), col]));
+  const incomingIds = new Set();
+  const merged = (incoming || []).map(nextCol => {
+    const key = String(nextCol.id);
+    incomingIds.add(key);
+    const prevCol = previousById.get(key);
+    if (!prevCol) return nextCol;
+    return {
+      ...prevCol,
+      ...nextCol,
+      cells_by_candidate: {
+        ...(prevCol.cells_by_candidate || {}),
+        ...(nextCol.cells_by_candidate || {}),
+      },
+      latest_run: nextCol.latest_run || prevCol.latest_run,
+      __optimistic: Boolean(nextCol.__optimistic),
+    };
+  });
+
+  for (const prevCol of previous || []) {
+    if (incomingIds.has(String(prevCol.id))) continue;
+    const status = String(prevCol.latest_run?.status || '').toLowerCase();
+    if (prevCol.__optimistic || status === 'queued' || status === 'running') {
+      merged.push(prevCol);
+    }
+  }
+  return merged;
 }
 
 const AI_CELL_STALE_MS = 24 * 60 * 60 * 1000;
@@ -1620,6 +1797,8 @@ export default function TalentPool() {
   };
 
   const [loading, setLoading] = useState(false);
+  const [loadNotice, setLoadNotice] = useState('');
+  const [loadError, setLoadError] = useState('');
   const [isFilterCollapsed, setIsFilterCollapsed] = useState(() => {
     return localStorage.getItem('tp-filter-collapsed') === 'true';
   });
@@ -1681,7 +1860,10 @@ export default function TalentPool() {
   /** Latest fetchCandidates — avoids admin scope effect re-running when this callback identity changes after each fetch. */
   const fetchCandidatesRef = useRef(null);
   const aiColumnDeleteInFlightRef = useRef(null);
+  const aiColumnsInFlightKeyRef = useRef('');
   const linkedInPrewarmRef = useRef({ ids: new Set(), signature: '', ts: 0 });
+  const talentPoolNonPageQueryKeyRef = useRef('');
+  const loadedMetaKeyRef = useRef('');
 
   const [isRevalidating, setIsRevalidating] = useState(false);
   const talentPoolScopeReady = role !== 'admin'
@@ -1862,22 +2044,25 @@ export default function TalentPool() {
     const metaUrl = qs
       ? `${API_BASE}/candidates/browse/meta?${qs}`
       : `${API_BASE}/candidates/browse/meta`;
-    axios.get(metaUrl).then(r => {
-      if (!cancelled) {
-        const data = r.data || {};
-        setMeta({
-          companies: Array.isArray(data.companies) ? data.companies : [],
-          cities: Array.isArray(data.cities) ? data.cities : [],
-          titles: Array.isArray(data.titles) ? data.titles : [],
-          products: Array.isArray(data.products) ? data.products : [],
-          statuses: Array.isArray(data.statuses) ? data.statuses : [],
-          recruiters: Array.isArray(data.recruiters) ? data.recruiters : [],
-          location_types: Array.isArray(data.location_types) ? data.location_types : [],
-        });
-      }
-    }).catch(error => {
-      console.error('Failed to fetch talent pool filter metadata:', error);
-    });
+    if (loadedMetaKeyRef.current !== metaUrl) {
+      axios.get(metaUrl).then(r => {
+        if (!cancelled) {
+          const data = r.data || {};
+          loadedMetaKeyRef.current = metaUrl;
+          setMeta({
+            companies: Array.isArray(data.companies) ? data.companies : [],
+            cities: Array.isArray(data.cities) ? data.cities : [],
+            titles: Array.isArray(data.titles) ? data.titles : [],
+            products: Array.isArray(data.products) ? data.products : [],
+            statuses: Array.isArray(data.statuses) ? data.statuses : [],
+            recruiters: Array.isArray(data.recruiters) ? data.recruiters : [],
+            location_types: Array.isArray(data.location_types) ? data.location_types : [],
+          });
+        }
+      }).catch(error => {
+        console.error('Failed to fetch talent pool filter metadata:', error);
+      });
+    }
 
     fetchTalentPoolSummary();
 
@@ -2005,7 +2190,49 @@ export default function TalentPool() {
     [tpAiRunFocus],
   );
   const isAiRunFocusActive = focusCandidateIds.length > 0;
+  const focusCandidateIdsKey = useMemo(() => focusCandidateIds.join(','), [focusCandidateIds]);
+  const talentPoolNonPageQueryKey = useMemo(() => JSON.stringify({
+    pageSize,
+    globalSearch,
+    filters,
+    activeStatusTab,
+    sortBy,
+    sortDir,
+    roleId: talentPoolRoleFilterId,
+    viewScope: talentPoolViewScope,
+    recruiterId: talentPoolRecruiterFilterId,
+    focus: focusCandidateIdsKey,
+    scopeReady: talentPoolScopeReady,
+  }), [
+    pageSize,
+    globalSearch,
+    filters,
+    activeStatusTab,
+    sortBy,
+    sortDir,
+    talentPoolRoleFilterId,
+    talentPoolViewScope,
+    talentPoolRecruiterFilterId,
+    focusCandidateIdsKey,
+    talentPoolScopeReady,
+  ]);
+  const talentPoolQueryKey = useMemo(
+    () => `${isAiRunFocusActive ? 1 : page}|${talentPoolNonPageQueryKey}`,
+    [isAiRunFocusActive, page, talentPoolNonPageQueryKey],
+  );
   const displayedCandidates = Array.isArray(candidates) ? candidates : [];
+
+  useEffect(() => {
+    if (!loading || displayedCandidates.length) {
+      setLoadNotice('');
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setLoadNotice('Candidate data is still loading from the server. Keeping the page responsive while it finishes.');
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [loading, displayedCandidates.length]);
+
   const displayedTotal = total;
   const displayedTotalPages = totalPages;
   const displayedStatusCounts = statusCounts;
@@ -2054,6 +2281,7 @@ export default function TalentPool() {
       const cachedData = cache.lastParamsString === buildTalentPoolQueryKey(paramsString) ? cache.data : null;
       const hasData = !isAiRunFocusActive && visibleCandidatesRef.current.length > 0;
 
+      setLoadError('');
       if (!cachedData && !hasData) {
         setLoading(true);
       } else {
@@ -2069,9 +2297,12 @@ export default function TalentPool() {
       if (res.success && res.data) {
         setIsSemanticSearch(res.data.is_semantic_search || false);
         mergeContactInfoFromRows(res.data.candidates);
+      } else if (!res.success && !res.stale && !res.blocked) {
+        setLoadError(res.error || 'Failed to load candidates');
       }
     } catch (e) {
       console.error('Failed to fetch talent pool:', e);
+      setLoadError(e?.message || 'Failed to load candidates');
     } finally {
       if (requestId === talentPoolRequestSeqRef.current) {
         setLoading(false);
@@ -2133,26 +2364,25 @@ export default function TalentPool() {
     useAppStore.getState().prewarmLinkedInCache(nextIds).catch(console.error);
   }, [displayedCandidates]);
 
-  // Debounced refetch
   useEffect(() => {
-    if (!didInitRef.current) {
-      didInitRef.current = true;
-      return;
-    }
-    clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      if (page !== 1) {
-        setPage(1);
-        return;
-      }
-      fetchCandidates(1);
-    }, 120);
-    return () => clearTimeout(debounceRef.current);
-  }, [fetchCandidates]);
+    const previousNonPageKey = talentPoolNonPageQueryKeyRef.current;
+    const nonPageChanged = previousNonPageKey && previousNonPageKey !== talentPoolNonPageQueryKey;
+    talentPoolNonPageQueryKeyRef.current = talentPoolNonPageQueryKey;
 
-  useEffect(() => {
-    fetchCandidates(page);
-  }, [page, fetchCandidates]);
+    if (nonPageChanged && !isAiRunFocusActive && page !== 1) {
+      setTpPagination(1, pageSize);
+      return undefined;
+    }
+
+    clearTimeout(debounceRef.current);
+    const delay = didInitRef.current ? 120 : 0;
+    didInitRef.current = true;
+    debounceRef.current = setTimeout(() => {
+      const run = fetchCandidatesRef.current;
+      if (run) void run(isAiRunFocusActive ? 1 : page);
+    }, delay);
+    return () => clearTimeout(debounceRef.current);
+  }, [talentPoolQueryKey, talentPoolNonPageQueryKey, isAiRunFocusActive, page, pageSize, setTpPagination]);
 
   // Store fetchCandidates and page in refs to avoid dependency cycles in the sync interval
   const fetchRef = useRef(fetchCandidates);
@@ -2234,11 +2464,13 @@ export default function TalentPool() {
   const [aiColumnModal, setAiColumnModal] = useState(false);
 
   const fetchAiColumns = useCallback(async () => {
-    const requestId = ++aiColumnsRequestSeqRef.current;
     const requestedVisibleIdsKey = aiColumnVisibleIdsKey;
-    const previousColumns = useAppStore.getState().aiColumns || [];
-    if (!talentPoolScopeReady || !requestedVisibleIdsKey) {
+    if (!talentPoolScopeReady) {
       setAiColumns([]);
+      setAiColumnsLoading(false);
+      return;
+    }
+    if (!requestedVisibleIdsKey) {
       setAiColumnsLoading(false);
       return;
     }
@@ -2247,15 +2479,18 @@ export default function TalentPool() {
     if (talentPoolViewScope) params.set('view_scope', talentPoolViewScope);
     if (talentPoolRecruiterFilterId) params.set('recruiter_filter_id', talentPoolRecruiterFilterId);
     if (talentPoolRoleFilterId) params.set('role_id', talentPoolRoleFilterId);
+    const requestKey = params.toString();
+    if (aiColumnsInFlightKeyRef.current === requestKey) {
+      return;
+    }
+    const requestId = ++aiColumnsRequestSeqRef.current;
+    aiColumnsInFlightKeyRef.current = requestKey;
     setAiColumnsLoading(true);
     try {
-      const res = await longOperationAxios.get(`${API_BASE}/ai-columns?${params.toString()}`, { timeout: 120000 });
+      const res = await longOperationAxios.get(`${API_BASE}/ai-columns?${requestKey}`, { timeout: 120000 });
       if (requestId !== aiColumnsRequestSeqRef.current) return;
       const nextColumns = res.data?.columns || [];
-      if (!requestedVisibleIdsKey && previousColumns.length > 0 && nextColumns.length === 0) {
-        return;
-      }
-      setAiColumns(nextColumns);
+      setAiColumns(prev => mergeAiColumnDefinitions(prev || [], nextColumns));
     } catch (error) {
       if (requestId !== aiColumnsRequestSeqRef.current) return;
       console.error('Failed to fetch AI columns', error);
@@ -2264,6 +2499,9 @@ export default function TalentPool() {
         { id: 'talent-pool-ai-columns-fetch' },
       );
     } finally {
+      if (aiColumnsInFlightKeyRef.current === requestKey) {
+        aiColumnsInFlightKeyRef.current = '';
+      }
       if (requestId === aiColumnsRequestSeqRef.current) {
         setAiColumnsLoading(false);
       }
@@ -2592,12 +2830,61 @@ export default function TalentPool() {
     }
   };
 
+  const upsertOptimisticAiColumn = useCallback((runInfo = {}) => {
+    const candidateIdArray = Array.isArray(runInfo.candidateIds)
+      ? runInfo.candidateIds.map(Number).filter(Number.isFinite)
+      : [];
+    const rawDefinition = runInfo.definition || {};
+    const definition = {
+      ...rawDefinition,
+      id: rawDefinition.id ?? runInfo.columnDefinitionId,
+      name: rawDefinition.name || runInfo.columnName || 'Smart Column',
+    };
+    if (!definition.id || !candidateIdArray.length) return;
+    const optimisticColumn = createOptimisticAiColumn(definition, candidateIdArray, runInfo.runId || null);
+    setAiColumns(prev => {
+      const existingIndex = (prev || []).findIndex(col => String(col.id) === String(definition.id));
+      if (existingIndex === -1) {
+        return [...(prev || []), optimisticColumn];
+      }
+      return (prev || []).map((col, index) => (
+        index === existingIndex
+          ? mergeAiColumnDefinitions([col], [optimisticColumn])[0]
+          : col
+      ));
+    });
+  }, [setAiColumns]);
+
+  const attachAiColumnRun = useCallback((runInfo = {}) => {
+    if (!runInfo?.columnDefinitionId || !runInfo?.runId) return;
+    setAiColumns(prev => (prev || []).map(col => {
+      if (String(col.id) !== String(runInfo.columnDefinitionId)) return col;
+      return {
+        ...col,
+        latest_run: {
+          ...(col.latest_run || {}),
+          id: runInfo.runId,
+          run_id: runInfo.runId,
+          status: col.latest_run?.status || 'queued',
+        },
+      };
+    }));
+  }, [setAiColumns]);
+
+  const revertOptimisticAiColumn = useCallback((runInfo = {}) => {
+    if (!runInfo?.columnDefinitionId) return;
+    setAiColumns(prev => (prev || []).filter(col => (
+      String(col.id) !== String(runInfo.columnDefinitionId) || !col.__optimistic
+    )));
+  }, [setAiColumns]);
+
   const rerunAiColumn = async (definition) => {
     const selectedIdArray = Array.from(selectedIds || []);
     if (selectedIdArray.length === 0) {
       toast.error('Select at least one row first, then run the smart column');
       return;
     }
+    const previousColumns = useAppStore.getState().aiColumns || [];
     // Optimistic update: immediately show selected rows as "queued" in the UI
     setAiColumns(prev => (prev || []).map(col => {
       if (col.id !== definition.id) return col;
@@ -2630,7 +2917,7 @@ export default function TalentPool() {
       void fetchAiColumns();
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Failed to run smart column');
-      void fetchAiColumns(); // revert optimistic update
+      setAiColumns(previousColumns);
     }
   };
 
@@ -2661,14 +2948,13 @@ export default function TalentPool() {
 
   const panelSurface = {
     background: 'rgba(255,255,255,0.84)',
-    backdropFilter: 'blur(18px)',
     border: '1px solid rgba(226, 232, 240, 0.92)',
-    boxShadow: '0 18px 40px rgba(15,23,42,0.06)',
+    boxShadow: '0 10px 24px rgba(15,23,42,0.05)',
   };
   const surfaceBorder = 'rgba(226, 232, 240, 0.9)';
 
   return (
-    <div style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 18, height: '100vh', overflow: 'hidden', padding: '22px', boxSizing: 'border-box' }}>
+    <div className="talent-pool-page" style={{ fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', gap: 18, height: '100vh', overflow: 'hidden', padding: '22px', boxSizing: 'border-box' }}>
 
       {/* ── Left Filter Sidebar ── */}
       <aside style={{
@@ -2676,7 +2962,6 @@ export default function TalentPool() {
         minWidth: isFilterCollapsed ? 0 : 220,
         padding: isFilterCollapsed ? 0 : '20px 18px',
         background: panelSurface.background,
-        backdropFilter: panelSurface.backdropFilter,
         border: isFilterCollapsed ? 'none' : panelSurface.border,
         boxShadow: isFilterCollapsed ? 'none' : panelSurface.boxShadow,
         borderRadius: isFilterCollapsed ? 0 : 24,
@@ -3044,6 +3329,31 @@ export default function TalentPool() {
         </div>
 
         <div style={{ ...panelSurface, flex: 1, minHeight: 0, borderRadius: 24, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+          {(loadNotice || loadError) && displayedCandidates.length === 0 && (
+            <div style={{
+              padding: '10px 18px',
+              background: loadError ? '#fef2f2' : '#fff7ed',
+              color: loadError ? '#991b1b' : '#8b6b44',
+              borderBottom: `1px solid ${loadError ? '#fecaca' : '#fed7aa'}`,
+              fontSize: 12,
+              fontWeight: 700,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+            }}>
+              <span>{loadError || loadNotice}</span>
+              {loadError && (
+                <button
+                  type="button"
+                  onClick={() => fetchCandidates(page)}
+                  style={{ padding: '6px 10px', borderRadius: 9, border: '1px solid currentColor', background: '#fff', color: 'inherit', fontSize: 12, fontWeight: 800, cursor: 'pointer' }}
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
           {isAiRunFocusActive && (
             <div style={{
               padding: '12px 18px',
@@ -3144,10 +3454,10 @@ export default function TalentPool() {
           )}
 
           {/* Table */}
-          <div style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
+          <div className="talent-pool-table-scroll" style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 2000 }}>
               <thead>
-                <tr style={{ background: 'rgba(248,250,252,0.96)', borderBottom: `1px solid ${surfaceBorder}`, position: 'sticky', top: 0, zIndex: 10, backdropFilter: 'blur(12px)' }}>
+                <tr style={{ background: 'rgba(248,250,252,0.98)', borderBottom: `1px solid ${surfaceBorder}`, position: 'sticky', top: 0, zIndex: 10 }}>
                   {cols.filter(c => !c.hidden).map((col, index) => (
                     <th key={col.key}
                       onClick={() => col.key === 'selection' ? toggleSelectAll() : handleSort(col.sortKey)}
@@ -3256,10 +3566,10 @@ export default function TalentPool() {
                           <User size={24} color="#cbd5e1" />
                         </div>
                         <p style={{ color: '#64748b', fontWeight: 600, fontSize: 15, margin: 0 }}>
-                          {talentPoolScopeReady ? 'No candidates found' : 'Select a recruiter to load this pool'}
+                          {loadError ? 'Candidate data did not load' : talentPoolScopeReady ? 'No candidates found' : 'Select a recruiter to load this pool'}
                         </p>
                         <p style={{ color: '#cbd5e1', fontSize: 13, margin: 0 }}>
-                          {talentPoolScopeReady ? 'Try adjusting your filters or search query' : 'Recruiter-scoped totals load after a recruiter is selected'}
+                          {loadError || (talentPoolScopeReady ? 'Try adjusting your filters or search query' : 'Recruiter-scoped totals load after a recruiter is selected')}
                         </p>
                         {hasFilters && <button onClick={clearFilters} style={{ padding: '8px 16px', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, color: '#334155', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>Clear Filters</button>}
                       </div>
@@ -3440,14 +3750,7 @@ export default function TalentPool() {
                     {dynamicAiCols.map(col => {
                       const cellsMap = col.definition?.cells_by_candidate || {};
                       const cell = cellsMap[c.id] ?? cellsMap[String(c.id)] ?? cellsMap[Number(c.id)];
-                      const outputs = cell?.outputs || {};
-                      const rawOut = outputs[col.outputKey];
-                      const aiVal =
-                        rawOut != null && String(rawOut).trim() !== ''
-                          ? String(rawOut)
-                          : col.isPrimaryOutput
-                            ? String(cell?.primary_output || '').trim()
-                            : '';
+                      const aiVal = resolveAiCellValue(cell, col.outputKey, col.isPrimaryOutput);
                       const st = cell?.status;
                       const aiCreditsDisplay = cell?.ai_credits_display || '';
                       const isEmpty =
@@ -3507,7 +3810,7 @@ export default function TalentPool() {
                                 WebkitBoxOrient: 'vertical',
                                 overflow: 'hidden',
                               }}>
-                                {String(aiVal)}
+                                {renderFriendlyAiValue(aiVal)}
                               </div>
                               <div style={{
                                 display: 'flex',
@@ -3765,7 +4068,14 @@ export default function TalentPool() {
           recruiterFilterId={talentPoolRecruiterFilterId}
           roleId={talentPoolRoleFilterId}
           onClose={() => setAiColumnModal(false)}
+          onColumnDefinitionCreated={(runInfo) => {
+            upsertOptimisticAiColumn(runInfo);
+          }}
+          onColumnRunFailed={(runInfo) => {
+            revertOptimisticAiColumn(runInfo);
+          }}
           onColumnsCreated={(runInfo) => {
+            attachAiColumnRun(runInfo);
             startTpAiRunFocus({
               runId: runInfo?.runId,
               columnDefinitionId: runInfo?.columnDefinitionId,

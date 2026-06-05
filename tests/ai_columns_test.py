@@ -1452,6 +1452,12 @@ def test_map_raw_outputs_to_schema_keys_aligns_label_style_keys():
     assert got["competitor_industry"] == "Software"
 
 
+def test_map_raw_outputs_to_schema_keys_serializes_nested_values():
+    raw = {"result": {"answer": "Yes", "months": 9}}
+    got = map_raw_outputs_to_schema_keys(raw, ["result"])
+    assert got["result"] == '{"answer": "Yes", "months": 9}'
+
+
 def test_model_to_dict_supports_pydantic_v1_style_objects():
     class V1Style:
         def dict(self):
@@ -1478,6 +1484,197 @@ def test_run_ai_task_fills_all_outputs_when_model_returns_empty_dict(monkeypatch
     )
     assert result["outputs"]["a"] == result["outputs"]["b"]
     assert result["outputs"]["a"] == "nothing parsed"
+
+
+def test_run_ai_task_uses_top_level_model_answer_when_outputs_missing(monkeypatch):
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+
+    def fake_openai(*args, **kwargs):
+        return {"answer": "Stable: current role is 9 months.", "confidence": "medium"}
+
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Summarize stability for {candidate.full_name}",
+        mode="content",
+        output_schema=[{"key": "result", "label": "Result", "primary": True}],
+        context={"candidate.full_name": "Aarthi Nambiar"},
+    )
+
+    assert result["primary_output"] == "Stable: current role is 9 months."
+    assert "No structured response" not in result["primary_output"]
+
+
+def test_run_ai_task_empty_model_output_returns_no_not_generic_string(monkeypatch):
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+
+    def fake_openai(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Find unsupported info for {candidate.full_name}",
+        mode="content",
+        output_schema=[{"key": "result", "label": "Result", "primary": True}],
+        context={"candidate.full_name": "Empty Candidate"},
+    )
+
+    assert result["primary_output"] == "No"
+    assert "No structured response" not in result["primary_output"]
+
+
+def test_run_ai_task_promotes_first_non_empty_output_when_primary_is_blank(monkeypatch):
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+
+    def fake_openai(*args, **kwargs):
+        return {
+            "outputs": {"status": "", "reason": "Clear: no contradiction found in the row."},
+            "reasoning": "The status field was omitted but the reason contains the answer.",
+            "confidence": "medium",
+        }
+
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Find contradictions for {candidate.full_name}.",
+        mode="content",
+        output_schema=[
+            {"key": "status", "label": "Status", "type": "text", "primary": True},
+            {"key": "reason", "label": "Reason", "type": "text"},
+        ],
+        context={"candidate.full_name": "Blank Primary Candidate"},
+    )
+
+    assert result["primary_output"] == "Clear: no contradiction found in the row."
+    assert result["details"]["response"] == "Clear: no contradiction found in the row."
+
+
+def test_career_facts_datadog_october_2025_current_role_is_nine_months(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 5, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    context = build_candidate_context(
+        {
+            "id": 104,
+            "name": "Aarthi Nambiar",
+            "raw_fields": {
+                "enrichment": {
+                    "roles": [
+                        {
+                            "company": "Datadog",
+                            "title": "Enterprise Sales Development Representative",
+                            "start_date": "10-2025",
+                            "end_date": "",
+                            "duration_months": 13,
+                        }
+                    ]
+                }
+            },
+        }
+    )
+
+    facts = compute_career_facts(context)
+
+    assert facts["current_company"] == "Datadog"
+    assert facts["current_job_months"] == 9
+    assert facts["current_company_tenure_months"] == 9
+    assert facts["company_tenures"] == [
+        {
+            "company": "Datadog",
+            "months": 9,
+            "years": 0.75,
+            "titles": ["Enterprise Sales Development Representative"],
+            "is_current_company": True,
+        }
+    ]
+
+
+def test_career_context_uses_raw_current_company_details_when_structured_unknown():
+    context = build_candidate_context(
+        {
+            "id": 105,
+            "name": "Raw Details Candidate",
+            "headline": "Sales Development Manager",
+            "raw_fields": {
+                "experiences/0/companyName": "Parkar",
+                "experiences/0/title": "Manager - Data Solutions",
+                "experiences/0/companyIndustry": "Information Technology And Services",
+                "experiences/0/companyWebsite": "parkardigital.com",
+                "experiences/0/companySize": "201-500",
+            },
+            "roles": [
+                {
+                    "company": "Parkar",
+                    "title": "Manager - Data Solutions",
+                    "start_date": "2025-01-01",
+                    "end_date": "Present",
+                    "company_details": {
+                        "business_model": "Unknown",
+                        "product_service": "Unknown",
+                        "customer_segment": "Mid-Market",
+                        "industry": "Unknown",
+                    },
+                }
+            ],
+        }
+    )
+
+    facts = compute_career_facts(context)
+    pack = build_candidate_context_pack(context, facts)
+    current_role = pack["current_role"]
+
+    assert current_role["source_industry"] == "Information Technology And Services"
+    assert current_role["source_website"] == "parkardigital.com"
+    assert current_role["source_company_size"] == "201-500"
+    assert "current role industry: Information Technology And Services" in facts["current_company_enterprise_saas_evidence"]
+    assert "current role company website: parkardigital.com" in facts["current_company_enterprise_saas_evidence"]
+
+
+def test_data_quality_with_unknown_current_company_details_routes_to_web():
+    context = build_candidate_context(
+        {
+            "id": 106,
+            "name": "Web Detail Candidate",
+            "headline": "Sales Development Manager",
+            "raw_fields": {
+                "experiences/0/companyName": "Parkar",
+                "experiences/0/title": "Manager - Data Solutions",
+                "experiences/0/companyIndustry": "Information Technology And Services",
+                "experiences/0/companyWebsite": "parkardigital.com",
+            },
+            "roles": [
+                {
+                    "company": "Parkar",
+                    "title": "Manager - Data Solutions",
+                    "start_date": "2025-01-01",
+                    "end_date": "Present",
+                    "company_details": {
+                        "business_model": "Unknown",
+                        "product_service": "Unknown",
+                        "customer_segment": "Mid-Market",
+                        "industry": "Unknown",
+                    },
+                }
+            ],
+        }
+    )
+    prompt = (
+        "Score this candidate row data quality for recruiting decisions from 1 to 5. "
+        "Penalize missing current company details, product/service, or business model."
+    )
+
+    routing = classify_ai_column_prompt(prompt)
+    plan = build_query_plan(
+        prompt,
+        context,
+        [{"key": "quality_score", "label": "Quality Score", "primary": True}],
+        routing,
+    )
+
+    assert routing["data_source"] == "hybrid"
+    assert plan["web_needed"] is True
+    assert "company_verification" in plan["tool_calls"]
 
 
 def test_run_ai_task_uses_deterministic_tenure_when_model_outputs_are_empty(monkeypatch):
@@ -1964,7 +2161,7 @@ def test_run_ai_task_auto_falls_back_to_web_when_row_context_is_insufficient(mon
     )
 
     assert result["primary_output"] == "Acme, BetaCo, GammaInc"
-    assert calls == [False, True]
+    assert calls == [True]
 
 
 def test_run_ai_task_web_without_source_url_keeps_answer_with_verification_warning(monkeypatch):

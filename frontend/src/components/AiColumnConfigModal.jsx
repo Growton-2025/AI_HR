@@ -41,6 +41,8 @@ export default function AiColumnConfigModal({
   roleId,
   onClose,
   onColumnsCreated,
+  onColumnDefinitionCreated,
+  onColumnRunFailed,
 }) {
   const promptRef = useRef(null);
   const fieldPickerRef = useRef(null);
@@ -357,6 +359,7 @@ export default function AiColumnConfigModal({
     }
 
     setRunning(true);
+    let definition = null;
     try {
       const saveRes = await aiColumnAxios.post(`${API_BASE}/ai-columns`, {
         name: resolvedName,
@@ -373,7 +376,15 @@ export default function AiColumnConfigModal({
         recruiter_filter_id: recruiterFilterId,
       }, { timeout: AI_RUN_TIMEOUT_MS });
 
-      const definition = saveRes.data || {};
+      definition = saveRes.data || {};
+      onColumnDefinitionCreated?.({
+        definition,
+        columnName: definition.name || resolvedName,
+        columnDefinitionId: definition.id,
+        candidateIds: selectedIdArray,
+        selectionMode: 'selected_ids',
+      });
+
       const runRes = await aiColumnAxios.post(`${API_BASE}/ai-columns/run`, {
         column_definition_id: definition.id,
         selection_mode: 'selected_ids',
@@ -393,6 +404,12 @@ export default function AiColumnConfigModal({
       });
       onClose?.();
     } catch (error) {
+      if (definition?.id) {
+        onColumnRunFailed?.({
+          columnDefinitionId: definition.id,
+          candidateIds: selectedIdArray,
+        });
+      }
       toast.error(getRequestErrorMessage(error, 'Failed to start smart column run'));
     } finally {
       setRunning(false);

@@ -39,6 +39,53 @@ def test_parse_linkedin_style_duplicate_role_headers():
     assert education[0].degree == "MBA"
 
 
+def test_apify_current_role_month_year_uses_dates_over_stale_duration(monkeypatch):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 5, tzinfo=tz or timezone.utc)
+
+    monkeypatch.setattr(enrich, "datetime", FrozenDateTime)
+    raw = {
+        "experiences/0/companyName": "Datadog",
+        "experiences/0/title": "Enterprise Sales Development Representative",
+        "experiences/0/jobStartedOn": "10-2025",
+        "experiences/0/jobEndedOn": "",
+        "experiences/0/duration": "13 months",
+    }
+
+    roles = enrich.parse_roles_from_raw(raw, {"headline": "Enterprise Sales Development Representative"})
+    metrics = enrich.calculate_tenure_metrics(roles)
+    context = build_candidate_context(
+        {
+            "name": "Aarthi Nambiar",
+            "raw_fields": {
+                "enrichment": {
+                    "roles": [
+                        {
+                            "company": role.company,
+                            "title": role.title,
+                            "start_date": role.start.date().isoformat() if role.start else "",
+                            "end_date": "",
+                            "duration_months": role.duration_months,
+                        }
+                        for role in roles
+                    ]
+                }
+            },
+        }
+    )
+    facts = compute_career_facts(context)
+
+    assert roles[0].start.date().isoformat() == "2025-10-01"
+    assert roles[0].duration_months == 9
+    assert roles[0].duration_source == "date_range"
+    assert metrics["current_job_months"] == 9
+    assert metrics["company_tenures"][0]["months"] == 9
+    assert facts["current_job_months"] == 9
+    assert facts["current_company_tenure_months"] == 9
+
+
 def test_parse_apify_experience_columns_and_profile_claim_context():
     raw = {
         "headline": "SaaS account executive for US and EMEA markets",

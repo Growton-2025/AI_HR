@@ -26,8 +26,6 @@ const getStatusCount = (counts, statusName) => {
 
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
-    const fetchTalentPoolSummary = useAppStore(state => state.fetchTalentPoolSummary)
-    const fetchAnalytics = useAppStore(state => state.fetchAnalytics)
     const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
@@ -46,18 +44,6 @@ function Sidebar() {
     const isDragging = useRef(false)
     const startX = useRef(0)
     const startWidth = useRef(sidebarWidth)
-
-    useEffect(() => {
-        fetchTalentPoolSummary()
-        fetchAnalytics()
-    }, [
-        fetchTalentPoolSummary,
-        fetchAnalytics,
-        role,
-        talentPoolViewScope,
-        talentPoolRecruiterFilterId,
-        talentPoolRoleFilterId,
-    ])
 
     const isIconOnly = sidebarWidth < ICON_THRESHOLD
 

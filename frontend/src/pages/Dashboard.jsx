@@ -133,8 +133,9 @@ const Dashboard = () => {
   const hasLoadedRef = useRef(false);
 
   useEffect(() => {
+    let cancelled = false;
     const run = async () => {
-      if (hasLoadedRef.current) {
+      if (hasLoadedRef.current && !cancelled) {
         setIsRevalidating(true);
       }
       await Promise.allSettled([
@@ -142,10 +143,14 @@ const Dashboard = () => {
         fetchCallStats(),
         fetchTalentPoolSummary(),
       ]);
+      if (cancelled) return;
       hasLoadedRef.current = true;
       setIsRevalidating(false);
     };
-    run();
+    void run();
+    return () => {
+      cancelled = true;
+    };
   }, [fetchAnalytics, fetchCallStats, fetchTalentPoolSummary, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
 
   const isAdmin = user?.role === 'admin';
@@ -219,13 +224,9 @@ const Dashboard = () => {
         opacity: isRevalidating ? 0.7 : 1,
         transition: 'opacity 0.2s'
       }}>
-        {(!analytics && !isRevalidating) ? (
-          [1,2,3].map(i => <DashboardCard key={i} loading />)
-        ) : (
-          metricCards.map(m => (
-            <DashboardCard key={m.title} {...m} />
-          ))
-        )}
+        {metricCards.map(m => (
+          <DashboardCard key={m.title} {...m} />
+        ))}
       </div>
 
       {/* Dynamic Charts */}

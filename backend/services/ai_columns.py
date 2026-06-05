@@ -292,7 +292,7 @@ def build_candidate_context(
     return ctx
 
 
-def flatten_profile_context(profile: Dict[str, Any], *, max_fields: int = 220) -> Dict[str, str]:
+def flatten_profile_context(profile: Dict[str, Any], *, max_fields: int = 650) -> Dict[str, str]:
     """Expose the full row as row.* keys so AI columns can behave like Clay chatbot prompts."""
     out: Dict[str, str] = {}
 
@@ -376,6 +376,15 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
             "routing_mode": "web_research",
         }
 
+    if any(term in lower for term in WEB_FRESHNESS_TERMS) or any(
+        term in lower for term in ("public evidence", "publicly", "web", "website", "news")
+    ):
+        return {
+            "data_source": "web",
+            "web_required_reason": "fresh_or_public_web_evidence_requested",
+            "routing_mode": "web_research",
+        }
+
     if urls and ("jd" in lower or "job description" in lower or "score" in lower or "fit" in lower):
         return {
             "data_source": "hybrid",
@@ -383,10 +392,22 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
             "routing_mode": "web_research",
         }
 
-    if any(term in lower for term in ("score", "fit score", "against this jd", "job description", "paste jd")):
+    if any(term in lower for term in ("fit score", "against this jd", "job description", "paste jd")) or (
+        "score" in lower and any(term in lower for term in (" jd", "job description", "role fit", "candidate fit"))
+    ):
         return {
             "data_source": "hybrid",
             "web_required_reason": "jd_fit_requires_public_verification",
+            "routing_mode": "web_research",
+        }
+
+    if any(
+        term in lower
+        for term in COMPANY_ENRICHMENT_PROMPT_TERMS
+    ):
+        return {
+            "data_source": "hybrid",
+            "web_required_reason": "company_details_or_data_quality_verification",
             "routing_mode": "web_research",
         }
 
@@ -403,15 +424,6 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
         return {
             "data_source": "hybrid",
             "web_required_reason": "current_employer_enterprise_saas_verification",
-            "routing_mode": "web_research",
-        }
-
-    if any(term in lower for term in WEB_FRESHNESS_TERMS) or any(
-        term in lower for term in ("public evidence", "publicly", "web", "website", "news")
-    ):
-        return {
-            "data_source": "web",
-            "web_required_reason": "fresh_or_public_web_evidence_requested",
             "routing_mode": "web_research",
         }
 
@@ -444,9 +456,33 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
 def _parse_role_context_entries(context: Dict[str, str]) -> List[Dict[str, str]]:
     enriched_grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
     db_grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
+    raw_grouped: Dict[int, Dict[str, str]] = defaultdict(dict)
     for key, value in (context or {}).items():
         enriched_match = re.match(r"row\.raw_fields\.enrichment\.roles\.(\d+)\.(.+)", str(key))
         db_match = re.match(r"row\.roles\.(\d+)\.(.+)", str(key))
+        raw_match = re.match(r"row\.raw_fields\.experiences/(\d+)/(.+)", str(key))
+        if raw_match:
+            text = stringify_context_value(value)
+            if not text:
+                continue
+            idx = int(raw_match.group(1))
+            field = raw_match.group(2)
+            mapped = {
+                "companyName": "company",
+                "title": "title",
+                "jobStartedOn": "start_date",
+                "jobEndedOn": "end_date",
+                "companyIndustry": "source_industry",
+                "companyWebsite": "source_website",
+                "companySize": "source_company_size",
+                "jobLocation": "location",
+                "jobLocationCountry": "location",
+            }.get(field)
+            if mapped:
+                raw_grouped[idx][mapped] = text
+                if mapped == "source_industry":
+                    raw_grouped[idx].setdefault("industry", text)
+            continue
         match = enriched_match or db_match
         if not match:
             continue
@@ -459,6 +495,15 @@ def _parse_role_context_entries(context: Dict[str, str]) -> List[Dict[str, str]]
     # Verified import enrichment keeps original role dates/details in raw_fields.
     # Prefer that source for tenure so DB roles without dates cannot erase it.
     grouped = enriched_grouped if enriched_grouped else db_grouped
+    for idx, raw_role in raw_grouped.items():
+        if idx not in grouped:
+            grouped[idx] = dict(raw_role)
+            continue
+        role = grouped[idx]
+        for key, raw_value in raw_role.items():
+            current = stringify_context_value(role.get(key))
+            if not current or current.lower() == "unknown":
+                role[key] = raw_value
     entries = [grouped[idx] for idx in sorted(grouped)]
     if not entries and (context.get("role.current_company") or context.get("role.current_title")):
         entries.append(
@@ -588,14 +633,28 @@ def _role_duration_months(role: Dict[str, str]) -> int:
     return 0
 
 
+def _role_date_duration_months(role: Dict[str, Any], *, default_current: bool = False) -> int:
+    start = _parse_role_date(role.get("start_date") or role.get("starts_at") or role.get("start"))
+    end_raw = role.get("end_date") or role.get("ends_at") or role.get("end")
+    end = _parse_role_date(end_raw, default_current=default_current or bool(start and not stringify_context_value(end_raw)))
+    return _months_between(start, end)
+
+
 def _current_company_enterprise_saas_status(context: Dict[str, str], current_role: Dict[str, str]) -> Tuple[str, List[str]]:
     fields = {
         "current role product/service": current_role.get("product_service") or context.get("role.company_product_service"),
+        "current role industry": current_role.get("industry")
+        or current_role.get("source_industry")
+        or context.get("row.raw_fields.experiences/0/companyIndustry"),
         "current role customer segment": current_role.get("customer_segment")
         or context.get("role.company_customer_segment")
         or context.get("row.roles.0.company_details.customer_segment"),
         "current role business model": current_role.get("business_model")
         or context.get("row.roles.0.company_details.business_model"),
+        "current role company size": current_role.get("source_company_size")
+        or context.get("row.raw_fields.experiences/0/companySize"),
+        "current role company website": current_role.get("source_website")
+        or context.get("row.raw_fields.experiences/0/companyWebsite"),
         "candidate product/service": context.get("candidate.product_service"),
         "headline": context.get("candidate.headline"),
     }
@@ -656,7 +715,8 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         if not normalized_company:
             continue
         start = _parse_role_date(role.get("start_date") or role.get("starts_at") or role.get("start"))
-        end = _parse_role_date(role.get("end_date") or role.get("ends_at") or role.get("end"), default_current=idx == 0)
+        end_raw = role.get("end_date") or role.get("ends_at") or role.get("end")
+        end = _parse_role_date(end_raw, default_current=idx == 0)
         months = _months_between(start, end) or _role_duration_months(role)
         title = stringify_context_value(role.get("title"))
         location = stringify_context_value(role.get("city") or role.get("location"))
@@ -761,14 +821,7 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
             f"{len(short_company_stints)} stint(s) under 24 months."
         )
 
-    current_start = _parse_role_date(
-        current_role.get("start_date") or current_role.get("starts_at") or current_role.get("start")
-    )
-    current_end = _parse_role_date(
-        current_role.get("end_date") or current_role.get("ends_at") or current_role.get("end"),
-        default_current=True,
-    )
-    current_job_months = _months_between(current_start, current_end) or _role_duration_months(current_role)
+    current_job_months = _role_date_duration_months(current_role, default_current=True) or _role_duration_months(current_role)
     candidate_city = _city_from_location(context.get("candidate.city"))
     if candidate_city:
         cities.add(candidate_city)
@@ -1004,6 +1057,71 @@ def _prompt_has_any(prompt: str, terms: Sequence[str]) -> bool:
     return any(term.lower() in lower for term in terms)
 
 
+COMPANY_ENRICHMENT_PROMPT_TERMS = (
+    "all company",
+    "all companies",
+    "current company",
+    "current employer",
+    "company details",
+    "current company details",
+    "company classification",
+    "company enrichment",
+    "company size",
+    "company website",
+    "employer",
+    "industry",
+    "product/service",
+    "product service",
+    "business model",
+    "customer segment",
+    "segment",
+    "customer presence",
+    "enterprise",
+    "saas",
+    "funding",
+    "revenue",
+    "headquarters",
+    "competitor",
+    "competitors",
+    "data quality",
+)
+
+
+def _prompt_needs_company_enrichment(prompt: str) -> bool:
+    return _prompt_has_any(prompt, COMPANY_ENRICHMENT_PROMPT_TERMS)
+
+
+def _role_value_unknown(value: Any) -> bool:
+    text = stringify_context_value(value).strip()
+    return not text or text.lower() in {"unknown", "n/a", "na", "none", "null", "[]", "{}"}
+
+
+def _role_company_detail_gaps(role: Dict[str, Any]) -> List[str]:
+    gaps: List[str] = []
+    checks = {
+        "industry": role.get("industry") or role.get("source_industry") or role.get("company_details.industry"),
+        "product_service": role.get("product_service") or role.get("company_details.product_service"),
+        "business_model": role.get("business_model") or role.get("company_details.business_model"),
+        "customer_segment": role.get("customer_segment") or role.get("company_details.customer_segment"),
+        "company_website": role.get("source_website") or role.get("website") or role.get("companyWebsite"),
+        "company_size": role.get("source_company_size") or role.get("company_size") or role.get("companySize"),
+    }
+    for key, value in checks.items():
+        if _role_value_unknown(value):
+            gaps.append(key)
+    return gaps
+
+
+def _company_detail_missing_info(roles: Sequence[Dict[str, Any]]) -> List[str]:
+    missing: List[str] = []
+    for role in roles:
+        company = stringify_context_value(role.get("company")) or "Unknown company"
+        gaps = _role_company_detail_gaps(role)
+        if gaps:
+            missing.append(f"{company}: missing {', '.join(gaps)}")
+    return missing
+
+
 def _prompt_terms(prompt: str, taxonomy: Dict[str, Sequence[str]]) -> List[str]:
     lower = (prompt or "").lower()
     found: List[str] = []
@@ -1133,11 +1251,7 @@ def _matched_duration(roles: Sequence[Dict[str, Any]], terms: Sequence[str]) -> 
         role_text = _role_text(role)
         if not any(term.lower() in role_text for term in terms):
             continue
-        months = int(float(role.get("duration_months") or role.get("months") or 0))
-        if not months:
-            start = _parse_role_date(role.get("start_date") or role.get("start"))
-            end = _parse_role_date(role.get("end_date") or role.get("end"), default_current=False)
-            months = _months_between(start, end)
+        months = _role_date_duration_months(role) or _role_duration_months(role)
         total_months += months
         matches.append(
             {
@@ -1151,12 +1265,7 @@ def _matched_duration(roles: Sequence[Dict[str, Any]], terms: Sequence[str]) -> 
 
 
 def _role_months(role: Dict[str, Any]) -> int:
-    months = int(float(role.get("duration_months") or role.get("months") or 0))
-    if months:
-        return months
-    start = _parse_role_date(role.get("start_date") or role.get("start"))
-    end = _parse_role_date(role.get("end_date") or role.get("end"), default_current=False)
-    return _months_between(start, end)
+    return _role_date_duration_months(role) or _role_duration_months(role)
 
 
 def _expanded_geography_terms(term: str) -> List[str]:
@@ -1285,7 +1394,6 @@ def build_query_plan(
         prompt,
         (
             "currently working",
-            "current employer",
             "public",
             "publicly",
             "recent",
@@ -1293,9 +1401,7 @@ def build_query_plan(
             "layoff",
             "website",
             "news",
-            "enterprise",
-            "saas",
-            "employer",
+            *COMPANY_ENRICHMENT_PROMPT_TERMS,
         ),
     )
     if wants_career_metrics:
@@ -1332,13 +1438,40 @@ def build_query_plan(
 
     current_status = ""
     facts = compute_career_facts(context)
+    context_pack = build_candidate_context_pack(context, facts)
+    roles = context_pack.get("roles") or []
+    company_missing_info = (
+        _company_detail_missing_info(roles)
+        if wants_company_verification or _prompt_needs_company_enrichment(prompt)
+        else []
+    )
     if facts:
         current_status = stringify_context_value(facts.get("current_company_enterprise_saas"))
     urls = extract_urls(prompt)
     web_needed = routing.get("data_source") == "web"
     if routing.get("data_source") == "hybrid":
-        web_needed = bool(urls) or _prompt_has_any(prompt, ("public", "latest", "recent", "news", "layoff", "posted"))
-    if current_status == "Needs web verification" and _prompt_has_any(prompt, ("enterprise", "saas", "employer")):
+        web_needed = bool(urls) or _prompt_has_any(
+            prompt,
+            (
+                "public",
+                "latest",
+                "recent",
+                "news",
+                "layoff",
+                "posted",
+                "data quality",
+                "company details",
+                "current company details",
+                "company classification",
+                "product/service",
+                "product service",
+                "business model",
+            ),
+        )
+    if (
+        _prompt_needs_company_enrichment(prompt)
+        and (company_missing_info or current_status == "Needs web verification")
+    ):
         web_needed = True
 
     plan = {
@@ -1348,7 +1481,7 @@ def build_query_plan(
         "web_needed": bool(web_needed),
         "web_policy": "auto_fallback",
         "strictness": "unknown_instead_of_guess",
-        "missing_info": [],
+        "missing_info": company_missing_info,
         "output_fields": [item["key"] for item in normalize_output_schema(output_schema)],
         "routing": routing,
     }
@@ -1575,7 +1708,10 @@ def map_raw_outputs_to_schema_keys(raw: Any, schema_keys: List[str]) -> Dict[str
         nk = normalize_output_key(k)
         if not nk:
             continue
-        s = str(v).strip() if v is not None else ""
+        if isinstance(v, (dict, list)):
+            s = json.dumps(v, ensure_ascii=False, default=str).strip()
+        else:
+            s = str(v).strip() if v is not None else ""
         if not s:
             continue
         prev = by_norm.get(nk)
@@ -1583,7 +1719,11 @@ def map_raw_outputs_to_schema_keys(raw: Any, schema_keys: List[str]) -> Dict[str
             by_norm[nk] = s
     out: Dict[str, str] = {}
     for sk in schema_keys:
-        direct = str(raw.get(sk) or "").strip()
+        direct_value = raw.get(sk)
+        if isinstance(direct_value, (dict, list)):
+            direct = json.dumps(direct_value, ensure_ascii=False, default=str).strip()
+        else:
+            direct = str(direct_value or "").strip()
         if direct:
             out[sk] = direct
             continue

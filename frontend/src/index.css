@@ -325,7 +325,7 @@ body {
   font-size: 32px;
   font-weight: 800;
   color: #0f172a;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
   margin-bottom: 8px;
 }
 
@@ -1726,4 +1726,65 @@ input:checked + .slider:before {
 
 .revalidating {
   animation: revalidate-pulse 2s infinite ease-in-out;
+}
+
+.talent-pool-page {
+  contain: layout paint;
+}
+
+.talent-pool-table-scroll {
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 900px) {
+  .app-sidebar {
+    width: 72px !important;
+  }
+
+  .main-content {
+    margin-left: 72px !important;
+    width: calc(100% - 72px) !important;
+  }
+
+  .talent-pool-page {
+    padding: 12px !important;
+    gap: 12px !important;
+  }
+
+  .talent-pool-page > aside {
+    position: absolute !important;
+    z-index: 20;
+    max-height: calc(100vh - 24px);
+  }
+}
+
+@media (max-width: 560px) {
+  .main-content {
+    margin-left: 0 !important;
+    width: 100% !important;
+  }
+
+  .app-sidebar {
+    transform: translateX(-100%);
+  }
+
+  .talent-pool-page {
+    height: 100svh !important;
+    padding: 8px !important;
+  }
+
+  .talent-pool-table-scroll table {
+    min-width: 1280px !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
