@@ -470,7 +470,7 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
                     "company": "Opentext",
                     "start_date": "2026-01-01",
                     "end_date": "Present",
-                    "location": "Bengaluru, Karnataka India",
+                    "location": "India",
                     "company_details": {
                         "product_service": "Enterprise SaaS software",
                         "customer_segment": ["Enterprise"],
@@ -489,7 +489,7 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
                     "company": "Route Mobile Limited",
                     "start_date": "2022-07-01",
                     "end_date": "2024-03-01",
-                    "location": "Bengaluru, Karnataka India",
+                    "location": "India",
                 },
             ],
         }
@@ -497,6 +497,7 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
     facts = compute_career_facts(context)
     cases = [
         ("How many cities has this person worked in?", "1", ("tenure", "job hopping")),
+        ("How many places has this person worked from?", "2", ("tenure", "job hopping")),
         ("List the cities this person has worked from.", "bengaluru", ("tenure", "job hopping")),
         ("What is the average tenure and current job tenure?", "22", ("city",)),
         ("How many unique companies has this person worked at?", "3", ("tenure",)),
@@ -524,6 +525,11 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
         assert "[object Object]" not in combined
         for forbidden in forbidden_terms:
             assert forbidden.lower() not in primary_output.lower(), prompt
+
+    assert facts["career_city_count"] == 1
+    assert facts["career_cities"] == ["bengaluru"]
+    assert facts["career_location_count"] == 2
+    assert facts["career_locations"] == ["bengaluru", "india"]
 
 
 def test_career_facts_detect_job_hopping_from_company_windows():

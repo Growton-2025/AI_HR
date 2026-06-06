@@ -781,10 +781,21 @@ def _city_from_location(value: Any) -> str:
     return "" if first in non_city_terms else first
 
 
+def _place_from_location(value: Any) -> str:
+    text = stringify_context_value(value)
+    if not text:
+        return ""
+    first = re.split(r"[,|/]", text, maxsplit=1)[0].strip().lower()
+    if not first or first in {"remote", "hybrid", "onsite"}:
+        return ""
+    return first
+
+
 def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     roles = [role for role in _parse_role_context_entries(context) if not _role_is_community_membership(role)]
     companies: Dict[str, Dict[str, Any]] = {}
     cities = set()
+    places = set()
     ae_months = 0
     undated_duration_months = 0
     role_tenures: List[Dict[str, Any]] = []
@@ -831,6 +842,9 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         city = _city_from_location(location)
         if city:
             cities.add(city)
+        place = _place_from_location(location)
+        if place:
+            places.add(place)
         bucket = companies.setdefault(
             normalized_company,
             {"company": company, "months": 0, "intervals": [], "undated_months": 0, "titles": []},
@@ -923,6 +937,9 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     candidate_city = _city_from_location(context.get("candidate.city"))
     if candidate_city:
         cities.add(candidate_city)
+    candidate_place = _place_from_location(context.get("candidate.city") or context.get("candidate.location"))
+    if candidate_place:
+        places.add(candidate_place)
     current_company_enterprise_saas, current_company_evidence = _current_company_enterprise_saas_status(context, current_role)
 
     return {
@@ -947,6 +964,8 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         "ae_experience_years": round(ae_months / 12, 1),
         "career_city_count": len(cities),
         "career_cities": sorted(cities),
+        "career_location_count": len(places),
+        "career_locations": sorted(places),
         "companies": [company["company"] for company in companies.values()],
         "company_tenures": company_tenures,
         "short_company_stints_count": len(short_company_stints),
@@ -1054,7 +1073,19 @@ def _format_tenure_answer(facts: Dict[str, Any]) -> str:
     )
 
 
-def _format_locations_answer(facts: Dict[str, Any]) -> str:
+def _wants_places(prompt: str) -> bool:
+    prompt_l = (prompt or "").lower()
+    return any(term in prompt_l for term in ("place", "places", "location", "locations")) and "city" not in prompt_l
+
+
+def _format_locations_answer(prompt: str, facts: Dict[str, Any]) -> str:
+    if _wants_places(prompt):
+        locations = facts.get("career_locations") or []
+        count = int(facts.get("career_location_count") or 0)
+        if not count:
+            return "No location data found in profile."
+        label = "place/location" if count == 1 else "places/locations"
+        return f"{count} {label}: {_display_list(locations)}."
     cities = facts.get("career_cities") or []
     count = int(facts.get("career_city_count") or 0)
     if not count:
@@ -1136,7 +1167,7 @@ def _intent_specific_answer(prompt: str, facts: Dict[str, Any], intents: Sequenc
     if "stability" in (prompt or "").lower() and ("job_hopping" in ordered or "tenure_metrics" in ordered):
         return _format_stability_answer(facts)
     if "career_locations" in ordered:
-        return _format_locations_answer(facts)
+        return _format_locations_answer(prompt, facts)
     if "tenure_metrics" in ordered:
         return _format_tenure_answer(facts)
     if "company_history" in ordered:
@@ -1188,6 +1219,9 @@ def map_career_facts_to_outputs(
             or ("current" in label and ("tenure" in label or "month" in label or "current_job" in key))
             or ("city" in label and "count" in label)
             or ("cities" in label)
+            or ("location" in label and "count" in label)
+            or ("place" in label and "count" in label)
+            or ("locations" in label or "places" in label)
             or ("company" in label and "count" in label)
             or ("company" in label and ("history" in label or "list" in label))
             or ("role" in label and "history" in label)
@@ -1247,6 +1281,10 @@ def map_career_facts_to_outputs(
             outputs[key] = str(facts.get("career_city_count") or 0)
         elif "cities" in label:
             outputs[key] = ", ".join(facts.get("career_cities") or [])
+        elif ("location" in label or "place" in label) and "count" in label:
+            outputs[key] = str(facts.get("career_location_count") or 0)
+        elif "locations" in label or "places" in label:
+            outputs[key] = ", ".join(facts.get("career_locations") or [])
         elif "company" in label and "count" in label:
             outputs[key] = str(facts.get("unique_company_count") or 0)
         elif "company" in label and ("history" in label or "list" in label):
@@ -1851,6 +1889,8 @@ def run_candidate_query_tools(
         "career_locations": {
             "count": int(facts.get("career_city_count") or 0),
             "cities": facts.get("career_cities") or [],
+            "location_count": int(facts.get("career_location_count") or 0),
+            "locations": facts.get("career_locations") or [],
             "source": "structured_role_history",
         },
         "company_history": {
@@ -2001,6 +2041,12 @@ def default_output_schema(goal: str) -> List[Dict[str, Any]]:
         ]
     if "career_locations" in intents:
         list_first = "list" in goal_l or "which" in goal_l
+        if _wants_places(goal):
+            return [
+                {"key": "career_location_count", "label": "Career Location Count", "type": "text", "primary": not list_first},
+                {"key": "career_locations", "label": "Career Locations", "type": "text", "primary": list_first},
+                {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
+            ]
         return [
             {"key": "career_city_count", "label": "Career City Count", "type": "text", "primary": not list_first},
             {"key": "career_cities", "label": "Career Cities", "type": "text", "primary": list_first},
