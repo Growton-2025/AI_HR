@@ -61,6 +61,22 @@ const EMPTY_AI_RESPONSE_TEXTS = new Set([
   'needs review',
 ]);
 
+export function renderTextWithLinks(text) {
+  if (!text || typeof text !== 'string') return text;
+  const urlRegex = /(https?:\/\/[^\s,]+)/g;
+  const parts = text.split(urlRegex);
+  return parts.map((part, i) => {
+    if (part.match(/^https?:\/\//)) {
+      return (
+        <a key={i} href={part} target="_blank" rel="noreferrer" style={{ color: '#2563eb', textDecoration: 'underline' }}>
+          {part}
+        </a>
+      );
+    }
+    return part;
+  });
+}
+
 function isMeaningfulAiValue(value) {
   const text = String(value ?? '').trim();
   const lower = text.toLowerCase();
@@ -113,21 +129,37 @@ function renderAiValuePart(value, depth = 0) {
     );
   }
   if (typeof actual === 'boolean') return actual ? 'Yes' : 'No';
-  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(actual)}</span>;
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{typeof actual === 'string' ? renderTextWithLinks(actual) : String(actual)}</span>;
 }
 
-export function renderFriendlyAiValue(aiVal) {
+export function formatInlineObject(obj) {
+  if (obj == null) return '—';
+  if (Array.isArray(obj)) {
+    return obj.map(x => typeof x === 'object' ? formatInlineObject(x) : String(x)).join(', ');
+  }
+  if (typeof obj === 'object') {
+    return Object.entries(obj)
+      .map(([k, v]) => `${formatKey(k)}: ${typeof v === 'object' ? formatInlineObject(v) : typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—')}`)
+      .join(' · ');
+  }
+  return String(obj);
+}
+
+export function renderFriendlyAiValue(aiVal, options = {}) {
+  const { inline } = options;
   if (aiVal == null || String(aiVal).trim() === '') {
     return '—';
   }
   const parsed = parseStructuredValue(aiVal);
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    if (inline) return <span style={{ whiteSpace: 'pre-wrap' }}>{formatInlineObject(parsed)}</span>;
     return renderAiValuePart(parsed);
   }
   if (parsed && Array.isArray(parsed)) {
+    if (inline) return <span style={{ whiteSpace: 'pre-wrap' }}>{formatInlineObject(parsed)}</span>;
     return renderAiValuePart(parsed);
   }
-  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(aiVal)}</span>;
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{typeof aiVal === 'string' ? renderTextWithLinks(aiVal) : String(aiVal)}</span>;
 }
 
 export default function AiColumnCellDrawer({ open, loading, detail, title, onClose }) {
@@ -144,13 +176,21 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
   const toolResults = details.tool_results && typeof details.tool_results === 'object' ? details.tool_results : null;
   const searchedAt = details.searched_at || detail?.completed_at || detail?.updated_at;
   const aiCredits = details.ai_credits && typeof details.ai_credits === 'object' ? details.ai_credits : null;
-  const aiCreditsDisplay = aiCredits?.display || details.ai_credits_display || '—';
+  const aiCreditsAreZero = aiCredits
+    && Number(aiCredits.usd || 0) === 0
+    && Number(aiCredits.total_tokens || 0) === 0;
+  const aiCreditsDisplay = aiCreditsAreZero
+    ? 'No AI credits used'
+    : (aiCredits?.display || details.ai_credits_display || '—');
   const aiCreditsMeta = aiCredits
-    ? [
+    ? (aiCreditsAreZero ? [
+        aiCredits.model,
+        'row-only deterministic answer',
+      ] : [
         aiCredits.model,
         Number.isFinite(Number(aiCredits.total_tokens)) ? `${Number(aiCredits.total_tokens).toLocaleString()} tokens` : '',
         aiCredits.usage_payload_type,
-      ].filter(Boolean).join(' · ')
+      ]).filter(Boolean).join(' · ')
     : '';
   const freshnessMeta = [
     details.web_search_tool,
@@ -277,7 +317,7 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
             <div style={sectionStyle}>
               <div style={sectionLabelStyle}>Reasoning</div>
               <div style={{ fontSize: 13, color: '#334155', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-                {details.reasoning || detail.error_message || 'No reasoning captured.'}
+                {renderTextWithLinks(details.reasoning || detail.error_message || 'No reasoning captured.')}
               </div>
             </div>
 

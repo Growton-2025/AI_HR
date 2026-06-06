@@ -497,7 +497,6 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
     facts = compute_career_facts(context)
     cases = [
         ("How many cities has this person worked in?", "1", ("tenure", "job hopping")),
-        ("How many places has this person worked from?", "2", ("tenure", "job hopping")),
         ("Which places did this person work from at each company?", "Opentext: India", ("tenure", "job hopping")),
         ("List the cities this person has worked from.", "bengaluru", ("tenure", "job hopping")),
         ("What is the average tenure and current job tenure?", "22", ("city",)),
@@ -507,9 +506,13 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
         ("What is the current company and current title?", "Account Development Executive at Opentext", ("tenure",)),
         ("How many months of Account Executive experience does this person have?", "0 months", ("tenure breakdown",)),
         ("Has this person worked in SaaS companies?", "SaaS company signal: Yes", ("bengaluru", "tenure")),
-        ("Which geographies or markets has this person handled?", "Bengaluru", ("tenure",)),
         ("Give a short stability summary.", "Stability: Yes", ("[object Object]",)),
         ("Summarize this candidate’s sales experience.", "Sales experience found", ("tenure breakdown",)),
+    ]
+    model_routed_cases = [
+        "How many places has this person worked from?",
+        "Which geographies or markets has this person handled?",
+        "Does this person have APAC geographic experience?",
     ]
 
     for prompt, expected, forbidden_terms in cases:
@@ -526,6 +529,15 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
         assert "[object Object]" not in combined
         for forbidden in forbidden_terms:
             assert forbidden.lower() not in primary_output.lower(), prompt
+
+    for prompt in model_routed_cases:
+        schema = ai_columns_service.default_output_schema(prompt)
+        outputs = map_career_facts_to_outputs(prompt, schema, facts)
+        plan = build_query_plan(prompt, context, schema, classify_ai_column_prompt(prompt))
+
+        assert outputs == {}, prompt
+        assert plan["web_needed"] is False, prompt
+        assert "geography_experience" in plan["tool_calls"] or "career_locations" in plan["tool_calls"]
 
     assert facts["career_city_count"] == 1
     assert facts["career_cities"] == ["bengaluru"]

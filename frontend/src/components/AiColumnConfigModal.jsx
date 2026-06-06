@@ -36,6 +36,7 @@ const inputStyle = {
 
 export default function AiColumnConfigModal({
   selectedIds = new Set(),
+  initialDefinition = null,
   viewScope,
   recruiterFilterId,
   roleId,
@@ -65,6 +66,7 @@ export default function AiColumnConfigModal({
   const [fieldCatalogError, setFieldCatalogError] = useState('');
   const [slashPicker, setSlashPicker] = useState(null);
   const [highlightedFieldIndex, setHighlightedFieldIndex] = useState(0);
+  const isEditMode = Boolean(initialDefinition?.id);
 
   const selectedIdArray = useMemo(
     () => Array.from(selectedIds || []).map(Number).filter(Number.isFinite),
@@ -128,6 +130,35 @@ export default function AiColumnConfigModal({
     }
     return grouped;
   }, [visibleFieldSuggestions]);
+
+  useEffect(() => {
+    if (!initialDefinition?.id) {
+      setPrompt('');
+      setColumnName('');
+      setUseWebSearch(false);
+      setSelectedPresetId('');
+      setOutputSchema(DEFAULT_OUTPUT_SCHEMA);
+      setRequiredFields([]);
+      setContextInputs({ our_product: '', pitch_context: '' });
+      return;
+    }
+
+    setPrompt(initialDefinition.prompt_template || '');
+    setColumnName(initialDefinition.name || '');
+    setUseWebSearch(initialDefinition.mode === 'web_research');
+    setSelectedPresetId('');
+    setOutputSchema(
+      Array.isArray(initialDefinition.output_schema) && initialDefinition.output_schema.length
+        ? initialDefinition.output_schema
+        : DEFAULT_OUTPUT_SCHEMA,
+    );
+    setRequiredFields(Array.isArray(initialDefinition.required_fields) ? initialDefinition.required_fields : []);
+    setContextInputs({
+      our_product: '',
+      pitch_context: '',
+      ...(initialDefinition.context_inputs || {}),
+    });
+  }, [initialDefinition]);
 
   useEffect(() => {
     let cancelled = false;
@@ -346,7 +377,7 @@ export default function AiColumnConfigModal({
 
   const handleRun = async () => {
     if (!selectedCount) {
-      toast.error('Select one or more rows first');
+      toast.error(isEditMode ? 'Select rows first, then save and rerun this smart column.' : 'Select one or more rows first');
       return;
     }
     if (!prompt.trim()) {
@@ -361,28 +392,40 @@ export default function AiColumnConfigModal({
     setRunning(true);
     let definition = null;
     try {
-      const saveRes = await aiColumnAxios.post(`${API_BASE}/ai-columns`, {
+      const nextDefinitionPayload = {
+        ...(isEditMode ? { id: initialDefinition.id } : {}),
         name: resolvedName,
         prompt_template: prompt.trim(),
         mode: useWebSearch ? 'web_research' : 'auto',
         output_schema: outputSchema,
         required_fields: requiredFields,
         only_run_if: {
+          ...(isEditMode && initialDefinition?.only_run_if ? initialDefinition.only_run_if : {}),
           required_fields: requiredFields,
           summary: requiredFields.length ? `Only run rows with ${requiredFields.join(', ')}` : '',
         },
         context_inputs: contextInputs,
         view_scope: viewScope,
         recruiter_filter_id: recruiterFilterId,
+      };
+      const saveRes = await aiColumnAxios.post(`${API_BASE}/ai-columns`, {
+        ...nextDefinitionPayload,
       }, { timeout: AI_RUN_TIMEOUT_MS });
 
-      definition = saveRes.data || {};
+      definition = {
+        ...(isEditMode ? initialDefinition : {}),
+        ...nextDefinitionPayload,
+        ...(saveRes.data || {}),
+        id: saveRes.data?.id || initialDefinition?.id,
+        name: saveRes.data?.name || resolvedName,
+      };
       onColumnDefinitionCreated?.({
         definition,
         columnName: definition.name || resolvedName,
         columnDefinitionId: definition.id,
         candidateIds: selectedIdArray,
         selectionMode: 'selected_ids',
+        isEditMode,
       });
 
       const runRes = await aiColumnAxios.post(`${API_BASE}/ai-columns/run`, {
@@ -396,11 +439,13 @@ export default function AiColumnConfigModal({
 
       toast.success(`Running "${definition.name || resolvedName}" on ${selectedCount} row${selectedCount === 1 ? '' : 's'}`);
       onColumnsCreated?.({
+        definition,
         columnName: definition.name || resolvedName,
         columnDefinitionId: definition.id,
         runId: runRes.data?.run_id,
         candidateIds: selectedIdArray,
         selectionMode: 'selected_ids',
+        isEditMode,
       });
       onClose?.();
     } catch (error) {
@@ -408,6 +453,7 @@ export default function AiColumnConfigModal({
         onColumnRunFailed?.({
           columnDefinitionId: definition.id,
           candidateIds: selectedIdArray,
+          isEditMode,
         });
       }
       toast.error(getRequestErrorMessage(error, 'Failed to start smart column run'));
@@ -459,7 +505,9 @@ export default function AiColumnConfigModal({
                 <HayasaBrand size="compact" tone="dark" iconOnly />
               </div>
               <div>
-                <div style={{ fontSize: 18, fontWeight: 800, color: '#0f172a' }}>Smart Column</div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: '#0f172a' }}>
+                  {isEditMode ? 'Edit Smart Column' : 'Smart Column'}
+                </div>
                 <div style={{ fontSize: 12, color: '#64748b', fontWeight: 700 }}>
                   {selectedCount} selected row{selectedCount === 1 ? '' : 's'}
                 </div>
@@ -741,7 +789,7 @@ export default function AiColumnConfigModal({
               </button>
               <button
                 type="button"
-                disabled={running || !selectedCount || !prompt.trim()}
+                disabled={running || !prompt.trim()}
                 onClick={handleRun}
                 style={{
                   display: 'inline-flex',
@@ -752,14 +800,14 @@ export default function AiColumnConfigModal({
                   background: '#0f172a',
                   color: '#fff',
                   padding: '10px 14px',
-                  cursor: running || !selectedCount || !prompt.trim() ? 'not-allowed' : 'pointer',
+                  cursor: running || !prompt.trim() ? 'not-allowed' : 'pointer',
                   fontWeight: 800,
                   fontSize: 13,
-                  opacity: running || !selectedCount || !prompt.trim() ? 0.55 : 1,
+                  opacity: running || !prompt.trim() ? 0.55 : 1,
                 }}
               >
                 <Play size={14} />
-                {running ? 'Starting...' : `Run ${useWebSearch ? 'with web' : 'without web'}`}
+                {running ? 'Starting...' : (isEditMode ? 'Save & Rerun' : 'Create & Run')}
               </button>
             </div>
           </div>

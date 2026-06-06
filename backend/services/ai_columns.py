@@ -946,6 +946,68 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         cities.add(candidate_city)
     if candidate_place and not places:
         places.add(candidate_place)
+
+    # Deduplicate country/city pairs using context evidence and fallback mapping
+    known_countries = {
+        "india", "united states", "usa", "us", "uk", "united kingdom", "canada",
+        "germany", "france", "australia", "singapore", "japan", "china", "brazil",
+        "mexico", "spain", "italy", "netherlands", "sweden", "norway", "denmark",
+        "finland", "uae", "united arab emirates", "saudi arabia", "south africa",
+        "malaysia", "indonesia", "thailand", "vietnam", "philippines", "hong kong",
+        "new zealand", "ireland", "belgium", "switzerland", "austria", "poland",
+        "turkey", "egypt", "israel", "russia"
+    }
+    city_to_country_fallback = {
+        "bengaluru": "india",
+        "bangalore": "india",
+        "mumbai": "india",
+        "delhi": "india",
+        "noida": "india",
+        "gurgaon": "india",
+        "gurugram": "india",
+        "pune": "india",
+        "hyderabad": "india",
+        "chennai": "india",
+        "kolkata": "india",
+        "ahmedabad": "india",
+        "london": "united kingdom",
+        "san francisco": "united states",
+        "new york": "united states",
+        "singapore": "singapore",
+        "sydney": "australia",
+        "melbourne": "australia",
+        "toronto": "canada",
+        "vancouver": "canada",
+        "dubai": "uae",
+    }
+    evidence_strings = []
+    for k, v in context.items():
+        if k.endswith(".location") or k.endswith(".city") or k.endswith(".headquarters"):
+            val_str = stringify_context_value(v).lower()
+            if val_str:
+                evidence_strings.append(val_str)
+    for role in roles:
+        loc = stringify_context_value(role.get("city") or role.get("location")).lower()
+        if loc:
+            evidence_strings.append(loc)
+    places_to_remove = set()
+    for p1 in places:
+        if p1 in known_countries:
+            for p2 in places:
+                if p1 != p2:
+                    if city_to_country_fallback.get(p2) == p1:
+                        places_to_remove.add(p1)
+                        break
+                    found_together = False
+                    for ev in evidence_strings:
+                        if p1 in ev and p2 in ev:
+                            found_together = True
+                            break
+                    if found_together:
+                        places_to_remove.add(p1)
+                        break
+    places = places - places_to_remove
+
     current_company_enterprise_saas, current_company_evidence = _current_company_enterprise_saas_status(context, current_role)
 
     return {
@@ -972,6 +1034,8 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         "career_cities": sorted(cities),
         "career_location_count": len(places),
         "career_locations": sorted(places),
+        "career_location_raw_places": sorted(places),
+        "career_location_city_evidence": sorted(cities),
         "current_profile_city": candidate_city,
         "current_profile_location": stringify_context_value(context.get("candidate.location") or context.get("candidate.city")),
         "companies": [company["company"] for company in companies.values()],
@@ -1084,6 +1148,15 @@ def _format_tenure_answer(facts: Dict[str, Any]) -> str:
 def _wants_places(prompt: str) -> bool:
     prompt_l = (prompt or "").lower()
     return any(term in prompt_l for term in ("place", "places", "location", "locations")) and "city" not in prompt_l
+
+
+def _needs_model_geography_reasoning(prompt: str, intents: Sequence[str]) -> bool:
+    prompt_l = (prompt or "").lower()
+    if any(term in prompt_l for term in ("each company", "per company", "company wise", "company-wise", "by company")):
+        return False
+    if "geography_experience" in intents:
+        return True
+    return "career_locations" in intents and _wants_places(prompt)
 
 
 def _format_locations_answer(prompt: str, facts: Dict[str, Any]) -> str:
@@ -1226,8 +1299,11 @@ def map_career_facts_to_outputs(
     intents = infer_smart_column_intents(prompt_template, output_schema)
     if not intents or not facts:
         return {}
+    if _needs_model_geography_reasoning(prompt_template, intents):
+        return {}
     asks_thresholded_fit = bool(re.search(r"\b\d+\+?\s*(?:years?|yrs?|months?|mos?)\b", prompt_l))
-    if asks_thresholded_fit and {"function_experience", "segment_experience", "geography_experience"}.issubset(set(intents)):
+    is_evaluation = bool(re.search(r"\b(if|yes|no|mark|qualified|eligible)\b", prompt_l))
+    if asks_thresholded_fit or is_evaluation:
         return {}
 
     # Check if all keys in output_schema can be deterministically satisfied.
@@ -1258,7 +1334,6 @@ def map_career_facts_to_outputs(
             or ("enterprise" in label and "saas" in label)
             or ("job" in label and ("hop" in label or "switch" in label))
             or ("short" in label and "stint" in label)
-            or ("qualified" in label or "qualification" in label or "eligible" in label)
             or ("reasoning" in label)
             or (key in {"result", "summary", "reasoning"} or key.endswith("_reasoning"))
         )
@@ -1267,14 +1342,6 @@ def map_career_facts_to_outputs(
 
     outputs: Dict[str, str] = {}
     yes_no = ""
-    if "10+" in prompt_l or "10 plus" in prompt_l or "minimum 5+" in prompt_l:
-        current_company_ok = facts.get("current_company_enterprise_saas") == "Yes"
-        qualified = (
-            float(facts.get("total_experience_months") or 0) >= 120
-            and float(facts.get("ae_experience_months") or 0) >= 60
-            and (current_company_ok if "enterprise" in prompt_l and "saas" in prompt_l else True)
-        )
-        yes_no = "Yes" if qualified else "No"
 
     summary = (
         f"Average tenure (completed roles): {facts.get('average_tenure_months') or 0} months. "
@@ -1332,8 +1399,6 @@ def map_career_facts_to_outputs(
             outputs[key] = str(facts.get("job_hopping_status") or "Unknown")
         elif "short" in label and "stint" in label:
             outputs[key] = str(facts.get("short_company_stints_count") or 0)
-        elif "qualified" in label or "qualification" in label or "eligible" in label:
-            outputs[key] = yes_no or "Needs web verification"
         elif "reasoning" in label or key.endswith("_reasoning"):
             outputs[key] = summary if "tenure" in label else intent_reason
         elif key == "result":
@@ -1863,7 +1928,6 @@ def build_query_plan(
         and (company_missing_info or current_status == "Needs web verification")
     ):
         web_needed = True
-
     plan = {
         "intent": "Answer a per-candidate Smart Column query from enriched profile context.",
         "needed_data": sorted(set(tool_calls + ["candidate_context_pack"])),
@@ -2071,8 +2135,7 @@ def default_output_schema(goal: str) -> List[Dict[str, Any]]:
         list_first = "list" in goal_l or "which" in goal_l
         if _wants_places(goal):
             return [
-                {"key": "career_location_count", "label": "Career Location Count", "type": "text", "primary": not list_first},
-                {"key": "career_locations", "label": "Career Locations", "type": "text", "primary": list_first},
+                {"key": "result", "label": "Result", "type": "text", "primary": True},
                 {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
             ]
         return [

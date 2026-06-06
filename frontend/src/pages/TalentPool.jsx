@@ -1861,6 +1861,7 @@ export default function TalentPool() {
   const didInitRef = useRef(false);
   const uploadFileRef = useRef(null);
   const talentPoolRequestSeqRef = useRef(0);
+  const tableScrollRef = useRef(null);
   const aiColumnsRequestSeqRef = useRef(0);
   const visibleCandidatesRef = useRef(candidates);
   /** Latest fetchCandidates — avoids admin scope effect re-running when this callback identity changes after each fetch. */
@@ -2209,6 +2210,7 @@ export default function TalentPool() {
     recruiterId: talentPoolRecruiterFilterId,
     focus: focusCandidateIdsKey,
     scopeReady: talentPoolScopeReady,
+    focusStartedAt: tpAiRunFocus?.startedAt || null,
   }), [
     pageSize,
     globalSearch,
@@ -2221,12 +2223,19 @@ export default function TalentPool() {
     talentPoolRecruiterFilterId,
     focusCandidateIdsKey,
     talentPoolScopeReady,
+    tpAiRunFocus?.startedAt,
   ]);
   const talentPoolQueryKey = useMemo(
     () => `${isAiRunFocusActive ? 1 : page}|${talentPoolNonPageQueryKey}`,
     [isAiRunFocusActive, page, talentPoolNonPageQueryKey],
   );
   const displayedCandidates = Array.isArray(candidates) ? candidates : [];
+
+  useEffect(() => {
+    if (isAiRunFocusActive && tableScrollRef.current) {
+      tableScrollRef.current.scrollLeft = 0;
+    }
+  }, [isAiRunFocusActive]);
 
   useEffect(() => {
     if (!loading || displayedCandidates.length) {
@@ -2283,6 +2292,13 @@ export default function TalentPool() {
         candidateIds: isAiRunFocusActive ? focusCandidateIds : [],
       });
 
+      console.log("[DEBUG COMPONENT] fetchCandidates start:", {
+        requestId,
+        isAiRunFocusActive,
+        focusCandidateIds,
+        paramsString
+      });
+
       const cache = useAppStore.getState().talentPoolCache || { data: null, lastParamsString: null };
       const cachedData = cache.lastParamsString === buildTalentPoolQueryKey(paramsString) ? cache.data : null;
       const hasData = !isAiRunFocusActive && visibleCandidatesRef.current.length > 0;
@@ -2296,7 +2312,19 @@ export default function TalentPool() {
 
       const res = await fetchTalentPool(paramsString);
 
+      console.log("[DEBUG COMPONENT] fetchCandidates response resolved:", {
+        requestId,
+        latestRequestId: talentPoolRequestSeqRef.current,
+        success: res.success,
+        stale: res.stale,
+        blocked: res.blocked
+      });
+
       if (requestId !== talentPoolRequestSeqRef.current) {
+        console.log("[DEBUG COMPONENT] fetchCandidates ignoring response due to requestId mismatch:", {
+          requestId,
+          latestRequestId: talentPoolRequestSeqRef.current
+        });
         return;
       }
 
@@ -2467,7 +2495,7 @@ export default function TalentPool() {
   }) || Boolean(talentPoolRoleFilterId);
 
   // ── AI Columns (definition-backed, Clay-style) ───────────────────────────
-  const [aiColumnModal, setAiColumnModal] = useState(false);
+  const [aiColumnModal, setAiColumnModal] = useState(null);
 
   const fetchAiColumns = useCallback(async () => {
     const requestedVisibleIdsKey = aiColumnVisibleIdsKey;
@@ -2787,27 +2815,12 @@ export default function TalentPool() {
     }
   };
 
-  const renameAiColumn = async (definition) => {
-    const nextName = window.prompt('Rename smart column', definition?.name || '');
-    if (!nextName || nextName.trim() === definition?.name) return;
-    try {
-      await longOperationAxios.post(`${API_BASE}/ai-columns`, {
-        id: definition.id,
-        name: nextName.trim(),
-        prompt_template: definition.prompt_template,
-        mode: definition.mode || 'auto',
-        output_schema: definition.output_schema || [],
-        required_fields: definition.required_fields || [],
-        only_run_if: definition.only_run_if || {},
-        context_inputs: definition.context_inputs || {},
-        view_scope: definition.view_scope,
-        recruiter_filter_id: definition.recruiter_filter_id,
-      }, { timeout: 120000 });
-      toast.success('Smart column renamed');
-      void fetchAiColumns();
-    } catch (error) {
-      toast.error(getRequestErrorMessage(error, 'Failed to rename smart column'));
+  const openAiColumnEditor = (definition) => {
+    if (!definition?.id) {
+      toast.error('Invalid smart column id — try refreshing the page');
+      return;
     }
+    setAiColumnModal({ mode: 'edit', definition });
   };
 
   const deleteAiColumn = async (definition) => {
@@ -2879,10 +2892,14 @@ export default function TalentPool() {
 
   const revertOptimisticAiColumn = useCallback((runInfo = {}) => {
     if (!runInfo?.columnDefinitionId) return;
+    if (runInfo.isEditMode) {
+      void fetchAiColumns();
+      return;
+    }
     setAiColumns(prev => (prev || []).filter(col => (
       String(col.id) !== String(runInfo.columnDefinitionId) || !col.__optimistic
     )));
-  }, [setAiColumns]);
+  }, [fetchAiColumns, setAiColumns]);
 
   const rerunAiColumn = async (definition) => {
     const selectedIdArray = Array.from(selectedIds || []);
@@ -3247,7 +3264,7 @@ export default function TalentPool() {
 
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
               <button
-                onClick={() => setAiColumnModal(true)}
+                onClick={() => setAiColumnModal({ mode: 'create' })}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: 7,
                   padding: '8px 16px', borderRadius: 12,
@@ -3460,7 +3477,7 @@ export default function TalentPool() {
           )}
 
           {/* Table */}
-          <div className="talent-pool-table-scroll" style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
+          <div ref={tableScrollRef} className="talent-pool-table-scroll" style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 2000 }}>
               <thead>
                 <tr style={{ background: 'rgba(248,250,252,0.98)', borderBottom: `1px solid ${surfaceBorder}`, position: 'sticky', top: 0, zIndex: 10 }}>
@@ -3503,10 +3520,10 @@ export default function TalentPool() {
                                   type="button"
                                   onClick={(event) => {
                                     event.stopPropagation();
-                                    renameAiColumn(col.definition);
+                                    openAiColumnEditor(col.definition);
                                   }}
                                   style={{ width: 24, height: 24, borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', color: '#64748b', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
-                                  title="Rename smart column"
+                                  title="Edit smart column"
                                 >
                                   <Edit2 size={11} />
                                 </button>
@@ -3759,6 +3776,7 @@ export default function TalentPool() {
                       const aiVal = resolveAiCellValue(cell, col.outputKey, col.isPrimaryOutput);
                       const st = cell?.status;
                       const aiCreditsDisplay = cell?.ai_credits_display || '';
+                      const showAiCreditsDisplay = aiCreditsDisplay && aiCreditsDisplay !== '$0.000000';
                       const isEmpty =
                         !aiVal && st !== 'running' && st !== 'queued';
                       return (
@@ -3810,19 +3828,20 @@ export default function TalentPool() {
                               flexDirection: 'column',
                               gap: 6,
                             }}>
-                              <div style={{
-                                display: '-webkit-box',
-                                WebkitLineClamp: 4,
-                                WebkitBoxOrient: 'vertical',
-                                overflow: 'hidden',
-                              }}>
-                                {renderFriendlyAiValue(aiVal)}
-                              </div>
+                                <div style={{
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 4,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflow: 'hidden',
+                                }}>
+                                  {renderFriendlyAiValue(aiVal, { inline: true })}
+                                </div>
                               <div style={{
                                 display: 'flex',
                                 alignItems: 'center',
                                 justifyContent: 'space-between',
                                 gap: 8,
+                                flexWrap: 'wrap',
                               }}>
                                 <span style={{
                                   fontSize: 10,
@@ -3830,19 +3849,46 @@ export default function TalentPool() {
                                   fontWeight: 800,
                                   textTransform: 'uppercase',
                                   letterSpacing: '0.06em',
+                                  whiteSpace: 'nowrap',
                                 }}>
                                   Click for full answer
                                 </span>
-                                {aiCreditsDisplay && (
-                                  <span style={{
-                                    fontSize: 10,
-                                    color: '#0f766e',
-                                    fontWeight: 800,
-                                    whiteSpace: 'nowrap',
-                                  }}>
-                                    {aiCreditsDisplay}
-                                  </span>
-                                )}
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, justifyContent: 'flex-end' }}>
+                                  {Array.isArray(cell?.details?.sources) && cell.details.sources.filter(s => s.url).length > 0 && (
+                                    <a
+                                      href={cell.details.sources.find(s => s.url).url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      onClick={e => e.stopPropagation()}
+                                      title={cell.details.sources.filter(s => s.url).length > 1 ? `Plus ${cell.details.sources.filter(s => s.url).length - 1} more sources` : ''}
+                                      style={{
+                                        fontSize: 10,
+                                        color: '#2563eb',
+                                        textDecoration: 'none',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 3,
+                                        background: '#dbeafe',
+                                        padding: '2px 6px',
+                                        borderRadius: 6,
+                                        fontWeight: 700,
+                                        whiteSpace: 'nowrap'
+                                      }}
+                                    >
+                                      <ExternalLink size={10} /> Source
+                                    </a>
+                                  )}
+                                  {showAiCreditsDisplay && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      color: '#0f766e',
+                                      fontWeight: 800,
+                                      whiteSpace: 'nowrap',
+                                    }}>
+                                      {aiCreditsDisplay}
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             </div>
                           )}
@@ -4070,10 +4116,11 @@ export default function TalentPool() {
       {aiColumnModal && (
         <AiColumnConfigModal
           selectedIds={selectedIds}
+          initialDefinition={aiColumnModal?.mode === 'edit' ? aiColumnModal.definition : null}
           viewScope={talentPoolViewScope}
           recruiterFilterId={talentPoolRecruiterFilterId}
           roleId={talentPoolRoleFilterId}
-          onClose={() => setAiColumnModal(false)}
+          onClose={() => setAiColumnModal(null)}
           onColumnDefinitionCreated={(runInfo) => {
             upsertOptimisticAiColumn(runInfo);
           }}
@@ -4088,7 +4135,7 @@ export default function TalentPool() {
               columnName: runInfo?.columnName,
               candidateIds: runInfo?.candidateIds,
             });
-            setAiColumnModal(false);
+            setAiColumnModal(null);
             void fetchAiColumns();
           }}
         />

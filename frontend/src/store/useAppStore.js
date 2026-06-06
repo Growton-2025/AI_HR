@@ -1402,6 +1402,7 @@ export const useAppStore = create(persist((set, get) => ({
     },
 
     startTpAiRunFocus: (payload = {}) => {
+        console.log("[DEBUG STORE] startTpAiRunFocus payload:", payload)
         const state = get()
         const candidateIds = Array.isArray(payload.candidateIds)
             ? [...new Set(payload.candidateIds.map(Number).filter(Number.isFinite))]
@@ -1435,6 +1436,7 @@ export const useAppStore = create(persist((set, get) => ({
             talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
             talentPoolRequest: null,
             talentPoolRequestParamsString: '',
+            talentPoolRequestSeq: (state.talentPoolRequestSeq || 0) + 1,
         })
     },
 
@@ -1613,13 +1615,17 @@ export const useAppStore = create(persist((set, get) => ({
         const cache = state.talentPoolCache || { data: null, lastParamsString: null, lastFetchedAt: 0 }
         const fullParams = get().buildTalentPoolQueryKey(paramsString)
 
+        console.log("[DEBUG STORE] fetchTalentPool start:", { paramsString, fullParams, force })
+
         if (!force && state.talentPoolRequest && state.talentPoolRequestParamsString === fullParams) {
+            console.log("[DEBUG STORE] fetchTalentPool returning ongoing request for", fullParams)
             return state.talentPoolRequest
         }
 
         // SWR Implementation: If we have cached data for these identical params, return it immediately.
         // This makes navigation back to Talent Pool feel instantaneous.
         if (!force && cache.lastParamsString === fullParams && cache.data) {
+            console.log("[DEBUG STORE] fetchTalentPool SWR cache HIT for", fullParams)
             const d = cache.data;
             const incomingHasRows = (d.candidates || []).length > 0 || Number(d.total || 0) > 0
             const currentHasRows = (state.tpCandidates || []).length > 0 || Number(state.tpTotal || 0) > 0
@@ -1637,14 +1643,21 @@ export const useAppStore = create(persist((set, get) => ({
         }
 
         const requestSeq = (state.talentPoolRequestSeq || 0) + 1
+        console.log("[DEBUG STORE] fetchTalentPool dispatching requestSeq:", requestSeq, "for fullParams:", fullParams)
         const request = axios.get(`${API_BASE}/candidates/browse?${fullParams}`)
             .then(res => {
                 const d = res.data;
                 const latestState = get()
-                if (
-                    latestState.talentPoolRequestSeq === requestSeq &&
-                    latestState.talentPoolRequestParamsString === fullParams
-                ) {
+                const matches = latestState.talentPoolRequestSeq === requestSeq &&
+                    latestState.talentPoolRequestParamsString === fullParams;
+                console.log("[DEBUG STORE] fetchTalentPool promise resolved for requestSeq:", requestSeq, {
+                    matches,
+                    latestRequestSeq: latestState.talentPoolRequestSeq,
+                    latestRequestParamsString: latestState.talentPoolRequestParamsString,
+                    candidatesCount: (d.candidates || []).length,
+                    total: d.total
+                })
+                if (matches) {
                     set({
                         tpCandidates: d.candidates || [],
                         tpTotal: d.total || 0,
@@ -1663,6 +1676,11 @@ export const useAppStore = create(persist((set, get) => ({
                 const isLatestRequest =
                     latestState.talentPoolRequestSeq === requestSeq &&
                     latestState.talentPoolRequestParamsString === fullParams
+                console.log("[DEBUG STORE] fetchTalentPool promise rejected for requestSeq:", requestSeq, {
+                    isLatestRequest,
+                    latestRequestSeq: latestState.talentPoolRequestSeq,
+                    latestRequestParamsString: latestState.talentPoolRequestParamsString
+                })
                 if (!isLatestRequest) {
                     return { success: false, stale: true, error: 'Ignored stale talent pool request' }
                 }

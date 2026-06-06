@@ -1213,7 +1213,16 @@ def _run_ai_task(
         "AE experience, or city count from the raw role dates yourself — "
         "your manual arithmetic on month-only LinkedIn dates will always be off by at least one month per role. "
         "If the deterministic facts section is absent, return Unknown for any tenure or experience output. "
-        "Never invent missing data; return Unknown or Needs verification when evidence is insufficient."
+        "Never invent missing data; return Unknown or Needs verification when evidence is insufficient. "
+        "GEOGRAPHY RULE — LOCATION DEDUPLICATION: "
+        "You have complete world geography knowledge covering every country, state, city, and town. "
+        "When a candidate's role locations include both a city AND its parent country "
+        "(e.g., 'Bengaluru' AND 'India', or 'Mumbai' AND 'India', or 'London' AND 'UK'), "
+        "these are NOT two separate locations — the city is already inside the country. "
+        "Count and report them as ONE unique location (use the more specific city name). "
+        "Apply this deduplication for any city-country or city-state pair you recognize from "
+        "your world geography knowledge before reporting location counts or lists. "
+        "Similarly, treat 'Bengaluru' and 'Bangalore' as the same city (alternate spelling)."
     )
     content_first_system_prompt = (
         f"{system_prompt} "
@@ -1356,6 +1365,19 @@ def _run_ai_task(
         reasoning_text = deterministic_reasoning
     elif not reasoning_text and fallback_text:
         reasoning_text = fallback_text
+
+    if sources:
+        url_list = []
+        for s in sources:
+            if isinstance(s, dict):
+                url = str(s.get("url") or "").strip()
+                if url and url not in url_list:
+                    url_list.append(url)
+        if url_list:
+            urls_str = "\n\nSources: " + ", ".join(url_list)
+            if urls_str not in reasoning_text:
+                reasoning_text += urls_str
+
     ai_credits = _combine_ai_credits(model_call_credits)
     details = {
         "response": primary_output,
