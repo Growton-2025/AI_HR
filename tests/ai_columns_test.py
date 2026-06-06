@@ -498,6 +498,7 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
     cases = [
         ("How many cities has this person worked in?", "1", ("tenure", "job hopping")),
         ("How many places has this person worked from?", "2", ("tenure", "job hopping")),
+        ("Which places did this person work from at each company?", "Opentext: India", ("tenure", "job hopping")),
         ("List the cities this person has worked from.", "bengaluru", ("tenure", "job hopping")),
         ("What is the average tenure and current job tenure?", "22", ("city",)),
         ("How many unique companies has this person worked at?", "3", ("tenure",)),
@@ -530,6 +531,39 @@ def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
     assert facts["career_cities"] == ["bengaluru"]
     assert facts["career_location_count"] == 2
     assert facts["career_locations"] == ["bengaluru", "india"]
+    assert facts["current_profile_location"] == "Bengaluru, Karnataka India"
+
+
+def test_career_locations_do_not_count_current_profile_city_as_work_location():
+    context = build_candidate_context(
+        {
+            "id": 11857,
+            "name": "Different Current City",
+            "location": "Mumbai, Maharashtra India",
+            "roles": [
+                {
+                    "title": "Account Executive",
+                    "company": "Alpha SaaS",
+                    "start_date": "2024-01",
+                    "end_date": "Present",
+                    "location": "Delhi, India",
+                },
+                {
+                    "title": "SDR",
+                    "company": "Beta SaaS",
+                    "start_date": "2022-01",
+                    "end_date": "2023-12",
+                    "location": "Bengaluru, India",
+                },
+            ],
+        }
+    )
+    facts = compute_career_facts(context)
+
+    assert facts["career_cities"] == ["bengaluru", "delhi"]
+    assert facts["career_city_count"] == 2
+    assert facts["current_profile_city"] == "mumbai"
+    assert "mumbai" not in facts["career_cities"]
 
 
 def test_career_facts_detect_job_hopping_from_company_windows():

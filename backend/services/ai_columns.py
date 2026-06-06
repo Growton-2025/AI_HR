@@ -829,20 +829,23 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         months = _months_between(start, end) or _role_duration_months(role)
         title = stringify_context_value(role.get("title"))
         location = stringify_context_value(role.get("city") or role.get("location"))
+        city = _city_from_location(location)
+        place = _place_from_location(location)
         role_tenures.append(
             {
                 "company": company,
                 "title": title,
+                "location": location,
+                "city": city,
+                "place": place,
                 "start_date": start.date().isoformat() if start else "",
                 "end_date": end.date().isoformat() if end else "",
                 "months": months,
                 "years": round(months / 12, 2) if months else 0,
             }
         )
-        city = _city_from_location(location)
         if city:
             cities.add(city)
-        place = _place_from_location(location)
         if place:
             places.add(place)
         bucket = companies.setdefault(
@@ -934,11 +937,14 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         )
 
     current_job_months = _role_date_duration_months(current_role, default_current=True) or _role_duration_months(current_role)
-    candidate_city = _city_from_location(context.get("candidate.city"))
-    if candidate_city:
-        cities.add(candidate_city)
+    candidate_city = _city_from_location(context.get("candidate.city") or context.get("candidate.location"))
     candidate_place = _place_from_location(context.get("candidate.city") or context.get("candidate.location"))
-    if candidate_place:
+    # Candidate profile location is the person's current/base location, not
+    # necessarily a role work location. Use it only as a fallback when role
+    # history carries no location signal at all.
+    if candidate_city and not cities:
+        cities.add(candidate_city)
+    if candidate_place and not places:
         places.add(candidate_place)
     current_company_enterprise_saas, current_company_evidence = _current_company_enterprise_saas_status(context, current_role)
 
@@ -966,6 +972,8 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
         "career_cities": sorted(cities),
         "career_location_count": len(places),
         "career_locations": sorted(places),
+        "current_profile_city": candidate_city,
+        "current_profile_location": stringify_context_value(context.get("candidate.location") or context.get("candidate.city")),
         "companies": [company["company"] for company in companies.values()],
         "company_tenures": company_tenures,
         "short_company_stints_count": len(short_company_stints),
@@ -1079,6 +1087,21 @@ def _wants_places(prompt: str) -> bool:
 
 
 def _format_locations_answer(prompt: str, facts: Dict[str, Any]) -> str:
+    prompt_l = (prompt or "").lower()
+    if any(term in prompt_l for term in ("each company", "per company", "company wise", "company-wise", "by company")):
+        rows = []
+        seen = set()
+        for role in facts.get("role_tenures") or []:
+            company = stringify_context_value(role.get("company")) or "Unknown company"
+            place = stringify_context_value(role.get("place") or role.get("city") or role.get("location")) or "No location data"
+            key = (_normalize_company_name(company), place.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(f"{company}: {place.title() if place != 'No location data' else place}")
+        if rows:
+            return "Company locations: " + "; ".join(rows) + "."
+        return "No company-level location data found in profile."
     if _wants_places(prompt):
         locations = facts.get("career_locations") or []
         count = int(facts.get("career_location_count") or 0)
@@ -2040,6 +2063,11 @@ def default_output_schema(goal: str) -> List[Dict[str, Any]]:
             {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
         ]
     if "career_locations" in intents:
+        if any(term in goal_l for term in ("each company", "per company", "company wise", "company-wise", "by company")):
+            return [
+                {"key": "result", "label": "Result", "type": "text", "primary": True},
+                {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
+            ]
         list_first = "list" in goal_l or "which" in goal_l
         if _wants_places(goal):
             return [
