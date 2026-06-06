@@ -451,6 +451,81 @@ def test_career_facts_marks_enterprise_saas_ae_qualification():
     assert outputs["current_enterprise_saas"] == "Yes"
 
 
+def test_abhijit_singh_same_person_intent_regressions(monkeypatch):
+    class FrozenDateTime(ai_columns_service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 6, tzinfo=tz)
+
+    monkeypatch.setattr(ai_columns_service, "datetime", FrozenDateTime)
+    context = build_candidate_context(
+        {
+            "id": 11856,
+            "name": "ABHIJIT SINGH",
+            "location": "Bengaluru, Karnataka India",
+            "headline": "Enterprise Account Development Executive at OpenText India | Founding Team | Ex - Salesforce",
+            "roles": [
+                {
+                    "title": "Account Development Executive",
+                    "company": "Opentext",
+                    "start_date": "2026-01-01",
+                    "end_date": "Present",
+                    "location": "Bengaluru, Karnataka India",
+                    "company_details": {
+                        "product_service": "Enterprise SaaS software",
+                        "customer_segment": ["Enterprise"],
+                        "business_model": "B2B subscription",
+                    },
+                },
+                {
+                    "title": "",
+                    "company": "Salesforce",
+                    "start_date": "2024-03-01",
+                    "end_date": "2025-12-01",
+                    "location": "Bengaluru, Karnataka India",
+                },
+                {
+                    "title": "Business Manager",
+                    "company": "Route Mobile Limited",
+                    "start_date": "2022-07-01",
+                    "end_date": "2024-03-01",
+                    "location": "Bengaluru, Karnataka India",
+                },
+            ],
+        }
+    )
+    facts = compute_career_facts(context)
+    cases = [
+        ("How many cities has this person worked in?", "1", ("tenure", "job hopping")),
+        ("List the cities this person has worked from.", "bengaluru", ("tenure", "job hopping")),
+        ("What is the average tenure and current job tenure?", "22", ("city",)),
+        ("How many unique companies has this person worked at?", "3", ("tenure",)),
+        ("List the companies in career order.", "Opentext, Salesforce, Route Mobile Limited", ("tenure",)),
+        ("Does this person show job hopping?", "Job hopping: Yes", ("city",)),
+        ("What is the current company and current title?", "Account Development Executive at Opentext", ("tenure",)),
+        ("How many months of Account Executive experience does this person have?", "0 months", ("tenure breakdown",)),
+        ("Has this person worked in SaaS companies?", "SaaS company signal: Yes", ("bengaluru", "tenure")),
+        ("Which geographies or markets has this person handled?", "Bengaluru", ("tenure",)),
+        ("Give a short stability summary.", "Stability: Yes", ("[object Object]",)),
+        ("Summarize this candidate’s sales experience.", "Sales experience found", ("tenure breakdown",)),
+    ]
+
+    for prompt, expected, forbidden_terms in cases:
+        schema = ai_columns_service.default_output_schema(prompt)
+        outputs = map_career_facts_to_outputs(prompt, schema, facts)
+        plan = build_query_plan(prompt, context, schema, classify_ai_column_prompt(prompt))
+        primary_key = next((item["key"] for item in schema if item.get("primary")), schema[0]["key"])
+        primary_output = outputs.get(primary_key, "")
+
+        assert outputs, prompt
+        assert expected.lower() in primary_output.lower(), prompt
+        assert plan["web_needed"] is False, prompt
+        combined = ai_columns_service.stringify_context_value(outputs)
+        assert "[object Object]" not in combined
+        for forbidden in forbidden_terms:
+            assert forbidden.lower() not in primary_output.lower(), prompt
+
+
 def test_career_facts_detect_job_hopping_from_company_windows():
     profile = {
         "id": 5,
@@ -1393,7 +1468,7 @@ def test_web_json_call_uses_ga_search_and_stamps_freshness(monkeypatch):
 
     result = ai_columns._call_openai_for_json("system", "user", use_web=True)
 
-    assert captured["model"] == "gpt-4o-mini"
+    assert captured["model"] == ai_columns._AI_COLUMN_OPENAI_MODEL
     assert captured["tools"][0]["type"] == "web_search"
     assert captured["tools"][0]["search_context_size"] == "high"
     assert "Today is 2026-05-23" in captured["input"]

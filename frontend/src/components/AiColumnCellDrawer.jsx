@@ -76,50 +76,56 @@ function resolveDrawerResponse(detail, details, outputs) {
   return detail ? 'No' : '';
 }
 
+function renderAiValuePart(value, depth = 0) {
+  if (value == null || String(value).trim() === '') return '—';
+  const parsed = parseStructuredValue(value);
+  const actual = parsed ?? value;
+  if (Array.isArray(actual)) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+        {actual.map((item, idx) => (
+          <div key={idx} style={{
+            padding: '5px 8px',
+            borderRadius: 8,
+            background: depth ? '#f8fafc' : 'rgba(99, 102, 241, 0.06)',
+            border: '1px solid #e2e8f0',
+          }}>
+            {renderAiValuePart(item, depth + 1)}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (actual && typeof actual === 'object') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+        {Object.entries(actual).map(([k, v]) => (
+          <div key={k} style={{ fontSize: depth ? 12 : 13, lineHeight: 1.5, color: '#334155' }}>
+            <span style={{ fontWeight: 700, color: '#1e293b' }}>{formatKey(k)}:</span>{' '}
+            {typeof v === 'object' && v !== null ? (
+              <div style={{ marginTop: 4 }}>{renderAiValuePart(v, depth + 1)}</div>
+            ) : (
+              <span style={{ color: '#475569' }}>{typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—')}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (typeof actual === 'boolean') return actual ? 'Yes' : 'No';
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(actual)}</span>;
+}
+
 export function renderFriendlyAiValue(aiVal) {
   if (aiVal == null || String(aiVal).trim() === '') {
     return '—';
   }
   const parsed = parseStructuredValue(aiVal);
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
-        {Object.entries(parsed).map(([k, v]) => {
-          const formattedKey = formatKey(k);
-          const formattedValue = typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—');
-          return (
-            <div key={k} style={{ fontSize: '12px', lineHeight: 1.4, color: '#334155' }}>
-              <span style={{ fontWeight: 700, color: '#1e293b' }}>{formattedKey}:</span>{' '}
-              <span style={{ color: '#475569' }}>{formattedValue}</span>
-            </div>
-          );
-        })}
-      </div>
-    );
+    return renderAiValuePart(parsed);
   }
   if (parsed && Array.isArray(parsed)) {
-    return (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: '100%', marginTop: 2 }}>
-        {parsed.map((item, idx) => (
-          <span
-            key={idx}
-            style={{
-              display: 'inline-block',
-              padding: '2px 8px',
-              borderRadius: 6,
-              background: 'rgba(99, 102, 241, 0.06)',
-              color: '#4f46e5',
-              fontSize: '11px',
-              fontWeight: 700,
-              border: '1px solid rgba(99, 102, 241, 0.12)',
-              whiteSpace: 'nowrap'
-            }}
-          >
-            {String(item)}
-          </span>
-        ))}
-      </div>
-    );
+    return renderAiValuePart(parsed);
   }
   return <span style={{ whiteSpace: 'pre-wrap' }}>{String(aiVal)}</span>;
 }

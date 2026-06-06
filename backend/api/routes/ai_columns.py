@@ -31,6 +31,7 @@ from backend.services.ai_columns import (
     extract_prompt_tokens,
     fill_prompt_template,
     get_profiles_for_scope,
+    infer_smart_column_intents,
     labelize_key,
     map_raw_outputs_to_schema_keys,
     map_career_facts_to_outputs,
@@ -475,6 +476,18 @@ def _primary_ai_output(values: Dict[str, Any], primary_key: str) -> str:
         if _is_meaningful_ai_output(text):
             return text
     return "No"
+
+
+def _outputs_conflict_with_intent(prompt: str, outputs: Dict[str, Any], schema: List[Dict[str, Any]]) -> bool:
+    intents = infer_smart_column_intents(prompt, schema)
+    output_text = " ".join(_stringify_ai_output(value) for value in (outputs or {}).values()).lower()
+    if "[object object]" in output_text:
+        return True
+    if "career_locations" in intents and "tenure_metrics" not in intents:
+        return any(term in output_text for term in ("tenure", "current job tenure", "average tenure", "job hopping"))
+    if "tenure_metrics" in intents and "career_locations" not in intents:
+        return " city" in output_text and "tenure" not in output_text
+    return False
 
 
 def _slugify(name: str) -> str:
@@ -1283,6 +1296,13 @@ def _run_ai_task(
         career_outputs=career_outputs,
         has_tool_context=bool(tool_results),
     )
+    if career_outputs and _outputs_conflict_with_intent(rendered_prompt or prompt_template, normalized_values, normalized_outputs):
+        normalized_values = {
+            item["key"]: str(career_outputs.get(item["key"]) or "").strip()
+            for item in normalized_outputs
+        }
+        deterministic_career_fallback = True
+        fallback_text = ""
     if deterministic_career_fallback:
         data_source = "row"
         web_required_reason = ""

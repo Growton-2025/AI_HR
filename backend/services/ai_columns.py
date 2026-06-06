@@ -88,6 +88,21 @@ COLUMN_CONTEXT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
 
 TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
 URL_PATTERN = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
+
+SMART_COLUMN_TOOL_INTENTS: Sequence[str] = (
+    "career_locations",
+    "tenure_metrics",
+    "company_history",
+    "role_history",
+    "job_hopping",
+    "current_role",
+    "experience_summary",
+    "function_experience",
+    "industry_experience",
+    "segment_experience",
+    "geography_experience",
+    "company_verification",
+)
 MAX_IMPORTED_FIELDS = 120
 COMMUNITY_MEMBERSHIP_TERMS = (
     "revgenuis",
@@ -350,6 +365,66 @@ def stringify_context_value(value: Any) -> str:
 
 def extract_urls(text: str) -> List[str]:
     return [match.group(0).rstrip(".,;") for match in URL_PATTERN.finditer(text or "")]
+
+
+def _intent_text(prompt_template: str, output_schema: Optional[Sequence[Dict[str, Any]]] = None) -> str:
+    parts = [prompt_template or ""]
+    for item in output_schema or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("key") or ""))
+            parts.append(str(item.get("label") or ""))
+    return " ".join(parts).lower()
+
+
+def _text_has_any(text: str, terms: Sequence[str]) -> bool:
+    return any(term in text for term in terms)
+
+
+def infer_smart_column_intents(
+    prompt_template: str,
+    output_schema: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Infer the row/tool capabilities needed for a free-form Smart Column query.
+
+    This is intentionally capability-oriented rather than answer-oriented: it
+    maps arbitrary user wording to stable profile tools, then downstream code
+    formats the answer from the selected tools.
+    """
+    text = _intent_text(prompt_template, output_schema)
+    intents: List[str] = []
+
+    def add(intent: str) -> None:
+        if intent in SMART_COLUMN_TOOL_INTENTS and intent not in intents:
+            intents.append(intent)
+
+    if _text_has_any(text, ("city", "cities", "location", "locations", "worked from", "work from")):
+        add("career_locations")
+    if _text_has_any(text, ("geograph", "region", "regions", "market", "markets", "emea", "apac", "americas", "india", "singapore", "us market")):
+        add("geography_experience")
+    if _text_has_any(text, ("tenure", "stability", "current job", "current role tenure", "time spent", "average stay", "avg stay")):
+        add("tenure_metrics")
+    if _text_has_any(text, ("job hop", "hopper", "hopping", "short stint", "frequent switch", "switching jobs", "stability")):
+        add("job_hopping")
+    if _text_has_any(text, ("unique compan", "company history", "companies worked", "employers", "worked at", "career order", "company count", "list companies")):
+        add("company_history")
+    if _text_has_any(text, ("role history", "roles", "titles", "career path", "career order", "list role", "designation")):
+        add("role_history")
+    if _text_has_any(text, ("current company", "current title", "current employer", "current role", "present company", "present role")):
+        add("current_role")
+    if _text_has_any(text, ("account executive", " ae ", "sales", "sdr", "bdr", "hunting", "farming", "function experience")):
+        add("function_experience")
+    if _text_has_any(text, ("saas", "industry", "industries", "product", "service", "software", "fintech", "it services")):
+        add("industry_experience")
+    if _text_has_any(text, ("enterprise", "smb", "mid market", "mid-market", "segment", "customer segment")):
+        add("segment_experience")
+    if _text_has_any(text, ("company details", "company verification", "business model", "company size", "company website", "funding", "revenue", "competitor", "competitors")):
+        add("company_verification")
+    if _text_has_any(text, ("summarize", "summary", "profile", "candidate", "experience", "background")):
+        add("experience_summary")
+
+    if not intents and _text_has_any(text, ("work", "career", "job")):
+        add("experience_summary")
+    return intents
 
 
 def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
@@ -919,35 +994,186 @@ def career_facts_to_text(facts: Dict[str, Any]) -> str:
     )
 
 
+def _display_list(values: Sequence[Any]) -> str:
+    return ", ".join(
+        stringify_context_value(value).strip().title()
+        for value in values
+        if stringify_context_value(value).strip()
+    )
+
+
+def _ordered_companies(facts: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for role in facts.get("role_tenures") or []:
+        company = stringify_context_value(role.get("company"))
+        norm = _normalize_company_name(company)
+        if company and norm and norm not in seen:
+            out.append(company)
+            seen.add(norm)
+    for company in facts.get("companies") or []:
+        norm = _normalize_company_name(company)
+        if company and norm and norm not in seen:
+            out.append(company)
+            seen.add(norm)
+    return out
+
+
+def _format_role_history(facts: Dict[str, Any], *, limit: int = 6) -> str:
+    roles = facts.get("role_tenures") or []
+    if not roles:
+        return "No role history found in profile."
+    lines = []
+    for role in roles[:limit]:
+        title = stringify_context_value(role.get("title")) or "Unknown title"
+        company = stringify_context_value(role.get("company")) or "Unknown company"
+        start = stringify_context_value(role.get("start_date")) or "?"
+        end = stringify_context_value(role.get("end_date")) or "?"
+        lines.append(f"{title} at {company} ({start} to {end})")
+    return "Career order, current to past: " + "; ".join(lines)
+
+
+def _format_current_role(facts: Dict[str, Any]) -> str:
+    role = (facts.get("role_tenures") or [{}])[0] if facts.get("role_tenures") else {}
+    company = stringify_context_value(facts.get("current_company") or role.get("company"))
+    title = stringify_context_value(role.get("title"))
+    if company and title:
+        return f"Current role: {title} at {company}."
+    if company:
+        return f"Current company: {company}. Current title not found in profile."
+    return "No current role data found in profile."
+
+
+def _format_tenure_answer(facts: Dict[str, Any]) -> str:
+    if not facts.get("role_tenures") and not facts.get("company_tenures"):
+        return "No tenure data found in profile."
+    return (
+        f"Average tenure across completed companies: {facts.get('average_tenure_months') or 0} months. "
+        f"Current job tenure: {facts.get('current_job_months') or 0} months. "
+        f"Overall experience: {facts.get('total_experience_months') or 0} months."
+    )
+
+
+def _format_locations_answer(facts: Dict[str, Any]) -> str:
+    cities = facts.get("career_cities") or []
+    count = int(facts.get("career_city_count") or 0)
+    if not count:
+        return "No city data found in profile."
+    label = "city" if count == 1 else "cities"
+    return f"{count} {label}: {_display_list(cities)}."
+
+
+def _format_company_history_answer(facts: Dict[str, Any]) -> str:
+    companies = _ordered_companies(facts)
+    if not companies:
+        return "No company history found in profile."
+    label = "company" if len(companies) == 1 else "companies"
+    return f"{len(companies)} unique {label}, current to past: {', '.join(companies)}."
+
+
+def _format_job_hopping_answer(facts: Dict[str, Any]) -> str:
+    status = stringify_context_value(facts.get("job_hopping_status") or "Unknown")
+    reason = stringify_context_value(facts.get("job_hopping_reason"))
+    return f"Job hopping: {status}. {reason}".strip()
+
+
+def _format_stability_answer(facts: Dict[str, Any]) -> str:
+    status = stringify_context_value(facts.get("job_hopping_status") or "Unknown")
+    reason = stringify_context_value(facts.get("job_hopping_reason"))
+    return (
+        f"Stability: {status}. "
+        f"Average completed-company tenure: {facts.get('average_tenure_months') or 0} months. "
+        f"Current job tenure: {facts.get('current_job_months') or 0} months. "
+        f"{reason}"
+    ).strip()
+
+
+def _format_function_answer(prompt: str, facts: Dict[str, Any]) -> str:
+    prompt_l = (prompt or "").lower()
+    if "account executive" in prompt_l or " ae " in f" {prompt_l} ":
+        return f"Account Executive experience: {facts.get('ae_experience_months') or 0} months."
+    roles = [
+        role for role in (facts.get("role_tenures") or [])
+        if re.search(r"\b(sales|account|business development|sdr|bdr|executive)\b", stringify_context_value(role.get("title")).lower())
+    ]
+    if roles:
+        return "Sales experience found in roles: " + "; ".join(
+            f"{role.get('title') or 'Unknown title'} at {role.get('company') or 'Unknown company'}"
+            for role in roles[:5]
+        )
+    return "No matching sales/function experience found in profile."
+
+
+def _format_industry_answer(prompt: str, facts: Dict[str, Any]) -> str:
+    if "saas" in (prompt or "").lower():
+        status = stringify_context_value(facts.get("current_company_enterprise_saas") or "Needs web verification")
+        evidence = facts.get("current_company_enterprise_saas_evidence") or []
+        suffix = f" Evidence: {'; '.join(evidence[:3])}." if evidence else ""
+        return f"SaaS company signal: {status}.{suffix}"
+    return "Industry-specific answer needs the profile industry fields or company enrichment."
+
+
+def _format_geography_answer(facts: Dict[str, Any]) -> str:
+    cities = facts.get("career_cities") or []
+    if cities:
+        return f"Geography/location signals from profile: {_display_list(cities)}."
+    return "No geography or market data found in profile."
+
+
+def _format_experience_summary(facts: Dict[str, Any]) -> str:
+    companies = _ordered_companies(facts)
+    current = _format_current_role(facts)
+    return (
+        f"{current} Total experience: {facts.get('total_experience_months') or 0} months "
+        f"across {facts.get('unique_company_count') or len(companies)} companies."
+    )
+
+
+def _intent_specific_answer(prompt: str, facts: Dict[str, Any], intents: Sequence[str]) -> str:
+    if not facts:
+        return "No profile data found for this query."
+    ordered = list(intents or infer_smart_column_intents(prompt))
+    if "stability" in (prompt or "").lower() and ("job_hopping" in ordered or "tenure_metrics" in ordered):
+        return _format_stability_answer(facts)
+    if "career_locations" in ordered:
+        return _format_locations_answer(facts)
+    if "tenure_metrics" in ordered:
+        return _format_tenure_answer(facts)
+    if "company_history" in ordered:
+        return _format_company_history_answer(facts)
+    if "role_history" in ordered:
+        return _format_role_history(facts)
+    if "job_hopping" in ordered:
+        return _format_job_hopping_answer(facts)
+    if "current_role" in ordered:
+        return _format_current_role(facts)
+    if "function_experience" in ordered:
+        return _format_function_answer(prompt, facts)
+    if "industry_experience" in ordered:
+        return _format_industry_answer(prompt, facts)
+    if "geography_experience" in ordered:
+        return _format_geography_answer(facts)
+    if "experience_summary" in ordered:
+        return _format_experience_summary(facts)
+    return "No profile data found for this query."
+
+
+def _intent_specific_reason(prompt: str, intents: Sequence[str]) -> str:
+    names = ", ".join(intents or infer_smart_column_intents(prompt) or ["profile_lookup"])
+    return f"Answered from selected profile tool intent(s): {names}."
+
+
 def map_career_facts_to_outputs(
     prompt_template: str,
     output_schema: Sequence[Dict[str, Any]],
     facts: Dict[str, Any],
 ) -> Dict[str, str]:
     prompt_l = (prompt_template or "").lower()
-    wants_career = any(
-        term in prompt_l
-        for term in (
-            "average tenure",
-            "avg tenure",
-            "stability",
-            "current job",
-            "current role",
-            "completed roles",
-            "time spent",
-            "number of cities",
-            "cities the person has worked",
-            "total years",
-            "overall experience",
-            "unique companies",
-            "job hopping",
-            "job hopper",
-            "hopper",
-            "short stint",
-            "frequent switch",
-        )
-    )
-    if not wants_career or not facts:
+    intents = infer_smart_column_intents(prompt_template, output_schema)
+    if not intents or not facts:
+        return {}
+    asks_thresholded_fit = bool(re.search(r"\b\d+\+?\s*(?:years?|yrs?|months?|mos?)\b", prompt_l))
+    if asks_thresholded_fit and {"function_experience", "segment_experience", "geography_experience"}.issubset(set(intents)):
         return {}
 
     # Check if all keys in output_schema can be deterministically satisfied.
@@ -959,17 +1185,25 @@ def map_career_facts_to_outputs(
         
         is_supported = (
             ("average" in label and "tenure" in label)
-            or ("current" in label and ("job" in label or "tenure" in label or "role" in label))
+            or ("current" in label and ("tenure" in label or "month" in label or "current_job" in key))
             or ("city" in label and "count" in label)
             or ("cities" in label)
             or ("company" in label and "count" in label)
+            or ("company" in label and ("history" in label or "list" in label))
+            or ("role" in label and "history" in label)
+            or key == "current_role"
+            or ("current" in label and ("company" in label or "title" in label))
             or ("total" in label and ("experience" in label or "month" in label))
             or ("ae" in label or "account_executive" in label or "account executive" in label)
+            or ("sales" in label and "experience" in label)
+            or ("saas" in label)
+            or ("geograph" in label or "market" in label or "location" in label)
             or ("enterprise" in label and "saas" in label)
             or ("job" in label and ("hop" in label or "switch" in label))
             or ("short" in label and "stint" in label)
             or ("qualified" in label or "qualification" in label or "eligible" in label)
-            or (key in {"result", "summary", "reasoning"})
+            or ("reasoning" in label)
+            or (key in {"result", "summary", "reasoning"} or key.endswith("_reasoning"))
         )
         if not is_supported:
             return {}  # Abort deterministic mapping; LLM is required!
@@ -999,13 +1233,15 @@ def map_career_facts_to_outputs(
     )
     if yes_no:
         summary += f" Qualification: {yes_no}."
+    intent_answer = _intent_specific_answer(prompt_template, facts, intents)
+    intent_reason = _intent_specific_reason(prompt_template, intents)
 
     for item in normalize_output_schema(output_schema):
         key = item["key"]
         label = f"{key} {item.get('label', '')}".lower()
         if "average" in label and "tenure" in label:
             outputs[key] = str(facts.get("average_tenure_months") or 0)
-        elif "current" in label and ("job" in label or "tenure" in label or "role" in label):
+        elif "current" in label and ("tenure" in label or "month" in label or "current_job" in key):
             outputs[key] = str(facts.get("current_job_months") or 0)
         elif "city" in label and "count" in label:
             outputs[key] = str(facts.get("career_city_count") or 0)
@@ -1013,22 +1249,40 @@ def map_career_facts_to_outputs(
             outputs[key] = ", ".join(facts.get("career_cities") or [])
         elif "company" in label and "count" in label:
             outputs[key] = str(facts.get("unique_company_count") or 0)
+        elif "company" in label and ("history" in label or "list" in label):
+            outputs[key] = ", ".join(_ordered_companies(facts))
+        elif "role" in label and "history" in label:
+            outputs[key] = _format_role_history(facts)
+        elif key == "current_role" or ("current" in label and ("company" in label or "title" in label)):
+            outputs[key] = _format_current_role(facts)
         elif "total" in label and ("experience" in label or "month" in label):
             outputs[key] = str(facts.get("total_experience_months") or 0)
         elif "ae" in label or "account_executive" in label or "account executive" in label:
             outputs[key] = str(facts.get("ae_experience_months") or 0)
+        elif "sales" in label and "experience" in label:
+            outputs[key] = _format_function_answer(prompt_template, facts)
         elif "enterprise" in label and "saas" in label:
             outputs[key] = str(facts.get("current_company_enterprise_saas") or "Needs web verification")
+        elif "saas" in label:
+            outputs[key] = _format_industry_answer(prompt_template, facts)
+        elif "geograph" in label or "market" in label or "location" in label:
+            outputs[key] = _format_geography_answer(facts)
         elif "job" in label and ("hop" in label or "switch" in label):
             outputs[key] = str(facts.get("job_hopping_status") or "Unknown")
         elif "short" in label and "stint" in label:
             outputs[key] = str(facts.get("short_company_stints_count") or 0)
         elif "qualified" in label or "qualification" in label or "eligible" in label:
             outputs[key] = yes_no or "Needs web verification"
-        elif key in {"result", "summary", "reasoning"}:
-            outputs[key] = summary
+        elif "reasoning" in label or key.endswith("_reasoning"):
+            outputs[key] = summary if "tenure" in label else intent_reason
+        elif key == "result":
+            outputs[key] = intent_answer
+        elif key == "summary":
+            outputs[key] = summary if set(intents).issubset({"experience_summary"}) else intent_answer
+        elif key == "reasoning":
+            outputs[key] = intent_reason
         else:
-            outputs[key] = summary
+            outputs[key] = intent_answer
     return outputs
 
 
@@ -1426,6 +1680,7 @@ def build_query_plan(
     prompt = prompt_template or ""
     routing = routing or classify_ai_column_prompt(prompt)
     tool_calls: List[str] = []
+    tool_intents = infer_smart_column_intents(prompt, output_schema)
     wants_career_metrics = _prompt_has_any(
         prompt,
         (
@@ -1458,6 +1713,16 @@ def build_query_plan(
     )
     if wants_career_metrics:
         tool_calls.append("career_metrics")
+    if any(intent in tool_intents for intent in ("career_locations", "tenure_metrics", "company_history", "role_history", "experience_summary", "current_role")):
+        tool_calls.append("career_metrics")
+    if "career_locations" in tool_intents:
+        tool_calls.append("career_locations")
+    if "company_history" in tool_intents:
+        tool_calls.append("company_history")
+    if "role_history" in tool_intents:
+        tool_calls.append("role_history")
+    if "current_role" in tool_intents:
+        tool_calls.append("profile_lookup")
     if _prompt_has_any(
         prompt,
         (
@@ -1473,17 +1738,27 @@ def build_query_plan(
         ),
     ):
         tool_calls.extend(["career_metrics", "job_hopping"])
+    if "job_hopping" in tool_intents:
+        tool_calls.extend(["career_metrics", "job_hopping"])
     if _prompt_terms(prompt, FUNCTION_QUERY_TERMS):
+        tool_calls.append("functional_experience")
+    if "function_experience" in tool_intents:
         tool_calls.append("functional_experience")
     if _prompt_terms(prompt, SEGMENT_QUERY_TERMS):
         tool_calls.append("segment_experience")
+    if "segment_experience" in tool_intents:
+        tool_calls.append("segment_experience")
     if _prompt_terms(prompt, GEOGRAPHY_QUERY_TERMS):
+        tool_calls.append("geography_experience")
+    if "geography_experience" in tool_intents:
         tool_calls.append("geography_experience")
     if _prompt_terms(prompt, INDUSTRY_QUERY_TERMS) or _prompt_has_any(prompt, ("industry", "product", "service")):
         tool_calls.append("industry_experience")
+    if "industry_experience" in tool_intents:
+        tool_calls.append("industry_experience")
     if _prompt_competitor_targets(prompt):
         tool_calls.append("competitor_match")
-    if wants_company_verification:
+    if wants_company_verification or "company_verification" in tool_intents:
         tool_calls.append("company_verification")
     if not tool_calls:
         tool_calls.append("profile_lookup")
@@ -1518,10 +1793,12 @@ def build_query_plan(
                 "product/service",
                 "product service",
                 "business model",
+                "competitor",
+                "competitors",
             ),
         )
     if (
-        _prompt_needs_company_enrichment(prompt)
+        "company_verification" in tool_intents
         and (company_missing_info or current_status == "Needs web verification")
     ):
         web_needed = True
@@ -1535,13 +1812,17 @@ def build_query_plan(
         "strictness": "unknown_instead_of_guess",
         "missing_info": company_missing_info,
         "output_fields": [item["key"] for item in normalize_output_schema(output_schema)],
+        "tool_intents": tool_intents,
         "routing": routing,
     }
     if isinstance(planner_json, dict) and planner_json:
-        for key in ("intent", "needed_data", "tool_calls", "web_needed", "missing_info", "output_fields"):
+        for key in ("intent", "needed_data", "tool_calls", "tool_intents", "web_needed", "missing_info", "output_fields"):
             value = planner_json.get(key)
             if value not in (None, "", []):
-                plan[key] = value
+                if key == "tool_intents" and isinstance(value, list):
+                    plan[key] = [intent for intent in value if intent in SMART_COLUMN_TOOL_INTENTS]
+                else:
+                    plan[key] = value
     return plan
 
 
@@ -1567,6 +1848,19 @@ def run_candidate_query_tools(
         "context_pack": context_pack,
         "career_metrics": facts,
         "current_role": context_pack.get("current_role") or {},
+        "career_locations": {
+            "count": int(facts.get("career_city_count") or 0),
+            "cities": facts.get("career_cities") or [],
+            "source": "structured_role_history",
+        },
+        "company_history": {
+            "count": int(facts.get("unique_company_count") or 0),
+            "companies": facts.get("companies") or [],
+            "company_tenures": facts.get("company_tenures") or [],
+        },
+        "role_history": {
+            "roles": facts.get("role_tenures") or [],
+        },
         "role_specific_tenures": facts.get("role_tenures") or [],
         "company_specific_tenures": {
             _normalize_company_name(item.get("company") or ""): item
@@ -1647,6 +1941,8 @@ def verify_smart_column_outputs(
         unknown_reasons.append("Web-derived answer has no source URL.")
 
     output_text = " ".join(stringify_context_value(v) for v in (outputs or {}).values()).lower()
+    if "[object object]" in output_text:
+        errors.append("Output contains an unserialized object.")
     if "unknown" in output_text or "needs verification" in output_text or "not publicly verifiable" in output_text:
         unknown_reasons.append("Answer contains unknown or unverifiable fields.")
 
@@ -1697,6 +1993,39 @@ def summarize_only_run_if(required_fields: Sequence[str]) -> str:
 
 def default_output_schema(goal: str) -> List[Dict[str, Any]]:
     goal_l = (goal or "").lower()
+    intents = infer_smart_column_intents(goal)
+    if "stability" in goal_l and "summary" in goal_l:
+        return [
+            {"key": "result", "label": "Result", "type": "text", "primary": True},
+            {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
+        ]
+    if "career_locations" in intents:
+        list_first = "list" in goal_l or "which" in goal_l
+        return [
+            {"key": "career_city_count", "label": "Career City Count", "type": "text", "primary": not list_first},
+            {"key": "career_cities", "label": "Career Cities", "type": "text", "primary": list_first},
+            {"key": "reasoning", "label": "Reasoning", "type": "text", "primary": False},
+        ]
+    if "tenure_metrics" in intents:
+        return [
+            {"key": "average_tenure_months", "label": "Average Tenure Months", "type": "text", "primary": True},
+            {"key": "current_job_months", "label": "Current Job Months", "type": "text", "primary": False},
+            {"key": "tenure_reasoning", "label": "Tenure Reasoning", "type": "text", "primary": False},
+        ]
+    if "company_history" in intents:
+        list_first = "list" in goal_l or "career order" in goal_l or "which" in goal_l
+        return [
+            {"key": "company_count", "label": "Company Count", "type": "text", "primary": not list_first},
+            {"key": "company_history", "label": "Company History", "type": "text", "primary": list_first},
+        ]
+    if "role_history" in intents:
+        return [
+            {"key": "role_history", "label": "Role History", "type": "text", "primary": True},
+        ]
+    if "current_role" in intents:
+        return [
+            {"key": "current_role", "label": "Current Role", "type": "text", "primary": True},
+        ]
     if "competitor" in goal_l:
         return [
             {"key": "competitors", "label": "Competitors", "type": "text", "primary": True},

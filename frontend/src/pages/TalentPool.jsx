@@ -74,16 +74,56 @@ function isMeaningfulAiValue(value) {
 function resolveAiCellValue(cell, outputKey, isPrimaryOutput) {
   const outputs = cell?.outputs || {};
   const directOutput = outputs?.[outputKey];
-  if (isMeaningfulAiValue(directOutput)) return String(directOutput).trim();
+  if (isMeaningfulAiValue(directOutput)) return directOutput;
 
   if (isPrimaryOutput && isMeaningfulAiValue(cell?.primary_output)) {
-    return String(cell.primary_output).trim();
+    return cell.primary_output;
   }
 
   const firstOutput = Object.values(outputs).find(isMeaningfulAiValue);
-  if (firstOutput != null) return String(firstOutput).trim();
+  if (firstOutput != null) return firstOutput;
 
   return cell ? 'No' : '';
+}
+
+function renderAiValuePart(value, depth = 0) {
+  if (value == null || String(value).trim() === '') return '—';
+  const parsed = parseStructuredValue(value);
+  const actual = parsed ?? value;
+  if (Array.isArray(actual)) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+        {actual.map((item, idx) => (
+          <div key={idx} style={{
+            padding: '4px 7px',
+            borderRadius: 6,
+            background: depth ? 'rgba(241,245,249,0.8)' : 'rgba(99, 102, 241, 0.06)',
+            border: '1px solid rgba(203,213,225,0.65)',
+          }}>
+            {renderAiValuePart(item, depth + 1)}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (actual && typeof actual === 'object') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, width: '100%' }}>
+        {Object.entries(actual).map(([k, v]) => (
+          <div key={k} style={{ fontSize: depth ? '10.5px' : '11px', lineHeight: 1.45, color: '#334155' }}>
+            <span style={{ fontWeight: 700, color: '#1e293b' }}>{formatKey(k)}:</span>{' '}
+            {typeof v === 'object' && v !== null ? (
+              <div style={{ marginTop: 3 }}>{renderAiValuePart(v, depth + 1)}</div>
+            ) : (
+              <span style={{ color: '#475569' }}>{typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—')}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (typeof actual === 'boolean') return actual ? 'Yes' : 'No';
+  return <span style={{ whiteSpace: 'pre-wrap' }}>{String(actual)}</span>;
 }
 
 export function renderFriendlyAiValue(aiVal) {
@@ -92,44 +132,10 @@ export function renderFriendlyAiValue(aiVal) {
   }
   const parsed = parseStructuredValue(aiVal);
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
-        {Object.entries(parsed).map(([k, v]) => {
-          const formattedKey = formatKey(k);
-          const formattedValue = typeof v === 'boolean' ? (v ? 'Yes' : 'No') : String(v ?? '—');
-          return (
-            <div key={k} style={{ fontSize: '11px', lineHeight: 1.4, color: '#334155' }}>
-              <span style={{ fontWeight: 700, color: '#1e293b' }}>{formattedKey}:</span>{' '}
-              <span style={{ color: '#475569' }}>{formattedValue}</span>
-            </div>
-          );
-        })}
-      </div>
-    );
+    return renderAiValuePart(parsed);
   }
   if (parsed && Array.isArray(parsed)) {
-    return (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, width: '100%', marginTop: 2 }}>
-        {parsed.map((item, idx) => (
-          <span
-            key={idx}
-            style={{
-              display: 'inline-block',
-              padding: '2px 6px',
-              borderRadius: 6,
-              background: 'rgba(99, 102, 241, 0.06)',
-              color: '#4f46e5',
-              fontSize: '10px',
-              fontWeight: 700,
-              border: '1px solid rgba(99, 102, 241, 0.12)',
-              whiteSpace: 'nowrap'
-            }}
-          >
-            {String(item)}
-          </span>
-        ))}
-      </div>
-    );
+    return renderAiValuePart(parsed);
   }
   return <span style={{ whiteSpace: 'pre-wrap' }}>{String(aiVal)}</span>;
 }
