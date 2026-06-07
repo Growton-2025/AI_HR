@@ -397,7 +397,7 @@ def load_all_profiles_from_db():
         )
         candidates_raw = cur.fetchall()
 
-        cur.execute(_ROLES_SELECT_BODY)
+        cur.execute(_ROLES_SELECT_BODY + " ORDER BY r.candidate_id, r.id ASC")
         roles_raw = cur.fetchall()
         roles_by_candidate = _roles_by_candidate_from_roles_raw(roles_raw)
         profiles = _profile_dicts_from_candidates_and_roles(candidates_raw, roles_by_candidate)
@@ -438,6 +438,7 @@ def refresh_profiles_in_cache(candidate_ids: List[int]) -> int:
             _ROLES_SELECT_BODY
             + """
             WHERE r.candidate_id = ANY(%s)
+            ORDER BY r.candidate_id, r.id ASC
         """,
             (ids,),
         )

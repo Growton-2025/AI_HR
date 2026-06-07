@@ -47,28 +47,11 @@ def calculate_candidate_tenure(roles, raw_total_exp):
     """
     # 1. Identify the most recent company (canonical current company)
     most_recent_company = None
-    latest_start = None
-
-    for r in roles:
-        details_text = r.get("details") or ""
-        if details_text.strip().startswith('{'):
-            try:
-                parsed = json.loads(details_text)
-                sd = parse_date(parsed.get("start_date"))
-                if sd:
-                    if latest_start is None or sd > latest_start:
-                        latest_start = sd
-                        most_recent_company = (r.get("company_name") or "").lower().strip()
-            except Exception:
-                pass
-
-    # If no start date was found but we have roles, fall back to the first role's company
-    if not most_recent_company and roles:
-        for r in roles:
-            comp = (r.get("company_name") or "").lower().strip()
-            if comp:
-                most_recent_company = comp
-                break
+    
+    # 1. Identify the most recent company (canonical current company)
+    # The first role is the current role, as inserted by the import pipeline
+    if roles:
+        most_recent_company = (roles[0].get("company_name") or "").lower().strip()
 
     intervals = []
     undated_months = 0
@@ -188,7 +171,8 @@ def main(owner_user_id: int = None, dry_run: bool = False):
                         SELECT id FROM candidates
                         WHERE owner_user_id = %s
                           AND COALESCE(is_archived, FALSE) = FALSE
-                    );
+                    )
+                    ORDER BY r.candidate_id, r.id ASC;
                 """, (owner_user_id,))
             else:
                 cur.execute("""
@@ -198,7 +182,8 @@ def main(owner_user_id: int = None, dry_run: bool = False):
                     WHERE r.candidate_id IN (
                         SELECT id FROM candidates
                         WHERE COALESCE(is_archived, FALSE) = FALSE
-                    );
+                    )
+                    ORDER BY r.candidate_id, r.id ASC;
                 """)
             all_roles = cur.fetchall()
             print(f"Loaded {len(all_roles)} roles.")
