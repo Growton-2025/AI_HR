@@ -283,8 +283,8 @@ def months_between(start: Optional[datetime], end: Optional[datetime]) -> int:
     if end < start:
         return 0
     months = (end.year - start.year) * 12 + (end.month - start.month)
-    if end.day >= start.day:
-        months += 1
+    if end.day < start.day:
+        months -= 1
     return max(months, 0)
 
 
