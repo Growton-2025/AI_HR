@@ -275,7 +275,30 @@ def ensure_candidate_pool_migrations(conn) -> None:
                 "CREATE INDEX IF NOT EXISTS ix_candidates_owner ON candidates (owner_user_id);"
             )
             cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_active_status
+                ON candidates (status)
+                WHERE COALESCE(is_archived, FALSE) = FALSE;
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_candidates_owner_active_status
+                ON candidates (owner_user_id, status)
+                WHERE COALESCE(is_archived, FALSE) = FALSE;
+                """
+            )
+            cur.execute(
                 "CREATE INDEX IF NOT EXISTS ix_candidates_norm_li ON candidates (normalized_linkedin);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ix_recruitment_roles_user ON recruitment_roles (user_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ix_rrc_role_candidate ON recruitment_role_candidates (role_id, candidate_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ix_rrc_candidate ON recruitment_role_candidates (candidate_id);"
             )
             cur.execute(
                 """

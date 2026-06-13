@@ -1,180 +1,318 @@
-import { useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { Linkedin } from 'lucide-react'
+import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
+import { useState, useEffect, useRef } from 'react'
+import { renderTextWithLinks } from './AiColumnCellDrawer'
 
-function SearchResults() {
-    const {
-        searchResults,
-        selectedCandidates,
-        toggleCandidateSelection,
-        candidatePriorities,
-        setCandidatePriority,
-        candidateFeedback,
-        setCandidateFeedback
-    } = useAppStore(useShallow((state) => ({
-        searchResults: state.searchResults,
-        selectedCandidates: state.selectedCandidates,
-        toggleCandidateSelection: state.toggleCandidateSelection,
-        candidatePriorities: state.candidatePriorities,
-        setCandidatePriority: state.setCandidatePriority,
-        candidateFeedback: state.candidateFeedback,
-        setCandidateFeedback: state.setCandidateFeedback,
-    })))
+function formatExperience(value) {
+    const num = Number(value)
+    if (!Number.isFinite(num) || num <= 0) return 'Exp: N/A'
+    const rounded = Number.isInteger(num) ? num : num.toFixed(1)
+    return `Exp: ${rounded} yrs`
+}
 
-    const [expandedSummary, setExpandedSummary] = useState(null)
+function ConfidenceDot({ confidence }) {
+    const color = confidence === 'high' ? '#16a34a' : confidence === 'medium' ? '#d97706' : '#94a3b8'
+    return (
+        <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            fontSize: 11, fontWeight: 700, color, textTransform: 'capitalize',
+        }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: color, display: 'inline-block' }} />
+            {confidence || 'medium'} confidence
+        </span>
+    )
+}
 
-    const priorityOptions = ['--', 'High', 'Medium', 'Low']
+function SourceBadge({ sources }) {
+    const withUrl = (sources || []).filter(s => s && s.url)
+    if (!withUrl.length) return null
+    return (
+        <a
+            href={withUrl[0].url}
+            target="_blank"
+            rel="noreferrer"
+            onClick={e => e.stopPropagation()}
+            title={withUrl.length > 1 ? `Plus ${withUrl.length - 1} more source(s)` : withUrl[0].title || ''}
+            style={{
+                fontSize: 10, color: '#2563eb', textDecoration: 'none',
+                display: 'inline-flex', alignItems: 'center', gap: 3,
+                background: '#dbeafe', padding: '2px 7px', borderRadius: 6,
+                fontWeight: 700, whiteSpace: 'nowrap',
+            }}
+        >
+            <ExternalLink size={10} /> Web source
+        </a>
+    )
+}
 
-    const getPriorityBadge = (priority) => {
-        if (!priority || priority === '--') return null
-        const classes = {
-            'High': 'priority-badge priority-high',
-            'Medium': 'priority-badge priority-medium',
-            'Low': 'priority-badge priority-low'
-        }
-        return <span className={classes[priority]}>{priority}</span>
-    }
+function MatchChips({ matched, missing }) {
+    if (!matched?.length && !missing?.length) return null
+    return (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 8 }}>
+            {(matched || []).map((m, i) => {
+                const label = typeof m === 'string' ? m : (m.criterion && m.value ? `${m.criterion}: ${m.value}` : JSON.stringify(m))
+                return (
+                    <span key={i} style={{
+                        fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 99,
+                        background: '#dcfce7', color: '#166534', border: '1px solid #bbf7d0',
+                    }}>✓ {label}</span>
+                )
+            })}
+            {(missing || []).slice(0, 3).map((m, i) => {
+                const label = typeof m === 'string' ? m : (m.criterion && m.value ? `${m.criterion}: ${m.value}` : JSON.stringify(m))
+                return (
+                    <span key={i} style={{
+                        fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 99,
+                        background: '#fef3c7', color: '#92400e', border: '1px solid #fde68a',
+                    }}>⚠ {label}</span>
+                )
+            })}
+        </div>
+    )
+}
 
-    const getPrioritySelectClass = (priority) => {
-        const classes = {
-            'High': 'priority-select-high',
-            'Medium': 'priority-select-medium',
-            'Low': 'priority-select-low'
-        }
-        return classes[priority] || 'priority-select-default'
-    }
+function CandidateCard({ candidate }) {
+    const [expanded, setExpanded] = useState(false)
+    const { selectedCandidates, toggleCandidateSelection } = useAppStore(
+        useShallow(state => ({ selectedCandidates: state.selectedCandidates, toggleCandidateSelection: state.toggleCandidateSelection }))
+    )
 
-    const selectedCount = Object.keys(selectedCandidates).length
+    const primaryRole = candidate.roles?.[0] || {}
+    const id = candidate.id
+    const isSelected = !!selectedCandidates[id]
+    const title = primaryRole.title || candidate.headline || 'Current role unavailable'
+    const company = primaryRole.company || ''
+    const location = candidate.location || candidate.city || 'Location unavailable'
+
+    // `answer` is the short 1-2 sentence verdict from the LLM (like AI Column primary_output)
+    // `reasoning` is the detailed 2-4 sentence explanation
+    const answer = candidate.answer || candidate.reasoning || candidate.summary || ''
+    const reasoning = candidate.reasoning || ''
+    const hasDetailedReasoning = reasoning && reasoning !== answer && reasoning.length > 30
+    const sources = Array.isArray(candidate.sources) ? candidate.sources : []
+    const score = candidate.match_score
+    const confidence = candidate.confidence || 'medium'
+    const matched = candidate.matched_criteria || []
+    const missing = candidate.missing_criteria || []
+
+    const scoreColor = score > 80 ? { bg: '#e7f6ec', color: '#166534' }
+        : score > 60 ? { bg: '#f7f0e4', color: '#8b6b44' }
+        : { bg: '#edf2f7', color: '#475569' }
 
     return (
-        <div>
-            <div className="section-label">Screening Results</div>
+        <article className={`shortlist-card ${isSelected ? 'selected' : ''}`}>
+            <div className="shortlist-card-top">
+                <label className="shortlist-check">
+                    <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => toggleCandidateSelection(id)}
+                        aria-label={`Select ${candidate.name || 'candidate'}`}
+                    />
+                </label>
 
-            <table className="data-table">
-                <thead>
-                    <tr>
-                        <th style={{ width: '40px' }}>#</th>
-                        <th>Name</th>
-                        <th>Title / Company</th>
-                        <th>LinkedIn</th>
-                        <th style={{ width: '200px' }}>Summary</th>
-                        <th style={{ width: '100px' }}>Priority</th>
-                        <th style={{ width: '60px' }}>Select</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {searchResults.map((candidate, idx) => {
-                        const primaryRole = candidate.roles?.[0] || {}
-                        const id = candidate.id
-                        const name = candidate.name || 'N/A'
-                        const nameParts = name.split(' ')
-                        const firstName = nameParts[0] || 'N/A'
-                        const lastName = nameParts.slice(1).join(' ') || ''
-                        const summary = candidate.reasoning || 'N/A'
-                        const truncatedSummary = summary.length > 60 ? summary.substring(0, 60) + '...' : summary
-                        const isSelected = !!selectedCandidates[id]
-                        const priority = candidatePriorities[id] || '--'
+                <div className="shortlist-person">
+                    <h3>{candidate.name || 'Unnamed candidate'}</h3>
+                    <div>{company ? `${title} at ${company}` : title}</div>
+                </div>
 
-                        return (
-                            <tr key={id} className="animate-slide-up" style={{ animationDelay: `${idx * 0.05}s` }}>
-                                <td>{idx + 1}</td>
-                                <td>{name}</td>
-                                <td>
-                                    <div style={{ fontWeight: 600 }}>{primaryRole.title || 'N/A'}</div>
-                                    <div style={{ fontSize: '13px', color: '#64748b' }}>{primaryRole.company || 'N/A'}</div>
-                                </td>
-                                <td>
-                                    {candidate.linkedin ? (
-                                        <a href={candidate.linkedin} target="_blank" rel="noopener noreferrer" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                                            <Linkedin size={16} /> Profile
-                                        </a>
-                                    ) : '—'}
-                                </td>
-                                <td>
-                                    <span
-                                        style={{ cursor: 'pointer' }}
-                                        onClick={() => setExpandedSummary(expandedSummary === id ? null : id)}
-                                        title="Click to expand"
-                                    >
-                                        {truncatedSummary}
-                                    </span>
-                                </td>
-                                <td>
-                                    <select
-                                        className={`select-field priority-select ${getPrioritySelectClass(priority)}`}
-                                        value={priority}
-                                        onChange={(e) => setCandidatePriority(id, e.target.value)}
-                                    >
-                                        {priorityOptions.map(opt => (
-                                            <option key={opt} value={opt}>{opt}</option>
-                                        ))}
-                                    </select>
-                                </td>
-                                <td style={{ textAlign: 'center' }}>
-                                    <input
-                                        type="checkbox"
-                                        checked={isSelected}
-                                        onChange={() => toggleCandidateSelection(id)}
-                                    />
-                                </td>
-                            </tr>
-                        )
-                    })}
-                </tbody>
-            </table>
+                <div className="shortlist-meta">
+                    <span>{formatExperience(candidate.total_experience_years)}</span>
+                    <span>
+                        <MapPin size={14} />
+                        {location}
+                    </span>
+                    {score != null && (
+                        <span style={{
+                            display: 'inline-flex', padding: '3px 9px', borderRadius: 99,
+                            background: scoreColor.bg, color: scoreColor.color,
+                            fontSize: 11, fontWeight: 700,
+                        }}>
+                            {score}% match
+                        </span>
+                    )}
+                    {candidate.linkedin && (
+                        <a href={candidate.linkedin} target="_blank" rel="noopener noreferrer">
+                            LinkedIn <ExternalLink size={13} />
+                        </a>
+                    )}
+                </div>
+            </div>
 
-            {/* Expanded Summary Modal */}
-            {expandedSummary && (
-                <div className="modal-overlay" onClick={() => setExpandedSummary(null)}>
-                    <div className="modal-content" onClick={e => e.stopPropagation()}>
-                        <h3 style={{ marginBottom: '16px' }}>Full Summary</h3>
-                        <p style={{ lineHeight: 1.6 }}>
-                            {searchResults.find(c => c.id === expandedSummary)?.reasoning || 'N/A'}
-                        </p>
-                        <button
-                            className="btn btn-secondary"
-                            style={{ marginTop: '16px' }}
-                            onClick={() => setExpandedSummary(null)}
-                        >
-                            Close
-                        </button>
+            {/* AI Answer — styled like an AI Column cell */}
+            {answer && (
+                <div style={{
+                    margin: '8px 0 0',
+                    background: 'linear-gradient(135deg, #faf5ff, #eff6ff)',
+                    border: '1px solid #e0e7ff',
+                    borderRadius: 10,
+                    padding: '10px 14px',
+                    fontSize: 13,
+                    color: '#1e1b4b',
+                    lineHeight: 1.65,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                }}>
+                    {renderTextWithLinks(answer)}
+
+                    {/* Footer row: AI badge, confidence, source, expand toggle */}
+                    <div style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        flexWrap: 'wrap', gap: 6, marginTop: 8,
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <span style={{
+                                fontSize: 10, color: '#6366f1', fontWeight: 800,
+                                textTransform: 'uppercase', letterSpacing: '0.06em',
+                                display: 'flex', alignItems: 'center', gap: 4,
+                            }}>
+                                AI Match Analysis
+                            </span>
+                            <ConfidenceDot confidence={confidence} />
+                            <SourceBadge sources={sources} />
+                        </div>
+                        {hasDetailedReasoning && (
+                            <button
+                                onClick={() => setExpanded(e => !e)}
+                                style={{
+                                    background: 'none', border: 'none', cursor: 'pointer',
+                                    fontSize: 11, color: '#6366f1', fontWeight: 700,
+                                    display: 'flex', alignItems: 'center', gap: 3, padding: 0,
+                                }}
+                            >
+                                {expanded ? <><ChevronUp size={13} /> Less</> : <><ChevronDown size={13} /> Full reasoning</>}
+                            </button>
+                        )}
                     </div>
+
+                    {/* Expanded reasoning */}
+                    {expanded && hasDetailedReasoning && (
+                        <div style={{
+                            marginTop: 10, paddingTop: 10,
+                            borderTop: '1px solid rgba(99,102,241,0.15)',
+                            fontSize: 12.5, color: '#334155', lineHeight: 1.7,
+                        }}>
+                            {renderTextWithLinks(reasoning)}
+                        </div>
+                    )}
                 </div>
             )}
 
-            {/* Feedback Section for Selected Candidates */}
-            {selectedCount > 0 && (
-                <div className="feedback-panel">
-                    <div className="section-label">Feedback for Selected Candidates</div>
+            <MatchChips matched={matched} missing={missing} />
 
-                    <div className="feedback-banner">
-                        <span className="feedback-banner-count">
-                            {selectedCount} candidate(s) selected
+            {candidate.contributing_roles_details?.roles?.length > 0 && (
+                <div className="shortlist-role-strip">
+                    <BriefcaseBusiness size={14} />
+                    {candidate.contributing_roles_details.roles.slice(0, 3).map((role) => (
+                        <span key={`${role.company}-${role.title}`}>
+                            {role.title || 'Role'}{role.company ? `, ${role.company}` : ''}
                         </span>
-                        <span className="feedback-banner-text">Add your feedback below</span>
+                    ))}
+                </div>
+            )}
+        </article>
+    )
+}
+
+function SearchResults() {
+    const searchResults = useAppStore(state => state.searchResults)
+    const [page, setPage] = useState(1)
+    const [pageSize, setPageSize] = useState(25)
+
+    const totalPages = Math.max(1, Math.ceil(searchResults.length / pageSize))
+    
+    // Ensure page is valid if results decrease
+    useEffect(() => {
+        if (page > totalPages) setPage(totalPages)
+    }, [totalPages, page])
+
+    const startIndex = (page - 1) * pageSize
+    const endIndex = startIndex + pageSize
+    const displayedResults = searchResults.slice(startIndex, endIndex)
+
+    return (
+        <div className="shortlist-results">
+            <div className="shortlist-results-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px' }}>
+                    <div className="section-label">Shortlisted Matches ({searchResults.length})</div>
+                    {searchResults.length > 0 && (
+                        <div className="shortlist-sort-note">Sorted by AI match score</div>
+                    )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ fontSize: '13px', color: '#64748b' }}>Cards per page:</span>
+                    <select
+                        value={pageSize}
+                        onChange={e => {
+                            setPageSize(Number(e.target.value))
+                            setPage(1)
+                        }}
+                        style={{
+                            padding: '4px 8px', borderRadius: '8px', border: '1px solid rgba(203, 213, 225, 0.9)',
+                            fontSize: '12px', fontWeight: 600, color: '#0f172a', outline: 'none',
+                            background: '#fff', cursor: 'pointer'
+                        }}
+                    >
+                        <option value={10}>10</option>
+                        <option value={25}>25</option>
+                        <option value={50}>50</option>
+                        <option value={100}>100</option>
+                        <option value={200}>200</option>
+                        <option value={500}>500</option>
+                    </select>
+                </div>
+            </div>
+
+            <div className="shortlist-card-list">
+                {displayedResults.map((candidate) => (
+                    <CandidateCard key={candidate.id} candidate={candidate} />
+                ))}
+            </div>
+            
+            {searchResults.length > 0 && (
+                <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderTop: '1px solid #eef2f7', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottomLeftRadius: '12px', borderBottomRightRadius: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                        <span style={{ fontSize: 13, color: '#64748b' }}>
+                            Showing {Math.min(startIndex + 1, searchResults.length)}–{Math.min(endIndex, searchResults.length)} of <strong style={{ color: '#0f172a' }}>{searchResults.length}</strong> matches
+                        </span>
                     </div>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
+                            style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1 }}>
+                            <ChevronLeft size={14} color="#64748b" />
+                        </button>
 
-                    {Object.entries(selectedCandidates).map(([id, candidate]) => {
-                        const numId = parseInt(id)
-                        const priority = candidatePriorities[numId] || '--'
-                        const feedback = candidateFeedback[numId] || ''
+                        {(() => {
+                            const pages = [];
+                            const range = 2;
+                            for (let i = 1; i <= totalPages; i++) {
+                                if (i === 1 || i === totalPages || (i >= page - range && i <= page + range)) {
+                                    pages.push(
+                                        <button
+                                            key={i}
+                                            onClick={() => setPage(i)}
+                                            style={{
+                                                width: 34, height: 34, borderRadius: 10, fontSize: 13, fontWeight: i === page ? 700 : 600,
+                                                background: i === page ? '#f97316' : '#fff', color: i === page ? '#fff' : '#64748b',
+                                                border: i === page ? 'none' : '1px solid rgba(203, 213, 225, 0.9)', cursor: 'pointer'
+                                            }}
+                                        >
+                                            {i}
+                                        </button>
+                                    );
+                                } else if (i === page - range - 1 || i === page + range + 1) {
+                                    pages.push(<span key={i} style={{ color: '#94a3b8', margin: '0 4px' }}>...</span>);
+                                }
+                            }
+                            return pages;
+                        })()}
 
-                        return (
-                            <div key={id} className="feedback-card">
-                                <div className="feedback-card-title">
-                                    <span>{candidate.name}</span>
-                                    {getPriorityBadge(priority)}
-                                </div>
-                                <textarea
-                                    className="textarea-field feedback-textarea"
-                                    placeholder="Enter your feedback about this candidate..."
-                                    value={feedback}
-                                    onChange={(e) => setCandidateFeedback(numId, e.target.value)}
-                                />
-                            </div>
-                        )
-                    })}
+                        <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages}
+                            style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.4 : 1 }}>
+                            <ChevronRight size={14} color="#64748b" />
+                        </button>
+                    </div>
                 </div>
             )}
         </div>

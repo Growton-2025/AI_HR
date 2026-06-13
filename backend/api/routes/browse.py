@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from pydantic import BaseModel
 from backend.pipeline.query import (
     update_candidate_status,
@@ -68,12 +68,14 @@ async def get_sample_candidate(
 # ── Server-side browse result cache ───────────────────────────────────────────────
 # Caches filtered + paginated results so repeated requests return instantly
 _browse_cache: dict = {}  # key: param_hash → {result, ts}
+_summary_cache: dict = {}  # key: param_hash → {result, ts}
 _BROWSE_CACHE_TTL = 20   # seconds
 
 def _invalidate_browse_cache():
     """Called when outreach data changes so stale data isn't served."""
-    global _browse_cache
+    global _browse_cache, _summary_cache
     _browse_cache.clear()
+    _summary_cache.clear()
 # ──────────────────────────────────────────────────────────────
 
 
@@ -166,6 +168,7 @@ INDUSTRY_KEYWORDS = [
     "FMCG", "Banking", "Insurance", "Payments", "Logistics", "Supply Chain", "Manufacturing", "Automotive",
     "Telecom", "Real Estate", "Healthcare", "Pharma", "Biotech", "Energy", "Gaming", "IT Services"
 ]
+INDUSTRY_KEYWORDS_LOWER = [kw.lower() for kw in INDUSTRY_KEYWORDS]
 
 
 def resolve_browse_scope(
@@ -260,6 +263,257 @@ def _role_candidate_id_set(
         return_db_connection(conn)
 
 
+def _summary_scope_sql(
+    current_user: schemas.User,
+    *,
+    effective_scope: str,
+    effective_recruiter: Optional[int],
+    role_id: Optional[int],
+) -> tuple[str, List[Any]]:
+    where = ["COALESCE(c.is_archived, FALSE) = FALSE"]
+    params: List[Any] = []
+    user_role = (current_user.role or "").strip().lower()
+
+    if user_role != "admin":
+        where.append("c.owner_user_id = %s")
+        params.append(current_user.id)
+    elif effective_scope == VIEW_SCOPE_RECRUITER_POOLS:
+        where.append("c.owner_user_id IS NOT NULL")
+        if effective_recruiter is not None:
+            where.append("c.owner_user_id = %s")
+            params.append(effective_recruiter)
+    elif effective_scope == VIEW_SCOPE_ALL_RECRUITER_POOLS:
+        where.append("c.owner_user_id IS NOT NULL")
+
+    if role_id:
+        role_filters = ["rrc.candidate_id = c.id", "rrc.role_id = %s"]
+        params.append(role_id)
+        if user_role != "admin":
+            role_filters.append("rr.user_id = %s")
+            params.append(current_user.id)
+        elif effective_scope == VIEW_SCOPE_RECRUITER_POOLS and effective_recruiter is not None:
+            role_filters.append("rr.user_id = %s")
+            params.append(effective_recruiter)
+
+        where.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM recruitment_role_candidates rrc
+                JOIN recruitment_roles rr ON rr.id = rrc.role_id
+                WHERE {role_where}
+            )
+            """.format(role_where=" AND ".join(role_filters))
+        )
+
+    return " AND ".join(where), params
+
+
+async def fetch_browse_summary_counts(
+    *,
+    current_user: schemas.User,
+    view_scope: Optional[str] = None,
+    recruiter_filter_id: Optional[int] = None,
+    role_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return count-only Talent Pool summary directly from SQL."""
+    effective_scope, effective_recruiter = resolve_browse_scope(
+        current_user,
+        view_scope,
+        recruiter_filter_id,
+    )
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        where_sql, params = _summary_scope_sql(
+            current_user,
+            effective_scope=effective_scope,
+            effective_recruiter=effective_recruiter,
+            role_id=role_id,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                    COUNT(*)::int AS count
+                FROM candidates c
+                WHERE {where_sql}
+                GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
+                """,
+                params,
+            )
+            status_counts = {str(row[0]): int(row[1] or 0) for row in cur.fetchall()}
+
+        return {
+            "total": sum(status_counts.values()),
+            "status_counts": status_counts,
+            "effective_scope": effective_scope,
+            "effective_recruiter": effective_recruiter,
+        }
+    finally:
+        return_db_connection(conn)
+
+
+def _can_use_fast_sql_browse(
+    *,
+    q: Optional[str],
+    title: Optional[str],
+    company: Optional[str],
+    city: Optional[str],
+    location_type: Optional[str],
+    product_service: Optional[str],
+    status: Optional[str],
+    created_by: Optional[str],
+    min_exp: Optional[float],
+    max_exp: Optional[float],
+    min_avg_tenure: Optional[float],
+    candidate_ids: Optional[List[int]],
+) -> bool:
+    return not any([
+        q,
+        title,
+        company,
+        city,
+        location_type,
+        product_service,
+        status,
+        created_by,
+        min_exp is not None,
+        max_exp is not None,
+        min_avg_tenure is not None,
+        candidate_ids,
+    ])
+
+
+async def fetch_browse_page_sql(
+    *,
+    current_user: schemas.User,
+    view_scope: Optional[str],
+    recruiter_filter_id: Optional[int],
+    page: int,
+    page_size: int,
+    role_id: Optional[int],
+    sort_by: Optional[str],
+    sort_dir: Optional[str],
+) -> Dict[str, Any]:
+    effective_scope, effective_recruiter = resolve_browse_scope(
+        current_user,
+        view_scope,
+        recruiter_filter_id,
+    )
+    summary = await fetch_browse_summary_counts(
+        current_user=current_user,
+        view_scope=effective_scope,
+        recruiter_filter_id=effective_recruiter,
+        role_id=role_id,
+    )
+    where_sql, params = _summary_scope_sql(
+        current_user,
+        effective_scope=effective_scope,
+        effective_recruiter=effective_recruiter,
+        role_id=role_id,
+    )
+    sort_map = {
+        "name": "c.id",
+        "city": "LOWER(COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1), ''))",
+        "exp": "COALESCE(c.total_experience_years, 0)",
+        "tenure": "COALESCE(c.avg_years_in_company, 0)",
+    }
+    order_expr = sort_map.get(sort_by or "name", sort_map["name"])
+    direction = "DESC" if sort_dir == "desc" else "ASC"
+    offset = (page - 1) * page_size
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH page_candidates AS (
+                    SELECT c.*
+                    FROM candidates c
+                    WHERE {where_sql}
+                    ORDER BY {order_expr} {direction}, c.id ASC
+                    LIMIT %s OFFSET %s
+                )
+                SELECT
+                    c.id,
+                    c.name,
+                    c.first_name,
+                    c.last_name,
+                    c.linkedin,
+                    c.email,
+                    COALESCE(c.mobile_phone, c.phone, '') AS phone,
+                    '' AS response,
+                    '' AS notes,
+                    COALESCE(c.headline, '') AS title,
+                    COALESCE(c.raw_fields->>'import_company', '') AS company,
+                    COALESCE(c.raw_fields->>'extracted_industry', c.raw_fields->>'services', '') AS product_service,
+                    COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1), '') AS city,
+                    COALESCE(c.raw_fields->>'work_preference', c.raw_fields->>'location_type', '') AS location_type,
+                    COALESCE(c.total_experience_years, 0) AS total_experience_years,
+                    COALESCE(c.avg_years_in_company, 0) AS avg_tenure_years,
+                    COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                    c.created_by,
+                    c.headline,
+                    c.owner_user_id,
+                    c.pool_source
+                FROM page_candidates c
+                ORDER BY {order_expr} {direction}, c.id ASC
+                """,
+                [*params, page_size, offset],
+            )
+            rows = cur.fetchall()
+
+        candidates = []
+        for row in rows:
+            name_val = row[1] or ""
+            fn = (row[2] or "").strip() or (name_val.split() or [""])[0]
+            ln = (row[3] or "").strip() or (" ".join(name_val.split()[1:]) if name_val else "")
+            candidates.append({
+                "id": row[0],
+                "name": name_val,
+                "first_name": fn,
+                "last_name": ln,
+                "linkedin": row[4],
+                "email": row[5] or "",
+                "phone": row[6] or "",
+                "response": row[7] or "",
+                "notes": row[8] or "",
+                "title": row[9] or "",
+                "company": row[10] or "",
+                "product_service": row[11] or "",
+                "city": row[12] or "",
+                "location_type": row[13] or "",
+                "total_experience_years": round(float(row[14] or 0), 1),
+                "avg_tenure_years": round(float(row[15] or 0), 1),
+                "status": row[16] or "To be started",
+                "created_by": row[17] or "",
+                "headline": row[18] or "",
+                "match_score": None,
+                "owner_user_id": row[19],
+                "pool_source": row[20],
+                "is_master_row": row[19] is None,
+                "raw_fields": {},
+            })
+
+        total = int(summary.get("total") or 0)
+        return {
+            "candidates": candidates,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "status_counts": summary.get("status_counts", {}),
+            "is_semantic_search": False,
+        }
+    finally:
+        return_db_connection(conn)
+
+
 async def build_browse_candidate_rows(
     *,
     current_user: schemas.User,
@@ -315,6 +569,8 @@ async def build_browse_candidate_rows(
 
         semantic_scores = await get_semantic_scores(product_service)
 
+    ql = q.lower() if q else None
+
     results = []
     for p in all_profiles:
         profile_id = p.get("id")
@@ -329,8 +585,8 @@ async def build_browse_candidate_rows(
 
         product_val = extracted_prod or cand_services or company_product or primary_role.get("industry") or ""
         if not product_val:
-            search_text = f"{p.get('headline') or ''} {p.get('about') or ''}"
-            found = [kw for kw in INDUSTRY_KEYWORDS if kw.lower() in search_text.lower()]
+            search_text_lower = f"{p.get('headline') or ''} {p.get('about') or ''}".lower()
+            found = [kw for kw, kw_lower in zip(INDUSTRY_KEYWORDS, INDUSTRY_KEYWORDS_LOWER) if kw_lower in search_text_lower]
             if found:
                 product_val = ", ".join(list(set(found))[:3])
 
@@ -344,8 +600,7 @@ async def build_browse_candidate_rows(
         if not company_val and isinstance(p.get("raw_fields"), dict):
             company_val = (p.get("raw_fields") or {}).get("import_company") or ""
 
-        if q:
-            ql = q.lower()
+        if ql:
             searchable = " ".join(str(v or "") for v in (name_val, title_val, company_val, city_val, p.get("linkedin"), p.get("normalized_linkedin"), p.get("email"), p.get("phone"), p.get("mobile_phone"))).lower()
             if ql not in searchable:
                 continue
@@ -468,20 +723,38 @@ async def browse_summary(
     """Return unfiltered Talent Pool counts for the current scope."""
     started = time.monotonic()
     try:
-        payload = await build_browse_candidate_rows(
-            current_user=current_user,
-            view_scope=view_scope,
-            recruiter_filter_id=recruiter_filter_id,
-            role_id=role_id,
-            sort_by="name",
-            sort_dir="asc",
+        effective_scope, effective_recruiter = resolve_browse_scope(
+            current_user,
+            view_scope,
+            recruiter_filter_id,
         )
-        result = {
-            "total": len(payload.get("candidates", [])),
-            "status_counts": payload.get("status_counts", {}),
-            "effective_scope": payload.get("effective_scope"),
-            "effective_recruiter": payload.get("effective_recruiter"),
-        }
+        cache_key_src = json.dumps({
+            "uid": current_user.id,
+            "role": current_user.role,
+            "view_scope": effective_scope,
+            "recruiter_filter_id": effective_recruiter,
+            "role_id": role_id,
+        }, sort_keys=True)
+        cache_key = hashlib.md5(cache_key_src.encode()).hexdigest()
+        cached = _summary_cache.get(cache_key)
+        if cached and (time.monotonic() - cached["ts"]) < _BROWSE_CACHE_TTL:
+            result = cached["result"]
+            _log_browse_timing(
+                "summary",
+                started,
+                total=result["total"],
+                scope=result["effective_scope"],
+                recruiter_id=result["effective_recruiter"],
+            )
+            return result
+
+        result = await fetch_browse_summary_counts(
+            current_user=current_user,
+            view_scope=effective_scope,
+            recruiter_filter_id=effective_recruiter,
+            role_id=role_id,
+        )
+        _summary_cache[cache_key] = {"result": result, "ts": time.monotonic()}
         _log_browse_timing(
             "summary",
             started,
@@ -535,8 +808,43 @@ async def browse_candidates(
         view_scope,
         recruiter_filter_id,
     )
-    await _ensure_profiles_loaded()
     candidate_id_list = _parse_candidate_ids(candidate_ids)
+
+    if not PROFILES_BY_ID and _can_use_fast_sql_browse(
+        q=q,
+        title=title,
+        company=company,
+        city=city,
+        location_type=location_type,
+        product_service=product_service,
+        status=status,
+        created_by=created_by,
+        min_exp=min_exp,
+        max_exp=max_exp,
+        min_avg_tenure=min_avg_tenure,
+        candidate_ids=candidate_id_list,
+    ):
+        result = await fetch_browse_page_sql(
+            current_user=current_user,
+            view_scope=effective_scope,
+            recruiter_filter_id=effective_recruiter,
+            page=page,
+            page_size=page_size,
+            role_id=role_id,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        _log_browse_timing(
+            "rows",
+            started,
+            total=result.get("total"),
+            page_size=page_size,
+            scope=effective_scope,
+            recruiter_id=effective_recruiter,
+        )
+        return result
+
+    await _ensure_profiles_loaded()
 
     # ── Cache key from all params ───────────────────────────────────
     cache_key_src = json.dumps({
@@ -680,9 +988,9 @@ async def browse_metadata(
         if ei := p.get("extracted_industry"): products.add(ei)
         
         # Add fallback terms to metadata
-        search_text = f"{p.get('headline') or ''} {p.get('about') or ''}"
-        for kw in INDUSTRY_KEYWORDS:
-            if kw.lower() in search_text.lower():
+        search_text_lower = f"{p.get('headline') or ''} {p.get('about') or ''}".lower()
+        for kw, kw_lower in zip(INDUSTRY_KEYWORDS, INDUSTRY_KEYWORDS_LOWER):
+            if kw_lower in search_text_lower:
                 products.add(kw)
         
         if lc := (p.get("work_preference") or p.get("location_type") or ""): locations.add(lc)

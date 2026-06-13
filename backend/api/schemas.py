@@ -29,6 +29,8 @@ class LoginRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
+    source_type: Optional[str] = "master"
+    source_role_id: Optional[int] = None
 
 class RoleCreate(BaseModel):
     name: str

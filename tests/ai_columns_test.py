@@ -857,6 +857,46 @@ def test_run_ai_task_sends_full_row_context_even_without_tokens(monkeypatch):
     assert "row.raw_fields.Spreadsheet Note" in captured["user_prompt"]
 
 
+def test_run_ai_task_sends_strict_prompt_contract_instructions(monkeypatch):
+    captured = {}
+
+    def fake_openai(system_prompt, user_prompt, *, use_web=False):
+        captured["system_prompt"] = system_prompt
+        captured["user_prompt"] = user_prompt
+        captured["use_web"] = use_web
+        return {
+            "outputs": {"result": "deepak@example.com"},
+            "reasoning": "Answered only the requested field.",
+            "confidence": "high",
+            "steps": ["Read requested row field"],
+            "sources": [],
+        }
+
+    context = build_candidate_context({
+        "id": 1,
+        "name": "Deepak Basavaraj",
+        "email": "deepak@example.com",
+        "headline": "Account Director",
+    })
+
+    monkeypatch.setattr(ai_columns, "_openai_client", object())
+    monkeypatch.setattr(ai_columns, "_call_openai_for_json", fake_openai)
+    result = ai_columns._run_ai_task(
+        prompt_template="Return only the candidate email address.",
+        mode="content",
+        output_schema=[{"key": "result", "label": "Result", "primary": True}],
+        context=context,
+    )
+
+    assert result["primary_output"] == "deepak@example.com"
+    assert captured["use_web"] is False
+    assert "PROMPT CONTRACT RULE" in captured["system_prompt"]
+    assert "The user's prompt is the exact task contract" in captured["system_prompt"]
+    assert "Do not add inferred criteria" in captured["system_prompt"]
+    assert "The User prompt below is the exact task contract" in captured["user_prompt"]
+    assert "Do not infer adjacent criteria" in captured["user_prompt"]
+
+
 def test_full_row_context_handles_array_like_values():
     class ArrayLike:
         size = 2
@@ -959,6 +999,16 @@ def test_browse_summary_uses_unfiltered_scope_counts(monkeypatch):
     }
     monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
 
+    async def fake_summary(**kwargs):
+        return {
+            "total": 2,
+            "status_counts": {"Shortlisted": 1, "To be started": 1},
+            "effective_scope": "recruiter_pools",
+            "effective_recruiter": 7,
+        }
+
+    monkeypatch.setattr(browse, "fetch_browse_summary_counts", fake_summary)
+
     filtered = asyncio.run(
         browse.build_browse_candidate_rows(
             current_user=_user(),
@@ -974,23 +1024,24 @@ def test_browse_summary_uses_unfiltered_scope_counts(monkeypatch):
     assert summary["status_counts"]["To be started"] == 1
 
 
-def test_browse_summary_initializes_empty_profile_cache(monkeypatch):
-    profiles = {}
+def test_browse_summary_does_not_initialize_profile_cache(monkeypatch):
     calls = []
 
     def fake_initialize_cache():
         calls.append("init")
-        profiles[1] = {
-            "id": 1,
-            "name": "Cold Worker Candidate",
-            "status": "Shortlisted",
-            "owner_user_id": 7,
-            "roles": [{"title": "Account Director", "company": "Exotel"}],
+
+    async def fake_summary(**kwargs):
+        return {
+            "total": 1,
+            "status_counts": {"Shortlisted": 1},
+            "effective_scope": "master",
+            "effective_recruiter": None,
         }
 
-    monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+    monkeypatch.setattr(browse, "PROFILES_BY_ID", {})
     monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
-    browse._browse_cache.clear()
+    monkeypatch.setattr(browse, "fetch_browse_summary_counts", fake_summary)
+    browse._invalidate_browse_cache()
 
     summary = asyncio.run(
         browse.browse_summary(
@@ -1000,22 +1051,25 @@ def test_browse_summary_initializes_empty_profile_cache(monkeypatch):
         )
     )
 
-    assert calls == ["init"]
+    assert calls == []
     assert summary["total"] == 1
     assert summary["status_counts"] == {"Shortlisted": 1}
 
 
-def test_browse_summary_returns_503_when_active_db_cache_stays_empty(monkeypatch):
+def test_browse_summary_surfaces_count_query_errors(monkeypatch):
     calls = []
 
     def fake_initialize_cache():
         calls.append("init")
 
+    async def fake_summary(**kwargs):
+        raise HTTPException(status_code=503, detail={"code": "counts_unavailable"})
+
     monkeypatch.setattr(browse, "PROFILES_BY_ID", {})
     monkeypatch.setattr(browse, "is_cache_initialized", lambda: True)
     monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
-    monkeypatch.setattr(browse, "count_active_candidates_from_db", lambda: 4174)
-    browse._browse_cache.clear()
+    monkeypatch.setattr(browse, "fetch_browse_summary_counts", fake_summary)
+    browse._invalidate_browse_cache()
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(
@@ -1026,9 +1080,9 @@ def test_browse_summary_returns_503_when_active_db_cache_stays_empty(monkeypatch
             )
         )
 
-    assert calls == ["init"]
+    assert calls == []
     assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "profile_cache_unavailable"
+    assert exc.value.detail["code"] == "counts_unavailable"
 
 
 def test_browse_meta_initializes_empty_profile_cache(monkeypatch):
@@ -1048,7 +1102,7 @@ def test_browse_meta_initializes_empty_profile_cache(monkeypatch):
 
     monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
     monkeypatch.setattr(browse, "initialize_cache", fake_initialize_cache)
-    browse._browse_cache.clear()
+    browse._invalidate_browse_cache()
 
     meta = asyncio.run(
         browse.browse_metadata(
@@ -1089,7 +1143,7 @@ def test_browse_candidate_ids_preserves_scope_and_order(monkeypatch):
         },
     }
     monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
-    browse._browse_cache.clear()
+    browse._invalidate_browse_cache()
 
     result = asyncio.run(
         browse.browse_candidates(
@@ -1389,6 +1443,16 @@ def test_admin_master_totals_are_not_capped_at_5000(monkeypatch):
         for i in range(1, 5006)
     }
     monkeypatch.setattr(browse, "PROFILES_BY_ID", profiles)
+
+    async def fake_summary_large(**kwargs):
+        return {
+            "total": 5005,
+            "status_counts": {"Shortlisted": 2502, "To be started": 2503},
+            "effective_scope": "master",
+            "effective_recruiter": None,
+        }
+
+    monkeypatch.setattr(browse, "fetch_browse_summary_counts", fake_summary_large)
     browse._browse_cache.clear()
 
     result = asyncio.run(

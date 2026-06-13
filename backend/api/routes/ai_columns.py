@@ -25,6 +25,8 @@ from backend.services.ai_columns import (
     build_query_plan,
     career_facts_to_text,
     classify_ai_column_prompt,
+    call_openai_json,
+    collect_response_sources,
     compute_career_facts,
     default_output_schema,
     evaluate_required_fields,
@@ -40,7 +42,9 @@ from backend.services.ai_columns import (
     run_candidate_query_tools,
     safe_json,
     summarize_only_run_if,
+    utc_now_iso,
     verify_smart_column_outputs,
+    web_search_tool_config,
 )
 from backend.services.candidate_pool import (
     VIEW_SCOPE_MASTER,
@@ -1202,6 +1206,13 @@ def _run_ai_task(
         "outputs must be an object whose keys exactly match the requested output keys. "
         "confidence must be one of low, medium, high. steps must be an array of short strings. "
         "sources must be an array of objects with optional title, url, note. "
+        "PROMPT CONTRACT RULE: The user's prompt is the exact task contract. "
+        "Answer only what the prompt explicitly asks for, using the requested output schema keys. "
+        "Do not add inferred criteria, adjacent interpretations, substitute questions, extra screening dimensions, "
+        "or broader recruiter recommendations unless the user prompt explicitly asks for them. "
+        "Use all available row/web evidence only to answer that exact prompt, not to expand the task. "
+        "If the exact prompt cannot be answered from the available evidence, return Unknown, Needs verification, "
+        "or a blank output as appropriate instead of answering a related question. "
         "CRITICAL — TENURE AND EXPERIENCE RULES: "
         "The task may include a section labelled 'Deterministic row-derived career facts'. "
         "These numbers were computed by a bug-fixed, overlap-aware algorithm that: "
@@ -1232,10 +1243,12 @@ def _run_ai_task(
     output_hint = ", ".join([f"{item['key']} ({item['label']})" for item in normalized_outputs])
     user_prompt = (
         f"Requested outputs: {output_hint}\n"
+        "The User prompt below is the exact task contract. Produce only the requested outputs for that exact task. "
+        "Do not infer adjacent criteria, replace the task with a similar screening question, or add extra conclusions. "
         "Before answering, inspect the full candidate profile context, candidate context pack, deterministic tool "
         "results, raw import fields, structured role history, and any existing enriched company details. "
-        "Use the most complete available profile data as the source of truth for this candidate. "
-        "The user prompt may mention only part of the row; use all relevant enriched and raw profile data when answering. "
+        "Use the most complete available profile data as the source of truth for this candidate, but only when it "
+        "directly supports the exact user prompt. "
         "Do not create SQL or make unsupported assumptions.\n\n"
         f"Query plan JSON:\n{json.dumps(query_plan, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate context pack JSON:\n{json.dumps(context_pack, ensure_ascii=False, indent=2, default=str)}\n\n"

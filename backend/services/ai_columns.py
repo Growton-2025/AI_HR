@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from openai import OpenAI
 
 from backend.services.candidate_pool import profile_passes_scope
 from backend.services.imported_fields import (
     IMPORTED_EXTRA_FIELDS_KEY,
     iter_imported_extra_fields,
 )
+
+
+logger = logging.getLogger(__name__)
+_OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
 
 DEFAULT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
@@ -176,6 +184,183 @@ def safe_json(value: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def json_block_to_dict(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(text or "")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        start = (text or "").find("{")
+        end = (text or "").rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        try:
+            parsed = json.loads((text or "")[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def web_search_tool_config(
+    tool_type: Optional[str] = None,
+    *,
+    default_tool: str = "web_search",
+    context_size: str = "high",
+) -> Dict[str, Any]:
+    normalized_tool = (tool_type or default_tool or "web_search").strip()
+    if normalized_tool == "web_search_preview":
+        return {"type": "web_search_preview", "search_context_size": context_size}
+    return {"type": "web_search", "search_context_size": context_size}
+
+
+def _to_plain_openai(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_to_plain_openai(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_plain_openai(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _to_plain_openai(v) for k, v in value.items()}
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _to_plain_openai(model_dump())
+        except Exception:
+            pass
+    as_dict = getattr(value, "dict", None)
+    if callable(as_dict):
+        try:
+            return _to_plain_openai(as_dict())
+        except Exception:
+            pass
+    return str(value)
+
+
+def collect_response_sources(value: Any, *, limit: int = 8) -> List[Dict[str, str]]:
+    plain = _to_plain_openai(value)
+    found: List[Dict[str, str]] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            url = node.get("url")
+            title = node.get("title") or node.get("name")
+            if isinstance(url, str) and url.strip():
+                found.append({
+                    "url": url.strip(),
+                    "title": str(title or url).strip(),
+                    "note": str(node.get("note") or node.get("snippet") or "").strip(),
+                })
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(plain)
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for source in found:
+        url = source.get("url") or ""
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(source)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def call_openai_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    model: str,
+    use_web: bool = False,
+    web_search_tool: str = "web_search",
+    web_search_context_size: str = "high",
+    temperature: float = 0.2,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    if not _OPENAI_CLIENT:
+        return {}
+    try:
+        request_timeout = timeout if timeout is not None else (75.0 if use_web else 35.0)
+        if use_web:
+            searched_at = utc_now_iso()
+            dated_user_prompt = (
+                f"Freshness requirement: perform live web research now. Today is {searched_at[:10]} "
+                f"(UTC timestamp {searched_at}). Prefer current official/company/news sources, "
+                "ignore stale snippets when newer source dates conflict, and include source URLs. "
+                "Every cited source must directly support the target person/company/event in the answer; "
+                "do not cite unrelated industry examples as evidence for the target. If no directly relevant "
+                "current source is found, say no verified current source was found and leave source URLs blank. "
+                "For LinkedIn profile or post activity checks, use only public evidence; if the LinkedIn page, "
+                "posts, or activity cannot be publicly verified, return Not publicly verifiable with low confidence.\n\n"
+                f"{user_prompt}"
+            )
+            tool_config = web_search_tool_config(
+                web_search_tool,
+                default_tool=web_search_tool,
+                context_size=web_search_context_size,
+            )
+            try:
+                response = _OPENAI_CLIENT.responses.create(
+                    model=model,
+                    tools=[tool_config],
+                    input=f"{system_prompt}\n\n{dated_user_prompt}",
+                    timeout=request_timeout,
+                )
+            except Exception:
+                if tool_config.get("type") == "web_search_preview":
+                    raise
+                logger.warning("OpenAI web_search failed; retrying with web_search_preview", exc_info=True)
+                tool_config = web_search_tool_config(
+                    "web_search_preview",
+                    default_tool=web_search_tool,
+                    context_size=web_search_context_size,
+                )
+                response = _OPENAI_CLIENT.responses.create(
+                    model=model,
+                    tools=[tool_config],
+                    input=f"{system_prompt}\n\n{dated_user_prompt}",
+                    timeout=request_timeout,
+                )
+            parsed = json_block_to_dict(getattr(response, "output_text", "") or "")
+            parsed.setdefault("sources", collect_response_sources(response))
+            parsed["searched_at"] = searched_at
+            parsed["freshness_date"] = searched_at[:10]
+            parsed["web_search_tool"] = tool_config.get("type") or ""
+            parsed["web_search_context_size"] = tool_config.get("search_context_size") or ""
+            parsed["model"] = model
+            return parsed
+
+        response = _OPENAI_CLIENT.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            timeout=request_timeout,
+        )
+        content = ""
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                content = getattr(msg, "content", None) or ""
+        parsed = json_block_to_dict(content)
+        parsed["model"] = model
+        return parsed
+    except Exception as exc:
+        logger.warning("OpenAI JSON call failed: %s", exc)
+        return {}
 
 
 def flatten_raw_fields(raw_fields: Any, prefix: str = "raw") -> List[Dict[str, Any]]:

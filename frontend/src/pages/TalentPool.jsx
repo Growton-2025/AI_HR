@@ -885,7 +885,7 @@ const readPersistedContactInfo = () => {
   }
 };
 
-function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, tpTotal, tpStatusCounts }) {
+function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, tpTotal, tpStatusCounts, countsLoading = false }) {
   const summary = analytics?.summary;
   if (!summary || typeof summary !== 'object') return null;
 
@@ -894,15 +894,15 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
   const displayShortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted;
   const displayPipeline = tpStatusCounts || summary.pipeline_health || {};
 
-  const conversionRate = displayTotal > 0
+  const conversionRate = countsLoading ? '...' : displayTotal > 0
     ? Math.round((displayShortlisted / displayTotal) * 100)
     : 0;
 
   const cards = [
-    { label: 'Total sourced', value: displayTotal, icon: UserPlus, tone: 'warm' },
-    { label: 'Shortlisted', value: displayShortlisted, icon: Activity, tone: 'emerald', status: 'Shortlisted' },
-    { label: 'Conversion rate', value: `${conversionRate}%`, icon: BarChart2, tone: 'slate' },
-    { label: 'In follow up', value: displayPipeline?.['Followup / In conversation'] || 0, icon: MessageSquareMore, tone: 'amber', status: 'Followup / In conversation' },
+    { label: 'Total sourced', value: countsLoading ? '...' : displayTotal, icon: UserPlus, tone: 'warm' },
+    { label: 'Shortlisted', value: countsLoading ? '...' : displayShortlisted, icon: Activity, tone: 'emerald', status: 'Shortlisted' },
+    { label: 'Conversion rate', value: countsLoading ? '...' : `${conversionRate}%`, icon: BarChart2, tone: 'slate' },
+    { label: 'In follow up', value: countsLoading ? '...' : displayPipeline?.['Followup / In conversation'] || 0, icon: MessageSquareMore, tone: 'amber', status: 'Followup / In conversation' },
   ];
 
   const recruiterPerf = analytics.recruiter_performance || [];
@@ -1004,17 +1004,17 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
   );
 }
 
-function CompactMetricsStrip({ analytics, tpTotal, tpStatusCounts, expanded, onToggle }) {
+function CompactMetricsStrip({ analytics, tpTotal, tpStatusCounts, expanded, onToggle, countsLoading = false }) {
   const summary = analytics?.summary || {};
   const totalSourced = tpTotal != null ? tpTotal : summary.total_sourced;
   const shortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted || 0;
   const followUp = (tpStatusCounts || summary.pipeline_health || {})['Followup / In conversation'] || 0;
-  const conversion = totalSourced > 0 ? Math.round((shortlisted / totalSourced) * 100) : 0;
+  const conversion = countsLoading ? '...' : totalSourced > 0 ? Math.round((shortlisted / totalSourced) * 100) : 0;
   const items = [
-    ['Total sourced', totalSourced],
-    ['Shortlisted', shortlisted],
-    ['Conversion', `${conversion}%`],
-    ['Follow up', followUp],
+    ['Total sourced', countsLoading ? '...' : totalSourced],
+    ['Shortlisted', countsLoading ? '...' : shortlisted],
+    ['Conversion', countsLoading ? '...' : `${conversion}%`],
+    ['Follow up', countsLoading ? '...' : followUp],
   ];
 
   return (
@@ -1852,6 +1852,7 @@ export default function TalentPool() {
   const [recentUploads, setRecentUploads] = useState([]);
   const [scopeRoles, setScopeRoles] = useState([]);
   const [contactInfo, setContactInfo] = useState(readPersistedContactInfo); // { [candidateId]: { email, phone, enriching } }
+  const [hasLoadedRecruiterScope, setHasLoadedRecruiterScope] = useState(role !== 'recruiter');
   const analytics = useAppStore(state => state.analytics);
   const fetchAnalytics = useAppStore(state => state.fetchAnalytics);
   const syncOutreachResponses = useAppStore(state => state.syncOutreachResponses);
@@ -1876,6 +1877,16 @@ export default function TalentPool() {
   const talentPoolScopeReady = role !== 'admin'
     || talentPoolViewScope !== 'recruiter_pools'
     || Boolean(talentPoolRecruiterFilterId);
+
+  useEffect(() => {
+    setHasLoadedRecruiterScope(role !== 'recruiter');
+  }, [role, user?.id]);
+
+  useEffect(() => {
+    if (role === 'recruiter' && scopeTotal != null) {
+      setHasLoadedRecruiterScope(true);
+    }
+  }, [role, scopeTotal]);
 
   // Poll Clay/DB updates aggressively for enriching records so contact data appears quickly.
   useEffect(() => {
@@ -2251,6 +2262,9 @@ export default function TalentPool() {
   const displayedTotal = total;
   const displayedTotalPages = totalPages;
   const displayedStatusCounts = statusCounts;
+  const recruiterCountLoading = role === 'recruiter' && !hasLoadedRecruiterScope;
+  const metricsTotal = recruiterCountLoading ? null : (scopeTotal ?? total);
+  const metricsStatusCounts = recruiterCountLoading ? {} : (scopeStatusCounts || statusCounts);
   const allVisibleSelected = displayedCandidates.length > 0 && displayedCandidates.every((candidate) => selectedIds.has(candidate.id));
   const statusFilterOptions = useMemo(() => uniqueSortedOptions(
     RECRUITMENT_STAGES,
@@ -2331,6 +2345,9 @@ export default function TalentPool() {
       if (res.success && res.data) {
         setIsSemanticSearch(res.data.is_semantic_search || false);
         mergeContactInfoFromRows(res.data.candidates);
+        if (role === 'recruiter') {
+          setHasLoadedRecruiterScope(true);
+        }
       } else if (!res.success && !res.stale && !res.blocked) {
         setLoadError(res.error || 'Failed to load candidates');
       }
@@ -2343,7 +2360,7 @@ export default function TalentPool() {
         setIsRevalidating(false);
       }
     }
-  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds, talentPoolScopeReady]);
+  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds, talentPoolScopeReady, role]);
 
   fetchCandidatesRef.current = fetchCandidates;
 
@@ -3293,7 +3310,7 @@ export default function TalentPool() {
                 <span style={{ fontSize: 13, color: '#0f172a', fontWeight: 700 }}>
                   {!talentPoolScopeReady
                     ? 'Select recruiter'
-                    : loading && !displayedCandidates.length
+                    : recruiterCountLoading || (loading && !displayedCandidates.length)
                       ? '...'
                       : `${displayedTotal.toLocaleString()} candidates`}
                 </span>
@@ -3319,8 +3336,9 @@ export default function TalentPool() {
           {analytics && (
             <CompactMetricsStrip
               analytics={analytics}
-              tpTotal={scopeTotal ?? total}
-              tpStatusCounts={scopeStatusCounts || statusCounts}
+              tpTotal={metricsTotal}
+              tpStatusCounts={metricsStatusCounts}
+              countsLoading={recruiterCountLoading}
               expanded={metricsExpanded}
               onToggle={() => setMetricsExpanded(prev => !prev)}
             />
@@ -3330,8 +3348,9 @@ export default function TalentPool() {
             <div style={{ padding: '14px 20px 18px', borderTop: `1px solid ${surfaceBorder}` }}>
               <StatisticsDashboard
                 analytics={analytics}
-                tpTotal={scopeTotal ?? total}
-                tpStatusCounts={scopeStatusCounts || statusCounts}
+                tpTotal={metricsTotal}
+                tpStatusCounts={metricsStatusCounts}
+                countsLoading={recruiterCountLoading}
                 role={role}
                 onStatClick={(status) => {
                   startTransition(() => {
@@ -3424,6 +3443,7 @@ export default function TalentPool() {
               const isActive = activeStatusTab === tab;
               const count = tab === '' ? (displayedTotal || 0) : (displayedStatusCounts?.[tab] || 0);
               const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
+              const isLoadingCount = recruiterCountLoading || (loading && !displayedCandidates.length);
 
               return (
                 <button key={tab || 'all'}
@@ -3456,7 +3476,7 @@ export default function TalentPool() {
                   }}
                 >
                   {tab === '' ? (
-                    <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({displayedTotal})</span>
+                    <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({isLoadingCount ? '...' : displayedTotal})</span>
                   ) : (
                     <>
                       <span style={{ width: 6, height: 6, borderRadius: '50%', background: isActive ? '#fff' : (style.dot || '#94a3b8') }} />
@@ -3466,7 +3486,7 @@ export default function TalentPool() {
                         background: isActive ? 'rgba(255,255,255,0.14)' : '#e2e8f0',
                         color: isActive ? '#fff' : '#64748b'
                       }}>
-                        {count}
+                        {isLoadingCount ? '...' : count}
                       </span>
                     </>
                   )}
@@ -3477,8 +3497,8 @@ export default function TalentPool() {
           )}
 
           {/* Table */}
-          <div ref={tableScrollRef} className="talent-pool-table-scroll" style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 2000 }}>
+          <div ref={tableScrollRef} className="talent-pool-table-scroll" style={{ flex: 1, overflowY: 'auto', overflowX: 'auto', background: 'rgba(255,255,255,0.68)', paddingBottom: 12 }}>
+            <table style={{ width: 'max-content', minWidth: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ background: 'rgba(248,250,252,0.98)', borderBottom: `1px solid ${surfaceBorder}`, position: 'sticky', top: 0, zIndex: 10 }}>
                   {cols.filter(c => !c.hidden).map((col, index) => (
@@ -3921,7 +3941,11 @@ export default function TalentPool() {
                 </select>
               </div>
               <span style={{ fontSize: 13, color: '#64748b' }}>
-                Showing {displayedTotal === 0 ? 0 : Math.min((page - 1) * pageSize + 1, displayedTotal)}–{Math.min(page * pageSize, displayedTotal)} of <strong style={{ color: '#0f172a' }}>{displayedTotal.toLocaleString()}</strong> candidates
+                {recruiterCountLoading || (loading && !displayedCandidates.length) ? (
+                  <>Loading candidates...</>
+                ) : (
+                  <>Showing {displayedTotal === 0 ? 0 : Math.min((page - 1) * pageSize + 1, displayedTotal)}–{Math.min(page * pageSize, displayedTotal)} of <strong style={{ color: '#0f172a' }}>{displayedTotal.toLocaleString()}</strong> candidates</>
+                )}
               </span>
             </div>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

@@ -427,6 +427,105 @@ body {
   border-color: #fdba74;
 }
 
+.screening-workspace {
+  width: 100%;
+  position: relative;
+  min-height: 100vh;
+  padding: 40px;
+  box-sizing: border-box;
+}
+
+.screening-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.shortlist-search-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  gap: 16px;
+  align-items: start;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  box-shadow: 0 10px 20px rgba(15, 23, 42, 0.04);
+  padding: 24px;
+  margin-bottom: 28px;
+}
+
+.shortlist-query-panel,
+.shortlist-source-panel {
+  min-width: 0;
+}
+
+.shortlist-field-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 800;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.shortlist-query-box {
+  position: relative;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.shortlist-query-box:focus-within {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.shortlist-textarea {
+  min-height: 96px;
+  border-radius: 8px;
+  padding: 18px 52px 18px 18px;
+}
+
+.shortlist-clear-input {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.shortlist-source-select,
+.shortlist-destination-select {
+  width: 100%;
+  min-height: 44px;
+  border-radius: 8px;
+  font-size: 14px;
+  background: white;
+}
+
+.shortlist-search-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.shortlist-button-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
 /* Buttons */
 .btn {
   padding: 10px 20px;
@@ -682,6 +781,184 @@ body {
 
 .screening-results-panel {
   animation: screeningStageEnter 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.shortlist-results {
+  display: grid;
+  gap: 16px;
+}
+
+.shortlist-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.shortlist-sort-note {
+  color: #94a3b8;
+  font-size: 13px;
+  font-style: italic;
+}
+
+.shortlist-card-list {
+  display: grid;
+  gap: 14px;
+}
+
+.shortlist-card {
+  background: white;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+  padding: 18px 20px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.shortlist-card.selected {
+  border-color: #60a5fa;
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.1);
+}
+
+.shortlist-card-top {
+  display: grid;
+  grid-template-columns: 28px minmax(180px, 1fr) auto;
+  gap: 14px;
+  align-items: start;
+}
+
+.shortlist-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: 2px;
+}
+
+.shortlist-person h3 {
+  margin: 0 0 4px;
+  color: #0f172a;
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.shortlist-person div {
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shortlist-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shortlist-meta span,
+.shortlist-meta a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.shortlist-analysis {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  margin: 18px 0 0 42px;
+  padding: 16px;
+  background: #f8fafc;
+  border-radius: 8px;
+}
+
+.shortlist-analysis p {
+  margin: 0;
+  color: #334155;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.shortlist-analysis span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #4f46e5;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.shortlist-role-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 0 42px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.shortlist-role-strip span {
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #fff;
+}
+
+.shortlist-action-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: grid;
+  grid-template-columns: auto auto minmax(220px, 360px) auto auto;
+  align-items: center;
+  gap: 12px;
+  min-width: min(760px, calc(100vw - 40px));
+  background: #0f172a;
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 12px 14px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.28);
+}
+
+.shortlist-selected-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: #1e293b;
+  color: #facc15;
+  font-weight: 800;
+}
+
+.shortlist-selected-label {
+  color: #e2e8f0;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.shortlist-action-bar .btn-secondary {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-color: #334155;
+}
+
+.shortlist-action-bar .btn-secondary:hover {
+  background: #334155;
+  color: white;
 }
 
 @keyframes screeningStageEnter {
@@ -1758,6 +2035,47 @@ input:checked + .slider:before {
     z-index: 20;
     max-height: calc(100vh - 24px);
   }
+
+  .screening-workspace {
+    padding: 24px;
+  }
+
+  .shortlist-search-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .shortlist-search-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .shortlist-button-row {
+    justify-content: flex-end;
+  }
+
+  .shortlist-card-top {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .shortlist-meta {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+
+  .shortlist-analysis {
+    grid-template-columns: 1fr;
+  }
+
+  .shortlist-action-bar {
+    grid-template-columns: auto auto minmax(160px, 1fr);
+    left: calc(50% + 36px);
+    width: calc(100vw - 112px);
+    min-width: 0;
+  }
+
+  .shortlist-action-bar .btn {
+    width: 100%;
+  }
 }
 
 @media (max-width: 560px) {
@@ -1777,6 +2095,42 @@ input:checked + .slider:before {
 
   .talent-pool-table-scroll table {
     min-width: 1280px !important;
+  }
+
+  .screening-workspace {
+    padding: 16px;
+  }
+
+  .shortlist-search-shell {
+    padding: 16px;
+  }
+
+  .shortlist-button-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .shortlist-card {
+    padding: 16px;
+  }
+
+  .shortlist-analysis,
+  .shortlist-role-strip {
+    margin-left: 0;
+  }
+
+  .shortlist-action-bar {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: auto;
+    transform: none;
+    grid-template-columns: auto 1fr;
+  }
+
+  .shortlist-destination-select,
+  .shortlist-action-bar .btn {
+    grid-column: 1 / -1;
   }
 }
 

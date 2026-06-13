@@ -264,6 +264,23 @@ if (!API_URL && !isLocalHost) {
 const useAbsoluteApi = /^https?:\/\//.test(API_URL) && !isLocalHost
 export const API_BASE = useAbsoluteApi ? `${API_URL}/api` : '/api'
 
+const roleCacheKey = (role) => {
+    if (role && typeof role === 'object') return String(role.id ?? role.name)
+    return String(role || '')
+}
+
+const roleNameFrom = (role) => {
+    if (role && typeof role === 'object') return role.name
+    return role
+}
+
+const roleUrl = (role, suffix = '') => {
+    const name = roleNameFrom(role)
+    const id = role && typeof role === 'object' ? role.id : null
+    const params = id ? `?role_id=${encodeURIComponent(id)}` : ''
+    return `${API_BASE}/roles/${encodeURIComponent(name)}${suffix}${params}`
+}
+
 // Absolute base for OAuth and top-level redirects
 export const BACKEND_BASE = isLocalHost ? 'http://127.0.0.1:8000' : (API_URL || window.location.origin)
 
@@ -276,6 +293,38 @@ const WS_URL = `${protocol}//${BACKEND_HOST}/api/ws/search`
 import { persist } from 'zustand/middleware'
 
 const defaultCallStats = { due_today: 0, upcoming: 0, completed: 0, active_lists: 0 }
+
+function getAnalyticsUserKey(user) {
+    if (!user?.id) return ''
+    return `${user.id}:${String(user.role || '').trim().toLowerCase()}`
+}
+
+function emptyAuthScopedCaches() {
+    return {
+        analytics: null,
+        analyticsLastFetchedAt: 0,
+        analyticsRequest: null,
+        analyticsUserKey: '',
+        analyticsRequestUserKey: '',
+        tpCandidates: [],
+        tpTotal: 0,
+        tpTotalPages: 1,
+        tpStatusCounts: {},
+        tpScopeTotal: null,
+        tpScopeStatusCounts: {},
+        tpScopeSummaryIsRefreshing: false,
+        tpScopeSummaryRequest: null,
+        tpScopeSummaryRequestParamsString: '',
+        tpScopeSummaryLastFetchedAt: 0,
+        tpScopeSummaryLastParamsString: '',
+        talentPoolCache: { data: null, lastParamsString: null, lastFetchedAt: 0 },
+        talentPoolIndex: { rows: [], lastFetchedAt: 0, lastParamsString: '' },
+        talentPoolRequest: null,
+        talentPoolRequestParamsString: '',
+        talentPoolIndexRequest: null,
+        talentPoolIndexRequestParamsString: '',
+    }
+}
 
 export const useAppStore = create(persist((set, get) => ({
     // Navigation
@@ -307,10 +356,12 @@ export const useAppStore = create(persist((set, get) => ({
             set({
                 token: access_token,
                 isAuthenticated: true,
-                user: userData
+                user: userData,
+                ...emptyAuthScopedCaches()
             })
 
             axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
+            get().invalidateTalentPoolCaches({ clearRows: true })
             return { success: true }
         } catch (error) {
             console.error('OTP Verification failed:', error)
@@ -337,7 +388,8 @@ export const useAppStore = create(persist((set, get) => ({
             set({
                 token: access_token,
                 isAuthenticated: true,
-                user: userData
+                user: userData,
+                ...emptyAuthScopedCaches()
             })
 
             // Set default header
@@ -355,7 +407,7 @@ export const useAppStore = create(persist((set, get) => ({
     logout: () => {
         localStorage.removeItem('token')
         delete axios.defaults.headers.common['Authorization']
-        set({ token: null, isAuthenticated: false, user: null })
+        set({ token: null, isAuthenticated: false, user: null, ...emptyAuthScopedCaches() })
         get().invalidateTalentPoolCaches({ clearRows: true })
     },
 
@@ -369,7 +421,8 @@ export const useAppStore = create(persist((set, get) => ({
             set({
                 token: access_token,
                 isAuthenticated: true,
-                user: userData
+                user: userData,
+                ...emptyAuthScopedCaches()
             })
 
             // Set default header
@@ -385,7 +438,16 @@ export const useAppStore = create(persist((set, get) => ({
     fetchProfile: async () => {
         try {
             const res = await axios.get(`${API_BASE}/me`, { timeout: 8000 })
-            set({ user: res.data, isAuthenticated: true })
+            const previousUserKey = getAnalyticsUserKey(get().user)
+            const nextUserKey = getAnalyticsUserKey(res.data)
+            set({
+                user: res.data,
+                isAuthenticated: true,
+                ...(previousUserKey && previousUserKey !== nextUserKey ? emptyAuthScopedCaches() : {}),
+            })
+            if (previousUserKey && previousUserKey !== nextUserKey) {
+                get().invalidateTalentPoolCaches({ clearRows: true })
+            }
             return { success: true }
         } catch (e) {
             console.error('Failed to fetch profile:', e)
@@ -510,40 +572,61 @@ export const useAppStore = create(persist((set, get) => ({
     analytics: null,
     analyticsLastFetchedAt: 0,
     analyticsRequest: null,
+    analyticsUserKey: '',
+    analyticsRequestUserKey: '',
     fetchAnalytics: async (options = {}) => {
         const force = typeof options === 'boolean' ? options : options.force === true
         const state = get()
         const freshnessMs = 60 * 1000
+        const userKey = getAnalyticsUserKey(state.user)
 
-        if (state.analytics && !force) {
+        if (!userKey) {
+            set({
+                analytics: null,
+                analyticsLastFetchedAt: 0,
+                analyticsRequest: null,
+                analyticsUserKey: '',
+                analyticsRequestUserKey: '',
+            })
+            return { success: false, error: 'No authenticated user' }
+        }
+
+        if (state.analytics && state.analyticsUserKey === userKey && !force) {
             if (!state.analyticsRequest && (!state.analyticsLastFetchedAt || Date.now() - state.analyticsLastFetchedAt >= freshnessMs)) {
                 setTimeout(() => { get().fetchAnalytics({ force: true }) }, 0)
             }
             return { success: true, data: state.analytics, cached: true }
         }
 
-        if (state.analyticsRequest) {
+        if (state.analyticsRequest && state.analyticsRequestUserKey === userKey) {
             return state.analyticsRequest
         }
 
         const request = axios.get(`${API_BASE}/candidates/analytics`, { timeout: 60000 })
             .then(res => {
+                if (getAnalyticsUserKey(get().user) !== userKey) {
+                    return { success: false, stale: true, error: 'Ignored stale analytics request' }
+                }
                 set({
                     analytics: res.data,
                     analyticsLastFetchedAt: Date.now(),
-                    analyticsRequest: null
+                    analyticsRequest: null,
+                    analyticsUserKey: userKey,
+                    analyticsRequestUserKey: '',
                 })
                 return { success: true, data: res.data, cached: false }
             })
             .catch(e => {
                 console.error('Failed to fetch analytics:', e)
-                set({ analyticsRequest: null })
+                if (getAnalyticsUserKey(get().user) === userKey) {
+                    set({ analyticsRequest: null, analyticsRequestUserKey: '' })
+                }
                 const fallback = get().analytics
-                if (fallback) return { success: true, data: fallback, cached: true }
+                if (fallback && get().analyticsUserKey === userKey) return { success: true, data: fallback, cached: true }
                 return { success: false, error: e.response?.data?.detail || 'Failed to fetch analytics' }
             })
 
-        set({ analyticsRequest: request })
+        set({ analyticsRequest: request, analyticsRequestUserKey: userKey })
         return request
     },
 
@@ -630,6 +713,8 @@ export const useAppStore = create(persist((set, get) => ({
     // Search via REST (synchronous)
     searchCandidates: async (query, options = {}) => {
         const initialStatus = options.initialStatus || 'Screening...'
+        const sourceType = options.sourceType || options.source_type || 'master'
+        const sourceRoleId = options.sourceRoleId || options.source_role_id || null
         set({
             isSearching: true,
             searchResults: [],
@@ -641,7 +726,11 @@ export const useAppStore = create(persist((set, get) => ({
             lastSearchError: '',
         })
         try {
-            const res = await axios.post(`${API_BASE}/search`, { query })
+            const res = await axios.post(`${API_BASE}/search`, {
+                query,
+                source_type: sourceType,
+                source_role_id: sourceRoleId,
+            })
             const totalCandidates = res.data.total ?? res.data.candidates?.length ?? 0
             set({
                 searchResults: res.data.candidates,
@@ -669,7 +758,9 @@ export const useAppStore = create(persist((set, get) => ({
     },
 
     // Search via WebSocket (streaming)
-    searchCandidatesStream: (query) => {
+    searchCandidatesStream: (query, options = {}) => {
+        const sourceType = options.sourceType || options.source_type || 'master'
+        const sourceRoleId = options.sourceRoleId || options.source_role_id || null
         const existingWs = get()._ws
         if (existingWs) {
             try {
@@ -716,7 +807,9 @@ export const useAppStore = create(persist((set, get) => ({
             } catch (_) { }
             set({ _ws: null })
             get().searchCandidates(query, {
-                initialStatus: 'Realtime screening unavailable. Running standard search...'
+                initialStatus: 'Realtime screening unavailable. Running standard search...',
+                sourceType,
+                sourceRoleId,
             })
         }
 
@@ -733,7 +826,12 @@ export const useAppStore = create(persist((set, get) => ({
         ws.onopen = () => {
             if (finished) return
             const token = get().token
-            ws.send(JSON.stringify({ query, token }))
+            ws.send(JSON.stringify({
+                query,
+                token,
+                source_type: sourceType,
+                source_role_id: sourceRoleId,
+            }))
             set({ statusMessage: 'Processing query...' })
             armFallbackTimer(12000)
         }
@@ -822,12 +920,29 @@ export const useAppStore = create(persist((set, get) => ({
         }
         set({
             isSearching: false,
+            isSearchPaused: false,
             statusMessage: 'Screening stopped',
             searchOutcome: 'cancelled',
             lastSearchError: '',
             _ws: null,
             _searchFallbackTimer: null,
         })
+    },
+
+    pauseSearch: () => {
+        const ws = get()._ws
+        if (ws) {
+            ws.send(JSON.stringify({ action: 'pause' }))
+            set({ isSearchPaused: true })
+        }
+    },
+
+    resumeSearch: () => {
+        const ws = get()._ws
+        if (ws) {
+            ws.send(JSON.stringify({ action: 'resume' }))
+            set({ isSearchPaused: false })
+        }
     },
 
     clearSearch: () => {
@@ -849,6 +964,7 @@ export const useAppStore = create(persist((set, get) => ({
             searchTotal: 0,
             usage: null,
             isSearching: false,
+            isSearchPaused: false,
             searchOutcome: 'idle',
             lastSearchError: '',
             _ws: null,
@@ -1045,41 +1161,33 @@ export const useAppStore = create(persist((set, get) => ({
     clearViewingRole: () => set({ viewingRole: null }),
 
     assignCandidatesToRole: async (roleName, assignments) => {
-        // 1. Optimistically update candidate counts in roles list
         const prevRoles = [...get().roles]
-        const updatedRoles = prevRoles.map(r =>
-            r.name === roleName
-                ? { ...r, candidate_count: r.candidate_count + assignments.length }
-                : r
-        )
-        set({ roles: updatedRoles })
+        const previousCache = { ...get().roleDetailsCache }
+        const previousViewingRole = get().viewingRole
 
-        // 2. Identify the full candidate objects from our current state (searchResults or cache)
-        // We look in searchResults to find the full profile data for the assigned IDs
         const candidatesToAdd = assignments.map(assign => {
             const fullProfile = get().searchResults.find(c => c.id === assign.candidate_id) || {}
             return {
                 ...fullProfile,
-                ...assign, // Adds priority, feedback
-                // Add placeholder/loading state for contact info if needed, or keep existing
+                ...assign,
                 email: fullProfile.email || null,
                 mobile_phone: fullProfile.mobile_phone || null
             }
         })
 
-        // 3. Update the Cache immediately (User-perceived instant assignment)
-        const prevCache = { ...get().roleDetailsCache }
-        const existingCachedRole = prevCache[roleName] || { name: roleName, candidates: [] }
+        const nextCache = { ...previousCache }
+        const existingCachedRole = nextCache[roleName] || { name: roleName, candidates: [] }
+        const existingIds = new Set((existingCachedRole.candidates || []).map(candidate => Number(candidate.id)))
+        const optimisticAdds = candidatesToAdd.filter(candidate => !existingIds.has(Number(candidate.id)))
 
         const newCachedRole = {
             ...existingCachedRole,
-            candidates: [...(existingCachedRole.candidates || []), ...candidatesToAdd]
+            candidates: [...(existingCachedRole.candidates || []), ...optimisticAdds]
         }
 
-        prevCache[roleName] = newCachedRole
-        set({ roleDetailsCache: prevCache })
+        nextCache[roleName] = newCachedRole
+        set({ roleDetailsCache: nextCache })
 
-        // 4. If currently viewing this role, update the view immediately
         if (get().viewingRole?.name === roleName) {
             set({ viewingRole: newCachedRole })
         }
@@ -1089,18 +1197,15 @@ export const useAppStore = create(persist((set, get) => ({
                 assignments
             })
 
-            // Refresh roles immediately to get correct counts from server
-            const rolesResult = await get().fetchRoles({ force: true })
-            console.log('Refreshed roles after assignment:', rolesResult)
-
-            // Background fetch to get Clay enriched data (emails/phones)
-            // This will silently update the view/cache when data arrives
-            get()._fetchRoleDetailsBackground(roleName)
+            await get().fetchRoles({ force: true })
+            await get()._fetchRoleDetailsBackground(roleName)
+            get().invalidateTalentPoolCaches?.()
+            get().fetchTalentPoolSummary?.({ force: true })
+            get().fetchAnalytics?.({ force: true })
 
             return { success: true, data: res.data }
         } catch (error) {
-            // Rollback on fully failed request
-            set({ roles: prevRoles, roleDetailsCache: get().roleDetailsCache }) // Revert cache?? Ideally revert to exact prev state but complex
+            set({ roles: prevRoles, roleDetailsCache: previousCache, viewingRole: previousViewingRole })
             return { success: false, error: error.response?.data?.detail || 'Failed to assign candidates' }
         }
     },
@@ -2407,6 +2512,8 @@ export const useAppStore = create(persist((set, get) => ({
             tpScopeStatusCounts: {},
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
+            analyticsUserKey: '',
+            analyticsRequestUserKey: '',
             tpCandidates: currentState.tpCandidates,
             tpTotal: currentState.tpTotal,
             tpStatusCounts: currentState.tpStatusCounts,

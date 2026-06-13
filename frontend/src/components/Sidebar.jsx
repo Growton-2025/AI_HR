@@ -26,7 +26,7 @@ const getStatusCount = (counts, statusName) => {
 
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
-    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, fetchTalentPoolSummary, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
         setSidebarWidth: state.setSidebarWidth,
@@ -35,6 +35,7 @@ function Sidebar() {
         tpScopeStatusCounts: state.tpScopeStatusCounts,
         tpScopeSummaryLastParamsString: state.tpScopeSummaryLastParamsString,
         buildTalentPoolScopeQuery: state.buildTalentPoolScopeQuery,
+        fetchTalentPoolSummary: state.fetchTalentPoolSummary,
         talentPoolViewScope: state.talentPoolViewScope,
         talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
         talentPoolRoleFilterId: state.talentPoolRoleFilterId,
@@ -47,9 +48,20 @@ function Sidebar() {
 
     const isIconOnly = sidebarWidth < ICON_THRESHOLD
 
+    useEffect(() => {
+        if (!user) return
+        fetchTalentPoolSummary?.()
+    }, [
+        user,
+        fetchTalentPoolSummary,
+        talentPoolViewScope,
+        talentPoolRecruiterFilterId,
+        talentPoolRoleFilterId,
+    ])
+
     const allNavItems = [
         { path: "/",            label: "Dashboard",    icon: BarChart2,         id: "dashboard"   },
-        { path: '/screening',   label: 'Screening',    icon: Search,            id: 'screening'   },
+        { path: '/screening',   label: 'AI Shortlist', icon: Search,            id: 'screening'   },
         { path: '/talent-pool', label: 'Talent Pool',  icon: Users,             id: 'talent_pool' },
         { path: '/roles',       label: 'Manage Roles', icon: Briefcase,         id: 'roles'       },
         { path: '/campaigns',   label: 'Campaigns',    icon: Activity,          id: 'campaigns'   },

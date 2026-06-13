@@ -6,6 +6,7 @@ import hashlib
 import redis
 import tiktoken
 import copy
+import re
 import pandas as pd
 import io
 import psycopg2
@@ -16,6 +17,17 @@ from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from backend.db.connection import get_db_connection, return_db_connection
+from backend.services.ai_columns import (
+    build_candidate_context,
+    build_candidate_context_pack,
+    build_query_plan,
+    call_openai_json,
+    career_facts_to_text,
+    classify_ai_column_prompt,
+    compute_career_facts,
+    run_candidate_query_tools,
+    verify_smart_column_outputs,
+)
 
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,7 +38,8 @@ load_dotenv()
 MODEL_PRICING = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 5.00, "output": 15.00},
-    "text-embedding-3-small": {"input": 0.02, "output": 0.0}
+    "text-embedding-3-small": {"input": 0.02, "output": 0.0},
+    "text-embedding-3-large": {"input": 0.13, "output": 0.0},
 }
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
@@ -98,10 +111,23 @@ except Exception as e:
     redis_client = None
 
 # --- LLM and Embeddings Initialization ---
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
-specialist_llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
-generation_llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+SCREENING_CRITERIA_MODEL = os.getenv("SCREENING_CRITERIA_MODEL", "gpt-4o")
+SCREENING_REASONING_MODEL = os.getenv("SCREENING_REASONING_MODEL", "gpt-4o")
+SCREENING_GENERATION_MODEL = os.getenv("SCREENING_GENERATION_MODEL", SCREENING_REASONING_MODEL)
+SCREENING_EMBEDDING_MODEL = os.getenv("SCREENING_EMBEDDING_MODEL", "text-embedding-3-small")
+SCREENING_MAX_RESULTS = int(os.getenv("SCREENING_MAX_RESULTS", "25"))
+SCREENING_VECTOR_LIMIT = int(os.getenv("SCREENING_VECTOR_LIMIT", "750"))
+SCREENING_FULL_SCAN_LIMIT = int(os.getenv("SCREENING_FULL_SCAN_LIMIT", "5000"))
+SCREENING_WEB_SEARCH_DEFAULT = os.getenv("SCREENING_WEB_SEARCH_DEFAULT", "true").strip().lower() not in {"0", "false", "no"}
+SCREENING_WEB_VERIFY_TOP_K = int(os.getenv("SCREENING_WEB_VERIFY_TOP_K", "30"))
+SCREENING_WEB_CONCURRENCY = int(os.getenv("SCREENING_WEB_CONCURRENCY", "3"))
+SCREENING_WEB_SEARCH_TOOL = os.getenv("SCREENING_WEB_SEARCH_TOOL", os.getenv("AI_COLUMN_WEB_SEARCH_TOOL", "web_search"))
+SCREENING_WEB_SEARCH_CONTEXT_SIZE = os.getenv("SCREENING_WEB_SEARCH_CONTEXT_SIZE", os.getenv("AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE", "high"))
+
+llm = ChatOpenAI(model=SCREENING_CRITERIA_MODEL, temperature=0.0)
+specialist_llm = ChatOpenAI(model=SCREENING_REASONING_MODEL, temperature=0.1)
+generation_llm = ChatOpenAI(model=SCREENING_GENERATION_MODEL, temperature=0.2)
+embeddings = OpenAIEmbeddings(model=SCREENING_EMBEDDING_MODEL)
 
 # --- Helper Functions ---
 def safe_json_loads(json_str: str, default_val: Any = None) -> Any:
@@ -1032,117 +1058,531 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
     return total_duration, contributing_roles
 
 
-async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-    logger.info("Applying detailed filters...")
-    matching_candidates = []
+TEXT_CRITERIA_CONFIG = {
+    "required_keywords": {"label": "Keywords", "weight": 1.0, "taxonomy": None},
+    "required_companies": {"label": "Companies", "weight": 1.35, "taxonomy": None},
+    "required_industries": {"label": "Industries", "weight": 1.1, "taxonomy": None},
+    "required_functions": {"label": "Functions", "weight": 1.45, "taxonomy": SALES_TAXONOMY},
+    "required_segments": {"label": "Customer segments", "weight": 1.2, "taxonomy": SEGMENT_SYNONYMS},
+    "required_locations": {"label": "Locations", "weight": 0.9, "taxonomy": None},
+    "required_geographies": {"label": "Geographies", "weight": 1.05, "taxonomy": GEOGRAPHY_COUNTRY_TO_REGION_MAP},
+    "required_company_details": {"label": "Company details", "weight": 1.1, "taxonomy": COMPANY_DETAILS_TAXONOMY},
+    "required_culture_type": {"label": "Culture", "weight": 0.75, "taxonomy": CULTURE_TAXONOMY},
+}
 
-    sort_criterion = "required_functions"
-    if criteria.get("required_segments"): sort_criterion = "required_segments"
-    elif criteria.get("required_industries"): sort_criterion = "required_industries"
-    elif criteria.get("required_geographies"): sort_criterion = "required_geographies"
-    
-    for profile in profiles:
-        profile['evidence_log'] = []
-        profile['contributing_roles_details'] = {}
-        profile['calculated_experience'] = {}
-        
-        all_criteria_met = True
-        
-        min_total_exp = criteria.get("min_total_experience")
-        if min_total_exp and (profile.get("total_experience_years") or 0) < min_total_exp:
-            all_criteria_met = False
 
-        min_managed = criteria.get("min_people_managed")
-        if min_managed and (profile.get("max_people_managed") or 0) < min_managed:
-            all_criteria_met = False
+def _flatten_value_for_evidence(value: Any, *, max_items: int = 80) -> List[str]:
+    parts: List[str] = []
 
-        checks = [
-            check_company_presence,
-            check_industry_presence,
-            check_functional_presence,
-            check_customer_segments,
-            check_location_presence,
-            check_geography_experience,
-            check_company_details,
-            check_company_culture_presence,
-            check_excluded_geography_presence,
-            check_tenure_in_latest_role,
-            check_avg_tenure_in_last_n_roles
-        ]
-        
-        for check in checks:
-            if all_criteria_met and not check(profile, criteria):
-                all_criteria_met = False
-                break
-        
-        if all_criteria_met:
-            for key, calc_func in [
-                ("required_functions", calculate_functional_experience_duration),
-                ("required_industries", calculate_industry_experience_duration),
-                ("required_segments", calculate_segment_experience_duration),
-                ("required_geographies", calculate_geography_experience_duration),
-                ("required_company_details", calculate_company_details_experience_duration)
-            ]:
-                crit_obj = criteria.get(key)
-                if crit_obj and isinstance(crit_obj, dict):
-                     min_y = crit_obj.get("min_years", 0.0)
-                     duration, roles = calc_func(profile, crit_obj)
-                     profile['calculated_experience'][key] = {
-                        "duration": duration,
-                        "roles": roles,
-                        "label": ", ".join(get_values_from_criteria(crit_obj)),
-                        "required": min_y
-                    }
-                     if duration < min_y:
-                        all_criteria_met = False
-                        break
-        
-        if all_criteria_met:
-            if profile['calculated_experience']:
-                first_key = next(iter(profile['calculated_experience']))
-                profile['contributing_roles_details'] = {'roles': profile['calculated_experience'][first_key]['roles']}
-            else:
-                # Fallback role details
-                profile['contributing_roles_details'] = {'roles': profile.get('roles', [])[:3]}
-            
-            matching_candidates.append(profile)
+    def walk(item: Any) -> None:
+        if len(parts) >= max_items:
+            return
+        if item is None:
+            return
+        if isinstance(item, (str, int, float, bool)):
+            text = str(item).strip()
+            if text:
+                parts.append(text)
+            return
+        if isinstance(item, dict):
+            for key, val in item.items():
+                key_text = str(key).replace("_", " ").strip()
+                if isinstance(val, (dict, list, tuple)):
+                    nested = " ".join(_flatten_value_for_evidence(val, max_items=8))
+                    if nested:
+                        parts.append(f"{key_text}: {nested}")
+                else:
+                    val_text = str(val or "").strip()
+                    if val_text:
+                        parts.append(f"{key_text}: {val_text}")
+                if len(parts) >= max_items:
+                    break
+            return
+        if isinstance(item, (list, tuple, set)):
+            for child in item:
+                walk(child)
+                if len(parts) >= max_items:
+                    break
 
-    if matching_candidates and sort_criterion:
-        matching_candidates.sort(
-            key=lambda x: x['calculated_experience'].get(sort_criterion, {}).get('duration', 0.0),
-            reverse=True
+    walk(value)
+    return parts
+
+
+def _normalize_search_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+
+
+def _term_matches_text(term: str, text: str) -> bool:
+    term_l = _normalize_search_text(term)
+    if not term_l:
+        return False
+    if len(term_l) <= 3:
+        return re.search(rf"\b{re.escape(term_l)}\b", text) is not None
+    return term_l in text
+
+
+def _evidence_snippet(text: str, term: str, *, max_len: int = 180) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= max_len:
+        return clean
+    term_l = _normalize_search_text(term)
+    lower = clean.lower()
+    idx = lower.find(term_l) if term_l else -1
+    if idx < 0:
+        return clean[: max_len - 1].rstrip() + "..."
+    start = max(0, idx - 60)
+    end = min(len(clean), idx + len(term_l) + 90)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(clean) else ""
+    return prefix + clean[start:end].strip() + suffix
+
+
+def build_profile_evidence_chunks(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+
+    def add(source: str, value: Any, *, role: Optional[Dict[str, Any]] = None) -> None:
+        if value is None:
+            return
+        text = " ".join(_flatten_value_for_evidence(value)) if not isinstance(value, str) else value
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if text:
+            chunks.append({
+                "source": source,
+                "text": text[:1200],
+                "text_l": _normalize_search_text(text),
+                "role": role,
+            })
+
+    for key in (
+        "name",
+        "headline",
+        "about",
+        "location",
+        "city",
+        "candidate_services",
+        "extracted_industry",
+        "response",
+        "notes",
+    ):
+        add(key, profile.get(key))
+
+    raw_fields = profile.get("raw_fields")
+    if isinstance(raw_fields, dict):
+        add("uploaded fields", raw_fields)
+
+    for idx, role in enumerate(profile.get("roles") or [], start=1):
+        company_details = role.get("company_details") or {}
+        add(
+            f"role {idx}",
+            {
+                "title": role.get("title"),
+                "company": role.get("company"),
+                "details": role.get("details"),
+                "duration_years": role.get("duration_years"),
+                "start_date": role.get("start_date"),
+                "end_date": role.get("end_date"),
+            },
+            role=role,
         )
+        add(f"role {idx} company details", company_details, role=role)
+
+    return chunks
+
+
+def _expanded_terms(value: str, criterion_key: str) -> List[str]:
+    value_l = _normalize_search_text(value)
+    if not value_l:
+        return []
+
+    terms = {value_l}
+    if criterion_key == "required_functions":
+        for canonical, aliases in SALES_TAXONOMY.items():
+            canonical_l = _normalize_search_text(canonical)
+            alias_l = {_normalize_search_text(alias) for alias in aliases}
+            if value_l == canonical_l or value_l in alias_l:
+                terms.add(canonical_l)
+                terms.update(alias_l)
+    elif criterion_key == "required_segments":
+        for canonical, aliases in SEGMENT_SYNONYMS.items():
+            canonical_l = _normalize_search_text(canonical)
+            alias_l = {_normalize_search_text(alias) for alias in aliases}
+            if value_l == canonical_l or value_l in alias_l:
+                terms.add(canonical_l)
+                terms.update(alias_l)
+    elif criterion_key == "required_company_details":
+        for canonical, aliases in COMPANY_DETAILS_TAXONOMY.items():
+            canonical_l = _normalize_search_text(canonical)
+            alias_l = {_normalize_search_text(alias) for alias in aliases}
+            if value_l == canonical_l or value_l in alias_l:
+                terms.add(canonical_l)
+                terms.update(alias_l)
+    elif criterion_key == "required_culture_type":
+        for canonical, aliases in CULTURE_TAXONOMY.items():
+            canonical_l = _normalize_search_text(canonical)
+            alias_l = {_normalize_search_text(alias) for alias in aliases}
+            if value_l == canonical_l or value_l in alias_l:
+                terms.add(canonical_l)
+                terms.update(alias_l)
+    elif criterion_key == "required_geographies":
+        regions = {region for region in GEOGRAPHY_COUNTRY_TO_REGION_MAP.values()}
+        if value_l in regions:
+            terms.update(country for country, region in GEOGRAPHY_COUNTRY_TO_REGION_MAP.items() if region == value_l)
+        mapped_region = GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(value_l)
+        if mapped_region:
+            terms.add(mapped_region)
+
+    return sorted(term for term in terms if term)
+
+
+def _criterion_operator(criterion: Any) -> str:
+    if isinstance(criterion, dict):
+        op = str(criterion.get("operator") or "OR").upper()
+        return op if op in {"AND", "OR"} else "OR"
+    return "OR"
+
+
+def _score_text_criterion(
+    profile: Dict[str, Any],
+    criterion_key: str,
+    criterion: Any,
+    chunks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    values = get_values_from_criteria(criterion)
+    if criterion_key == "required_companies" and isinstance(criterion, list):
+        values = [str(item) for item in criterion if str(item).strip()]
+    values = [str(value).strip() for value in values if str(value).strip()]
+    if not values:
+        return {"applicable": False, "score": 1.0, "matched": [], "missing": [], "evidence": [], "met": True}
+
+    matched: List[str] = []
+    missing: List[str] = []
+    evidence: List[Dict[str, Any]] = []
+    matched_roles: List[Dict[str, Any]] = []
+
+    for value in values:
+        terms = _expanded_terms(value, criterion_key)
+        found = None
+        for chunk in chunks:
+            if criterion_key == "required_companies":
+                if not chunk["source"].startswith("role"):
+                    continue
+                role_company = chunk.get("role", {}).get("company", "") or ""
+                term = next((term for term in terms if _term_matches_text(term, role_company.lower())), None)
+            else:
+                term = next((term for term in terms if _term_matches_text(term, chunk["text_l"])), None)
+            
+            if term:
+                found = (term, chunk)
+                break
+        if found:
+            term, chunk = found
+            matched.append(value)
+            evidence.append({
+                "criterion": TEXT_CRITERIA_CONFIG.get(criterion_key, {}).get("label", criterion_key),
+                "value": value,
+                "source": chunk["source"],
+                "snippet": _evidence_snippet(chunk["text"], term),
+            })
+            if chunk.get("role"):
+                matched_roles.append(chunk["role"])
+        else:
+            missing.append(value)
+
+    operator = _criterion_operator(criterion)
+    met = len(matched) == len(values) if operator == "AND" else bool(matched)
+    return {
+        "applicable": True,
+        "score": len(matched) / max(1, len(values)),
+        "matched": matched,
+        "missing": missing,
+        "evidence": evidence,
+        "matched_roles": matched_roles,
+        "met": met,
+        "operator": operator,
+    }
+
+
+def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    profile_copy = copy.deepcopy({k: v for k, v in profile.items() if k != "embedding"})
+    chunks = build_profile_evidence_chunks(profile_copy)
+    matched_criteria: List[Dict[str, Any]] = []
+    missing_criteria: List[str] = []
+    evidence_log: List[Dict[str, Any]] = []
+    contributing_roles: List[Dict[str, Any]] = []
+    calculated_experience: Dict[str, Any] = {}
+    total_weight = 0.0
+    earned_weight = 0.0
+
+    min_total_exp = criteria.get("min_total_experience")
+    if min_total_exp is not None:
+        actual = float(profile_copy.get("total_experience_years") or 0)
+        total_weight += 1.2
+        if actual >= float(min_total_exp):
+            earned_weight += 1.2
+            matched_criteria.append({"criterion": "Total experience", "value": f"{actual:g} years"})
+            evidence_log.append({
+                "criterion": "Total experience",
+                "value": str(min_total_exp),
+                "source": "profile",
+                "snippet": f"Total experience {actual:g} years",
+            })
+        else:
+            missing_criteria.append(f"Total experience >= {min_total_exp} years")
+            return None
+
+    min_managed = criteria.get("min_people_managed")
+    if min_managed is not None:
+        actual = int(profile_copy.get("max_people_managed") or 0)
+        total_weight += 0.8
+        if actual >= int(min_managed):
+            earned_weight += 0.8
+            matched_criteria.append({"criterion": "People managed", "value": str(actual)})
+        else:
+            missing_criteria.append(f"Managed team size >= {min_managed}")
+            return None
+
+    if not check_excluded_geography_presence(profile_copy, criteria):
+        return None
+    if not check_tenure_in_latest_role(profile_copy, criteria):
+        return None
+    if not check_avg_tenure_in_last_n_roles(profile_copy, criteria):
+        return None
+
+    for key, config in TEXT_CRITERIA_CONFIG.items():
+        criterion = criteria.get(key)
+        result = _score_text_criterion(profile_copy, key, criterion, chunks)
+        if not result["applicable"]:
+            continue
+
+        weight = float(config["weight"])
+        total_weight += weight
+        earned_weight += weight * float(result["score"])
+
+        if result["matched"]:
+            matched_criteria.append({
+                "criterion": config["label"],
+                "value": ", ".join(result["matched"]),
+                "operator": result.get("operator", "OR"),
+            })
+            evidence_log.extend(result["evidence"])
+            contributing_roles.extend(result.get("matched_roles") or [])
+
+        if result["missing"]:
+            missing_criteria.extend(f"{config['label']}: {value}" for value in result["missing"])
+
+        if result.get("operator") == "AND" and not result["met"]:
+            return None
+            
+        # Strict enforcement for companies: if an employer is requested, it MUST be met
+        if key == "required_companies" and not result["met"]:
+            return None
+
+        calc_map = {
+            "required_functions": calculate_functional_experience_duration,
+            "required_industries": calculate_industry_experience_duration,
+            "required_segments": calculate_segment_experience_duration,
+            "required_geographies": calculate_geography_experience_duration,
+            "required_company_details": calculate_company_details_experience_duration,
+        }
+        calc_func = calc_map.get(key)
+        if calc_func and isinstance(criterion, dict):
+            duration, roles = calc_func(profile_copy, criterion)
+            min_years = float(criterion.get("min_years") or 0)
+            calculated_experience[key] = {
+                "duration": duration,
+                "roles": roles,
+                "label": ", ".join(get_values_from_criteria(criterion)),
+                "required": min_years,
+            }
+            if min_years and duration < min_years:
+                missing_criteria.append(f"{config['label']} experience >= {min_years:g} years")
+                return None
+
+    if total_weight <= 0:
+        score = 100.0
+    else:
+        score = round((earned_weight / total_weight) * 100, 1)
+
+    has_text_criteria = any(criteria.get(key) for key in TEXT_CRITERIA_CONFIG)
+    threshold = float(os.getenv("SCREENING_MATCH_THRESHOLD", "60"))
+    if has_text_criteria and (score < threshold or not evidence_log):
+        return None
+
+    seen_roles = set()
+    role_details = []
+    for role in contributing_roles or profile_copy.get("roles", [])[:3]:
+        role_key = (role.get("company"), role.get("title"), role.get("start_date"), role.get("end_date"))
+        if role_key in seen_roles:
+            continue
+        seen_roles.add(role_key)
+        role_details.append({
+            "company": role.get("company", ""),
+            "title": role.get("title", ""),
+            "duration_years": role.get("duration_years", 0.0) or 0.0,
+            "start_date": role.get("start_date"),
+            "end_date": role.get("end_date"),
+        })
+        if len(role_details) >= 5:
+            break
+
+    profile_copy["match_score"] = score
+    profile_copy["matched_criteria"] = matched_criteria
+    profile_copy["missing_criteria"] = missing_criteria[:12]
+    profile_copy["evidence_log"] = evidence_log[:12]
+    profile_copy["calculated_experience"] = calculated_experience
+    profile_copy["contributing_roles_details"] = {"roles": role_details}
+    return profile_copy
+
+
+async def filter_candidates_by_criteria(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    logger.info("Applying ranked evidence filters to %s profiles...", len(profiles))
+    matching_candidates: List[Dict[str, Any]] = []
+
+    for profile in profiles:
+        scored = score_candidate_against_criteria(profile, criteria)
+        if scored:
+            matching_candidates.append(scored)
+
+    matching_candidates.sort(
+        key=lambda x: (
+            x.get("match_score") or 0,
+            x.get("total_experience_years") or 0,
+            len(x.get("evidence_log") or []),
+        ),
+        reverse=True,
+    )
 
     top_n = criteria.get("top_n")
     if top_n and top_n > 0:
         matching_candidates = matching_candidates[:top_n]
+    elif "top_n" not in criteria and SCREENING_MAX_RESULTS > 0:
+        if criteria.get("_source_type") != "master":
+            matching_candidates = matching_candidates[:SCREENING_MAX_RESULTS]
     
     return matching_candidates
 
-async def generate_reasoning_for_profile(profile: Dict[str, Any], original_criteria: Dict[str, Any], tracker: TokenCostTracker) -> str:
-    prompt_template = PromptTemplate(
-        input_variables=["original_criteria_json", "matching_profile_json"],
-        template="""
-        You are an expert recruitment analyst. Synthesize a concise, single-paragraph summary explaining why this candidate is a good match based on the original search criteria.
+def _has_source_url(sources: Any) -> bool:
+    return any(isinstance(source, dict) and str(source.get("url") or "").strip() for source in (sources or []))
 
-        **Original Criteria:** {original_criteria_json}
-        **Candidate:** {matching_profile_json}
 
-        **Instructions:**
-        - Use EVIDENCE provided in the candidate object.
-        - Single flowing paragraph. No bullets.
-        """
+def _fallback_reasoning_from_evidence(profile: Dict[str, Any]) -> str:
+    evidence = profile.get("evidence_log") or []
+    if not evidence:
+        return "Matched from structured profile evidence."
+    snippets = []
+    for item in evidence[:4]:
+        source = item.get("source") or "profile"
+        snippet = item.get("snippet") or item.get("value") or ""
+        if snippet:
+            snippets.append(f"{source}: {snippet}")
+    return "Matched from profile evidence: " + "; ".join(snippets[:4])
+
+
+def _strict_decision_is_match(structured: Dict[str, Any]) -> bool:
+    decision = _normalize_search_text(structured.get("decision") or structured.get("match") or structured.get("answer"))
+    return decision in {"match", "yes", "true", "qualified", "pass"}
+
+
+async def evaluate_shortlist_profile(
+    profile: Dict[str, Any],
+    original_query: str,
+    criteria: Dict[str, Any],
+    tracker: TokenCostTracker,
+    *,
+    use_web: bool,
+) -> Optional[Dict[str, Any]]:
+    profile_safe = copy.deepcopy({k: v for k, v in profile.items() if k != "embedding"})
+    context = build_candidate_context(profile_safe)
+    career_facts = compute_career_facts(context)
+    context_pack = build_candidate_context_pack(context, career_facts)
+    routing = classify_ai_column_prompt(original_query)
+    query_plan = build_query_plan(
+        original_query,
+        context,
+        [{"key": "decision", "label": "Decision", "type": "text", "primary": True}],
+        routing,
     )
-    # Create a safe copy for JSON serialization (remove numpy arrays like 'embedding')
-    profile_safe = {k: v for k, v in profile.items() if k != "embedding"}
-    formatted_prompt = prompt_template.format(
-        original_criteria_json=json.dumps(original_criteria, indent=2),
-        matching_profile_json=json.dumps(profile_safe, indent=2)
+    tool_results = run_candidate_query_tools(original_query, context, career_facts, query_plan)
+    career_context = career_facts_to_text(career_facts)
+
+    system_prompt = (
+        "You are a senior recruitment analyst. Evaluate whether this candidate fits the hiring query. "
+        "Return valid JSON only with these exact keys: "
+        "decision, match_score, answer, matched_criteria, missing_criteria, evidence, sources, confidence, reasoning. "
+        "\ndecision: exactly 'match', 'no_match', or 'unknown'. "
+        "\nmatch_score: integer 0-100 reflecting how well the candidate satisfies the query criteria. "
+        "\nCRITICAL REJECTION RULES: Interpret relationship intents strictly. If the query asks for candidates working at a specific company (e.g. 'Google'), you MUST reject candidates who only: 1) Have certifications from that company. 2) Sell to that company as a customer. 3) Compete against that company. 4) Use the company's products. The candidate MUST have the company listed as an employer in their role history. If not, return decision='no_match' and match_score below 60."
+        "\nanswer: 1-2 natural sentences with your verdict, mentioning actual company names, titles, and durations from the profile. "
+        "Example: 'Yes — Sarah has 6 years at Salesforce as an Enterprise AE covering US West, directly meeting the enterprise SaaS requirement.' "
+        "\nreasoning: 2-4 sentences explaining the key evidence — walk through what you found in the profile (role history, companies, experience) and how it maps to the query. Be specific; do not use vague phrases like 'the candidate has relevant experience'. "
+        "\nmatched_criteria: list of criteria satisfied with the profile evidence that supports each. "
+        "\nmissing_criteria: list of criteria not clearly evidenced. "
+        "\nevidence: list of evidence items, each with criterion, value, source, and snippet. "
+        "\nsources: list of web sources used if web search was performed, each with url, title, note. "
+        "\nconfidence: 'high', 'medium', or 'low' based on the quality of evidence. "
+        "Use the full profile, career tool results, and any web evidence available. Do not invent facts not in the data."
     )
-    response = await specialist_llm.ainvoke(formatted_prompt)
-    content = response.content.replace('\n', ' ').replace('|', '')
-    tracker.add_usage(specialist_llm.model_name, formatted_prompt, response.content, "Reasoning")
-    return content
+    user_prompt = (
+        f"Hiring query:\n{original_query}\n\n"
+        f"Extracted criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Candidate profile context:\n{json.dumps(context_pack, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Deterministic career tool results:\n{json.dumps(tool_results, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Pre-scored evidence from profile:\n{json.dumps(profile_safe.get('evidence_log') or [], ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Career facts summary:\n{career_context or 'Not available.'}\n\n"
+        "Return JSON only. In 'answer', write a human-readable verdict that cites specific roles and companies. "
+        "In 'reasoning', walk through the evidence clearly referencing actual data from the profile."
+    )
+
+    structured = await asyncio.to_thread(
+        call_openai_json,
+        system_prompt,
+        user_prompt,
+        model=SCREENING_REASONING_MODEL,
+        use_web=use_web,
+        web_search_tool=SCREENING_WEB_SEARCH_TOOL,
+        web_search_context_size=SCREENING_WEB_SEARCH_CONTEXT_SIZE,
+        temperature=0.0,
+        timeout=90.0 if use_web else 40.0,
+    )
+    tracker.add_usage(SCREENING_REASONING_MODEL, f"{system_prompt}\n\n{user_prompt}", json.dumps(structured), "Shortlist Verification")
+
+    if not structured:
+        profile_safe["reasoning"] = _fallback_reasoning_from_evidence(profile_safe)
+        profile_safe["confidence"] = profile_safe.get("confidence") or "medium"
+        return profile_safe
+
+    sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
+    outputs = {"decision": structured.get("decision", "")}
+    verification = verify_smart_column_outputs(
+        original_query,
+        outputs,
+        data_source="web" if use_web else "row",
+        sources=sources,
+        tool_results=tool_results,
+    )
+
+    score = float(structured.get("match_score") or profile_safe.get("match_score") or 0)
+    if not _strict_decision_is_match(structured) or score < float(os.getenv("SCREENING_VERIFIED_MATCH_THRESHOLD", "70")):
+        return None
+    if use_web and verification.get("verification_status") == "failed":
+        return None
+
+    profile_safe["match_score"] = round(score, 1)
+    profile_safe["matched_criteria"] = structured.get("matched_criteria") if isinstance(structured.get("matched_criteria"), list) else profile_safe.get("matched_criteria", [])
+    profile_safe["missing_criteria"] = structured.get("missing_criteria") if isinstance(structured.get("missing_criteria"), list) else profile_safe.get("missing_criteria", [])
+    profile_safe["evidence_log"] = structured.get("evidence") if isinstance(structured.get("evidence"), list) else profile_safe.get("evidence_log", [])
+    profile_safe["sources"] = sources
+    profile_safe["confidence"] = str(structured.get("confidence") or "medium").strip().lower()
+    # `answer` is the short natural-language verdict (1-2 sentences, like an AI Column primary_output)
+    raw_answer = structured.get("answer") or ""
+    raw_reasoning = structured.get("reasoning") or ""
+    profile_safe["answer"] = str(raw_answer).replace("|", " ").strip()
+    profile_safe["reasoning"] = str(raw_reasoning or raw_answer or _fallback_reasoning_from_evidence(profile_safe)).replace("\n", " ").replace("|", " ")
+    profile_safe["verification_status"] = verification.get("verification_status")
+    profile_safe["source_verification_status"] = "verified" if _has_source_url(sources) else ("row_context" if not use_web else "not_publicly_verifiable")
+    profile_safe["searched_at"] = structured.get("searched_at") or ""
+    profile_safe["web_search_tool"] = structured.get("web_search_tool") or ""
+    return profile_safe
 
 async def process_query_main(
     query: str,
@@ -1151,6 +1591,9 @@ async def process_query_main(
     *,
     screening_user_id: Optional[int] = None,
     screening_role: Optional[str] = None,
+    source_type: Optional[str] = None,
+    source_role_id: Optional[int] = None,
+    pause_event: Optional[asyncio.Event] = None,
 ) -> AsyncIterator[Any]:
     
     # Ensure cache is initialized
@@ -1168,6 +1611,7 @@ async def process_query_main(
         input_variables=["query", "sales_taxonomy_json", "segment_taxonomy_json"],
         template="""
         Extract structured filtering criteria from the user's query: "{query}".
+        CRITICAL: The query may contain typos or grammatical errors. Bravely infer the user's intent and correct misspellings of job titles, skills, and company names when categorizing them.
         
         Taxonomies:
         Sales: {sales_taxonomy_json}
@@ -1181,17 +1625,25 @@ async def process_query_main(
         - "required_locations": {{"operator": "OR", "values": List[str]}} (City/State)
         - "required_geographies": {{"operator": "OR", "values": List[str]}} (Countries/Regions like 'APAC', 'EMEA')
         - "required_company_details": {{"operator": "OR", "values": List[str]}} (e.g. 'SaaS', 'B2B', 'Series A')
+        - "required_keywords": {{"operator": "OR", "values": List[str]}} (only when the query has important terms that do not fit the other keys. DO NOT put company names here. Put ALL company names in required_companies, even if there are typos in the query)
         - "min_total_experience": int
         - "min_people_managed": int
         - "top_n": int (default 10 if searching for "top", "best")
         
-        Example:
+        Example 1:
         Query: "Account executives in SaaS companies in Singapore with 5 years exp"
         JSON: {{
             "required_functions": {{"operator": "OR", "values": ["Account Executive"]}},
             "required_company_details": {{"operator": "OR", "values": ["SaaS"]}},
             "required_locations": {{"operator": "OR", "values": ["Singapore"]}},
             "min_total_experience": 5
+        }}
+
+        Example 2:
+        Query: "softweare enginer at mcirosoft" (Note: handle typos bravely and correctly map them)
+        JSON: {{
+            "required_functions": {{"operator": "OR", "values": ["Software Engineer"]}},
+            "required_companies": ["Microsoft"]
         }}
 
         Query: "{query}"
@@ -1208,11 +1660,11 @@ async def process_query_main(
     try:
         criteria_response = await llm.ainvoke(prompt_text)
         criteria = safe_json_loads(criteria_response.content, {})
+        logger.info(f"Extracted Criteria JSON: {json.dumps(criteria)}")
         tracker.add_usage(llm.model_name, prompt_text, criteria_response.content, "Criteria Extraction")
         
         if not criteria:
-            # Fallback
-            criteria = {"required_industries": {"operator": "OR", "values": [normalized_query]}}
+            criteria = {"required_keywords": {"operator": "OR", "values": [normalized_query]}}
             
         # Handle "all" or explicit top_n removal
         if "all" in normalized_query_lower:
@@ -1227,8 +1679,10 @@ async def process_query_main(
         return
 
     original_criteria = copy.deepcopy(criteria)
+    criteria["_screening_query"] = query
+    criteria["_source_type"] = source_type
 
-    def _pool_scope_ids():
+    def _visible_scope_ids() -> Optional[List[int]]:
         if screening_r == "recruiter" and screening_user_id is not None:
             return [
                 pid
@@ -1237,21 +1691,73 @@ async def process_query_main(
             ]
         return None
 
+    def _role_scope_ids(role_id: int) -> List[int]:
+        conn = get_db_connection()
+        if not conn:
+            logger.warning("Could not resolve screening role scope: database connection unavailable")
+            return []
+        try:
+            with conn.cursor() as cur:
+                if screening_r == "recruiter" and screening_user_id is not None:
+                    cur.execute(
+                        "SELECT id FROM recruitment_roles WHERE id = %s AND user_id = %s",
+                        (role_id, screening_user_id),
+                    )
+                else:
+                    cur.execute("SELECT id FROM recruitment_roles WHERE id = %s", (role_id,))
+                if not cur.fetchone():
+                    return []
+                cur.execute(
+                    "SELECT candidate_id FROM recruitment_role_candidates WHERE role_id = %s",
+                    (role_id,),
+                )
+                return [int(row[0]) for row in cur.fetchall() if row and row[0] is not None]
+        except Exception as e:
+            logger.error("Could not resolve screening role scope %s: %s", role_id, e)
+            return []
+        finally:
+            return_db_connection(conn)
+
+    def _pool_scope_ids() -> Optional[List[int]]:
+        visible = _visible_scope_ids()
+        normalized_source = (source_type or "master").strip().lower()
+        if normalized_source == "role":
+            if not source_role_id:
+                return []
+            role_ids = _role_scope_ids(int(source_role_id))
+            if visible is None:
+                return role_ids
+            visible_set = set(visible)
+            return [pid for pid in role_ids if pid in visible_set]
+        return visible
+
+    scoped_candidate_ids = _pool_scope_ids()
+
     def _scoped_build(ids_override: Optional[List[int]] = None):
-        scope = _pool_scope_ids()
+        scope = scoped_candidate_ids
         if scope is not None:
             if ids_override is not None:
                 allowed = set(scope)
-                merged = [i for i in ids_override if i in allowed]
-                return build_candidate_pool(merged if merged else scope)
+                return build_candidate_pool([i for i in ids_override if i in allowed])
             return build_candidate_pool(scope)
         return build_candidate_pool(ids_override)
+
+    scoped_candidate_count = (
+        len(scoped_candidate_ids)
+        if scoped_candidate_ids is not None
+        else len([p for p in PROFILES_BY_ID.values() if not p.get("is_archived")])
+    )
+
+    if scoped_candidate_ids is not None and not scoped_candidate_ids:
+        yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
+        return
     
     # 3. SEMANTIC SEARCH (Vector Retrieval)
     yield "Searching database..."
     
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
+        get_values_from_criteria(criteria.get("required_keywords")) +
         get_values_from_criteria(criteria.get("required_industries")) +
         get_values_from_criteria(criteria.get("required_functions")) +
         get_values_from_criteria(criteria.get("required_segments")) +
@@ -1264,7 +1770,9 @@ async def process_query_main(
     initial_candidate_pool = []
     used_vector_shortlist = False
     
-    if search_query_text:
+    if scoped_candidate_count <= SCREENING_FULL_SCAN_LIMIT:
+        initial_candidate_pool = _scoped_build()
+    elif search_query_text:
         try:
             query_embedding = embeddings.embed_query(search_query_text)
             tracker.add_usage(embeddings.model, search_query_text, usage_type="Embedding")
@@ -1273,17 +1781,17 @@ async def process_query_main(
             if conn:
                 try:
                     with conn.cursor() as cur:
-                        if screening_r == "recruiter" and screening_user_id is not None:
+                        if scoped_candidate_ids is not None:
                             cur.execute(
                                 """
                                 SELECT id FROM candidates
                                 WHERE COALESCE(is_archived, FALSE) = FALSE
-                                  AND owner_user_id = %s
+                                  AND id = ANY(%s)
                                   AND embedding IS NOT NULL
                                 ORDER BY embedding <=> %s::vector
-                                LIMIT 500
+                                LIMIT %s
                                 """,
-                                (screening_user_id, query_embedding),
+                                (scoped_candidate_ids, query_embedding, SCREENING_VECTOR_LIMIT),
                             )
                         else:
                             cur.execute(
@@ -1292,24 +1800,23 @@ async def process_query_main(
                                 WHERE COALESCE(is_archived, FALSE) = FALSE
                                   AND embedding IS NOT NULL
                                 ORDER BY embedding <=> %s::vector
-                                LIMIT 500
+                                LIMIT %s
                                 """,
-                                (query_embedding,),
+                                (query_embedding, SCREENING_VECTOR_LIMIT),
                             )
                         ids = [row[0] for row in cur.fetchall()]
                         if (
                             not ids
-                            and screening_r == "recruiter"
-                            and screening_user_id is not None
+                            and scoped_candidate_ids is not None
                         ):
                             cur.execute(
                                 """
                                 SELECT id FROM candidates
                                 WHERE COALESCE(is_archived, FALSE) = FALSE
-                                  AND owner_user_id = %s
+                                  AND id = ANY(%s)
                                 LIMIT 2000
                                 """,
-                                (screening_user_id,),
+                                (scoped_candidate_ids,),
                             )
                             ids = [row[0] for row in cur.fetchall()]
                 finally:
@@ -1325,54 +1832,67 @@ async def process_query_main(
     else:
         initial_candidate_pool = _scoped_build()
     
-    # 4. Filter Candidates
+    # 4. Soft-rank Candidates
     final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
-    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < len(
-        [p for p in PROFILES_BY_ID.values() if not p.get("is_archived")]
-    ):
+    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < scoped_candidate_count:
         logger.info("Vector shortlist returned no matches after filtering. Retrying scoped full cache.")
         final_candidates = await filter_candidates_by_criteria(_scoped_build(), criteria)
     
+    # Limit removed so the AI can chunk and process all pre-filtered candidates without artificial restrictions
+    # if SCREENING_WEB_SEARCH_DEFAULT:
+    #     final_candidates = final_candidates[:SCREENING_WEB_VERIFY_TOP_K]
+
     if not final_candidates:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
         return
 
     yield {"type": "progress_start", "total": len(final_candidates)}
     
-    # 5. Parallel Reasoning Generation
-    CONCURRENCY_LIMIT = 5
+    # 5. Parallel verification and reasoning generation
+    CONCURRENCY_LIMIT = max(1, SCREENING_WEB_CONCURRENCY if SCREENING_WEB_SEARCH_DEFAULT else 5)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     
-    async def get_reasoning_safe(profile):
+    async def verify_profile_safe(profile):
         async with semaphore:
+            if pause_event:
+                await pause_event.wait()
             try:
-                reasoning = await generate_reasoning_for_profile(profile, original_criteria, tracker)
-                profile['reasoning'] = reasoning
-                return profile
+                return await evaluate_shortlist_profile(
+                    profile,
+                    query,
+                    original_criteria,
+                    tracker,
+                    use_web=SCREENING_WEB_SEARCH_DEFAULT,
+                )
             except Exception as e:
-                logger.error(f"Reasoning Gen Failed for {profile['id']}: {e}")
-                return profile # Return without reasoning if failed
+                logger.error(f"Shortlist verification failed for {profile.get('id')}: {e}", exc_info=True)
+                return None
 
-    tasks = [get_reasoning_safe(p) for p in final_candidates]
+    tasks = [verify_profile_safe(p) for p in final_candidates]
     
     processed_count = 0
     processed_candidates = []
     
     for future in asyncio.as_completed(tasks):
         result = await future
-        processed_candidates.append(result)
         processed_count += 1
-        yield {
-            "type": "profile_chunk",
-            "data": result,
-            "current": processed_count,
-            "total": len(final_candidates)
-        }
+        if result:
+            processed_candidates.append(result)
+            yield {
+                "type": "profile_chunk",
+                "data": result,
+                "current": processed_count,
+                "total": len(final_candidates)
+            }
 
-    # Sort results
-    # (Optional: restore sort order from filtering step if needed, currently they come back in completion order)
-    # Ideally should sort based on filter score, but for now just yielding as they finish is fine for UX.
+    processed_candidates.sort(
+        key=lambda x: (
+            x.get("match_score") or 0,
+            x.get("total_experience_years") or 0,
+        ),
+        reverse=True,
+    )
     
     yield {"type": "complete", "data": processed_candidates, "summary": tracker.get_summary()}
 

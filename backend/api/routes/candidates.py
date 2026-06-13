@@ -204,6 +204,8 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
             tracker,
             screening_user_id=current_user.id,
             screening_role=current_user.role,
+            source_type=request.source_type,
+            source_role_id=request.source_role_id,
         ):
             if isinstance(item, str):
                 status_messages.append(item)
@@ -273,6 +275,8 @@ async def websocket_search(websocket: WebSocket):
             query = data.get("query", "")
             session_id = data.get("session_id", hashlib.sha256(os.urandom(32)).hexdigest())
             token = data.get("token") or data.get("access_token")
+            source_type = data.get("source_type")
+            source_role_id = data.get("source_role_id")
 
             ws_user = deps.get_user_from_access_token(token)
             if not ws_user:
@@ -284,6 +288,23 @@ async def websocket_search(websocket: WebSocket):
                 continue
 
             tracker = TokenCostTracker()
+            
+            pause_event = asyncio.Event()
+            pause_event.set()
+
+            async def command_listener():
+                try:
+                    while True:
+                        msg = await websocket.receive_json()
+                        action = msg.get("action")
+                        if action == "pause":
+                            pause_event.clear()
+                        elif action == "resume":
+                            pause_event.set()
+                except Exception:
+                    pass
+
+            cmd_task = asyncio.create_task(command_listener())
 
             try:
                 # Use the pipeline generator
@@ -293,6 +314,9 @@ async def websocket_search(websocket: WebSocket):
                     tracker,
                     screening_user_id=ws_user.id,
                     screening_role=ws_user.role,
+                    source_type=source_type,
+                    source_role_id=source_role_id,
+                    pause_event=pause_event,
                 ):
                     if isinstance(item, str):
                         # Status message
@@ -342,6 +366,8 @@ async def websocket_search(websocket: WebSocket):
                 except Exception:
                     # Client likely disconnected
                     break
+            finally:
+                cmd_task.cancel()
 
     except (WebSocketDisconnect, RuntimeError):
         # RuntimeError is raised by Starlette if we try to send after close
