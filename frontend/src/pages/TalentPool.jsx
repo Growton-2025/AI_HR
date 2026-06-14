@@ -767,8 +767,10 @@ function buildTalentPoolParamsString({
   if (!normalizedCandidateIds.length && activeStatusTab) params.set('status', activeStatusTab);
   else if (!normalizedCandidateIds.length && filters?.status) params.set('status', filters.status);
 
-  if (!normalizedCandidateIds.length && filters?.min_exp !== undefined && filters?.min_exp !== '') params.set('min_exp', filters.min_exp);
-  if (!normalizedCandidateIds.length && filters?.max_exp !== undefined && filters?.max_exp !== '') params.set('max_exp', filters.max_exp);
+  const minExp = Number(filters?.min_exp);
+  const maxExp = Number(filters?.max_exp);
+  if (!normalizedCandidateIds.length && Number.isFinite(minExp) && minExp > 0) params.set('min_exp', minExp);
+  if (!normalizedCandidateIds.length && Number.isFinite(maxExp) && maxExp < 40) params.set('max_exp', maxExp);
   if (!normalizedCandidateIds.length && filters?.created_by) params.set('created_by', filters.created_by);
 
   params.set('sort_by', sortBy);
@@ -2286,7 +2288,7 @@ export default function TalentPool() {
     .sort((a, b) => Number(a) - Number(b))
     .join(',');
 
-  const fetchCandidates = useCallback(async (pg = 1) => {
+  const fetchCandidates = useCallback(async (pg = 1, options = {}) => {
     let requestId = 0;
     try {
       if (!talentPoolScopeReady) {
@@ -2324,7 +2326,7 @@ export default function TalentPool() {
         setIsRevalidating(true);
       }
 
-      const res = await fetchTalentPool(paramsString);
+      const res = await fetchTalentPool(paramsString, { force: options.force === true });
 
       console.log("[DEBUG COMPONENT] fetchCandidates response resolved:", {
         requestId,
@@ -3325,7 +3327,7 @@ export default function TalentPool() {
                 )}
               </div>
               <button onClick={async () => {
-                await fetchCandidates(page);
+                await fetchCandidates(page, { force: true });
               }}
                 style={{ width: 38, height: 38, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 12, cursor: 'pointer', color: '#64748b', boxShadow: '0 10px 24px rgba(15,23,42,0.05)' }}>
                 <RefreshCw size={14} style={{ animation: loading || isRevalidating ? 'spin 1s linear infinite' : 'none' }} />

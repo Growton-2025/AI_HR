@@ -201,6 +201,12 @@ def _matches_filter(filter_str: Optional[str], target_val: Any) -> bool:
     return any(v in tv_lower for v in filter_vals)
 
 
+def _split_filter_values(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    return [v.strip().lower() for v in str(raw).split(",") if v.strip()]
+
+
 def _parse_candidate_ids(raw: Optional[str]) -> List[int]:
     if not raw:
         return []
@@ -309,6 +315,182 @@ def _summary_scope_sql(
     return " AND ".join(where), params
 
 
+def _add_like_filter(
+    where: List[str],
+    params: List[Any],
+    raw: Optional[str],
+    expressions: List[str],
+) -> None:
+    values = _split_filter_values(raw)
+    if not values:
+        return
+
+    clauses: List[str] = []
+    for value in values:
+        needle = f"%{value}%"
+        for expr in expressions:
+            clauses.append(f"LOWER(COALESCE({expr}, '')) LIKE %s")
+            params.append(needle)
+    where.append("(" + " OR ".join(clauses) + ")")
+
+
+def _add_title_filter(where: List[str], params: List[Any], raw: Optional[str]) -> None:
+    values = _split_filter_values(raw)
+    if not values:
+        return
+
+    clauses: List[str] = []
+    for value in values:
+        needle = f"%{value}%"
+        clauses.append(
+            """
+            (
+                LOWER(COALESCE(c.headline, '')) LIKE %s
+                OR EXISTS (
+                    SELECT 1
+                    FROM roles r_title
+                    WHERE r_title.candidate_id = c.id
+                      AND LOWER(COALESCE(r_title.title, '')) LIKE %s
+                )
+            )
+            """
+        )
+        params.extend([needle, needle])
+    where.append("(" + " OR ".join(clauses) + ")")
+
+
+def _add_company_filter(where: List[str], params: List[Any], raw: Optional[str]) -> None:
+    values = _split_filter_values(raw)
+    if not values:
+        return
+
+    clauses: List[str] = []
+    for value in values:
+        needle = f"%{value}%"
+        clauses.append(
+            """
+            (
+                LOWER(COALESCE(c.raw_fields->>'import_company', '')) LIKE %s
+                OR EXISTS (
+                    SELECT 1
+                    FROM roles r_company
+                    JOIN companies co_company ON co_company.id = r_company.company_id
+                    WHERE r_company.candidate_id = c.id
+                      AND LOWER(COALESCE(co_company.name, '')) LIKE %s
+                )
+            )
+            """
+        )
+        params.extend([needle, needle])
+    where.append("(" + " OR ".join(clauses) + ")")
+
+
+def _add_global_search_filter(where: List[str], params: List[Any], raw: Optional[str]) -> None:
+    term = str(raw or "").strip().lower()
+    if not term:
+        return
+
+    needle = f"%{term}%"
+    where.append(
+        """
+        (
+            LOWER(COALESCE(c.name, '')) LIKE %s
+            OR LOWER(COALESCE(c.first_name, '')) LIKE %s
+            OR LOWER(COALESCE(c.last_name, '')) LIKE %s
+            OR LOWER(COALESCE(c.linkedin, '')) LIKE %s
+            OR LOWER(COALESCE(c.normalized_linkedin, '')) LIKE %s
+            OR LOWER(COALESCE(c.email, '')) LIKE %s
+            OR LOWER(COALESCE(c.phone, c.mobile_phone, '')) LIKE %s
+            OR LOWER(COALESCE(c.city, '')) LIKE %s
+            OR LOWER(COALESCE(c.location, '')) LIKE %s
+            OR LOWER(COALESCE(c.headline, '')) LIKE %s
+            OR LOWER(COALESCE(c.raw_fields->>'import_company', '')) LIKE %s
+            OR EXISTS (
+                SELECT 1
+                FROM roles r_search
+                LEFT JOIN companies co_search ON co_search.id = r_search.company_id
+                WHERE r_search.candidate_id = c.id
+                  AND (
+                    LOWER(COALESCE(r_search.title, '')) LIKE %s
+                    OR LOWER(COALESCE(co_search.name, '')) LIKE %s
+                  )
+            )
+        )
+        """
+    )
+    params.extend([needle] * 13)
+
+
+def _browse_where_sql(
+    current_user: schemas.User,
+    *,
+    effective_scope: str,
+    effective_recruiter: Optional[int],
+    role_id: Optional[int],
+    q: Optional[str] = None,
+    title: Optional[str] = None,
+    company: Optional[str] = None,
+    city: Optional[str] = None,
+    location_type: Optional[str] = None,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    min_exp: Optional[float] = None,
+    max_exp: Optional[float] = None,
+    min_avg_tenure: Optional[float] = None,
+    candidate_ids: Optional[List[int]] = None,
+    include_status: bool = True,
+) -> tuple[str, List[Any]]:
+    where_sql, params = _summary_scope_sql(
+        current_user,
+        effective_scope=effective_scope,
+        effective_recruiter=effective_recruiter,
+        role_id=role_id,
+    )
+    where = [where_sql]
+
+    ids = [int(cid) for cid in (candidate_ids or []) if cid is not None]
+    if ids:
+        where.append("c.id = ANY(%s)")
+        params.append(ids)
+
+    _add_global_search_filter(where, params, q)
+    _add_title_filter(where, params, title)
+    _add_company_filter(where, params, company)
+    _add_like_filter(
+        where,
+        params,
+        city,
+        ["c.city", "split_part(COALESCE(c.location, ''), ',', 1)", "c.location"],
+    )
+    _add_like_filter(
+        where,
+        params,
+        location_type,
+        ["c.raw_fields->>'work_preference'", "c.raw_fields->>'location_type'"],
+    )
+    _add_like_filter(where, params, created_by, ["c.created_by"])
+
+    if min_exp is not None:
+        where.append("COALESCE(c.total_experience_years, 0) >= %s")
+        params.append(min_exp)
+    if max_exp is not None:
+        where.append("COALESCE(c.total_experience_years, 0) <= %s")
+        params.append(max_exp)
+    if min_avg_tenure is not None:
+        where.append("COALESCE(c.avg_years_in_company, 0) >= %s")
+        params.append(min_avg_tenure)
+
+    if include_status:
+        status_values = _split_filter_values(status)
+        if status_values:
+            where.append(
+                "LOWER(COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')) = ANY(%s)"
+            )
+            params.append(status_values)
+
+    return " AND ".join(f"({clause})" for clause in where if clause), params
+
+
 async def fetch_browse_summary_counts(
     *,
     current_user: schemas.User,
@@ -371,20 +553,9 @@ def _can_use_fast_sql_browse(
     min_avg_tenure: Optional[float],
     candidate_ids: Optional[List[int]],
 ) -> bool:
-    return not any([
-        q,
-        title,
-        company,
-        city,
-        location_type,
-        product_service,
-        status,
-        created_by,
-        min_exp is not None,
-        max_exp is not None,
-        min_avg_tenure is not None,
-        candidate_ids,
-    ])
+    # Product/service search uses the semantic profile cache. Ordinary browse,
+    # filtering, sorting, role scope, and candidate-id focus stay SQL paginated.
+    return not bool(product_service and product_service.strip())
 
 
 async def fetch_browse_page_sql(
@@ -395,6 +566,17 @@ async def fetch_browse_page_sql(
     page: int,
     page_size: int,
     role_id: Optional[int],
+    q: Optional[str] = None,
+    title: Optional[str] = None,
+    company: Optional[str] = None,
+    city: Optional[str] = None,
+    location_type: Optional[str] = None,
+    status: Optional[str] = None,
+    created_by: Optional[str] = None,
+    min_exp: Optional[float] = None,
+    max_exp: Optional[float] = None,
+    min_avg_tenure: Optional[float] = None,
+    candidate_ids: Optional[List[int]] = None,
     sort_by: Optional[str],
     sort_dir: Optional[str],
 ) -> Dict[str, Any]:
@@ -403,20 +585,45 @@ async def fetch_browse_page_sql(
         view_scope,
         recruiter_filter_id,
     )
-    summary = await fetch_browse_summary_counts(
-        current_user=current_user,
-        view_scope=effective_scope,
-        recruiter_filter_id=effective_recruiter,
-        role_id=role_id,
-    )
-    where_sql, params = _summary_scope_sql(
+    count_where_sql, count_params = _browse_where_sql(
         current_user,
         effective_scope=effective_scope,
         effective_recruiter=effective_recruiter,
         role_id=role_id,
+        q=q,
+        title=title,
+        company=company,
+        city=city,
+        location_type=location_type,
+        created_by=created_by,
+        min_exp=min_exp,
+        max_exp=max_exp,
+        min_avg_tenure=min_avg_tenure,
+        candidate_ids=candidate_ids,
+        include_status=False,
+    )
+    row_where_sql, row_params = _browse_where_sql(
+        current_user,
+        effective_scope=effective_scope,
+        effective_recruiter=effective_recruiter,
+        role_id=role_id,
+        q=q,
+        title=title,
+        company=company,
+        city=city,
+        location_type=location_type,
+        status=status,
+        created_by=created_by,
+        min_exp=min_exp,
+        max_exp=max_exp,
+        min_avg_tenure=min_avg_tenure,
+        candidate_ids=candidate_ids,
+        include_status=True,
     )
     sort_map = {
-        "name": "c.id",
+        "name": "LOWER(COALESCE(c.name, ''))",
+        "title": "LOWER(COALESCE(pr.title, c.headline, ''))",
+        "company": "LOWER(COALESCE(pr.company, c.raw_fields->>'import_company', ''))",
         "city": "LOWER(COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1), ''))",
         "exp": "COALESCE(c.total_experience_years, 0)",
         "tenure": "COALESCE(c.avg_years_in_company, 0)",
@@ -432,13 +639,26 @@ async def fetch_browse_page_sql(
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                WITH page_candidates AS (
-                    SELECT c.*
-                    FROM candidates c
-                    WHERE {where_sql}
-                    ORDER BY {order_expr} {direction}, c.id ASC
-                    LIMIT %s OFFSET %s
-                )
+                SELECT
+                    COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                    COUNT(*)::int AS count
+                FROM candidates c
+                WHERE {count_where_sql}
+                GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
+                """,
+                count_params,
+            )
+            status_counts = {str(row[0]): int(row[1] or 0) for row in cur.fetchall()}
+
+            cur.execute(
+                f"SELECT COUNT(*)::int FROM candidates c WHERE {row_where_sql}",
+                row_params,
+            )
+            total_row = cur.fetchone()
+            total = int(total_row[0] or 0) if total_row else 0
+
+            cur.execute(
+                f"""
                 SELECT
                     c.id,
                     c.name,
@@ -447,11 +667,11 @@ async def fetch_browse_page_sql(
                     c.linkedin,
                     c.email,
                     COALESCE(c.mobile_phone, c.phone, '') AS phone,
-                    '' AS response,
-                    '' AS notes,
-                    COALESCE(c.headline, '') AS title,
-                    COALESCE(c.raw_fields->>'import_company', '') AS company,
-                    COALESCE(c.raw_fields->>'extracted_industry', c.raw_fields->>'services', '') AS product_service,
+                    COALESCE(c.response, '') AS response,
+                    COALESCE(c.notes, '') AS notes,
+                    COALESCE(pr.title, c.headline, '') AS title,
+                    COALESCE(pr.company, c.raw_fields->>'import_company', '') AS company,
+                    COALESCE(c.raw_fields->>'extracted_industry', c.raw_fields->>'services', pr.product_service, '') AS product_service,
                     COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1), '') AS city,
                     COALESCE(c.raw_fields->>'work_preference', c.raw_fields->>'location_type', '') AS location_type,
                     COALESCE(c.total_experience_years, 0) AS total_experience_years,
@@ -460,11 +680,35 @@ async def fetch_browse_page_sql(
                     c.created_by,
                     c.headline,
                     c.owner_user_id,
-                    c.pool_source
-                FROM page_candidates c
+                    c.pool_source,
+                    COALESCE(outreach.li_status, '') AS li_status,
+                    COALESCE(outreach.li_response_text, '') AS li_response_text,
+                    outreach.heyreach_campaign_id,
+                    outreach.campaign_id AS email_campaign_id,
+                    COALESCE(outreach.message_sent_count, 0) AS message_sent_count,
+                    COALESCE(outreach.li_sent_count, 0) AS li_sent_count
+                FROM candidates c
+                LEFT JOIN LATERAL (
+                    SELECT r.title, co.name AS company, co.product_service
+                    FROM roles r
+                    LEFT JOIN companies co ON co.id = r.company_id
+                    WHERE r.candidate_id = c.id
+                    ORDER BY r.id ASC
+                    LIMIT 1
+                ) pr ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT co.*
+                    FROM candidate_outreach co
+                    WHERE co.candidate_id = c.id
+                      AND co.recruitment_role_id IS NULL
+                    ORDER BY co.updated_at DESC NULLS LAST
+                    LIMIT 1
+                ) outreach ON TRUE
+                WHERE {row_where_sql}
                 ORDER BY {order_expr} {direction}, c.id ASC
+                LIMIT %s OFFSET %s
                 """,
-                [*params, page_size, offset],
+                [*row_params, page_size, offset],
             )
             rows = cur.fetchall()
 
@@ -497,17 +741,22 @@ async def fetch_browse_page_sql(
                 "owner_user_id": row[19],
                 "pool_source": row[20],
                 "is_master_row": row[19] is None,
+                "li_status": row[21] or "",
+                "li_response_text": row[22] or "",
+                "heyreach_campaign_id": row[23] or "",
+                "email_campaign_id": row[24] or "",
+                "message_sent_count": row[25] or 0,
+                "li_sent_count": row[26] or 0,
                 "raw_fields": {},
             })
 
-        total = int(summary.get("total") or 0)
         return {
             "candidates": candidates,
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": max(1, (total + page_size - 1) // page_size),
-            "status_counts": summary.get("status_counts", {}),
+            "status_counts": status_counts,
             "is_semantic_search": False,
         }
     finally:
@@ -810,7 +1059,7 @@ async def browse_candidates(
     )
     candidate_id_list = _parse_candidate_ids(candidate_ids)
 
-    if not PROFILES_BY_ID and _can_use_fast_sql_browse(
+    if _can_use_fast_sql_browse(
         q=q,
         title=title,
         company=company,
@@ -831,6 +1080,17 @@ async def browse_candidates(
             page=page,
             page_size=page_size,
             role_id=role_id,
+            q=q,
+            title=title,
+            company=company,
+            city=city,
+            location_type=location_type,
+            status=status,
+            created_by=created_by,
+            min_exp=min_exp,
+            max_exp=max_exp,
+            min_avg_tenure=min_avg_tenure,
+            candidate_ids=candidate_id_list,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
@@ -937,85 +1197,165 @@ async def browse_metadata(
 ):
     """Return unique filter values (for dropdowns) scoped like browse."""
     started = time.monotonic()
-    if (current_user.role or "").strip().lower() != "admin":
-        effective_scope = VIEW_SCOPE_RECRUITER_POOLS
-        effective_recruiter = current_user.id
-    else:
-        effective_scope = view_scope or VIEW_SCOPE_MASTER
-        effective_recruiter = recruiter_filter_id
-        if effective_scope == VIEW_SCOPE_RECRUITER_POOLS and not effective_recruiter:
-            raise HTTPException(
-                status_code=400,
-                detail="recruiter_filter_id is required when view_scope=recruiter_pools",
-            )
-    await _ensure_profiles_loaded()
-
-    role_candidate_ids = _role_candidate_id_set(
+    effective_scope, effective_recruiter = resolve_browse_scope(
         current_user,
+        view_scope,
+        recruiter_filter_id,
+    )
+    where_sql, params = _summary_scope_sql(
+        current_user,
+        effective_scope=effective_scope,
+        effective_recruiter=effective_recruiter,
         role_id=role_id,
-        view_scope=effective_scope,
-        recruiter_filter_id=effective_recruiter,
     )
-    all_profiles = [
-        p
-        for p in PROFILES_BY_ID.values()
-        if role_candidate_ids is None or int(p.get("id") or 0) in role_candidate_ids
-        if profile_passes_scope(
-            p,
-            user_role=(current_user.role or "").strip().lower(),
-            user_id=current_user.id,
-            view_scope=effective_scope,
-            recruiter_filter_id=effective_recruiter,
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    def _clean(values: List[Any], *, limit: int = 100) -> List[str]:
+        seen = set()
+        cleaned: List[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+        return sorted(cleaned, key=lambda item: item.lower())[:limit]
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT DISTINCT value
+                FROM (
+                    SELECT NULLIF(TRIM(c.raw_fields->>'import_company'), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                    UNION
+                    SELECT NULLIF(TRIM(co.name), '') AS value
+                    FROM candidates c
+                    JOIN roles r ON r.candidate_id = c.id
+                    JOIN companies co ON co.id = r.company_id
+                    WHERE {where_sql}
+                ) meta_values
+                WHERE value IS NOT NULL
+                LIMIT 100
+                """,
+                [*params, *params],
+            )
+            companies = _clean([row[0] for row in cur.fetchall()])
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT value
+                FROM (
+                    SELECT NULLIF(TRIM(c.headline), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                    UNION
+                    SELECT NULLIF(TRIM(r.title), '') AS value
+                    FROM candidates c
+                    JOIN roles r ON r.candidate_id = c.id
+                    WHERE {where_sql}
+                ) meta_values
+                WHERE value IS NOT NULL
+                LIMIT 100
+                """,
+                [*params, *params],
+            )
+            titles = _clean([row[0] for row in cur.fetchall()])
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT NULLIF(TRIM(COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1))), '') AS city
+                FROM candidates c
+                WHERE {where_sql}
+                LIMIT 100
+                """,
+                params,
+            )
+            cities = _clean([row[0] for row in cur.fetchall()])
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT value
+                FROM (
+                    SELECT NULLIF(TRIM(c.raw_fields->>'extracted_industry'), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                    UNION
+                    SELECT NULLIF(TRIM(c.raw_fields->>'services'), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                    UNION
+                    SELECT NULLIF(TRIM(co.product_service), '') AS value
+                    FROM candidates c
+                    JOIN roles r ON r.candidate_id = c.id
+                    JOIN companies co ON co.id = r.company_id
+                    WHERE {where_sql}
+                ) meta_values
+                WHERE value IS NOT NULL
+                LIMIT 100
+                """,
+                [*params, *params, *params],
+            )
+            products = _clean([row[0] for row in cur.fetchall()])
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT NULLIF(TRIM(COALESCE(c.raw_fields->>'work_preference', c.raw_fields->>'location_type')), '') AS location_type
+                FROM candidates c
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            locations = _clean([row[0] for row in cur.fetchall()], limit=200)
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status
+                FROM candidates c
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            statuses = _clean([row[0] for row in cur.fetchall()], limit=200)
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT NULLIF(TRIM(c.created_by), '') AS recruiter
+                FROM candidates c
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            recruiters = _clean([row[0] for row in cur.fetchall()], limit=200)
+
+        statuses = _clean([*statuses, *RECRUITMENT_STAGES], limit=300)
+        result = {
+            "companies": companies,
+            "cities": cities,
+            "titles": titles,
+            "products": products,
+            "location_types": locations,
+            "statuses": statuses,
+            "recruiters": recruiters,
+        }
+        _log_browse_timing(
+            "meta",
+            started,
+            total=sum(len(result.get(key, [])) for key in result),
+            scope=effective_scope,
+            recruiter_id=effective_recruiter,
         )
-    ]
-
-    companies, cities, titles, products, locations, statuses, recruiters = set(), set(), set(), set(), set(), set(), set()
-    for p in all_profiles:
-        primary_role = (p.get("roles") or [{}])[0]
-        if c := primary_role.get("company"): companies.add(c)
-        if ci := ((p.get("city") or "").strip() or (p.get("location") or "").split(",")[0].strip()):
-            cities.add(ci)
-        if t := (primary_role.get("title") or p.get("headline") or ""): titles.add(t)
-        if recruiter := (p.get("created_by") or "").strip(): recruiters.add(recruiter)
-        
-        # Combine local services and company product/service
-        if cp := (primary_role.get("company_details") or {}).get("product_service"): products.add(cp)
-        if cs := p.get("candidate_services"): 
-            for s in cs.split(","):
-                s_strip = s.strip()
-                if s_strip and len(s_strip) < 50: products.add(s_strip)
-        
-        if ei := p.get("extracted_industry"): products.add(ei)
-        
-        # Add fallback terms to metadata
-        search_text_lower = f"{p.get('headline') or ''} {p.get('about') or ''}".lower()
-        for kw, kw_lower in zip(INDUSTRY_KEYWORDS, INDUSTRY_KEYWORDS_LOWER):
-            if kw_lower in search_text_lower:
-                products.add(kw)
-        
-        if lc := (p.get("work_preference") or p.get("location_type") or ""): locations.add(lc)
-    
-    # Ensure all professional stages are in the filter
-    for s in RECRUITMENT_STAGES:
-        statuses.add(s)
-
-    result = {
-        "companies": sorted(companies)[:100],
-        "cities": sorted(cities)[:100],
-        "titles": sorted(titles)[:100],
-        "products": sorted(products)[:100],
-        "location_types": sorted(locations),
-        "statuses": sorted(statuses),
-        "recruiters": sorted(recruiters),
-    }
-    _log_browse_timing(
-        "meta",
-        started,
-        total=len(all_profiles),
-        scope=effective_scope,
-        recruiter_id=effective_recruiter,
-    )
-    return result
+        return result
+    finally:
+        return_db_connection(conn)
 
 @router.post("/candidates/{candidate_id}/status")
 async def update_status(

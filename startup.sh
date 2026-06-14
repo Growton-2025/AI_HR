@@ -5,13 +5,15 @@
 PORT=${PORT:-8000}
 WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
 PYTHON_EXEC=${PYTHON_EXEC:-python}
-RUN_STARTUP_MIGRATIONS=${RUN_STARTUP_MIGRATIONS:-true}
+RUN_STARTUP_MIGRATIONS=${RUN_STARTUP_MIGRATIONS:-false}
 
 echo "Starting backend on port $PORT with $WEB_CONCURRENCY worker(s)..."
 
 if [ "$RUN_STARTUP_MIGRATIONS" = "true" ] || [ "$RUN_STARTUP_MIGRATIONS" = "1" ]; then
     echo "Running startup migrations once before Gunicorn workers start..."
     $PYTHON_EXEC -c "from backend.db.connection import get_db_connection, return_db_connection; from backend.db.ai_column_migrate import ensure_ai_column_migrations; from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations; conn = get_db_connection(validate=False, register_pgvector=False); assert conn is not None, 'Database connection failed'; ensure_candidate_pool_migrations(conn); ensure_ai_column_migrations(conn); return_db_connection(conn)"
+else
+    echo "Startup migrations disabled. Run them as an explicit deployment step when schema changes are needed."
 fi
 
 gunicorn --bind 0.0.0.0:$PORT \
