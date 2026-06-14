@@ -716,13 +716,16 @@ export const useAppStore = create(persist((set, get) => ({
         const initialStatus = options.initialStatus || 'Screening...'
         const sourceType = options.sourceType || options.source_type || 'master'
         const sourceRoleId = options.sourceRoleId || options.source_role_id || null
+        // Preserve any results already streamed via WS — only clear if starting fresh
+        const alreadyHaveResults = get().searchResults?.length > 0
         set({
             isSearching: true,
-            searchResults: [],
+            // Don't wipe live-streamed results when falling back to REST
+            ...(alreadyHaveResults ? {} : { searchResults: [] }),
             usage: null,
             statusMessage: initialStatus,
-            searchProgress: 0,
-            searchTotal: 0,
+            searchProgress: alreadyHaveResults ? get().searchProgress : 0,
+            searchTotal: alreadyHaveResults ? get().searchTotal : 0,
             searchOutcome: 'loading',
             lastSearchError: '',
         })
@@ -733,21 +736,29 @@ export const useAppStore = create(persist((set, get) => ({
                 source_role_id: sourceRoleId,
             }, { timeout: SEARCH_REQUEST_TIMEOUT_MS })
             const totalCandidates = res.data.total ?? res.data.candidates?.length ?? 0
+            const currentResults = get().searchResults || []
+            // Use REST results if they have more matches than what was streamed
+            const useRestResults = totalCandidates > currentResults.length
             set({
-                searchResults: res.data.candidates,
+                searchResults: useRestResults ? res.data.candidates : currentResults,
                 usage: res.data.usage,
-                statusMessage: totalCandidates > 0 ? `Found ${totalCandidates} candidates` : 'No close matches found yet',
+                statusMessage: (useRestResults ? totalCandidates : currentResults.length) > 0
+                    ? `Found ${useRestResults ? totalCandidates : currentResults.length} candidates`
+                    : 'No close matches found yet',
                 isSearching: false,
                 searchProgress: 100,
-                searchOutcome: totalCandidates > 0 ? 'success' : 'empty',
+                searchOutcome: (useRestResults ? totalCandidates : currentResults.length) > 0 ? 'success' : 'empty',
             })
         } catch (e) {
             const errorMessage = getRequestErrorMessage(e, 'Screening failed')
+            const currentResults = get().searchResults || []
             set({
-                statusMessage: 'Screening failed: ' + errorMessage,
+                statusMessage: currentResults.length > 0
+                    ? `Found ${currentResults.length} candidates (connection dropped)`
+                    : 'Screening failed: ' + errorMessage,
                 isSearching: false,
-                searchOutcome: 'error',
-                lastSearchError: errorMessage,
+                searchOutcome: currentResults.length > 0 ? 'success' : 'error',
+                lastSearchError: currentResults.length > 0 ? '' : errorMessage,
             })
         } finally {
             const fallbackTimer = get()._searchFallbackTimer
@@ -834,14 +845,29 @@ export const useAppStore = create(persist((set, get) => ({
                 source_role_id: sourceRoleId,
             }))
             set({ statusMessage: 'Processing query...' })
-            armFallbackTimer(30000)
+            // 2 minutes — backend may need to warm the candidate cache on cold start
+            armFallbackTimer(120000)
         }
 
         ws.onmessage = (event) => {
             if (finished) return
 
             const data = JSON.parse(event.data)
-            armFallbackTimer(60000)
+
+            // Keep-alive ping from backend — reset the fallback timer but do nothing else
+            if (data.type === 'ping') {
+                armFallbackTimer(120000)
+                return
+            }
+
+            // Database is cold-loading — give it 3 minutes before falling back
+            if (data.type === 'status' && typeof data.message === 'string' && data.message.toLowerCase().includes('loading')) {
+                set({ statusMessage: data.message })
+                armFallbackTimer(180000)
+                return
+            }
+
+            armFallbackTimer(120000)
 
             switch (data.type) {
                 case 'status':

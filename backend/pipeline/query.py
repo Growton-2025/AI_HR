@@ -111,18 +111,18 @@ except Exception as e:
     redis_client = None
 
 # --- LLM and Embeddings Initialization ---
-SCREENING_CRITERIA_MODEL = os.getenv("SCREENING_CRITERIA_MODEL", "gpt-4o")
-SCREENING_REASONING_MODEL = os.getenv("SCREENING_REASONING_MODEL", "gpt-4o")
+SCREENING_CRITERIA_MODEL = os.getenv("SCREENING_CRITERIA_MODEL", "gpt-4.1-mini")
+SCREENING_REASONING_MODEL = os.getenv("SCREENING_REASONING_MODEL", "gpt-4.1-mini")
 SCREENING_GENERATION_MODEL = os.getenv("SCREENING_GENERATION_MODEL", SCREENING_REASONING_MODEL)
 SCREENING_EMBEDDING_MODEL = os.getenv("SCREENING_EMBEDDING_MODEL", "text-embedding-3-small")
 SCREENING_MAX_RESULTS = int(os.getenv("SCREENING_MAX_RESULTS", "25"))
 SCREENING_VECTOR_LIMIT = int(os.getenv("SCREENING_VECTOR_LIMIT", "750"))
 SCREENING_FULL_SCAN_LIMIT = int(os.getenv("SCREENING_FULL_SCAN_LIMIT", "5000"))
 SCREENING_WEB_SEARCH_DEFAULT = os.getenv("SCREENING_WEB_SEARCH_DEFAULT", "true").strip().lower() not in {"0", "false", "no"}
-SCREENING_WEB_VERIFY_TOP_K = int(os.getenv("SCREENING_WEB_VERIFY_TOP_K", "30"))
-SCREENING_WEB_CONCURRENCY = int(os.getenv("SCREENING_WEB_CONCURRENCY", "3"))
+SCREENING_WEB_VERIFY_TOP_K = int(os.getenv("SCREENING_WEB_VERIFY_TOP_K", "50"))  # soft cap; no longer used as hard limit
+SCREENING_WEB_CONCURRENCY = int(os.getenv("SCREENING_WEB_CONCURRENCY", "8"))
 SCREENING_COMPANY_FACT_ENRICH_LIMIT = int(os.getenv("SCREENING_COMPANY_FACT_ENRICH_LIMIT", "80"))
-SCREENING_DYNAMIC_VERIFY_LIMIT = int(os.getenv("SCREENING_DYNAMIC_VERIFY_LIMIT", "40"))
+SCREENING_DYNAMIC_VERIFY_LIMIT = int(os.getenv("SCREENING_DYNAMIC_VERIFY_LIMIT", "300"))
 SCREENING_WEB_SEARCH_TOOL = os.getenv("SCREENING_WEB_SEARCH_TOOL", os.getenv("AI_COLUMN_WEB_SEARCH_TOOL", "web_search"))
 SCREENING_WEB_SEARCH_CONTEXT_SIZE = os.getenv("SCREENING_WEB_SEARCH_CONTEXT_SIZE", os.getenv("AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE", "high"))
 
@@ -816,18 +816,45 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
     values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not values: return True
 
+    # Build a broad text corpus from the full profile for market-experience queries.
+    # "US market experience" means the candidate sold/operated in the market,
+    # not necessarily that they are physically located there.
+    profile_headline = (profile.get('headline') or '').lower()
+    profile_about = (profile.get('about') or '').lower()
+    profile_location = (profile.get('location') or '').lower()
+    profile_candidate_services = (profile.get('candidate_services') or '').lower()
+
+    # Broad synonyms for US/NA market experience expressed in profiles
+    _GEO_MARKET_SYNONYMS: Dict[str, List[str]] = {
+        "united states": ["united states", "us market", "usa market", "north america", "north american", "american clients", "us clients", "us accounts", "us customers", "us region", "us territory", "us sales", "us business", "outbound us", "americas"],
+        "us": ["us market", "us clients", "us accounts", "us customers", "us region", "us territory", "us sales", "outbound us", "united states", "north america", "americas"],
+        "usa": ["usa", "united states", "us market", "north america", "americas"],
+        "north america": ["north america", "north american", "us market", "americas", "united states", "canada"],
+        "apac": ["apac", "asia pacific", "asia-pacific", "southeast asia", "sea market"],
+        "emea": ["emea", "europe middle east africa", "european market"],
+        "uk": ["uk", "united kingdom", "british", "england"],
+        "europe": ["europe", "european", "emea"],
+        "india": ["india", "indian market", "in market"],
+        "singapore": ["singapore", "sg market", "apac"],
+    }
+
     found_values = set()
     for v in values:
         region_for_v = GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(v)
-        profile_location_lower = (profile.get('location') or '').lower()
-        
-        if v in profile_location_lower:
+        synonyms = _GEO_MARKET_SYNONYMS.get(v, [v])
+
+        # 1. Check candidate location (physical presence)
+        if v in profile_location or (region_for_v and region_for_v in profile_location):
             found_values.add(v)
             continue
-        if region_for_v and region_for_v in profile_location_lower:
+
+        # 2. Check headline and about for market-experience signals
+        broad_text = f"{profile_headline} {profile_about} {profile_candidate_services}"
+        if any(syn in broad_text for syn in synonyms):
             found_values.add(v)
             continue
-            
+
+        # 3. Check role titles, details, and company presence
         for role in profile.get('roles', []):
             role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
             company_details = role.get('company_details', {})
@@ -835,8 +862,11 @@ def check_geography_experience(profile: Dict[str, Any], criteria: Dict[str, Any]
             company_locations_text = ' '.join([loc.lower() for loc in company_office_locations])
             company_hq_text = (company_details.get('headquarters') or '').lower()
             combined = f"{role_text} {company_locations_text} {company_hq_text}"
-            
+
             if v in combined or (region_for_v and region_for_v in combined):
+                found_values.add(v)
+                break
+            if any(syn in combined for syn in synonyms):
                 found_values.add(v)
                 break
 
@@ -2283,6 +2313,21 @@ def _dynamic_candidate_candidates(
     return profiles[:SCREENING_DYNAMIC_VERIFY_LIMIT]
 
 
+def _needs_per_profile_web_search(criteria: Dict[str, Any]) -> bool:
+    """
+    Returns True only when per-profile web search is genuinely needed to verify
+    criteria that cannot be resolved from stored profile data alone.
+    - competitor_of: requires live web lookup of competitor companies
+    - funding_stage_min: requires live web lookup of funding stage
+    Everything else (geography experience, functions, industries, keywords)
+    can be evaluated from the stored profile data — much faster and cheaper.
+    """
+    return bool(
+        criteria.get("competitor_of") or
+        criteria.get("funding_stage_min")
+    )
+
+
 def _needs_company_fact_web_enrichment(criteria: Dict[str, Any]) -> bool:
     return bool(criteria.get("competitor_of"))
 
@@ -2857,9 +2902,11 @@ async def process_query_main(
         logger.info("Vector shortlist returned no matches after filtering. Retrying scoped full cache.")
         final_candidates = await filter_candidates_by_criteria(_scoped_build(), criteria)
     
-    verify_limit = criteria.get("top_n") or SCREENING_WEB_VERIFY_TOP_K
-    if verify_limit and verify_limit > 0:
-        final_candidates = final_candidates[: int(verify_limit)]
+    # Only apply a hard cap when the user explicitly requested a fixed number (e.g. "top 10").
+    # Otherwise send ALL pre-filtered candidates to AI verification.
+    explicit_top_n = criteria.get("top_n")
+    if explicit_top_n and int(explicit_top_n) > 0:
+        final_candidates = final_candidates[: int(explicit_top_n)]
 
     if not final_candidates:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -2867,9 +2914,17 @@ async def process_query_main(
 
     yield {"type": "progress_start", "total": len(final_candidates)}
     
-    # 5. Parallel verification and reasoning generation
-    CONCURRENCY_LIMIT = max(1, SCREENING_WEB_CONCURRENCY if SCREENING_WEB_SEARCH_DEFAULT else 5)
+    # 5. Parallel verification — all candidates run concurrently up to CONCURRENCY_LIMIT.
+    # Only enable per-profile web search when criteria genuinely needs live internet data
+    # (competitor lookups, funding stage). For all other queries (geography, function, industry)
+    # the AI evaluates from stored profile data alone — 10-20x faster.
+    use_web_per_profile = SCREENING_WEB_SEARCH_DEFAULT and _needs_per_profile_web_search(verification_criteria)
+    CONCURRENCY_LIMIT = max(1, SCREENING_WEB_CONCURRENCY if use_web_per_profile else 15)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    logger.info(
+        "Verifying %d profiles | use_web=%s | concurrency=%d",
+        len(final_candidates), use_web_per_profile, CONCURRENCY_LIMIT
+    )
     
     async def verify_profile_safe(profile):
         async with semaphore:
@@ -2881,7 +2936,7 @@ async def process_query_main(
                     query,
                     verification_criteria,
                     tracker,
-                    use_web=SCREENING_WEB_SEARCH_DEFAULT,
+                    use_web=use_web_per_profile,
                 )
             except Exception as e:
                 logger.error(f"Shortlist verification failed for {profile.get('id')}: {e}", exc_info=True)

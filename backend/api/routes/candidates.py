@@ -268,6 +268,31 @@ async def websocket_search(websocket: WebSocket):
     """
     await websocket.accept()
 
+    # If the cache is still cold, warm it up while keeping the socket alive with
+    # periodic status messages so the frontend fallback timer never fires.
+    if not is_cache_initialized():
+        await websocket.send_json({"type": "status", "message": "Loading candidate database..."})
+        dot_task = None
+        try:
+            async def _keep_alive_dots():
+                count = 0
+                while not is_cache_initialized():
+                    await asyncio.sleep(8)
+                    count += 1
+                    try:
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": f"Still loading candidate database{'.' * (count % 4 + 1)}"
+                        })
+                    except Exception:
+                        break
+
+            dot_task = asyncio.create_task(_keep_alive_dots())
+            await asyncio.to_thread(initialize_cache)
+        finally:
+            if dot_task and not dot_task.done():
+                dot_task.cancel()
+
     try:
         while True:
             # Receive search query
@@ -291,6 +316,8 @@ async def websocket_search(websocket: WebSocket):
             
             pause_event = asyncio.Event()
             pause_event.set()
+            
+            send_lock = asyncio.Lock()
 
             async def command_listener():
                 try:
@@ -304,12 +331,26 @@ async def websocket_search(websocket: WebSocket):
                 except Exception:
                     pass
 
+            async def heartbeat_sender():
+                try:
+                    while True:
+                        await asyncio.sleep(15)
+                        try:
+                            async with send_lock:
+                                await websocket.send_json({"type": "ping"})
+                        except Exception:
+                            break
+                except asyncio.CancelledError:
+                    pass
+
             cmd_task = asyncio.create_task(command_listener())
+            ping_task = asyncio.create_task(heartbeat_sender())
 
             try:
                 async def send_event(payload: Dict[str, Any]) -> bool:
                     try:
-                        await websocket.send_json(payload)
+                        async with send_lock:
+                            await websocket.send_json(payload)
                         return True
                     except (WebSocketDisconnect, RuntimeError):
                         return False
@@ -384,6 +425,7 @@ async def websocket_search(websocket: WebSocket):
                     break
             finally:
                 cmd_task.cancel()
+                ping_task.cancel()
 
     except (WebSocketDisconnect, RuntimeError):
         # RuntimeError is raised by Starlette if we try to send after close
