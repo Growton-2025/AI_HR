@@ -3,6 +3,7 @@ import axios from 'axios'
 import { toast } from 'sonner'
 
 const REQUEST_TIMEOUT_MS = 15000
+const SEARCH_REQUEST_TIMEOUT_MS = 120000
 const CALL_REQUEST_TIMEOUT_MS = 15000
 const CALL_RETRY_BACKOFF_MS = 3000
 const RATE_LIMIT_DEFAULT_RETRY_MS = 5000
@@ -730,7 +731,7 @@ export const useAppStore = create(persist((set, get) => ({
                 query,
                 source_type: sourceType,
                 source_role_id: sourceRoleId,
-            })
+            }, { timeout: SEARCH_REQUEST_TIMEOUT_MS })
             const totalCandidates = res.data.total ?? res.data.candidates?.length ?? 0
             set({
                 searchResults: res.data.candidates,
@@ -833,14 +834,14 @@ export const useAppStore = create(persist((set, get) => ({
                 source_role_id: sourceRoleId,
             }))
             set({ statusMessage: 'Processing query...' })
-            armFallbackTimer(12000)
+            armFallbackTimer(30000)
         }
 
         ws.onmessage = (event) => {
             if (finished) return
 
             const data = JSON.parse(event.data)
-            armFallbackTimer(20000)
+            armFallbackTimer(60000)
 
             switch (data.type) {
                 case 'status':
@@ -856,6 +857,13 @@ export const useAppStore = create(persist((set, get) => ({
                         searchResults: [...state.searchResults, data.data],
                         searchProgress: Math.round((data.current / data.total) * 100)
                     }))
+                    break
+
+                case 'progress':
+                    set({
+                        searchProgress: Math.round((data.current / data.total) * 100),
+                        statusMessage: `Reviewed ${data.current} of ${data.total} profiles...`
+                    })
                     break
 
                 case 'complete':

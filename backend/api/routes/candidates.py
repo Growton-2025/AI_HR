@@ -307,6 +307,13 @@ async def websocket_search(websocket: WebSocket):
             cmd_task = asyncio.create_task(command_listener())
 
             try:
+                async def send_event(payload: Dict[str, Any]) -> bool:
+                    try:
+                        await websocket.send_json(payload)
+                        return True
+                    except (WebSocketDisconnect, RuntimeError):
+                        return False
+
                 # Use the pipeline generator
                 async for item in process_query_main(
                     query,
@@ -320,30 +327,41 @@ async def websocket_search(websocket: WebSocket):
                 ):
                     if isinstance(item, str):
                         # Status message
-                        await websocket.send_json({
+                        if not await send_event({
                             "type": "status",
                             "message": item
-                        })
+                        }):
+                            break
 
                     elif isinstance(item, dict):
                         msg_type = item.get("type")
 
                         if msg_type == "progress_start":
-                            await websocket.send_json({
+                            if not await send_event({
                                 "type": "progress_start",
                                 "total": item.get("total", 0)
-                            })
+                            }):
+                                break
+
+                        elif msg_type == "progress":
+                            if not await send_event({
+                                "type": "progress",
+                                "current": item.get("current"),
+                                "total": item.get("total")
+                            }):
+                                break
 
                         elif msg_type == "profile_chunk":
-                            await websocket.send_json({
+                            if not await send_event({
                                 "type": "candidate",
                                 "data": item.get("data"),
                                 "current": item.get("current"),
                                 "total": item.get("total")
-                            })
+                            }):
+                                break
 
                         elif msg_type == "complete":
-                            await websocket.send_json({
+                            if not await send_event({
                                 "type": "complete",
                                 "candidates": item.get("data", []),
                                 "total": len(item.get("data", [])),
@@ -351,20 +369,18 @@ async def websocket_search(websocket: WebSocket):
                                     "total_tokens": tracker.total_tokens,
                                     "total_cost": round(tracker.total_cost, 6)
                                 }
-                            })
+                            }):
+                                break
                             break
 
             except Exception as e:
                 # Log error but don't crash loop unless critical
                 print(f"Error during search: {e}")
                 # Try to send error to client if possible
-                try:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": str(e)
-                    })
-                except Exception:
-                    # Client likely disconnected
+                if not await send_event({
+                    "type": "error",
+                    "message": str(e)
+                }):
                     break
             finally:
                 cmd_task.cancel()

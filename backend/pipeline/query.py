@@ -2857,9 +2857,9 @@ async def process_query_main(
         logger.info("Vector shortlist returned no matches after filtering. Retrying scoped full cache.")
         final_candidates = await filter_candidates_by_criteria(_scoped_build(), criteria)
     
-    # Limit removed so the AI can chunk and process all pre-filtered candidates without artificial restrictions
-    # if SCREENING_WEB_SEARCH_DEFAULT:
-    #     final_candidates = final_candidates[:SCREENING_WEB_VERIFY_TOP_K]
+    verify_limit = criteria.get("top_n") or SCREENING_WEB_VERIFY_TOP_K
+    if verify_limit and verify_limit > 0:
+        final_candidates = final_candidates[: int(verify_limit)]
 
     if not final_candidates:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -2887,22 +2887,33 @@ async def process_query_main(
                 logger.error(f"Shortlist verification failed for {profile.get('id')}: {e}", exc_info=True)
                 return None
 
-    tasks = [verify_profile_safe(p) for p in final_candidates]
+    tasks = [asyncio.create_task(verify_profile_safe(p)) for p in final_candidates]
     
     processed_count = 0
     processed_candidates = []
     
-    for future in asyncio.as_completed(tasks):
-        result = await future
-        processed_count += 1
-        if result:
-            processed_candidates.append(result)
-            yield {
-                "type": "profile_chunk",
-                "data": result,
-                "current": processed_count,
-                "total": len(final_candidates)
-            }
+    try:
+        for future in asyncio.as_completed(tasks):
+            result = await future
+            processed_count += 1
+            if result:
+                processed_candidates.append(result)
+                yield {
+                    "type": "profile_chunk",
+                    "data": result,
+                    "current": processed_count,
+                    "total": len(final_candidates)
+                }
+            else:
+                yield {
+                    "type": "progress",
+                    "current": processed_count,
+                    "total": len(final_candidates)
+                }
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
     processed_candidates.sort(
         key=lambda x: (
