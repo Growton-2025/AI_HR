@@ -332,7 +332,15 @@ def call_openai_json(
                     timeout=request_timeout,
                 )
             parsed = json_block_to_dict(getattr(response, "output_text", "") or "")
-            parsed.setdefault("sources", collect_response_sources(response))
+            collected_sources = collect_response_sources(response)
+            parsed_sources = parsed.get("sources") if isinstance(parsed.get("sources"), list) else []
+            if collected_sources and not any(
+                isinstance(source, dict) and stringify_context_value(source.get("url"))
+                for source in parsed_sources
+            ):
+                parsed["sources"] = collected_sources
+            else:
+                parsed.setdefault("sources", collected_sources)
             parsed["searched_at"] = searched_at
             parsed["freshness_date"] = searched_at[:10]
             parsed["web_search_tool"] = tool_config.get("type") or ""

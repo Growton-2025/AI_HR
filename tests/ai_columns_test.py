@@ -8,6 +8,7 @@ from backend.api import schemas
 from backend.api.routes import ai_columns
 from backend.api.routes import browse
 from backend.db.ai_column_migrate import ensure_ai_column_migrations
+from backend.pipeline import query as screening_query
 from backend.services import ai_columns as ai_columns_service
 from backend.services.ai_columns import (
     build_candidate_context_pack,
@@ -64,6 +65,181 @@ def _user(user_id=7, role="recruiter"):
         role=role,
         permissions={},
     )
+
+
+def test_screening_uses_dynamic_web_competitors_and_function_aliases():
+    profile = {
+        "id": 501,
+        "name": "Dynamic Competitor Match",
+        "headline": "Alliance Management leader",
+        "total_experience_years": 8,
+        "raw_fields": {},
+        "roles": [
+            {
+                "company": "MoEngage",
+                "title": "Alliance Management Lead",
+                "details": "Built partner, reseller, and channel motions for APAC markets.",
+                "duration_years": 5.5,
+                "company_details": {"product_service": "Customer engagement platform"},
+            }
+        ],
+    }
+    criteria = {
+        "competitor_of": [{"target": "CleverTap", "employment_scope": "current_employer"}],
+        "_web_company_facts": {
+            "competitors": [
+                {
+                    "target": "CleverTap",
+                    "companies": ["MoEngage", "Braze"],
+                    "sources": [{"url": "https://example.com", "title": "Competitors", "note": "web evidence"}],
+                }
+            ]
+        },
+        "min_function_years": [
+            {
+                "function": "Channel Sales",
+                "min_years": 5,
+                "aliases": ["channel sales", "partner sales", "reseller", "alliance management"],
+            }
+        ],
+    }
+
+    scored = screening_query.score_candidate_against_criteria(profile, criteria)
+
+    assert scored is not None
+    assert any(item["criterion"] == "Competitor employer" for item in scored["matched_criteria"])
+    assert any(item["criterion"] == "Function-specific tenure" for item in scored["matched_criteria"])
+
+
+def test_screening_competitor_defaults_to_current_employer():
+    profile = {
+        "id": 502,
+        "name": "Past Competitor Only",
+        "total_experience_years": 9,
+        "raw_fields": {},
+        "roles": [
+            {"company": "NeutralCo", "title": "Director", "details": "Revenue leadership", "duration_years": 2},
+            {"company": "MoEngage", "title": "Channel Sales Lead", "details": "Partner sales", "duration_years": 6},
+        ],
+    }
+    criteria = {
+        "competitor_of": [{"target": "CleverTap", "employment_scope": "current_employer"}],
+        "_web_company_facts": {"competitors": [{"target": "CleverTap", "companies": ["MoEngage"]}]},
+    }
+
+    assert screening_query.score_candidate_against_criteria(profile, criteria) is None
+
+
+def test_screening_geography_does_not_use_current_location_or_customer_presence():
+    criteria = {
+        "required_geographies": {
+            "operator": "OR",
+            "values": [{"geography": "India", "expanded_terms": ["India", "APAC"]}],
+        }
+    }
+    current_location_only = {
+        "id": 503,
+        "name": "Current Location Only",
+        "location": "Bengaluru, India",
+        "raw_fields": {},
+        "roles": [{"company": "Acme", "title": "Sales Lead", "details": "US enterprise sales", "duration_years": 4}],
+    }
+    customer_presence_only = {
+        "id": 504,
+        "name": "Customer Presence Only",
+        "raw_fields": {},
+        "roles": [
+            {
+                "company": "Acme",
+                "title": "Sales Lead",
+                "details": "US enterprise sales",
+                "duration_years": 4,
+                "company_details": {"customer_presence": ["India"]},
+            }
+        ],
+    }
+
+    current_location_scored = screening_query.score_candidate_against_criteria(current_location_only, criteria)
+    customer_presence_scored = screening_query.score_candidate_against_criteria(customer_presence_only, criteria)
+
+    assert current_location_scored is not None
+    assert customer_presence_scored is not None
+    assert not any(item["criterion"] == "Geographies" for item in current_location_scored["matched_criteria"])
+    assert not any(item["criterion"] == "Geographies" for item in customer_presence_scored["matched_criteria"])
+    assert any(item["source"] == "web required" for item in current_location_scored["evidence_log"])
+    assert any(item["source"] == "web required" for item in customer_presence_scored["evidence_log"])
+
+
+def test_screening_geography_matches_profile_region_claim_and_company_office():
+    singapore_criteria = {
+        "required_geographies": {
+            "operator": "OR",
+            "values": [{"geography": "Singapore", "expanded_terms": ["Singapore", "APAC"]}],
+        }
+    }
+    profile_claim = {
+        "id": 505,
+        "name": "APAC Claim",
+        "raw_fields": {"Focused Geography": "APAC"},
+        "roles": [{"company": "Acme", "title": "Inside Sales", "details": "Inbound sales", "duration_years": 3}],
+    }
+    office_criteria = {
+        "required_geographies": {
+            "operator": "OR",
+            "values": [{"geography": "India", "expanded_terms": ["India", "APAC"]}],
+        }
+    }
+    company_office = {
+        "id": 506,
+        "name": "Office Match",
+        "raw_fields": {},
+        "roles": [
+            {
+                "company": "Capillary",
+                "title": "Inside Sales Manager",
+                "details": "Sales development work",
+                "duration_years": 6,
+                "company_details": {"office_locations": ["India"]},
+            }
+        ],
+    }
+
+    assert screening_query.score_candidate_against_criteria(profile_claim, singapore_criteria) is not None
+    assert screening_query.score_candidate_against_criteria(company_office, office_criteria) is not None
+
+
+def test_screening_funding_stage_uses_db_when_known_and_web_when_unknown():
+    criteria = {"funding_stage_min": {"stage": "Series C", "employment_scope": "current_employer"}}
+    series_c = {
+        "id": 507,
+        "name": "Series C",
+        "raw_fields": {},
+        "roles": [{"company": "FundedCo", "title": "BDR", "duration_years": 2, "company_details": {"funding_stage": "Series C"}}],
+    }
+    series_a = {
+        "id": 508,
+        "name": "Series A",
+        "raw_fields": {},
+        "roles": [{"company": "EarlyCo", "title": "BDR", "duration_years": 2, "company_details": {"funding_stage": "Series A"}}],
+    }
+    unknown = {
+        "id": 509,
+        "name": "Unknown Funding",
+        "raw_fields": {},
+        "roles": [{"company": "UnknownCo", "title": "BDR", "duration_years": 2, "company_details": {}}],
+    }
+
+    assert screening_query.score_candidate_against_criteria(series_c, criteria) is not None
+    assert screening_query.score_candidate_against_criteria(series_a, criteria) is None
+    assert screening_query.score_candidate_against_criteria(unknown, criteria) is None
+
+    criteria_with_candidate_facts = {
+        **criteria,
+        "required_functions": {"operator": "OR", "values": ["BDR"]},
+    }
+    unknown_scored = screening_query.score_candidate_against_criteria(unknown, criteria_with_candidate_facts)
+    assert unknown_scored is not None
+    assert any(item["source"] == "web required" for item in unknown_scored["evidence_log"])
 
 
 def test_fetch_profile_refreshes_stale_cache_without_roles(monkeypatch):

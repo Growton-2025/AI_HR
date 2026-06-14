@@ -121,6 +121,8 @@ SCREENING_FULL_SCAN_LIMIT = int(os.getenv("SCREENING_FULL_SCAN_LIMIT", "5000"))
 SCREENING_WEB_SEARCH_DEFAULT = os.getenv("SCREENING_WEB_SEARCH_DEFAULT", "true").strip().lower() not in {"0", "false", "no"}
 SCREENING_WEB_VERIFY_TOP_K = int(os.getenv("SCREENING_WEB_VERIFY_TOP_K", "30"))
 SCREENING_WEB_CONCURRENCY = int(os.getenv("SCREENING_WEB_CONCURRENCY", "3"))
+SCREENING_COMPANY_FACT_ENRICH_LIMIT = int(os.getenv("SCREENING_COMPANY_FACT_ENRICH_LIMIT", "80"))
+SCREENING_DYNAMIC_VERIFY_LIMIT = int(os.getenv("SCREENING_DYNAMIC_VERIFY_LIMIT", "40"))
 SCREENING_WEB_SEARCH_TOOL = os.getenv("SCREENING_WEB_SEARCH_TOOL", os.getenv("AI_COLUMN_WEB_SEARCH_TOOL", "web_search"))
 SCREENING_WEB_SEARCH_CONTEXT_SIZE = os.getenv("SCREENING_WEB_SEARCH_CONTEXT_SIZE", os.getenv("AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE", "high"))
 
@@ -564,7 +566,13 @@ def normalize_query_with_llm(query: str) -> str:
 def get_values_from_criteria(crit_val):
     values = []
     if isinstance(crit_val, dict):
-        values = crit_val.get("values", [])
+        if "values" in crit_val:
+            values = crit_val.get("values", [])
+        else:
+            for key in ("value", "name", "term", "function", "industry", "geography", "stage", "target"):
+                if crit_val.get(key):
+                    values = [crit_val.get(key)]
+                    break
     elif isinstance(crit_val, list):
         values = crit_val
 
@@ -572,10 +580,20 @@ def get_values_from_criteria(crit_val):
     for item in values:
         if isinstance(item, str):
             flat_values.append(item)
+        elif isinstance(item, dict):
+            for key in ("value", "name", "term", "function", "industry", "geography", "stage", "target"):
+                if item.get(key):
+                    flat_values.append(str(item.get(key)))
+                    break
         elif isinstance(item, list):
             for sub_item in item:
                 if isinstance(sub_item, str):
                     flat_values.append(sub_item)
+                elif isinstance(sub_item, dict):
+                    for key in ("value", "name", "term", "function", "industry", "geography", "stage", "target"):
+                        if sub_item.get(key):
+                            flat_values.append(str(sub_item.get(key)))
+                            break
     return flat_values
 
 def get_list_from_llm_json(llm_json_response: Any) -> List[str]:
@@ -586,6 +604,69 @@ def get_list_from_llm_json(llm_json_response: Any) -> List[str]:
             if isinstance(value, list):
                 return [str(item) for item in value if isinstance(item, str)]
     return []
+
+
+def _criteria_objects(value: Any) -> List[Dict[str, Any]]:
+    if not value:
+        return []
+    if isinstance(value, dict):
+        if isinstance(value.get("values"), list):
+            objects: List[Dict[str, Any]] = []
+            for item in value.get("values") or []:
+                if isinstance(item, dict):
+                    objects.append(item)
+                elif str(item or "").strip():
+                    objects.append({"value": str(item).strip()})
+            if objects:
+                return objects
+        return [value]
+    if isinstance(value, list):
+        objects = []
+        for item in value:
+            if isinstance(item, dict):
+                objects.append(item)
+            elif str(item or "").strip():
+                objects.append({"value": str(item).strip()})
+        return objects
+    if str(value or "").strip():
+        return [{"value": str(value).strip()}]
+    return []
+
+
+def _criteria_alias_terms(criterion: Any, value: str) -> List[str]:
+    value_l = _normalize_search_text(value)
+    terms = set()
+    for item in _criteria_objects(criterion):
+        item_values = {
+            _normalize_search_text(item.get(key))
+            for key in ("value", "name", "term", "function", "industry", "geography", "stage", "target")
+            if item.get(key)
+        }
+        aliases: List[Any] = []
+        for key in ("aliases", "expanded_terms", "accepted_terms", "countries", "regions", "company_aliases"):
+            raw = item.get(key)
+            if isinstance(raw, list):
+                aliases.extend(raw)
+            elif isinstance(raw, str):
+                aliases.extend(re.split(r"[,;|]", raw))
+        alias_terms = {_normalize_search_text(alias) for alias in aliases if str(alias or "").strip()}
+        if value_l and (value_l in item_values or value_l in alias_terms):
+            terms.update(item_values)
+            terms.update(alias_terms)
+    return sorted(term for term in terms if term)
+
+
+def _criterion_match_terms(value: str, criterion_key: str, criterion: Any) -> List[str]:
+    terms = set(_expanded_terms(value, criterion_key))
+    terms.update(_criteria_alias_terms(criterion, value))
+    return sorted(term for term in terms if term)
+
+
+def _with_criteria_terms(values: List[str], criterion: Any, criterion_key: str) -> List[str]:
+    terms = set()
+    for value in values:
+        terms.update(_criterion_match_terms(value, criterion_key, criterion))
+    return sorted(term for term in terms if term)
 
 # --- CHECK FUNCTIONS ---
 
@@ -942,14 +1023,15 @@ def calculate_merged_duration_years(matching_roles: List[Dict[str, Any]]) -> flo
 # --- DURATION CALCULATIONS ---
 def calculate_functional_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
     if not criteria_obj or not isinstance(criteria_obj, dict): return 0.0, []
-    req_values = [v.lower() for v in criteria_obj.get("values", [])]
+    req_values = [_normalize_search_text(v) for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
+    req_terms = _with_criteria_terms(req_values, criteria_obj, "required_functions")
 
     matching_roles = []
     contributing_roles = []
     for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
-        if any(v in role_text for v in req_values):
+        if any(_term_matches_text(v, role_text) for v in req_terms):
             matching_roles.append(role)
             contributing_roles.append({
                 'company': role.get('company', ''),
@@ -963,13 +1045,14 @@ def calculate_functional_experience_duration(profile: Dict[str, Any], criteria_o
 def calculate_industry_experience_duration(profile: Dict[str, Any], criteria_obj: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
+    req_terms = _with_criteria_terms(req_values, criteria_obj, "required_industries")
 
     matching_roles = []
     contributing_roles = []
     for role in profile.get('roles', []):
         company_details = role.get('company_details', {})
         role_text = f"{(role.get('company') or '').lower()} {(company_details.get('industry', '') or '').lower()} {(company_details.get('product_service', '') or '').lower()}"
-        if any(v in role_text for v in req_values):
+        if any(_term_matches_text(v, role_text) for v in req_terms):
             matching_roles.append(role)
             contributing_roles.append({
                 'company': role.get('company', ''),
@@ -1015,17 +1098,41 @@ def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_ob
     req_values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
     if not req_values: return 0.0, []
 
-    regions_for_req_values = {v: GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(v) for v in req_values}
-    regions_to_check = {region for region in regions_for_req_values.values() if region}
+    req_terms = _with_criteria_terms(req_values, criteria_obj, "required_geographies")
 
     matching_roles = []
     contributing_roles = []
     for role in profile.get('roles', []):
-        role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         company_details = role.get('company_details', {})
-        combined = f"{role_text} {' '.join([x.lower() for x in company_details.get('customer_presence', [])])} {(company_details.get('headquarters') or '').lower()}"
+        allowed_company_geo = {
+            key: company_details.get(key)
+            for key in (
+                "headquarters",
+                "office_locations",
+                "offices",
+                "locations",
+                "operations",
+                "operating_locations",
+                "company_locations",
+            )
+            if company_details.get(key)
+        }
+        combined = " ".join(
+            _flatten_value_for_evidence(
+                {
+                    "role_title": role.get("title"),
+                    "role_details": role.get("details"),
+                    "role_location": role.get("location"),
+                    "role_city": role.get("city"),
+                    "source_location": role.get("source_location"),
+                    "company_location": role.get("company_location"),
+                    "company_geography": allowed_company_geo,
+                },
+                max_items=40,
+            )
+        ).lower()
 
-        if any(v in combined for v in req_values) or any(r in combined for r in regions_to_check):
+        if any(_term_matches_text(v, combined) for v in req_terms):
             if not any(cr['company'] == role.get('company', '') for cr in contributing_roles):
                 matching_roles.append(role)
                 contributing_roles.append({
@@ -1260,7 +1367,7 @@ def _score_text_criterion(
     matched_roles: List[Dict[str, Any]] = []
 
     for value in values:
-        terms = _expanded_terms(value, criterion_key)
+        terms = _criterion_match_terms(value, criterion_key, criterion)
         found = None
         for chunk in chunks:
             if criterion_key == "required_companies":
@@ -1300,6 +1407,461 @@ def _score_text_criterion(
         "met": met,
         "operator": operator,
     }
+
+
+def _profile_claim_geography_text(profile: Dict[str, Any]) -> str:
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    likely_claims: Dict[str, Any] = {}
+    for key, value in raw_fields.items():
+        key_l = _normalize_search_text(key)
+        if any(token in key_l for token in ("geograph", "market", "region", "country", "territory", "location")):
+            likely_claims[key] = value
+    return " ".join(_flatten_value_for_evidence(likely_claims, max_items=60)).lower()
+
+
+def _role_geography_text(role: Dict[str, Any]) -> str:
+    company_details = role.get("company_details") or {}
+    allowed_company_geo = {
+        key: company_details.get(key)
+        for key in (
+            "headquarters",
+            "office_locations",
+            "offices",
+            "locations",
+            "operations",
+            "operating_locations",
+            "company_locations",
+        )
+        if company_details.get(key)
+    }
+    return " ".join(
+        _flatten_value_for_evidence(
+            {
+                "title": role.get("title"),
+                "details": role.get("details"),
+                "location": role.get("location"),
+                "city": role.get("city"),
+                "source_location": role.get("source_location"),
+                "company_location": role.get("company_location"),
+                "company_geography": allowed_company_geo,
+            },
+            max_items=60,
+        )
+    ).lower()
+
+
+def _score_geography_criterion(
+    profile: Dict[str, Any],
+    criterion: Any,
+) -> Dict[str, Any]:
+    values = [str(value).strip() for value in get_values_from_criteria(criterion) if str(value).strip()]
+    if not values:
+        return {"applicable": False, "score": 1.0, "matched": [], "missing": [], "evidence": [], "met": True}
+
+    matched: List[str] = []
+    missing: List[str] = []
+    evidence: List[Dict[str, Any]] = []
+    matched_roles: List[Dict[str, Any]] = []
+    profile_claim_text = _profile_claim_geography_text(profile)
+
+    for value in values:
+        terms = _criterion_match_terms(value, "required_geographies", criterion)
+        found = None
+        for role in profile.get("roles") or []:
+            role_text = _role_geography_text(role)
+            term = next((term for term in terms if _term_matches_text(term, role_text)), None)
+            if term:
+                found = ("role/company geography", role, role_text, term)
+                break
+        if not found:
+            term = next((term for term in terms if _term_matches_text(term, profile_claim_text)), None)
+            if term:
+                found = ("uploaded geography claims", None, profile_claim_text, term)
+
+        if found:
+            source, role, text, term = found
+            matched.append(value)
+            evidence.append({
+                "criterion": "Geographies",
+                "value": value,
+                "source": source,
+                "snippet": _evidence_snippet(text, term),
+            })
+            if role:
+                matched_roles.append(role)
+        else:
+            missing.append(value)
+
+    operator = _criterion_operator(criterion)
+    met = len(matched) == len(values) if operator == "AND" else bool(matched)
+    return {
+        "applicable": True,
+        "score": len(matched) / max(1, len(values)),
+        "matched": matched,
+        "missing": missing,
+        "evidence": evidence,
+        "matched_roles": matched_roles,
+        "met": met,
+        "operator": operator,
+    }
+
+
+def _normalize_company_key(value: Any) -> str:
+    text = _normalize_search_text(value)
+    text = re.sub(r"\b(inc|inc\.|llc|ltd|limited|pvt|private|corp|corporation|technologies|technology|software)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip(" .,-")
+
+
+def _company_matches(candidate_company: str, target_company: str) -> bool:
+    candidate = _normalize_company_key(candidate_company)
+    target = _normalize_company_key(target_company)
+    if not candidate or not target:
+        return False
+    if candidate == target:
+        return True
+    candidate_pattern = rf"\b{re.escape(candidate)}\b"
+    target_pattern = rf"\b{re.escape(target)}\b"
+    return (
+        re.search(candidate_pattern, target) is not None
+        or re.search(target_pattern, candidate) is not None
+    )
+
+
+def _competitor_items(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = _criteria_objects(criteria.get("competitor_of"))
+    web_facts = criteria.get("_web_company_facts") if isinstance(criteria.get("_web_company_facts"), dict) else {}
+    web_competitors = web_facts.get("competitors") if isinstance(web_facts.get("competitors"), list) else []
+    for item in items:
+        target = str(item.get("target") or item.get("value") or item.get("name") or "").strip()
+        if item.get("companies") or item.get("competitors") or not target:
+            continue
+        for web_item in web_competitors:
+            web_target = str(web_item.get("target") or "").strip()
+            if web_target and _company_matches(web_target, target):
+                item["companies"] = web_item.get("companies") or web_item.get("competitors") or []
+                item["sources"] = web_item.get("sources") or []
+                break
+    return items
+
+
+def _score_competitor_criteria(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[bool, float, float, List[Dict[str, Any]], List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    items = _competitor_items(criteria)
+    if not items:
+        return True, 0.0, 0.0, [], [], [], []
+
+    total_weight = 0.0
+    earned_weight = 0.0
+    matched_criteria: List[Dict[str, Any]] = []
+    missing_criteria: List[str] = []
+    evidence: List[Dict[str, Any]] = []
+    roles_for_reasoning: List[Dict[str, Any]] = []
+    roles = profile.get("roles") or []
+
+    for item in items:
+        target = str(item.get("target") or item.get("value") or item.get("name") or "").strip()
+        raw_companies = item.get("companies") or item.get("competitors") or item.get("competitor_companies") or []
+        if isinstance(raw_companies, str):
+            raw_companies = re.split(r"[,;|]", raw_companies)
+        competitor_companies = [str(company).strip() for company in raw_companies if str(company or "").strip()]
+        scope = _normalize_search_text(item.get("employment_scope") or item.get("scope") or "current_employer")
+        current_only = scope not in {"any_employer", "past_or_current", "worked_at", "worked_with", "all_roles"}
+
+        if not competitor_companies:
+            missing_criteria.append(f"Competitor relationship for {target or 'target company'} needs web verification")
+            evidence.append({
+                "criterion": "Competitor company facts",
+                "value": target,
+                "source": "web required",
+                "snippet": "No competitor list was present in DB/profile criteria; verifier must resolve it with web sources.",
+            })
+            continue
+
+        total_weight += 1.5
+
+        search_roles = roles[:1] if current_only else roles
+        matched_role = None
+        matched_company = None
+        for role in search_roles:
+            role_company = role.get("company") or ""
+            for competitor in competitor_companies:
+                if _company_matches(role_company, competitor):
+                    matched_role = role
+                    matched_company = competitor
+                    break
+            if matched_role:
+                break
+
+        if matched_role:
+            earned_weight += 1.5
+            role_scope = "current employer" if current_only else "employer history"
+            matched_criteria.append({
+                "criterion": "Competitor employer",
+                "value": f"{matched_role.get('company')} matched {target or 'target'} competitor {matched_company}",
+            })
+            evidence.append({
+                "criterion": "Competitor employer",
+                "value": target,
+                "source": role_scope,
+                "snippet": f"{matched_role.get('title') or 'Role'} at {matched_role.get('company')} matched the dynamically resolved competitor list.",
+            })
+            roles_for_reasoning.append(matched_role)
+        else:
+            missing_criteria.append(
+                f"{'Current employer' if current_only else 'Employer history'} at a verified {target or 'target'} competitor"
+            )
+            return False, total_weight, earned_weight, matched_criteria, missing_criteria, evidence, roles_for_reasoning
+
+    return True, total_weight, earned_weight, matched_criteria, missing_criteria, evidence, roles_for_reasoning
+
+
+FUNDING_STAGE_RANKS = {
+    "pre seed": 0,
+    "pre-seed": 0,
+    "seed": 1,
+    "series a": 2,
+    "series b": 3,
+    "series c": 4,
+    "series d": 5,
+    "series e": 6,
+    "series f": 7,
+    "series g": 8,
+    "growth": 9,
+    "growth equity": 9,
+    "private equity": 10,
+    "pe": 10,
+    "ipo": 11,
+    "public": 11,
+    "publicly traded": 11,
+}
+
+
+def _funding_rank(value: Any) -> Optional[int]:
+    text = _normalize_search_text(value)
+    if not text:
+        return None
+    if "public" in text or "ipo" in text:
+        return FUNDING_STAGE_RANKS["public"]
+    if "private equity" in text or re.search(r"\bpe backed\b|\bpe-owned\b", text):
+        return FUNDING_STAGE_RANKS["private equity"]
+    if "growth" in text:
+        return FUNDING_STAGE_RANKS["growth"]
+    series_match = re.search(r"\bseries\s*([a-z])\+?\b", text)
+    if series_match:
+        letter = series_match.group(1).lower()
+        return max(2, ord(letter) - ord("a") + 2)
+    for key, rank in FUNDING_STAGE_RANKS.items():
+        if _term_matches_text(key, text):
+            return rank
+    return None
+
+
+def _funding_min_value(criteria: Dict[str, Any]) -> Optional[str]:
+    value = criteria.get("funding_stage_min")
+    if not value:
+        return None
+    if isinstance(value, dict):
+        for key in ("stage", "value", "name", "min_stage"):
+            if value.get(key):
+                return str(value.get(key))
+    return str(value)
+
+
+def _web_company_fact_items(criteria: Dict[str, Any], fact_key: str) -> List[Dict[str, Any]]:
+    web_facts = criteria.get("_web_company_facts") if isinstance(criteria.get("_web_company_facts"), dict) else {}
+    items = web_facts.get(fact_key)
+    return items if isinstance(items, list) else []
+
+
+def _web_company_funding_rank(company_name: str, criteria: Dict[str, Any]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    for item in _web_company_fact_items(criteria, "funding"):
+        if not isinstance(item, dict):
+            continue
+        item_company = str(item.get("company") or item.get("name") or "").strip()
+        if not _company_matches(company_name, item_company):
+            continue
+        rank = _funding_rank(item.get("stage") or item.get("funding_stage") or item.get("status"))
+        if rank is not None:
+            return rank, item
+    return None
+
+
+def _web_company_office_match(company_name: str, terms: List[str], criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for item in _web_company_fact_items(criteria, "geography"):
+        if not isinstance(item, dict):
+            continue
+        item_company = str(item.get("company") or item.get("name") or "").strip()
+        if not _company_matches(company_name, item_company):
+            continue
+        text = " ".join(
+            _flatten_value_for_evidence(
+                {
+                    "offices": item.get("offices"),
+                    "operations": item.get("operations"),
+                    "headquarters": item.get("headquarters"),
+                    "geographies": item.get("geographies"),
+                },
+                max_items=80,
+            )
+        ).lower()
+        if any(_term_matches_text(term, text) for term in terms):
+            return item
+    return None
+
+
+def _score_funding_stage(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[bool, float, float, List[Dict[str, Any]], List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    min_stage = _funding_min_value(criteria)
+    min_rank = _funding_rank(min_stage)
+    if min_rank is None:
+        return True, 0.0, 0.0, [], [], [], []
+
+    stage_criterion = criteria.get("funding_stage_min")
+    scope = "current_employer"
+    if isinstance(stage_criterion, dict):
+        scope = _normalize_search_text(stage_criterion.get("employment_scope") or stage_criterion.get("scope") or "current_employer")
+    current_only = scope not in {"any_employer", "past_or_current", "worked_at", "worked_with", "all_roles"}
+    roles = profile.get("roles") or []
+    roles_to_check = roles[:1] if current_only else roles
+    known_below: List[str] = []
+
+    for role in roles_to_check:
+        company_details = role.get("company_details") or {}
+        db_stage_text = " ".join(
+            _flatten_value_for_evidence(
+                {
+                    "funding_stage": company_details.get("funding_stage"),
+                    "business_model": company_details.get("business_model"),
+                    "company_status": company_details.get("company_status"),
+                    "ownership": company_details.get("ownership"),
+                },
+                max_items=20,
+            )
+        )
+        web_rank_item = _web_company_funding_rank(role.get("company") or "", criteria)
+        source = "DB company details"
+        sources = []
+        stage_text = db_stage_text
+        rank = _funding_rank(db_stage_text)
+        if web_rank_item:
+            rank, web_item = web_rank_item
+            stage_text = str(web_item.get("stage") or web_item.get("funding_stage") or web_item.get("status") or "")
+            source = "web company facts"
+            sources = web_item.get("sources") if isinstance(web_item.get("sources"), list) else []
+        if rank is None:
+            continue
+        if rank >= min_rank:
+            return True, 1.2, 1.2, [{
+                "criterion": "Funding stage",
+                "value": f"{role.get('company')} is {stage_text or 'funding stage matched'}",
+            }], [], [{
+                "criterion": "Funding stage",
+                "value": min_stage,
+                "source": source,
+                "snippet": f"{role.get('company')}: {stage_text}",
+                "sources": sources,
+            }], [role]
+        known_below.append(f"{role.get('company')}: {stage_text}")
+
+    if known_below:
+        return False, 1.2, 0.0, [], [f"Funding stage >= {min_stage}; DB shows below threshold ({'; '.join(known_below[:2])})"], [], []
+
+    has_other_candidate_filters = any(
+        criteria.get(key)
+        for key in (
+            "required_companies",
+            "required_industries",
+            "required_functions",
+            "required_segments",
+            "required_locations",
+            "required_geographies",
+            "required_keywords",
+            "required_culture_type",
+            "min_total_experience",
+            "min_people_managed",
+            "min_function_years",
+        )
+    )
+    unknown_missing = [f"Funding stage >= {min_stage} needs web verification"]
+    unknown_evidence = [{
+        "criterion": "Funding stage",
+        "value": min_stage,
+        "source": "web required",
+        "snippet": "No reliable funding stage was present in DB company details; verifier must resolve it with web sources.",
+    }]
+    if not has_other_candidate_filters:
+        return False, 1.2, 0.0, [], unknown_missing, unknown_evidence, []
+
+    return True, 0.0, 0.0, [], unknown_missing, unknown_evidence, []
+
+
+def _min_function_year_items(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = _criteria_objects(criteria.get("min_function_years"))
+    required_functions = criteria.get("required_functions")
+    if isinstance(required_functions, dict) and required_functions.get("min_years"):
+        for value in get_values_from_criteria(required_functions):
+            items.append({
+                "function": value,
+                "min_years": required_functions.get("min_years"),
+                "aliases": _criteria_alias_terms(required_functions, value),
+            })
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        function = str(item.get("function") or item.get("value") or item.get("name") or "").strip()
+        min_years = item.get("min_years") or item.get("years") or item.get("minimum_years")
+        key = (_normalize_search_text(function), str(min_years))
+        if function and min_years and key not in seen:
+            next_item = dict(item)
+            next_item["function"] = function
+            next_item["min_years"] = min_years
+            deduped.append(next_item)
+            seen.add(key)
+    return deduped
+
+
+def _score_min_function_years(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[bool, float, float, List[Dict[str, Any]], List[str], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    items = _min_function_year_items(criteria)
+    if not items:
+        return True, 0.0, 0.0, [], [], [], [], {}
+
+    total_weight = 1.35 * len(items)
+    earned_weight = 0.0
+    matched_criteria: List[Dict[str, Any]] = []
+    missing_criteria: List[str] = []
+    evidence: List[Dict[str, Any]] = []
+    contributing_roles: List[Dict[str, Any]] = []
+    calculated: Dict[str, Any] = {}
+
+    for item in items:
+        function = item["function"]
+        min_years = float(item.get("min_years") or 0)
+        criteria_obj = {
+            "values": [{
+                "function": function,
+                "aliases": item.get("aliases") or item.get("expanded_terms") or [],
+            }],
+        }
+        duration, roles = calculate_functional_experience_duration(profile, criteria_obj)
+        calculated[f"min_function_years:{function}"] = {
+            "duration": duration,
+            "roles": roles,
+            "label": function,
+            "required": min_years,
+        }
+        if duration < min_years:
+            missing_criteria.append(f"{function} experience >= {min_years:g} years")
+            return False, total_weight, earned_weight, matched_criteria, missing_criteria, evidence, contributing_roles, calculated
+        earned_weight += 1.35
+        matched_criteria.append({"criterion": "Function-specific tenure", "value": f"{duration:g} years in {function}"})
+        for role in roles[:3]:
+            evidence.append({
+                "criterion": "Function-specific tenure",
+                "value": function,
+                "source": "role history",
+                "snippet": f"{role.get('title')} at {role.get('company')} for {role.get('duration_years', 0):g} years",
+            })
+        contributing_roles.extend(roles)
+
+    return True, total_weight, earned_weight, matched_criteria, missing_criteria, evidence, contributing_roles, calculated
 
 
 def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1348,11 +1910,90 @@ def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str
     if not check_avg_tenure_in_last_n_roles(profile_copy, criteria):
         return None
 
+    for checker in (_score_competitor_criteria, _score_funding_stage):
+        met, weight, earned, matched, missing, evidence, roles = checker(profile_copy, criteria)
+        total_weight += weight
+        earned_weight += earned
+        matched_criteria.extend(matched)
+        missing_criteria.extend(missing)
+        evidence_log.extend(evidence)
+        contributing_roles.extend(roles)
+        if not met:
+            return None
+
+    (
+        function_years_met,
+        function_years_weight,
+        function_years_earned,
+        function_years_matched,
+        function_years_missing,
+        function_years_evidence,
+        function_years_roles,
+        function_years_calculated,
+    ) = _score_min_function_years(profile_copy, criteria)
+    total_weight += function_years_weight
+    earned_weight += function_years_earned
+    matched_criteria.extend(function_years_matched)
+    missing_criteria.extend(function_years_missing)
+    evidence_log.extend(function_years_evidence)
+    contributing_roles.extend(function_years_roles)
+    calculated_experience.update(function_years_calculated)
+    if not function_years_met:
+        return None
+
     for key, config in TEXT_CRITERIA_CONFIG.items():
         criterion = criteria.get(key)
-        result = _score_text_criterion(profile_copy, key, criterion, chunks)
+        if key == "required_geographies":
+            result = _score_geography_criterion(profile_copy, criterion)
+        else:
+            result = _score_text_criterion(profile_copy, key, criterion, chunks)
         if not result["applicable"]:
             continue
+
+        if (
+            key == "required_geographies"
+            and not result["matched"]
+            and SCREENING_WEB_SEARCH_DEFAULT
+            and profile_copy.get("roles")
+        ):
+            web_geo_matched = []
+            web_geo_evidence = []
+            web_geo_roles = []
+            for value in get_values_from_criteria(criterion):
+                terms = _criterion_match_terms(str(value), "required_geographies", criterion)
+                for role in profile_copy.get("roles") or []:
+                    web_geo = _web_company_office_match(role.get("company") or "", terms, criteria)
+                    if not web_geo:
+                        continue
+                    web_geo_matched.append(str(value))
+                    web_geo_roles.append(role)
+                    web_geo_evidence.append({
+                        "criterion": config["label"],
+                        "value": str(value),
+                        "source": "web company facts",
+                        "snippet": f"{role.get('company')}: {web_geo.get('offices') or web_geo.get('operations') or web_geo.get('headquarters') or web_geo.get('geographies')}",
+                        "sources": web_geo.get("sources") if isinstance(web_geo.get("sources"), list) else [],
+                    })
+                    break
+            if web_geo_matched:
+                result = {
+                    **result,
+                    "score": len(web_geo_matched) / max(1, len(get_values_from_criteria(criterion))),
+                    "matched": web_geo_matched,
+                    "missing": [value for value in result["missing"] if str(value) not in set(web_geo_matched)],
+                    "evidence": web_geo_evidence,
+                    "matched_roles": web_geo_roles,
+                    "met": True if _criterion_operator(criterion) == "OR" else len(web_geo_matched) == len(get_values_from_criteria(criterion)),
+                }
+            else:
+                missing_criteria.extend(f"{config['label']}: {value} needs company-office web verification" for value in result["missing"])
+                evidence_log.append({
+                    "criterion": config["label"],
+                    "value": ", ".join(result["missing"]),
+                    "source": "web required",
+                    "snippet": "No profile/DB geography evidence matched; verifier may use web sources only for employer office/operations facts.",
+                })
+                continue
 
         weight = float(config["weight"])
         total_weight += weight
@@ -1386,6 +2027,8 @@ def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str
         }
         calc_func = calc_map.get(key)
         if calc_func and isinstance(criterion, dict):
+            if key == "required_functions" and criteria.get("min_function_years"):
+                continue
             duration, roles = calc_func(profile_copy, criterion)
             min_years = float(criterion.get("min_years") or 0)
             calculated_experience[key] = {
@@ -1403,7 +2046,12 @@ def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str
     else:
         score = round((earned_weight / total_weight) * 100, 1)
 
-    has_text_criteria = any(criteria.get(key) for key in TEXT_CRITERIA_CONFIG)
+    has_text_criteria = (
+        any(criteria.get(key) for key in TEXT_CRITERIA_CONFIG)
+        or bool(criteria.get("competitor_of"))
+        or bool(criteria.get("funding_stage_min"))
+        or bool(criteria.get("min_function_years"))
+    )
     threshold = float(os.getenv("SCREENING_MATCH_THRESHOLD", "60"))
     if has_text_criteria and (score < threshold or not evidence_log):
         return None
@@ -1483,6 +2131,306 @@ def _strict_decision_is_match(structured: Dict[str, Any]) -> bool:
     return decision in {"match", "yes", "true", "qualified", "pass"}
 
 
+def _uses_dynamic_ai_matching(criteria: Dict[str, Any]) -> bool:
+    return any(
+        criteria.get(key)
+        for key in (
+            "competitor_of",
+            "min_function_years",
+            "funding_stage_min",
+            "required_industries",
+            "required_geographies",
+        )
+    )
+
+
+def _candidate_retrieval_text(profile: Dict[str, Any]) -> str:
+    values = _flatten_value_for_evidence(
+        {
+            "name": profile.get("name"),
+            "headline": profile.get("headline"),
+            "about": profile.get("about"),
+            "raw_fields": profile.get("raw_fields"),
+            "roles": profile.get("roles"),
+            "candidate_services": profile.get("candidate_services"),
+            "extracted_industry": profile.get("extracted_industry"),
+        },
+        max_items=220,
+    )
+    return _normalize_search_text(" ".join(values))
+
+
+def _dynamic_retrieval_terms(original_query: str, criteria: Dict[str, Any]) -> List[str]:
+    terms = set()
+    for source in (
+        original_query,
+        get_values_from_criteria(criteria.get("required_keywords")),
+        get_values_from_criteria(criteria.get("required_industries")),
+        get_values_from_criteria(criteria.get("required_functions")),
+        get_values_from_criteria(criteria.get("min_function_years")),
+        get_values_from_criteria(criteria.get("required_geographies")),
+        get_values_from_criteria(criteria.get("required_company_details")),
+    ):
+        if isinstance(source, str):
+            chunks = re.split(r"[^a-zA-Z0-9+\.]+", source)
+        else:
+            chunks = []
+            for item in source or []:
+                chunks.extend(re.split(r"[^a-zA-Z0-9+\.]+", str(item)))
+        for chunk in chunks:
+            normalized = _normalize_search_text(chunk)
+            if len(normalized) >= 3 and normalized not in {
+                "candidate", "candidates", "with", "who", "have", "has", "and", "for",
+                "years", "experience", "worked", "working", "help", "market", "above",
+            }:
+                terms.add(normalized)
+    web_facts = criteria.get("_web_company_facts") if isinstance(criteria.get("_web_company_facts"), dict) else {}
+    for item in web_facts.get("competitors") or []:
+        if isinstance(item, dict):
+            for company in item.get("companies") or []:
+                if str(company or "").strip():
+                    terms.add(_normalize_search_text(company))
+    return sorted(term for term in terms if term)
+
+
+def _dynamic_company_fact_names(criteria: Dict[str, Any], fact_key: str) -> List[str]:
+    names: List[str] = []
+    web_facts = criteria.get("_web_company_facts") if isinstance(criteria.get("_web_company_facts"), dict) else {}
+    for item in web_facts.get(fact_key) or []:
+        if not isinstance(item, dict):
+            continue
+        if fact_key == "competitors":
+            names.extend(str(company) for company in (item.get("companies") or []) if str(company or "").strip())
+        else:
+            company = str(item.get("company") or item.get("name") or "").strip()
+            if company:
+                names.append(company)
+    return names
+
+
+def _dynamic_candidate_candidates(
+    profiles: List[Dict[str, Any]],
+    original_query: str,
+    criteria: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not _uses_dynamic_ai_matching(criteria):
+        return profiles
+
+    company_names = []
+    if criteria.get("competitor_of"):
+        company_names.extend(_dynamic_company_fact_names(criteria, "competitors"))
+    if criteria.get("funding_stage_min"):
+        company_names.extend(_dynamic_company_fact_names(criteria, "funding"))
+    if criteria.get("required_geographies"):
+        company_names.extend(_dynamic_company_fact_names(criteria, "geography"))
+
+    company_matched: List[Dict[str, Any]] = []
+    if company_names:
+        for profile in profiles:
+            roles = profile.get("roles") or []
+            for role in roles[:5]:
+                role_company = role.get("company") or ""
+                if any(_company_matches(role_company, company) for company in company_names):
+                    profile_copy = copy.deepcopy({k: v for k, v in profile.items() if k != "embedding"})
+                    profile_copy.setdefault("evidence_log", []).append({
+                        "criterion": "Dynamic retrieval",
+                        "value": role_company,
+                        "source": "DB employer matched web company fact",
+                        "snippet": f"{role.get('title') or 'Role'} at {role_company}",
+                    })
+                    company_matched.append(profile_copy)
+                    break
+
+    terms = _dynamic_retrieval_terms(original_query, criteria)
+    ranked: List[Tuple[int, Dict[str, Any]]] = []
+    for profile in profiles:
+        text = _candidate_retrieval_text(profile)
+        score = sum(1 for term in terms if _term_matches_text(term, text))
+        if score:
+            ranked.append((score, profile))
+    ranked.sort(key=lambda item: (item[0], item[1].get("total_experience_years") or 0), reverse=True)
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    high_tenure: List[Dict[str, Any]] = []
+    min_year_reqs = [
+        float(item.get("min_years") or item.get("years") or item.get("minimum_years") or 0)
+        for item in _criteria_objects(criteria.get("min_function_years"))
+        if str(item.get("min_years") or item.get("years") or item.get("minimum_years") or "").strip()
+    ]
+    if min_year_reqs:
+        min_required = min(min_year_reqs)
+        high_tenure = sorted(
+            [
+                profile for profile in profiles
+                if float(profile.get("total_experience_years") or 0) >= min_required
+            ],
+            key=lambda profile: float(profile.get("total_experience_years") or 0),
+            reverse=True,
+        )[: max(5, SCREENING_DYNAMIC_VERIFY_LIMIT // 2)]
+
+    for profile in company_matched + high_tenure + [profile for _score, profile in ranked]:
+        pid = profile.get("id")
+        if pid in seen:
+            continue
+        seen.add(pid)
+        merged.append(profile)
+        if len(merged) >= SCREENING_DYNAMIC_VERIFY_LIMIT:
+            break
+
+    if merged:
+        return merged
+    return profiles[:SCREENING_DYNAMIC_VERIFY_LIMIT]
+
+
+def _needs_company_fact_web_enrichment(criteria: Dict[str, Any]) -> bool:
+    return bool(criteria.get("competitor_of"))
+
+
+def _needs_candidate_company_fact_web_enrichment(criteria: Dict[str, Any]) -> bool:
+    return bool(criteria.get("funding_stage_min") or criteria.get("required_geographies"))
+
+
+def _merge_web_company_facts(criteria: Dict[str, Any], structured: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = copy.deepcopy(criteria)
+    web_facts = enriched.get("_web_company_facts") if isinstance(enriched.get("_web_company_facts"), dict) else {}
+
+    competitors = structured.get("competitors") if isinstance(structured, dict) else None
+    if isinstance(competitors, list):
+        normalized_competitors = []
+        for item in competitors:
+            if not isinstance(item, dict):
+                continue
+            companies = item.get("companies") or item.get("competitors") or []
+            if isinstance(companies, str):
+                companies = re.split(r"[,;|]", companies)
+            companies = [str(company).strip() for company in companies if str(company or "").strip()]
+            sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+            normalized_competitors.append({
+                "target": str(item.get("target") or "").strip(),
+                "companies": companies,
+                "sources": sources,
+            })
+        web_facts["competitors"] = normalized_competitors
+
+    for key in ("funding", "geography"):
+        values = structured.get(key) if isinstance(structured, dict) else None
+        if isinstance(values, list):
+            web_facts[key] = [item for item in values if isinstance(item, dict)]
+
+    enriched["_web_company_facts"] = web_facts
+    return enriched
+
+
+async def enrich_criteria_with_company_web_facts(
+    original_query: str,
+    criteria: Dict[str, Any],
+    tracker: TokenCostTracker,
+) -> Dict[str, Any]:
+    if not _needs_company_fact_web_enrichment(criteria) or not SCREENING_WEB_SEARCH_DEFAULT:
+        return criteria
+
+    system_prompt = (
+        "You are a company research assistant for recruiting search. Resolve only company-level facts needed by the query. "
+        "Use web evidence when available. Do not infer or create candidate career facts. "
+        "Return valid JSON only with keys: competitors, funding, geography, notes. "
+        "competitors must be a list of objects with target, companies, sources. "
+        "funding must be a list of objects with company, stage/status, sources. "
+        "geography must be a list of objects with company, offices/operations/headquarters/geographies, sources. "
+        "Every source must include a non-empty url, title, and note. Omit facts that do not have reliable source URLs."
+    )
+    user_prompt = (
+        f"Recruiting query:\n{original_query}\n\n"
+        f"Extracted structured criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        "Resolve competitor_of targets dynamically. Prefer direct competitor/category pages or reputable company/research sources. "
+        "Do not use a hardcoded taxonomy. Return JSON only."
+    )
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json,
+            system_prompt,
+            user_prompt,
+            model=SCREENING_REASONING_MODEL,
+            use_web=True,
+            web_search_tool=SCREENING_WEB_SEARCH_TOOL,
+            web_search_context_size=SCREENING_WEB_SEARCH_CONTEXT_SIZE,
+            temperature=0.0,
+            timeout=90.0,
+        )
+        tracker.add_usage(SCREENING_REASONING_MODEL, f"{system_prompt}\n\n{user_prompt}", json.dumps(structured), "Company Fact Web Enrichment")
+    except Exception as e:
+        logger.warning("Company fact web enrichment failed: %s", e)
+        return criteria
+
+    return _merge_web_company_facts(criteria, structured if isinstance(structured, dict) else {})
+
+
+def _candidate_company_names_for_web(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[str]:
+    counts: Dict[str, int] = {}
+    current_only = bool(criteria.get("funding_stage_min") and not criteria.get("required_geographies"))
+    for profile in profiles:
+        roles = profile.get("roles") or []
+        role_iter = roles[:1] if current_only else roles[:5]
+        for role in role_iter:
+            company = str(role.get("company") or "").strip()
+            key = _normalize_company_key(company)
+            if not key:
+                continue
+            counts[company] = counts.get(company, 0) + 1
+    return [
+        company
+        for company, _count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:SCREENING_COMPANY_FACT_ENRICH_LIMIT]
+    ]
+
+
+async def enrich_criteria_with_candidate_company_web_facts(
+    original_query: str,
+    criteria: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+    tracker: TokenCostTracker,
+) -> Dict[str, Any]:
+    if not _needs_candidate_company_fact_web_enrichment(criteria) or not SCREENING_WEB_SEARCH_DEFAULT:
+        return criteria
+    company_names = _candidate_company_names_for_web(candidate_pool, criteria)
+    if not company_names:
+        return criteria
+
+    system_prompt = (
+        "You are a company research assistant for recruiting search. Resolve only company-level facts for the provided company list. "
+        "Use live web evidence. Do not infer or create candidate career facts. "
+        "Return valid JSON only with keys: funding, geography, notes. "
+        "funding: list objects with company, stage/status, sources. "
+        "geography: list objects with company, offices/operations/headquarters/geographies, sources. "
+        "Every source must include a non-empty url, title, and note. Omit facts that do not have reliable source URLs. "
+        "Do not use customer presence, subsidiaries, revenue share, product availability, or customer examples as geography evidence."
+    )
+    user_prompt = (
+        f"Recruiting query:\n{original_query}\n\n"
+        f"Extracted structured criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Candidate employer list to verify:\n{json.dumps(company_names, ensure_ascii=False, indent=2)}\n\n"
+        "For funding_stage_min, verify whether listed companies meet the threshold. "
+        "For geography criteria, verify only offices/operations/headquarters in the requested country/region. "
+        "Return only facts for companies from the provided list. Return JSON only."
+    )
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json,
+            system_prompt,
+            user_prompt,
+            model=SCREENING_REASONING_MODEL,
+            use_web=True,
+            web_search_tool=SCREENING_WEB_SEARCH_TOOL,
+            web_search_context_size=SCREENING_WEB_SEARCH_CONTEXT_SIZE,
+            temperature=0.0,
+            timeout=120.0,
+        )
+        tracker.add_usage(SCREENING_REASONING_MODEL, f"{system_prompt}\n\n{user_prompt}", json.dumps(structured), "Candidate Company Fact Web Enrichment")
+    except Exception as e:
+        logger.warning("Candidate company fact web enrichment failed: %s", e)
+        return criteria
+    return _merge_web_company_facts(criteria, structured if isinstance(structured, dict) else {})
+
+
 async def evaluate_shortlist_profile(
     profile: Dict[str, Any],
     original_query: str,
@@ -1512,13 +2460,20 @@ async def evaluate_shortlist_profile(
         "\ndecision: exactly 'match', 'no_match', or 'unknown'. "
         "\nmatch_score: integer 0-100 reflecting how well the candidate satisfies the query criteria. "
         "\nCRITICAL REJECTION RULES: Interpret relationship intents strictly. If the query asks for candidates working at a specific company (e.g. 'Google'), you MUST reject candidates who only: 1) Have certifications from that company. 2) Sell to that company as a customer. 3) Compete against that company. 4) Use the company's products. The candidate MUST have the company listed as an employer in their role history. If not, return decision='no_match' and match_score below 60."
+        "\nDYNAMIC EVIDENCE RULE: Do not use hidden/static taxonomies or your memory alone. Use only the provided DB/profile evidence and live web/company facts in the prompt, plus web search sources you can cite with URLs."
+        "\nSTRUCTURED CRITERIA RULES: competitor_of means employer relationship to a competitor of the target company. Use current employer unless employment_scope says any_employer/past_or_current. Verify competitor lists with web sources; do not rely on a hidden/static taxonomy. If a source names a competing product/business unit (for example a marketing cloud or engagement product), employment at the broad parent company counts only when the candidate's role/profile evidence connects them to that competing product/business unit or same business line."
+        "\nHARD CRITERIA RULE: Treat every extracted criterion as mandatory. A close match or partial match is no_match unless the user explicitly asks for near matches. If any required criterion is missing or unknown, put it in missing_criteria, set decision='no_match', and keep match_score below 60."
+        "\nFor funding_stage_min, use DB company facts first. If DB is missing, use web sources. If reliable sources are unavailable, mark the criterion missing/unknown and do not match by guess. Series C and above includes Series C, later venture rounds, Growth, Private Equity, Public, and IPO."
+        "\nFor min_function_years, count only role history/profile evidence for the requested function and its aliases. Do not invent role tenure from web. Show the arithmetic in evidence/reasoning. Do not combine unrelated roles, unrelated functions, geography duration, or total experience to satisfy function-specific years. If the sum is below the requested minimum, reject."
+        "\nFor required_industries, require company/product/market category evidence. A generic customer-facing role, CRM usage, certification, customer list, or sales activity does not by itself prove the employer is in that industry."
+        "\nFor required_geographies, current candidate location alone does NOT count as market experience. Count role location/details, uploaded focused geography/profile claims, explicit region claims, and verified employer office/operations/headquarters evidence. Do not count subsidiaries, customers, revenue mix, or product/certification mentions."
         "\nanswer: 1-2 natural sentences with your verdict, mentioning actual company names, titles, and durations from the profile. "
         "Example: 'Yes — Sarah has 6 years at Salesforce as an Enterprise AE covering US West, directly meeting the enterprise SaaS requirement.' "
         "\nreasoning: 2-4 sentences explaining the key evidence — walk through what you found in the profile (role history, companies, experience) and how it maps to the query. Be specific; do not use vague phrases like 'the candidate has relevant experience'. "
         "\nmatched_criteria: list of criteria satisfied with the profile evidence that supports each. "
         "\nmissing_criteria: list of criteria not clearly evidenced. "
-        "\nevidence: list of evidence items, each with criterion, value, source, and snippet. "
-        "\nsources: list of web sources used if web search was performed, each with url, title, note. "
+        "\nevidence: list of evidence items, each with criterion, value, source, and snippet. Label source as DB/profile evidence or web evidence. "
+        "\nsources: list of web sources used for company facts if web search was performed, each with url, title, note. "
         "\nconfidence: 'high', 'medium', or 'low' based on the quality of evidence. "
         "Use the full profile, career tool results, and any web evidence available. Do not invent facts not in the data."
     )
@@ -1552,6 +2507,9 @@ async def evaluate_shortlist_profile(
         return profile_safe
 
     sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
+    missing_items = structured.get("missing_criteria") if isinstance(structured.get("missing_criteria"), list) else []
+    if missing_items:
+        return None
     outputs = {"decision": structured.get("decision", "")}
     verification = verify_smart_column_outputs(
         original_query,
@@ -1612,6 +2570,8 @@ async def process_query_main(
         template="""
         Extract structured filtering criteria from the user's query: "{query}".
         CRITICAL: The query may contain typos or grammatical errors. Bravely infer the user's intent and correct misspellings of job titles, skills, and company names when categorizing them.
+        CRITICAL: Do not use a hardcoded competitor list. If the user asks for competitors, extract the target company into competitor_of and leave competitor discovery to web enrichment.
+        CRITICAL: Candidate career facts must later come from the candidate profile/DB only. Web can verify company facts such as competitors, funding stage, and office/operations presence.
         
         Taxonomies:
         Sales: {sales_taxonomy_json}
@@ -1624,9 +2584,18 @@ async def process_query_main(
         - "required_segments": {{"operator": "OR", "values": List[str]}} (Map to Segment Synonyms)
         - "required_locations": {{"operator": "OR", "values": List[str]}} (City/State)
         - "required_geographies": {{"operator": "OR", "values": List[str]}} (Countries/Regions like 'APAC', 'EMEA')
+          If a years/duration phrase is attached to a geography/market phrase (for example "5 years in APAC market" or "5+ years India experience"), put that number as min_years on required_geographies. Do NOT convert that to min_total_experience.
         - "required_company_details": {{"operator": "OR", "values": List[str]}} (e.g. 'SaaS', 'B2B', 'Series A')
+        - "competitor_of": List[{{"target": str, "employment_scope": "current_employer"|"any_employer"}}]
+          Use current_employer for phrases like "working for competitors"; use any_employer for "worked at/with competitors".
+        - "min_function_years": List[{{"function": str, "min_years": number, "aliases": List[str]}}]
+          Include aliases from the query intent, e.g. sales development may include SDR/BDR/business development representative; channel sales may include partner/reseller/channel/alliance management; inside sales may include inbound/remote sales; business development may include BD/account development when sales context is present.
+        - "funding_stage_min": {{"stage": str, "employment_scope": "current_employer"|"any_employer", "accepted_stages": List[str]}}
+          Treat "Series C and above" as stage "Series C" with accepted stages including Series C, Series D/E/F+, Growth, Private Equity, Public, IPO.
+        - For "APAC" or other regions in required_geographies, return objects when useful: {{"geography": "APAC", "expanded_terms": List[str]}}. Country searches may include the parent region in expanded_terms so explicit APAC profile claims can match Singapore/India.
         - "required_keywords": {{"operator": "OR", "values": List[str]}} (only when the query has important terms that do not fit the other keys. DO NOT put company names here. Put ALL company names in required_companies, even if there are typos in the query)
         - "min_total_experience": int
+          Use only when the query asks for overall candidate experience. Do NOT use it for function-specific years or geography/market years.
         - "min_people_managed": int
         - "top_n": int (default 10 if searching for "top", "best")
         
@@ -1644,6 +2613,27 @@ async def process_query_main(
         JSON: {{
             "required_functions": {{"operator": "OR", "values": ["Software Engineer"]}},
             "required_companies": ["Microsoft"]
+        }}
+
+        Example 3:
+        Query: "Candidates who are working for CleverTap competitors and has 5 years in channel sales"
+        JSON: {{
+            "competitor_of": [{{"target": "CleverTap", "employment_scope": "current_employer"}}],
+            "min_function_years": [{{"function": "Channel Sales", "min_years": 5, "aliases": ["channel sales", "channel partner", "partner sales", "reseller sales", "alliance management", "alliances"]}}]
+        }}
+
+        Example 4:
+        Query: "Candidates with 5 years of sales development experience and have worked in APAC market"
+        JSON: {{
+            "min_function_years": [{{"function": "Sales Development", "min_years": 5, "aliases": ["sales development", "SDR", "BDR", "business development representative"]}}],
+            "required_geographies": {{"operator": "OR", "values": [{{"geography": "APAC", "expanded_terms": ["APAC", "Asia Pacific", "India", "Singapore", "Australia", "Japan", "Indonesia", "Malaysia", "Philippines", "Thailand", "Vietnam", "New Zealand"]}}], "min_years": 5}}
+        }}
+
+        Example 5:
+        Query: "Candidates who are working for CleverTap competitors and has 5 years in APAC market"
+        JSON: {{
+            "competitor_of": [{{"target": "CleverTap", "employment_scope": "current_employer"}}],
+            "required_geographies": {{"operator": "OR", "values": [{{"geography": "APAC", "expanded_terms": ["APAC", "Asia Pacific", "India", "Singapore", "Australia", "Japan", "Indonesia", "Malaysia", "Philippines", "Thailand", "Vietnam", "New Zealand"]}}], "min_years": 5}}
         }}
 
         Query: "{query}"
@@ -1677,6 +2667,10 @@ async def process_query_main(
         logger.error(f"Error extracting criteria: {e}")
         yield f"Error analyzing query: {e}"
         return
+
+    if _needs_company_fact_web_enrichment(criteria) and SCREENING_WEB_SEARCH_DEFAULT:
+        yield "Resolving company facts with web evidence..."
+        criteria = await enrich_criteria_with_company_web_facts(query, criteria, tracker)
 
     original_criteria = copy.deepcopy(criteria)
     criteria["_screening_query"] = query
@@ -1754,17 +2748,27 @@ async def process_query_main(
     
     # 3. SEMANTIC SEARCH (Vector Retrieval)
     yield "Searching database..."
+
+    web_competitor_terms: List[str] = []
+    web_facts = criteria.get("_web_company_facts") if isinstance(criteria.get("_web_company_facts"), dict) else {}
+    for item in web_facts.get("competitors") or []:
+        if isinstance(item, dict):
+            web_competitor_terms.extend(str(company) for company in (item.get("companies") or []) if str(company or "").strip())
     
     search_query_text = " ".join(
         (criteria.get("required_companies") or []) + 
         get_values_from_criteria(criteria.get("required_keywords")) +
         get_values_from_criteria(criteria.get("required_industries")) +
         get_values_from_criteria(criteria.get("required_functions")) +
+        get_values_from_criteria(criteria.get("min_function_years")) +
         get_values_from_criteria(criteria.get("required_segments")) +
         get_values_from_criteria(criteria.get("required_geographies")) +
         get_values_from_criteria(criteria.get("required_locations")) +
         get_values_from_criteria(criteria.get("required_company_details")) +
-        get_values_from_criteria(criteria.get("required_culture_type"))
+        get_values_from_criteria(criteria.get("required_culture_type")) +
+        get_values_from_criteria(criteria.get("competitor_of")) +
+        get_values_from_criteria(criteria.get("funding_stage_min")) +
+        web_competitor_terms
     ).strip()
     
     initial_candidate_pool = []
@@ -1831,11 +2835,25 @@ async def process_query_main(
             initial_candidate_pool = _scoped_build()
     else:
         initial_candidate_pool = _scoped_build()
+
+    if _needs_candidate_company_fact_web_enrichment(criteria) and SCREENING_WEB_SEARCH_DEFAULT:
+        yield "Updating company facts with web evidence..."
+        criteria = await enrich_criteria_with_candidate_company_web_facts(
+            query,
+            criteria,
+            initial_candidate_pool,
+            tracker,
+        )
+    verification_criteria = copy.deepcopy(criteria)
     
     # 4. Soft-rank Candidates
-    final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
+    if _uses_dynamic_ai_matching(criteria):
+        yield "Selecting candidates for AI evidence review..."
+        final_candidates = _dynamic_candidate_candidates(initial_candidate_pool, query, criteria)
+    else:
+        final_candidates = await filter_candidates_by_criteria(initial_candidate_pool, criteria)
 
-    if not final_candidates and used_vector_shortlist and len(initial_candidate_pool) < scoped_candidate_count:
+    if not final_candidates and not _uses_dynamic_ai_matching(criteria) and used_vector_shortlist and len(initial_candidate_pool) < scoped_candidate_count:
         logger.info("Vector shortlist returned no matches after filtering. Retrying scoped full cache.")
         final_candidates = await filter_candidates_by_criteria(_scoped_build(), criteria)
     
@@ -1861,7 +2879,7 @@ async def process_query_main(
                 return await evaluate_shortlist_profile(
                     profile,
                     query,
-                    original_criteria,
+                    verification_criteria,
                     tracker,
                     use_web=SCREENING_WEB_SEARCH_DEFAULT,
                 )
