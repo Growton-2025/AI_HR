@@ -1616,7 +1616,7 @@ export const useAppStore = create(persist((set, get) => ({
         const state = get()
         const hasCachedSummary = state.tpScopeTotal != null && state.tpScopeSummaryLastParamsString === paramsString
 
-        if (hasCachedSummary && state.tpScopeSummaryLastFetchedAt && Date.now() - state.tpScopeSummaryLastFetchedAt < freshnessMs) {
+        if (!options.force && hasCachedSummary && state.tpScopeSummaryLastFetchedAt && Date.now() - state.tpScopeSummaryLastFetchedAt < freshnessMs) {
             return {
                 success: true,
                 cached: true,
@@ -1627,7 +1627,7 @@ export const useAppStore = create(persist((set, get) => ({
             }
         }
 
-        if (state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
+        if (!options.force && state.tpScopeSummaryRequest && state.tpScopeSummaryRequestParamsString === paramsString) {
             return state.tpScopeSummaryRequest
         }
 
@@ -1635,7 +1635,8 @@ export const useAppStore = create(persist((set, get) => ({
         const url = paramsString
             ? `${API_BASE}/candidates/browse/summary?${paramsString}`
             : `${API_BASE}/candidates/browse/summary`
-        const request = axios.get(url, { timeout: 60000 })
+            
+        const requestPromise = axios.get(url, { timeout: 60000 })
             .then(res => {
                 const d = res.data || {}
                 const statusCounts = d.status_counts || {}
@@ -1681,26 +1682,23 @@ export const useAppStore = create(persist((set, get) => ({
             .catch(error => {
                 console.error('Failed to fetch talent pool summary:', error)
                 const latestState = get()
-                if (
-                    latestState.tpScopeSummaryRequestSeq === requestSeq &&
-                    latestState.tpScopeSummaryRequestParamsString === paramsString
-                ) {
+                if (latestState.tpScopeSummaryRequestSeq === requestSeq) {
                     set({
                         tpScopeSummaryRequest: null,
                         tpScopeSummaryRequestParamsString: '',
                         tpScopeSummaryIsRefreshing: false,
                     })
                 }
-                return { success: false, error: getRequestErrorMessage(error, 'Failed to load pipeline counts') }
+                return { success: false }
             })
 
         set({
-            tpScopeSummaryRequest: request,
+            tpScopeSummaryRequest: requestPromise,
             tpScopeSummaryRequestParamsString: paramsString,
             tpScopeSummaryRequestSeq: requestSeq,
             tpScopeSummaryIsRefreshing: true,
         })
-        return request
+        return requestPromise
     },
 
     fetchTalentPool: async (paramsString, options = {}) => {
@@ -2488,7 +2486,11 @@ export const useAppStore = create(persist((set, get) => ({
         isSidebarCollapsed: state.isSidebarCollapsed,
         // Do not persist analytics: stale zeros (failed fetch / cold cache) overwrite real counts after reload.
         tpAiRunFocus: state.tpAiRunFocus,
-        searchQuery: state.searchQuery
+        searchQuery: state.searchQuery,
+        tpScopeTotal: state.tpScopeTotal,
+        tpScopeStatusCounts: state.tpScopeStatusCounts,
+        tpTotal: state.tpTotal,
+        tpStatusCounts: state.tpStatusCounts,
     }),
     merge: (persistedState, currentState) => {
         const nextState = {
@@ -2508,15 +2510,15 @@ export const useAppStore = create(persist((set, get) => ({
             callsRequest: null,
             callsRequestQueryKey: '',
             callStatsRequest: null,
-            tpScopeTotal: null,
-            tpScopeStatusCounts: {},
+            tpScopeTotal: nextState.tpScopeTotal,
+            tpScopeStatusCounts: nextState.tpScopeStatusCounts || {},
             tpScopeSummaryRequest: null,
             tpScopeSummaryRequestParamsString: '',
             analyticsUserKey: '',
             analyticsRequestUserKey: '',
             tpCandidates: currentState.tpCandidates,
-            tpTotal: currentState.tpTotal,
-            tpStatusCounts: currentState.tpStatusCounts,
+            tpTotal: nextState.tpTotal,
+            tpStatusCounts: nextState.tpStatusCounts || {},
             talentPoolCache: currentState.talentPoolCache,
             searchResults: currentState.searchResults,
             talentPoolRequest: null,
