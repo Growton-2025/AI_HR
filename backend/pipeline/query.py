@@ -379,7 +379,7 @@ _CANDIDATE_SELECT_BODY = """
                 c.first_name, c.last_name,
                 c.total_experience_years, c.max_people_managed, c.avg_years_in_company,
                 c.raw_fields->>'services', c.raw_fields->>'extracted_industry',
-                c.embedding, c.created_by, c.raw_fields, c.email, COALESCE(c.mobile_phone, c.phone),
+                NULL as embedding, c.created_by, c.raw_fields, c.email, COALESCE(c.mobile_phone, c.phone),
                 c.response, c.notes, c.status,
                 co.heyreach_campaign_id, co.li_status, co.campaign_id, co.status as email_outreach_status,
                 co.li_sent_count, co.message_sent_count,
@@ -3226,7 +3226,7 @@ async def get_recruiter_list() -> List[str]:
 async def get_semantic_scores(query_text: str) -> Dict[int, float]:
     """
     Calculates semantic similarity scores for all profiles based on a query.
-    Uses OpenAI embeddings and in-memory cosine similarity.
+    Uses OpenAI embeddings and PostgreSQL pgvector cosine similarity.
     """
     if not query_text:
         return {}
@@ -3235,24 +3235,28 @@ async def get_semantic_scores(query_text: str) -> Dict[int, float]:
         # 1. Embed the query
         query_vector = await embeddings.aembed_query(query_text)
         
-        import numpy as np
-        query_vec = np.array(query_vector)
-        
-        scores = {}
-        for pid, profile in PROFILES_BY_ID.items():
-            emb = profile.get("embedding")
-            if not emb:
-                scores[pid] = 0.0
-                continue
+        conn = get_db_connection(validate=False, register_pgvector=True)
+        if not conn:
+            return {}
             
-            # 2. Similarity (Cosine)
-            cand_vec = np.array(emb)
-            similarity = np.dot(query_vec, cand_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(cand_vec))
-            scores[pid] = float(similarity)
+        try:
+            with conn.cursor() as cur:
+                # 1 - (cosine distance) = cosine similarity
+                cur.execute("""
+                    SELECT id, 1 - (embedding <=> %s::vector) as similarity
+                    FROM candidates
+                    WHERE embedding IS NOT NULL AND COALESCE(is_archived, FALSE) = FALSE
+                """, (query_vector,))
+                
+                scores = {}
+                for row in cur.fetchall():
+                    scores[row[0]] = float(row[1])
+                return scores
+        finally:
+            return_db_connection(conn)
             
-        return scores
     except Exception as e:
-        logger.error(f"Semantic scoring failed: {e}")
+        logger.error(f"Semantic scoring failed: {e}", exc_info=True)
         return {}
 
 def update_candidate_status(candidate_id: int, status: str) -> bool:

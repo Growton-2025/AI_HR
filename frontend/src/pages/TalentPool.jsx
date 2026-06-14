@@ -888,12 +888,11 @@ const readPersistedContactInfo = () => {
 };
 
 function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, tpTotal, tpStatusCounts, countsLoading = false }) {
-  const summary = analytics?.summary;
-  if (!summary || typeof summary !== 'object') return null;
+  const summary = analytics?.summary && typeof analytics.summary === 'object' ? analytics.summary : {};
 
   // Filters should narrow the table and status tabs, not rewrite the global sourced KPI.
-  const displayTotal = tpTotal != null ? tpTotal : summary.total_sourced;
-  const displayShortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted;
+  const displayTotal = tpTotal != null ? tpTotal : summary.total_sourced || 0;
+  const displayShortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted || 0;
   const displayPipeline = tpStatusCounts || summary.pipeline_health || {};
 
   const conversionRate = countsLoading ? '...' : displayTotal > 0
@@ -907,7 +906,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
     { label: 'In follow up', value: countsLoading ? '...' : displayPipeline?.['Followup / In conversation'] || 0, icon: MessageSquareMore, tone: 'amber', status: 'Followup / In conversation' },
   ];
 
-  const recruiterPerf = analytics.recruiter_performance || [];
+  const recruiterPerf = analytics?.recruiter_performance || [];
   const tones = {
     warm: {
       accent: '#c27c3f',
@@ -1008,7 +1007,7 @@ function StatisticsDashboard({ analytics, role, onStatClick, onRecruiterClick, t
 
 function CompactMetricsStrip({ analytics, tpTotal, tpStatusCounts, expanded, onToggle, countsLoading = false }) {
   const summary = analytics?.summary || {};
-  const totalSourced = tpTotal != null ? tpTotal : summary.total_sourced;
+  const totalSourced = tpTotal != null ? tpTotal : summary.total_sourced || 0;
   const shortlisted = tpStatusCounts?.Shortlisted != null ? tpStatusCounts.Shortlisted : summary.shortlisted || 0;
   const followUp = (tpStatusCounts || summary.pipeline_health || {})['Followup / In conversation'] || 0;
   const conversion = countsLoading ? '...' : totalSourced > 0 ? Math.round((shortlisted / totalSourced) * 100) : 0;
@@ -3335,18 +3334,16 @@ export default function TalentPool() {
             </div>
           </div>
 
-          {analytics && (
-            <CompactMetricsStrip
-              analytics={analytics}
-              tpTotal={metricsTotal}
-              tpStatusCounts={metricsStatusCounts}
-              countsLoading={recruiterCountLoading}
-              expanded={metricsExpanded}
-              onToggle={() => setMetricsExpanded(prev => !prev)}
-            />
-          )}
+          <CompactMetricsStrip
+            analytics={analytics}
+            tpTotal={metricsTotal}
+            tpStatusCounts={metricsStatusCounts}
+            countsLoading={recruiterCountLoading}
+            expanded={metricsExpanded}
+            onToggle={() => setMetricsExpanded(prev => !prev)}
+          />
 
-          {analytics && metricsExpanded && (
+          {metricsExpanded && (
             <div style={{ padding: '14px 20px 18px', borderTop: `1px solid ${surfaceBorder}` }}>
               <StatisticsDashboard
                 analytics={analytics}
