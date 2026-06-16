@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from backend.api import schemas, deps
 from backend.db.connection import (
     get_db_connection_context,
@@ -196,6 +197,10 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
 
     results = []
     status_messages = []
+    verified_count = 0
+    total_reviewed = 0
+    potential_count = 0
+    filter_debug = None
 
     try:
         async for item in process_query_main(
@@ -206,6 +211,7 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
             screening_role=current_user.role,
             source_type=request.source_type,
             source_role_id=request.source_role_id,
+            use_web_search=bool(request.use_web_search),
         ):
             if isinstance(item, str):
                 status_messages.append(item)
@@ -213,12 +219,23 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
                 msg_type = item.get("type")
                 if msg_type == "complete":
                     results = item.get("data", [])
+                    verified_count = int(item.get("verified_count") or 0)
+                    total_reviewed = int(item.get("total_reviewed") or 0)
+                    potential_count = int(item.get("potential_count") or max(0, len(results) - verified_count))
+                    filter_debug = item.get("filter_debug")
                     break
                 elif msg_type == "profile_chunk":
-                    # Collect individual profiles
+                    # Collect/update individual profiles as the stream refines shortlist status.
                     profile = item.get("data")
                     if profile:
-                        results.append(profile)
+                        profile_key = str(profile.get("id") or profile.get("linkedin") or profile.get("name") or len(results))
+                        for idx, existing in enumerate(results):
+                            existing_key = str(existing.get("id") or existing.get("linkedin") or existing.get("name") or idx)
+                            if existing_key == profile_key:
+                                results[idx] = {**existing, **profile}
+                                break
+                        else:
+                            results.append(profile)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -230,7 +247,11 @@ async def search_candidates(request: schemas.SearchRequest, current_user: schema
             "total_tokens": tracker.total_tokens,
             "total_cost": round(tracker.total_cost, 6)
         },
-        "status_messages": status_messages
+        "verified_count": verified_count,
+        "total_reviewed": total_reviewed,
+        "potential_count": potential_count,
+        "status_messages": status_messages,
+        "filter_debug": filter_debug,
     }
 
 @router.post("/export")
@@ -302,6 +323,11 @@ async def websocket_search(websocket: WebSocket):
             token = data.get("token") or data.get("access_token")
             source_type = data.get("source_type")
             source_role_id = data.get("source_role_id")
+            raw_use_web_search = data.get("use_web_search", data.get("useWebSearch", False))
+            if isinstance(raw_use_web_search, str):
+                use_web_search = raw_use_web_search.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                use_web_search = bool(raw_use_web_search)
 
             ws_user = deps.get_user_from_access_token(token)
             if not ws_user:
@@ -350,7 +376,7 @@ async def websocket_search(websocket: WebSocket):
                 async def send_event(payload: Dict[str, Any]) -> bool:
                     try:
                         async with send_lock:
-                            await websocket.send_json(payload)
+                            await websocket.send_json(jsonable_encoder(payload))
                         return True
                     except (WebSocketDisconnect, RuntimeError):
                         return False
@@ -365,6 +391,7 @@ async def websocket_search(websocket: WebSocket):
                     source_type=source_type,
                     source_role_id=source_role_id,
                     pause_event=pause_event,
+                    use_web_search=use_web_search,
                 ):
                     if isinstance(item, str):
                         # Status message
@@ -397,7 +424,9 @@ async def websocket_search(websocket: WebSocket):
                                 "type": "candidate",
                                 "data": item.get("data"),
                                 "current": item.get("current"),
-                                "total": item.get("total")
+                                "total": item.get("total"),
+                                "reviewed": item.get("reviewed"),
+                                "verified": item.get("verified"),
                             }):
                                 break
 
@@ -406,6 +435,10 @@ async def websocket_search(websocket: WebSocket):
                                 "type": "complete",
                                 "candidates": item.get("data", []),
                                 "total": len(item.get("data", [])),
+                                "verified_count": item.get("verified_count", 0),
+                                "total_reviewed": item.get("total_reviewed", 0),
+                                "potential_count": item.get("potential_count", 0),
+                                "filter_debug": item.get("filter_debug"),
                                 "usage": {
                                     "total_tokens": tracker.total_tokens,
                                     "total_cost": round(tracker.total_cost, 6)

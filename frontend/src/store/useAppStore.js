@@ -202,6 +202,50 @@ function sortCallListsByCreatedAt(lists = []) {
     })
 }
 
+function searchCandidateKey(candidate, index = 0) {
+    return String(candidate?.id ?? candidate?.linkedin ?? candidate?.name ?? `candidate:${index}`)
+}
+
+function mergeSearchCandidates(existing = [], incoming = [], preferIncomingOrder = false) {
+    const merged = new Map()
+    const order = []
+
+    const add = (candidate, index) => {
+        if (!candidate) return
+        const key = searchCandidateKey(candidate, index)
+        if (!merged.has(key)) order.push(key)
+        merged.set(key, { ...(merged.get(key) || {}), ...candidate })
+    }
+
+    if (preferIncomingOrder) {
+        incoming.forEach(add)
+        existing.forEach(add)
+    } else {
+        existing.forEach(add)
+        incoming.forEach(add)
+    }
+
+    return order.map(key => merged.get(key)).filter(Boolean)
+}
+
+function countVerifiedSearchCandidates(candidates = []) {
+    return (candidates || []).filter(candidate => (
+        candidate?.is_verified_match ||
+        candidate?.shortlist_status === 'verified_match' ||
+        candidate?.shortlist_status === 'shortlisted'
+    )).length
+}
+
+function searchFoundMessage(total, verifiedCount = null) {
+    const safeTotal = Number(total) || 0
+    const safeVerified = Number.isFinite(Number(verifiedCount)) ? Number(verifiedCount) : 0
+    if (safeTotal <= 0) return 'No qualified matches found'
+    if (safeVerified > 0) {
+        return `${safeVerified} qualified match${safeVerified === 1 ? '' : 'es'}`
+    }
+    return `${safeTotal} qualified match${safeTotal === 1 ? '' : 'es'}`
+}
+
 function mergePendingCallLists(serverLists = [], currentLists = []) {
     const merged = [...(serverLists || [])]
     const pendingLists = (currentLists || []).filter(list => list?.is_pending)
@@ -706,6 +750,7 @@ export const useAppStore = create(persist((set, get) => ({
     searchTotal: 0,
     statusMessage: '',
     searchResults: [],
+    searchDebug: null,
     usage: null,
     searchOutcome: 'idle',
     lastSearchError: '',
@@ -716,6 +761,7 @@ export const useAppStore = create(persist((set, get) => ({
         const initialStatus = options.initialStatus || 'Screening...'
         const sourceType = options.sourceType || options.source_type || 'master'
         const sourceRoleId = options.sourceRoleId || options.source_role_id || null
+        const useWebSearch = Boolean(options.useWebSearch ?? options.use_web_search)
         // Preserve any results already streamed via WS — only clear if starting fresh
         const alreadyHaveResults = get().searchResults?.length > 0
         set({
@@ -726,6 +772,7 @@ export const useAppStore = create(persist((set, get) => ({
             statusMessage: initialStatus,
             searchProgress: alreadyHaveResults ? get().searchProgress : 0,
             searchTotal: alreadyHaveResults ? get().searchTotal : 0,
+            searchDebug: alreadyHaveResults ? get().searchDebug : null,
             searchOutcome: 'loading',
             lastSearchError: '',
         })
@@ -734,20 +781,21 @@ export const useAppStore = create(persist((set, get) => ({
                 query,
                 source_type: sourceType,
                 source_role_id: sourceRoleId,
+                use_web_search: useWebSearch,
             }, { timeout: SEARCH_REQUEST_TIMEOUT_MS })
             const totalCandidates = res.data.total ?? res.data.candidates?.length ?? 0
             const currentResults = get().searchResults || []
-            // Use REST results if they have more matches than what was streamed
-            const useRestResults = totalCandidates > currentResults.length
+            const mergedResults = mergeSearchCandidates(currentResults, res.data.candidates || [], true)
+            const visibleTotal = Math.max(totalCandidates, mergedResults.length)
+            const verifiedCount = res.data.verified_count ?? countVerifiedSearchCandidates(mergedResults)
             set({
-                searchResults: useRestResults ? res.data.candidates : currentResults,
+                searchResults: mergedResults,
+                searchDebug: res.data.filter_debug || null,
                 usage: res.data.usage,
-                statusMessage: (useRestResults ? totalCandidates : currentResults.length) > 0
-                    ? `Found ${useRestResults ? totalCandidates : currentResults.length} candidates`
-                    : 'No close matches found yet',
+                statusMessage: searchFoundMessage(visibleTotal, verifiedCount),
                 isSearching: false,
                 searchProgress: 100,
-                searchOutcome: (useRestResults ? totalCandidates : currentResults.length) > 0 ? 'success' : 'empty',
+                searchOutcome: visibleTotal > 0 ? 'success' : 'empty',
             })
         } catch (e) {
             const errorMessage = getRequestErrorMessage(e, 'Screening failed')
@@ -773,6 +821,7 @@ export const useAppStore = create(persist((set, get) => ({
     searchCandidatesStream: (query, options = {}) => {
         const sourceType = options.sourceType || options.source_type || 'master'
         const sourceRoleId = options.sourceRoleId || options.source_role_id || null
+        const useWebSearch = Boolean(options.useWebSearch ?? options.use_web_search)
         const existingWs = get()._ws
         if (existingWs) {
             try {
@@ -792,6 +841,7 @@ export const useAppStore = create(persist((set, get) => ({
             statusMessage: 'Connecting...',
             searchProgress: 0,
             searchTotal: 0,
+            searchDebug: null,
             searchOutcome: 'loading',
             lastSearchError: '',
             _searchFallbackTimer: null,
@@ -822,6 +872,7 @@ export const useAppStore = create(persist((set, get) => ({
                 initialStatus: 'Realtime screening unavailable. Running standard search...',
                 sourceType,
                 sourceRoleId,
+                useWebSearch,
             })
         }
 
@@ -843,8 +894,9 @@ export const useAppStore = create(persist((set, get) => ({
                 token,
                 source_type: sourceType,
                 source_role_id: sourceRoleId,
+                use_web_search: useWebSearch,
             }))
-            set({ statusMessage: 'Processing query...' })
+            set({ statusMessage: useWebSearch ? 'Researching company facts...' : 'Processing query...' })
             // 2 minutes — backend may need to warm the candidate cache on cold start
             armFallbackTimer(120000)
         }
@@ -875,34 +927,48 @@ export const useAppStore = create(persist((set, get) => ({
                     break
 
                 case 'progress_start':
-                    set({ searchTotal: data.total, statusMessage: `Found ${data.total} potential matches. Generating summaries...` })
+                    set({ searchTotal: data.total, statusMessage: `Generating reasoning for ${data.total} qualified match${data.total === 1 ? '' : 'es'}...` })
                     break
 
                 case 'candidate':
-                    set(state => ({
-                        searchResults: [...state.searchResults, data.data],
-                        searchProgress: Math.round((data.current / data.total) * 100)
-                    }))
+                    set(state => {
+                        const nextResults = mergeSearchCandidates(state.searchResults, [data.data])
+                        const reviewed = Number(data.reviewed ?? data.current ?? 0)
+                        const total = Number(data.total || state.searchTotal || 0)
+                        const verified = Number(data.verified ?? countVerifiedSearchCandidates(nextResults))
+                        return {
+                            searchResults: nextResults,
+                            searchProgress: total > 0 && reviewed > 0 ? Math.round((reviewed / total) * 100) : state.searchProgress,
+                            statusMessage: total > 0 && reviewed > 0
+                                ? `Generated reasoning for ${reviewed} of ${total}. ${searchFoundMessage(nextResults.length, verified)}`
+                                : `Scoring ${total || nextResults.length} profile${(total || nextResults.length) === 1 ? '' : 's'}...`,
+                        }
+                    })
                     break
 
                 case 'progress':
                     set({
                         searchProgress: Math.round((data.current / data.total) * 100),
-                        statusMessage: `Reviewed ${data.current} of ${data.total} profiles...`
+                        statusMessage: `Scored ${data.current} of ${data.total} profiles...`
                     })
                     break
 
                 case 'complete':
                     finished = true
                     clearFallbackTimer()
-                    const totalCandidates = data.total ?? data.candidates?.length ?? 0
-                    set({
-                        searchResults: data.candidates,
-                        usage: data.usage,
-                        statusMessage: totalCandidates > 0 ? `Found ${totalCandidates} candidates` : 'No close matches found yet',
-                        isSearching: false,
-                        searchProgress: 100,
-                        searchOutcome: totalCandidates > 0 ? 'success' : 'empty',
+                    set(state => {
+                        const mergedResults = mergeSearchCandidates(state.searchResults, data.candidates || [], true)
+                        const totalCandidates = Math.max(data.total ?? 0, mergedResults.length)
+                        const verifiedCount = data.verified_count ?? countVerifiedSearchCandidates(mergedResults)
+                        return {
+                            searchResults: mergedResults,
+                            searchDebug: data.filter_debug || state.searchDebug || null,
+                            usage: data.usage,
+                            statusMessage: searchFoundMessage(totalCandidates, verifiedCount),
+                            isSearching: false,
+                            searchProgress: 100,
+                            searchOutcome: totalCandidates > 0 ? 'success' : 'empty',
+                        }
                     })
                     set({ _ws: null })
                     ws.close()
@@ -996,6 +1062,7 @@ export const useAppStore = create(persist((set, get) => ({
             statusMessage: '',
             searchProgress: 0,
             searchTotal: 0,
+            searchDebug: null,
             usage: null,
             isSearching: false,
             isSearchPaused: false,

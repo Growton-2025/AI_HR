@@ -1,7 +1,7 @@
 import { useAppStore } from '../store/useAppStore'
 import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { renderTextWithLinks } from './AiColumnCellDrawer'
 
 function formatExperience(value) {
@@ -19,7 +19,7 @@ function ConfidenceDot({ confidence }) {
             fontSize: 11, fontWeight: 700, color, textTransform: 'capitalize',
         }}>
             <span style={{ width: 6, height: 6, borderRadius: '50%', background: color, display: 'inline-block' }} />
-            {confidence || 'medium'} confidence
+            {confidence || 'medium'} evidence
         </span>
     )
 }
@@ -43,6 +43,26 @@ function SourceBadge({ sources }) {
         >
             <ExternalLink size={10} /> Web source
         </a>
+    )
+}
+
+function ShortlistStatusBadge({ candidate }) {
+    const status = candidate.shortlist_status || (candidate.is_verified_match ? 'shortlisted' : 'shortlisted')
+    const config = {
+        shortlisted: { label: 'Evidence match', bg: '#dcfce7', color: '#166534', border: '#bbf7d0' },
+        verified_match: { label: 'Verified from evidence', bg: '#dcfce7', color: '#166534', border: '#bbf7d0' },
+    }
+    const item = config[status] || config.shortlisted
+    return (
+        <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            fontSize: 10, fontWeight: 800, color: item.color,
+            background: item.bg, border: `1px solid ${item.border}`,
+            borderRadius: 999, padding: '2px 7px', whiteSpace: 'nowrap',
+        }}>
+            <ShieldCheck size={10} />
+            {item.label}
+        </span>
     )
 }
 
@@ -72,6 +92,63 @@ function MatchChips({ matched, missing }) {
     )
 }
 
+function formatYears(value) {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return '0 yrs'
+    return `${Number.isInteger(num) ? num : num.toFixed(1)} yrs`
+}
+
+function ScopedTenureChips({ items }) {
+    if (!Array.isArray(items) || !items.length) return null
+    return (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 8 }}>
+            {items.slice(0, 5).map((item, index) => (
+                <span key={`${item.key || item.label}-${index}`} style={{
+                    fontSize: 10.5, fontWeight: 800, padding: '3px 8px', borderRadius: 99,
+                    background: '#ecfdf5', color: '#047857', border: '1px solid #a7f3d0',
+                }}>
+                    {formatYears(item.duration)} {item.label || item.dimension}
+                </span>
+            ))}
+        </div>
+    )
+}
+
+function EvidenceDrawer({ candidate }) {
+    const evidence = Array.isArray(candidate.evidence_log) ? candidate.evidence_log : []
+    const tenure = Array.isArray(candidate.scoped_tenure) ? candidate.scoped_tenure : []
+    if (!evidence.length && !tenure.length) return null
+    return (
+        <div style={{
+            marginTop: 10, paddingTop: 10,
+            borderTop: '1px solid rgba(99,102,241,0.15)',
+            display: 'grid', gap: 8,
+        }}>
+            {tenure.length > 0 && (
+                <div style={{ display: 'grid', gap: 6 }}>
+                    {tenure.slice(0, 4).map((item, index) => (
+                        <div key={`${item.key || item.label}-${index}`} style={{ fontSize: 12, color: '#334155', lineHeight: 1.45 }}>
+                            <strong>{item.label || item.dimension}</strong>: {formatYears(item.duration)} verified against {formatYears(item.required)} required
+                        </div>
+                    ))}
+                </div>
+            )}
+            {evidence.slice(0, 6).map((item) => (
+                <div key={item.id || `${item.source}-${item.snippet}`} style={{
+                    fontSize: 12, color: '#475569', lineHeight: 1.45,
+                    padding: '7px 9px', borderRadius: 8,
+                    background: '#f8fafc', border: '1px solid #e2e8f0',
+                }}>
+                    <strong style={{ color: '#0f172a' }}>{item.id || 'evidence'}</strong>
+                    {item.criterion ? ` · ${item.criterion}` : ''}
+                    {item.source ? ` · ${item.source}` : ''}
+                    <div style={{ marginTop: 3 }}>{item.snippet || item.value || item.source_text}</div>
+                </div>
+            ))}
+        </div>
+    )
+}
+
 function CandidateCard({ candidate }) {
     const [expanded, setExpanded] = useState(false)
     const { selectedCandidates, toggleCandidateSelection } = useAppStore(
@@ -95,6 +172,7 @@ function CandidateCard({ candidate }) {
     const confidence = candidate.confidence || 'medium'
     const matched = candidate.matched_criteria || []
     const missing = candidate.missing_criteria || []
+    const hasEvidenceDetails = (candidate.evidence_log?.length || 0) > 0 || (candidate.scoped_tenure?.length || 0) > 0
 
     const scoreColor = score > 80 ? { bg: '#e7f6ec', color: '#166534' }
         : score > 60 ? { bg: '#f7f0e4', color: '#8b6b44' }
@@ -129,7 +207,7 @@ function CandidateCard({ candidate }) {
                             background: scoreColor.bg, color: scoreColor.color,
                             fontSize: 11, fontWeight: 700,
                         }}>
-                            {score}% match
+                            {score}% evidence fit
                         </span>
                     )}
                     {candidate.linkedin && (
@@ -169,10 +247,11 @@ function CandidateCard({ candidate }) {
                             }}>
                                 AI Match Analysis
                             </span>
+                            <ShortlistStatusBadge candidate={candidate} />
                             <ConfidenceDot confidence={confidence} />
                             <SourceBadge sources={sources} />
                         </div>
-                        {hasDetailedReasoning && (
+                        {(hasDetailedReasoning || hasEvidenceDetails) && (
                             <button
                                 onClick={() => setExpanded(e => !e)}
                                 style={{
@@ -181,7 +260,7 @@ function CandidateCard({ candidate }) {
                                     display: 'flex', alignItems: 'center', gap: 3, padding: 0,
                                 }}
                             >
-                                {expanded ? <><ChevronUp size={13} /> Less</> : <><ChevronDown size={13} /> Full reasoning</>}
+                                {expanded ? <><ChevronUp size={13} /> Less</> : <><ChevronDown size={13} /> Evidence</>}
                             </button>
                         )}
                     </div>
@@ -196,10 +275,12 @@ function CandidateCard({ candidate }) {
                             {renderTextWithLinks(reasoning)}
                         </div>
                     )}
+                    {expanded && <EvidenceDrawer candidate={candidate} />}
                 </div>
             )}
 
             <MatchChips matched={matched} missing={missing} />
+            <ScopedTenureChips items={candidate.scoped_tenure} />
 
             {candidate.contributing_roles_details?.roles?.length > 0 && (
                 <div className="shortlist-role-strip">
@@ -217,10 +298,24 @@ function CandidateCard({ candidate }) {
 
 function SearchResults() {
     const searchResults = useAppStore(state => state.searchResults)
+    const searchDebug = useAppStore(state => state.searchDebug)
     const [page, setPage] = useState(1)
     const [pageSize, setPageSize] = useState(25)
 
-    const totalPages = Math.max(1, Math.ceil(searchResults.length / pageSize))
+    const rankedResults = useMemo(() => {
+        const statusRank = { shortlisted: 0, verified_match: 0 }
+        return [...searchResults].sort((left, right) => {
+            const leftStatus = left.shortlist_status || (left.is_verified_match ? 'shortlisted' : 'shortlisted')
+            const rightStatus = right.shortlist_status || (right.is_verified_match ? 'shortlisted' : 'shortlisted')
+            const statusDelta = (statusRank[leftStatus] ?? 9) - (statusRank[rightStatus] ?? 9)
+            if (statusDelta !== 0) return statusDelta
+            const scoreDelta = Number(right.match_score || 0) - Number(left.match_score || 0)
+            if (scoreDelta !== 0) return scoreDelta
+            return Number(right.total_experience_years || 0) - Number(left.total_experience_years || 0)
+        })
+    }, [searchResults])
+
+    const totalPages = Math.max(1, Math.ceil(rankedResults.length / pageSize))
     
     // Ensure page is valid if results decrease
     useEffect(() => {
@@ -229,15 +324,19 @@ function SearchResults() {
 
     const startIndex = (page - 1) * pageSize
     const endIndex = startIndex + pageSize
-    const displayedResults = searchResults.slice(startIndex, endIndex)
+    const displayedResults = rankedResults.slice(startIndex, endIndex)
 
     return (
         <div className="shortlist-results">
             <div className="shortlist-results-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px' }}>
-                    <div className="section-label">Shortlisted Matches ({searchResults.length})</div>
+                    <div className="section-label">Qualified Matches ({searchResults.length})</div>
                     {searchResults.length > 0 && (
-                        <div className="shortlist-sort-note">Sorted by AI match score</div>
+                        <div className="shortlist-sort-note">
+                            {searchDebug?.semantic_pool_count
+                                ? `${searchDebug.returned ?? searchResults.length} returned · ${searchDebug.passed ?? searchResults.length} qualified from ${searchDebug.semantic_pool_count} reviewed`
+                                : 'Sorted by strict fit score'}
+                        </div>
                     )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -274,7 +373,7 @@ function SearchResults() {
                 <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderTop: '1px solid #eef2f7', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottomLeftRadius: '12px', borderBottomRightRadius: '12px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                         <span style={{ fontSize: 13, color: '#64748b' }}>
-                            Showing {Math.min(startIndex + 1, searchResults.length)}–{Math.min(endIndex, searchResults.length)} of <strong style={{ color: '#0f172a' }}>{searchResults.length}</strong> matches
+                            Showing {Math.min(startIndex + 1, searchResults.length)}–{Math.min(endIndex, searchResults.length)} of <strong style={{ color: '#0f172a' }}>{searchResults.length}</strong> qualified matches
                         </span>
                     </div>
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

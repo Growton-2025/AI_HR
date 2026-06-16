@@ -1140,67 +1140,6 @@ def compute_career_facts(context: Dict[str, str]) -> Dict[str, Any]:
     if candidate_place and not places:
         places.add(candidate_place)
 
-    # Deduplicate country/city pairs using context evidence and fallback mapping
-    known_countries = {
-        "india", "united states", "usa", "us", "uk", "united kingdom", "canada",
-        "germany", "france", "australia", "singapore", "japan", "china", "brazil",
-        "mexico", "spain", "italy", "netherlands", "sweden", "norway", "denmark",
-        "finland", "uae", "united arab emirates", "saudi arabia", "south africa",
-        "malaysia", "indonesia", "thailand", "vietnam", "philippines", "hong kong",
-        "new zealand", "ireland", "belgium", "switzerland", "austria", "poland",
-        "turkey", "egypt", "israel", "russia"
-    }
-    city_to_country_fallback = {
-        "bengaluru": "india",
-        "bangalore": "india",
-        "mumbai": "india",
-        "delhi": "india",
-        "noida": "india",
-        "gurgaon": "india",
-        "gurugram": "india",
-        "pune": "india",
-        "hyderabad": "india",
-        "chennai": "india",
-        "kolkata": "india",
-        "ahmedabad": "india",
-        "london": "united kingdom",
-        "san francisco": "united states",
-        "new york": "united states",
-        "singapore": "singapore",
-        "sydney": "australia",
-        "melbourne": "australia",
-        "toronto": "canada",
-        "vancouver": "canada",
-        "dubai": "uae",
-    }
-    evidence_strings = []
-    for k, v in context.items():
-        if k.endswith(".location") or k.endswith(".city") or k.endswith(".headquarters"):
-            val_str = stringify_context_value(v).lower()
-            if val_str:
-                evidence_strings.append(val_str)
-    for role in roles:
-        loc = stringify_context_value(role.get("city") or role.get("location")).lower()
-        if loc:
-            evidence_strings.append(loc)
-    places_to_remove = set()
-    for p1 in places:
-        if p1 in known_countries:
-            for p2 in places:
-                if p1 != p2:
-                    if city_to_country_fallback.get(p2) == p1:
-                        places_to_remove.add(p1)
-                        break
-                    found_together = False
-                    for ev in evidence_strings:
-                        if p1 in ev and p2 in ev:
-                            found_together = True
-                            break
-                    if found_together:
-                        places_to_remove.add(p1)
-                        break
-    places = places - places_to_remove
-
     current_company_enterprise_saas, current_company_evidence = _current_company_enterprise_saas_status(context, current_role)
 
     return {
@@ -1496,7 +1435,15 @@ def map_career_facts_to_outputs(
         return {}
     asks_thresholded_fit = bool(re.search(r"\b\d+\+?\s*(?:years?|yrs?|months?|mos?)\b", prompt_l))
     is_evaluation = bool(re.search(r"\b(if|yes|no|mark|qualified|eligible)\b", prompt_l))
-    if asks_thresholded_fit or is_evaluation:
+    can_answer_eval = (
+        asks_thresholded_fit
+        and is_evaluation
+        and "overall experience" in prompt_l
+        and ("account executive" in prompt_l or " ae " in f" {prompt_l} ")
+        and "enterprise" in prompt_l
+        and "saas" in prompt_l
+    )
+    if (asks_thresholded_fit or is_evaluation) and not can_answer_eval:
         return {}
 
     # Check if all keys in output_schema can be deterministically satisfied.
@@ -1525,6 +1472,7 @@ def map_career_facts_to_outputs(
             or ("saas" in label)
             or ("geograph" in label or "market" in label or "location" in label)
             or ("enterprise" in label and "saas" in label)
+            or (key == "qualified" or "qualified" in label or "eligible" in label)
             or ("job" in label and ("hop" in label or "switch" in label))
             or ("short" in label and "stint" in label)
             or ("reasoning" in label)
@@ -1535,6 +1483,15 @@ def map_career_facts_to_outputs(
 
     outputs: Dict[str, str] = {}
     yes_no = ""
+    if can_answer_eval:
+        required_years = [int(value) for value in re.findall(r"\b(\d+)\+?\s*(?:years?|yrs?)\b", prompt_l)]
+        overall_required = (required_years[0] * 12) if required_years else 0
+        ae_required = (required_years[1] * 12) if len(required_years) > 1 else 0
+        yes_no = "Yes" if (
+            int(facts.get("total_experience_months") or 0) >= overall_required
+            and int(facts.get("ae_experience_months") or 0) >= ae_required
+            and str(facts.get("current_company_enterprise_saas") or "").lower() == "yes"
+        ) else "No"
 
     summary = (
         f"Average tenure (completed roles): {facts.get('average_tenure_months') or 0} months. "
@@ -1584,6 +1541,8 @@ def map_career_facts_to_outputs(
             outputs[key] = _format_function_answer(prompt_template, facts)
         elif "enterprise" in label and "saas" in label:
             outputs[key] = str(facts.get("current_company_enterprise_saas") or "Needs web verification")
+        elif key == "qualified" or "qualified" in label or "eligible" in label:
+            outputs[key] = yes_no or "No"
         elif "saas" in label:
             outputs[key] = _format_industry_answer(prompt_template, facts)
         elif "geograph" in label or "market" in label or "location" in label:

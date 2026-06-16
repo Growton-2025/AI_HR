@@ -2,7 +2,7 @@ import { startTransition, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useAppStore } from '../store/useAppStore'
 import SearchResults from '../components/SearchResults'
-import { AlertCircle, Check, Cpu, Database, Loader2, RotateCcw, Search, SearchCode, SearchX, X } from 'lucide-react'
+import { AlertCircle, Check, Cpu, Database, Globe, Loader2, RotateCcw, Search, SearchCode, SearchX, X } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 
 function buildRetrySuggestions(query) {
@@ -45,6 +45,7 @@ function Screening() {
         searchProgress,
         statusMessage,
         searchResults,
+        searchDebug,
         usage,
         searchOutcome,
         lastSearchError,
@@ -66,6 +67,7 @@ function Screening() {
         searchProgress: state.searchProgress,
         statusMessage: state.statusMessage,
         searchResults: state.searchResults,
+        searchDebug: state.searchDebug,
         usage: state.usage,
         searchOutcome: state.searchOutcome,
         lastSearchError: state.lastSearchError,
@@ -87,6 +89,7 @@ function Screening() {
     const [userPickedSource, setUserPickedSource] = useState(null)
     const [destinationRole, setDestinationRole] = useState('')
     const [isAddingToRole, setIsAddingToRole] = useState(false)
+    const [useWebSearch, setUseWebSearch] = useState(false)
     const selectedCount = Object.keys(selectedCandidates).length
 
     // Derive the effective source: default to first role, fall back to master only if no roles exist
@@ -126,7 +129,10 @@ function Screening() {
         setSearchQuery(nextQuery)
         const sourcePayload = sourceValueToPayload(sourceValue)
         startTransition(() => {
-            searchCandidatesStream(nextQuery, sourcePayload)
+            searchCandidatesStream(nextQuery, {
+                ...sourcePayload,
+                useWebSearch,
+            })
         })
     }
 
@@ -183,6 +189,9 @@ function Screening() {
 
     const retrySuggestions = useMemo(() => buildRetrySuggestions(searchQuery || inputQuery), [inputQuery, searchQuery])
     const hasResults = searchResults.length > 0
+    const reviewedCount = Number(searchDebug?.semantic_pool_count || searchDebug?.total_reviewed || 0)
+    const qualifiedCount = Number(searchDebug?.passed ?? searchResults.length)
+    const failedCount = Number(searchDebug?.failed || 0)
     const hasSettledSearch = hasResults || ['empty', 'error', 'cancelled'].includes(searchOutcome)
     const shouldShowStage = !hasResults
     const steps = [
@@ -231,6 +240,34 @@ function Screening() {
                             </button>
                         )}
                     </div>
+                    <label
+                        style={{
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: 10,
+                            marginTop: 10,
+                            padding: '10px 12px',
+                            borderRadius: 8,
+                            border: '1px solid #dbe3ee',
+                            background: useWebSearch ? '#f5f3ff' : '#fff',
+                            cursor: isSearching ? 'not-allowed' : 'pointer',
+                        }}
+                    >
+                        <input
+                            type="checkbox"
+                            checked={useWebSearch}
+                            disabled={isSearching}
+                            onChange={(event) => setUseWebSearch(event.target.checked)}
+                            style={{ marginTop: 3 }}
+                        />
+                        <Globe size={16} color="#4338ca" style={{ flexShrink: 0, marginTop: 1 }} />
+                        <span style={{ fontSize: 12, color: '#334155', lineHeight: 1.45 }}>
+                            <span style={{ fontWeight: 800, color: '#0f172a' }}>Use web search</span>
+                            <span style={{ display: 'block', marginTop: 3, color: '#64748b' }}>
+                                Adds live company research for competitors, funding, offices, category, and final reasoning. Slower but broader.
+                            </span>
+                        </span>
+                    </label>
                 </div>
 
                 <div className="shortlist-source-panel">
@@ -451,9 +488,12 @@ function Screening() {
                     )}
                     <div className="result-banner">
                         <div className="result-banner-content">
-                            <div className="result-banner-title">{searchResults.length} Shortlisted Match{searchResults.length === 1 ? '' : 'es'}</div>
+                            <div className="result-banner-title">{searchResults.length} Qualified Match{searchResults.length === 1 ? '' : 'es'}</div>
                             <div className="result-banner-subtitle">
                                 <strong>{selectedSourceLabel}</strong> · {searchQuery}
+                                {reviewedCount > 0 && (
+                                    <span> · {qualifiedCount} qualified after strict filters from {reviewedCount} reviewed{failedCount > 0 ? ` (${failedCount} rejected)` : ''}</span>
+                                )}
                             </div>
                         </div>
                         {usage && (

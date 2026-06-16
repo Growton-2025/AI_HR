@@ -103,30 +103,13 @@ const normalizeCount = (value) => {
   return Number.isFinite(count) ? count : null;
 };
 
-const getStatusCount = (counts, statusName) => {
-  if (!counts || typeof counts !== 'object') return null;
-  if (counts[statusName] != null) return normalizeCount(counts[statusName]);
-
-  const normalizedStatus = statusName.trim().toLowerCase();
-  const matchedKey = Object.keys(counts).find(key => key.trim().toLowerCase() === normalizedStatus);
-  return matchedKey ? normalizeCount(counts[matchedKey]) : null;
-};
-
 const Dashboard = () => {
-  const { user, analytics, fetchAnalytics, callStats, fetchCallStats, fetchTalentPoolSummary, tpScopeTotal, tpScopeStatusCounts, tpScopeSummaryLastParamsString, buildTalentPoolScopeQuery, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId } = useAppStore(useShallow((state) => ({
+  const { user, analytics, fetchAnalytics, callStats, fetchCallStats } = useAppStore(useShallow((state) => ({
     user: state.user,
     analytics: state.analytics,
     fetchAnalytics: state.fetchAnalytics,
     callStats: state.callStats,
     fetchCallStats: state.fetchCallStats,
-    fetchTalentPoolSummary: state.fetchTalentPoolSummary,
-    tpScopeTotal: state.tpScopeTotal,
-    tpScopeStatusCounts: state.tpScopeStatusCounts,
-    tpScopeSummaryLastParamsString: state.tpScopeSummaryLastParamsString,
-    buildTalentPoolScopeQuery: state.buildTalentPoolScopeQuery,
-    talentPoolViewScope: state.talentPoolViewScope,
-    talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
-    talentPoolRoleFilterId: state.talentPoolRoleFilterId,
   })));
   const [activeMode, setActiveMode] = useState(0);
   const [isRevalidating, setIsRevalidating] = useState(false);
@@ -141,7 +124,6 @@ const Dashboard = () => {
       await Promise.allSettled([
         fetchAnalytics(),
         fetchCallStats(),
-        fetchTalentPoolSummary(),
       ]);
       if (cancelled) return;
       hasLoadedRef.current = true;
@@ -151,27 +133,17 @@ const Dashboard = () => {
     return () => {
       cancelled = true;
     };
-  }, [fetchAnalytics, fetchCallStats, fetchTalentPoolSummary, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId]);
+  }, [fetchAnalytics, fetchCallStats]);
 
   const isAdmin = user?.role === 'admin';
 
-  const summaryTotal = normalizeCount(tpScopeTotal);
-  const summaryShortlisted = getStatusCount(tpScopeStatusCounts, 'Shortlisted');
-  const summaryFollowUp = getStatusCount(tpScopeStatusCounts, 'Followup / In conversation');
   const analyticsMetrics = analytics?.summary || {};
   const analyticsTotal = normalizeCount(analyticsMetrics.total_sourced);
-  const activeSummaryParams = buildTalentPoolScopeQuery();
-  const summaryMatchesScope = tpScopeSummaryLastParamsString === activeSummaryParams;
-  const summaryStatusEmpty = !tpScopeStatusCounts || Object.keys(tpScopeStatusCounts).length === 0;
-  const summaryLooksCold = summaryMatchesScope && summaryTotal === 0 && summaryStatusEmpty && Number(analyticsTotal || 0) > 0;
-  const scopedTotal = summaryMatchesScope && !summaryLooksCold ? summaryTotal : null;
-  const scopedShortlisted = summaryMatchesScope && !summaryLooksCold ? summaryShortlisted : null;
-  const scopedFollowUp = summaryMatchesScope && !summaryLooksCold ? summaryFollowUp : null;
   const displayMetrics = {
     ...analyticsMetrics,
-    total_sourced: scopedTotal ?? analyticsTotal ?? 0,
-    shortlisted: scopedShortlisted ?? normalizeCount(analyticsMetrics.shortlisted) ?? 0,
-    in_conversation: scopedFollowUp ?? normalizeCount(analyticsMetrics.in_conversation) ?? 0,
+    total_sourced: analyticsTotal ?? 0,
+    shortlisted: normalizeCount(analyticsMetrics.shortlisted) ?? 0,
+    in_conversation: normalizeCount(analyticsMetrics.in_conversation) ?? 0,
   };
     
   // If personal pipeline health, compute in_conversation dynamically if not preset

@@ -31,6 +31,7 @@ class SearchRequest(BaseModel):
     session_id: Optional[str] = None
     source_type: Optional[str] = "master"
     source_role_id: Optional[int] = None
+    use_web_search: bool = False
 
 class RoleCreate(BaseModel):
     name: str
