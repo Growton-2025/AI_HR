@@ -4746,51 +4746,51 @@ def _strict_presence_result(
                 role_company = str(role.get("company") or "")
                 matched_company = next((term for term in terms if _company_matches(role_company, term)), None)
                 if matched_company:
-                    found = ("role company", role_company, role)
+                    found = ("role company", role_company, role, role_company)
                     break
         elif criteria_key == "required_locations":
             location_text = _profile_location_text(profile)
             term = next((term for term in terms if _term_matches_text(term, location_text)), None)
             if term:
-                found = ("candidate location", _evidence_snippet(location_text, term), None)
+                found = ("candidate location", _evidence_snippet(location_text, term), None, location_text)
         elif criteria_key == "required_geographies":
             for role in profile.get("roles") or []:
                 role_text = _role_geography_text_for_profile(profile, role)
                 geo_terms = _geography_match_terms(value, criterion)
                 term = next((term for term in geo_terms if _term_matches_text(term, role_text)), None)
                 if term:
-                    found = ("role/company geography", _evidence_snippet(role_text, term), role)
+                    found = ("role/company geography", _evidence_snippet(role_text, term), role, role_text)
                     break
             if not found:
                 general_text = _profile_geography_experience_text(profile)
                 geo_terms = _geography_match_terms(value, criterion)
                 term = next((term for term in geo_terms if _term_matches_text(term, general_text)), None)
                 if term:
-                    found = ("enriched profile geography", _evidence_snippet(general_text, term), None)
+                    found = ("enriched profile geography", _evidence_snippet(general_text, term), None, general_text)
         elif criteria_key in {"required_industries", "required_segments", "required_company_details", "required_culture_type"}:
             chunks = build_profile_evidence_chunks(profile)
             for chunk in chunks:
                 term = next((term for term in terms if _term_matches_text(term, chunk["text_l"])), None)
                 if term:
-                    found = (chunk["source"], _evidence_snippet(chunk["text"], term), chunk.get("role"))
+                    found = (chunk["source"], _evidence_snippet(chunk["text"], term), chunk.get("role"), chunk["text"])
                     break
             if not found:
                 for role in profile.get("roles") or []:
                     web_text, web_item = _web_company_profile_text(role.get("company") or "", criteria_context or {})
                     term = next((term for term in terms if _term_matches_text(term, web_text)), None)
                     if term:
-                        found = ("web company profile", _evidence_snippet(web_text, term), role)
+                        found = ("web company profile", _evidence_snippet(web_text, term), role, web_text)
                         break
         else:
             chunks = build_profile_evidence_chunks(profile)
             for chunk in chunks:
                 term = next((term for term in terms if _term_matches_text(term, chunk["text_l"])), None)
                 if term:
-                    found = (chunk["source"], _evidence_snippet(chunk["text"], term), chunk.get("role"))
+                    found = (chunk["source"], _evidence_snippet(chunk["text"], term), chunk.get("role"), chunk["text"])
                     break
 
         if found:
-            source, snippet, role = found
+            source, snippet, role, source_text = found
             matched.append(value)
             evidence.append(
                 {
@@ -4798,7 +4798,7 @@ def _strict_presence_result(
                     "value": value,
                     "source": source,
                     "snippet": snippet,
-                    "source_text": snippet,
+                    "source_text": source_text,
                 }
             )
             if role:
@@ -4891,6 +4891,28 @@ def _assign_evidence_ids(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         next_item["id"] = str(next_item.get("id") or f"ev{index}")
         assigned.append(next_item)
     return assigned
+
+
+def _dedupe_evidence_log(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove repeated alias hits while preserving distinct evidence sources."""
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role") if isinstance(item.get("role"), dict) else {}
+        key = (
+            _normalize_search_text(item.get("criterion")),
+            _normalize_search_text(item.get("source")),
+            _normalize_search_text(item.get("source_text") or item.get("snippet") or item.get("value")),
+            _normalize_search_text(role.get("company")),
+            _normalize_search_text(role.get("title")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _prioritize_scoped_tenure_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -5133,7 +5155,9 @@ def _strict_shortlist_score_candidate(
         if len(role_details) >= 5:
             break
 
-    evidence_log = _assign_evidence_ids(_prioritize_scoped_tenure_evidence(evidence_log)[:12])
+    evidence_log = _assign_evidence_ids(
+        _dedupe_evidence_log(_prioritize_scoped_tenure_evidence(evidence_log))
+    )
     calculated_experience = _link_calculated_experience_evidence_ids(calculated_experience, evidence_log)
 
     profile_copy["shortlist_status"] = "shortlisted"

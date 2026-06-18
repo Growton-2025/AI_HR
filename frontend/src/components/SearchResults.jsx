@@ -114,6 +114,35 @@ function ScopedTenureChips({ items }) {
     )
 }
 
+function EvidenceText({ value }) {
+    const text = String(value || '').trim()
+    if (!text) return null
+
+    const markerPattern = /\s*[•*]\s*/g
+    const firstMarker = text.search(markerPattern)
+    if (firstMarker < 0) {
+        return <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{text}</div>
+    }
+
+    const prefix = text.slice(0, firstMarker).trim().replace(/\s*details:\s*$/i, '').trim()
+    const points = text
+        .slice(firstMarker)
+        .split(markerPattern)
+        .map(point => point.trim())
+        .filter(Boolean)
+
+    return (
+        <div style={{ overflowWrap: 'anywhere' }}>
+            {prefix && (
+                <div style={{ marginBottom: 6, fontWeight: 700, color: '#334155' }}>{prefix}</div>
+            )}
+            <ul style={{ margin: 0, paddingLeft: 20, display: 'grid', gap: 4 }}>
+                {points.map((point, index) => <li key={`${point.slice(0, 32)}-${index}`}>{point}</li>)}
+            </ul>
+        </div>
+    )
+}
+
 function EvidenceDrawer({ candidate }) {
     const evidence = Array.isArray(candidate.evidence_log) ? candidate.evidence_log : []
     const tenure = Array.isArray(candidate.scoped_tenure) ? candidate.scoped_tenure : []
@@ -133,7 +162,7 @@ function EvidenceDrawer({ candidate }) {
                     ))}
                 </div>
             )}
-            {evidence.slice(0, 6).map((item) => (
+            {evidence.map((item) => (
                 <div key={item.id || `${item.source}-${item.snippet}`} style={{
                     fontSize: 12, color: '#475569', lineHeight: 1.45,
                     padding: '7px 9px', borderRadius: 8,
@@ -142,7 +171,9 @@ function EvidenceDrawer({ candidate }) {
                     <strong style={{ color: '#0f172a' }}>{item.id || 'evidence'}</strong>
                     {item.criterion ? ` · ${item.criterion}` : ''}
                     {item.source ? ` · ${item.source}` : ''}
-                    <div style={{ marginTop: 3 }}>{item.snippet || item.value || item.source_text}</div>
+                    <div style={{ marginTop: 5 }}>
+                        <EvidenceText value={item.source_text || item.snippet || item.value} />
+                    </div>
                 </div>
             ))}
         </div>
