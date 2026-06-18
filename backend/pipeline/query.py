@@ -2458,21 +2458,9 @@ def _profile_claim_geography_text(profile: Dict[str, Any]) -> str:
 
 
 def _role_geography_text(role: Dict[str, Any]) -> str:
-    company_details = role.get("company_details") or {}
-    allowed_company_geo = {
-        key: company_details.get(key)
-        for key in (
-            "headquarters",
-            "office_locations",
-            "offices",
-            "locations",
-            "operations",
-            "operating_locations",
-            "company_locations",
-            "customer_presence",
-        )
-        if company_details.get(key)
-    }
+    # Keep employer headquarters/offices out of direct market-experience
+    # evidence. _role_geography_text_for_profile may use company geography only
+    # when it corroborates the candidate/role location.
     return " ".join(
         _flatten_value_for_evidence(
             {
@@ -2482,7 +2470,6 @@ def _role_geography_text(role: Dict[str, Any]) -> str:
                 "city": role.get("city"),
                 "source_location": role.get("source_location"),
                 "company_location": role.get("company_location"),
-                "company_geography": allowed_company_geo,
             },
             max_items=60,
         )
@@ -5188,6 +5175,8 @@ async def generate_reasoning_for_profile(
         "final_status, match_score, answer, reasoning, matched_criteria, missing_criteria, evidence_ids, confidence. "
         "final_status must be verified_match or not_verified. "
         "Every factual claim in answer/reasoning must be supported by the cited evidence_ids. "
+        "Treat every requirement in the original screening query as mandatory AND logic. "
+        "Never return verified_match for a partial match or when any stated requirement lacks evidence. "
         "Mention evidence IDs inline, e.g. ev1. Do not invent missing candidate facts. "
         "If evidence is insufficient, return not_verified."
     )
@@ -5791,6 +5780,147 @@ def _prune_function_years_shadowed_by_scoped_tenure(criteria: Dict[str, Any], qu
         criteria.pop("min_function_years", None)
 
 
+def _enforce_explicit_query_requirements(criteria: Dict[str, Any], query: str) -> None:
+    """Add requirements stated plainly in the query even if the LLM omits them.
+
+    Criteria categories are evaluated with AND semantics by the strict scorer;
+    values inside one category remain aliases/alternatives (OR).
+    """
+    query_l = _normalize_search_text(query)
+    if not query_l:
+        return
+
+    # Explicit role acronyms must remain executable function requirements.
+    function_terms = []
+    if re.search(r"\bbdrs?\b", query_l):
+        function_terms.append("BDR")
+    if re.search(r"\bsdrs?\b", query_l):
+        function_terms.append("SDR")
+    if function_terms:
+        existing = criteria.get("required_functions")
+        existing_values = _criteria_values_for_search(criteria, "required_functions")
+        merged_function = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+        merged_function["operator"] = "OR"
+        merged_function["values"] = list(dict.fromkeys(existing_values + function_terms))
+        criteria["required_functions"] = merged_function
+
+    # "US experience" and equivalent wording means market experience, never
+    # merely an employer HQ or the candidate's current location.
+    if _query_uses_market_geography(query_l):
+        explicit_geographies = []
+        geography_patterns = (
+            (r"\b(?:u\.?s\.?a?|united states)\b", "US"),
+            (r"\bnorth america(?:n)?\b", "North America"),
+            (r"\bapac\b|\basia[ -]pacific\b", "APAC"),
+            (r"\bemea\b", "EMEA"),
+            (r"\blatam\b|\blatin america\b", "LATAM"),
+        )
+        for pattern, canonical in geography_patterns:
+            if re.search(pattern, query_l):
+                explicit_geographies.append(canonical)
+        if explicit_geographies:
+            existing = criteria.get("required_geographies")
+            existing_values = _criteria_values_for_search(criteria, "required_geographies")
+            merged_geography = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+            merged_geography["operator"] = "OR"
+            merged_geography["values"] = list(dict.fromkeys(existing_values + explicit_geographies))
+            criteria["required_geographies"] = merged_geography
+
+    # Bind years to an explicitly named company type/domain. This prevents
+    # "15+ years in SaaS" from becoming 15 years in the BDR function.
+    scoped_duration_patterns = (
+        (r"\bsaas\b|\bsoftware as a service\b", "SaaS"),
+        (r"\bfintech\b", "fintech"),
+    )
+    scoped_years: List[Tuple[float, str]] = []
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", query_l):
+        years = float(match.group(1))
+        after = query_l[match.end(): min(len(query_l), match.end() + 80)]
+        if not re.match(r"\s*(?:of\s+experience\s+)?(?:in|with|selling\s+(?:in|to))\b", after):
+            continue
+        for pattern, canonical in scoped_duration_patterns:
+            if re.search(pattern, after):
+                scoped_years.append((years, canonical))
+                break
+
+    for years, value in scoped_years:
+        target_key = "required_company_details"
+        for key in ("required_company_details", "required_industries"):
+            criterion = criteria.get(key)
+            terms = [
+                term
+                for existing_value in get_values_from_criteria(criterion)
+                for term in _criterion_match_terms(str(existing_value), key, criterion)
+            ]
+            if any(_term_matches_text(term, value) or _term_matches_text(value, term) for term in terms):
+                target_key = key
+                break
+        _ensure_criterion_with_min_years(criteria, target_key, value, years)
+
+        min_function_items = criteria.get("min_function_years")
+        if isinstance(min_function_items, list):
+            kept = [
+                item
+                for item in min_function_items
+                if not isinstance(item, dict)
+                or abs(float(_coerce_positive_float(item.get("min_years") or item.get("min_function_years")) or 0) - years) > 0.01
+            ]
+            if kept:
+                criteria["min_function_years"] = kept
+            else:
+                criteria.pop("min_function_years", None)
+
+    # Keep tenure attached to outbound work instead of broadening it to all BDR
+    # experience. Inbound qualification must not satisfy this requirement.
+    outbound_years: Optional[float] = None
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", query_l):
+        after = query_l[match.end(): min(len(query_l), match.end() + 100)]
+        if not re.match(r"\s*(?:of\s+(?:exp|experience)\s+)?(?:in|with|doing)\b", after):
+            continue
+        if re.search(r"\boutbound\b", after) and re.search(
+            r"\b(?:lead\s+qualification|qualif(?:y|ying|ication)|prospect(?:ing)?|lead\s+generation)\b",
+            after,
+        ):
+            outbound_years = float(match.group(1))
+            break
+
+    if outbound_years:
+        existing_items = criteria.get("min_function_years")
+        if not isinstance(existing_items, list):
+            existing_items = [existing_items] if isinstance(existing_items, dict) else []
+        kept_items = []
+        for item in existing_items:
+            item_years = _coerce_positive_float(item.get("min_years") or item.get("min_function_years"))
+            item_text = _normalize_search_text(
+                " ".join(
+                    [
+                        str(item.get("function") or item.get("value") or ""),
+                        *[str(alias) for alias in (item.get("aliases") or [])],
+                    ]
+                )
+            )
+            if item_years and abs(item_years - outbound_years) <= 0.01 and "outbound" not in item_text:
+                continue
+            kept_items.append(item)
+        criteria["min_function_years"] = kept_items
+        _append_min_function_items(
+            criteria,
+            [
+                {
+                    "function": "Outbound lead qualification",
+                    "min_years": outbound_years,
+                    "aliases": [
+                        "outbound lead qualification",
+                        "outbound prospecting",
+                        "outbound lead generation",
+                        "cold outreach",
+                        "cold calling",
+                    ],
+                }
+            ],
+        )
+
+
 def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         return {}
@@ -5951,6 +6081,8 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
         criteria["top_n"] = 0
     elif not any(word in _normalize_search_text(query) for word in ["top", "one", "maximum", "best"]):
         criteria.pop("top_n", None)
+
+    _enforce_explicit_query_requirements(criteria, query)
 
     criteria["_filter_plan_debug"] = {
         "debug_reasoning": source.get("debug_reasoning"),
@@ -6303,6 +6435,7 @@ async def process_query_main(
 
     original_criteria = copy.deepcopy(criteria)
     original_criteria["_use_web_search"] = web_enabled
+    original_criteria["_screening_query"] = query
     criteria["_screening_query"] = query
     criteria["_source_type"] = source_type
 
@@ -6380,7 +6513,7 @@ async def process_query_main(
             await pause_event.wait()
 
     await _wait_if_paused()
-    yield "Performing initial semantic search..."
+    yield "Loading the complete selected candidate scope..."
     search_query_parts: List[str] = []
     for key in (
         "required_companies",
@@ -6413,42 +6546,13 @@ async def process_query_main(
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
         return
 
-    initial_candidate_pool: List[Dict[str, Any]]
-    scan_full_scope_for_strict_filters = _strict_search_should_scan_full_scope(criteria)
-    if search_query_text and not scan_full_scope_for_strict_filters:
-        initial_candidate_ids: List[int] = []
-        try:
-            query_embedding = embeddings.embed_query(search_query_text)
-            tracker.add_usage(embeddings.model, search_query_text, usage_type="Embedding")
-            conn = get_db_connection()
-            if conn:
-                try:
-                    with conn.cursor() as cur:
-                        allowed_ids = scoped_candidate_ids if scoped_candidate_ids is not None else active_candidate_ids
-                        cur.execute(
-                            """
-                            SELECT id
-                            FROM candidates
-                            WHERE COALESCE(is_archived, FALSE) = FALSE
-                              AND id = ANY(%s)
-                              AND embedding IS NOT NULL
-                            ORDER BY embedding <=> %s
-                            LIMIT 333
-                            """,
-                            (allowed_ids, str(query_embedding)),
-                        )
-                        initial_candidate_ids = [int(row[0]) for row in cur.fetchall()]
-                finally:
-                    return_db_connection(conn)
-        except Exception as e:
-            logger.warning("Semantic shortlist prefilter failed; falling back to scoped pool: %s", e)
-
-        if initial_candidate_ids:
-            initial_candidate_pool = _scoped_build(initial_candidate_ids)
-        else:
-            initial_candidate_pool = _scoped_build(scoped_candidate_ids if scoped_candidate_ids is not None else active_candidate_ids)
-    else:
-        initial_candidate_pool = _scoped_build(scoped_candidate_ids if scoped_candidate_ids is not None else active_candidate_ids)
+    # Shortlisting must evaluate the complete user-selected source. A semantic
+    # top-N prefilter made equivalent phrasings inspect different candidates and
+    # could therefore return false zero-result sets.
+    initial_candidate_pool: List[Dict[str, Any]] = _scoped_build(
+        scoped_candidate_ids if scoped_candidate_ids is not None else active_candidate_ids
+    )
+    scan_full_scope_for_strict_filters = True
 
     if not initial_candidate_pool:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -6482,7 +6586,7 @@ async def process_query_main(
         logger.debug("Could not attach schema evidence to shortlist pool", exc_info=True)
 
     logger.info(
-        "SHORTLIST semantic_pool query=%s scoped_count=%s semantic_pool_count=%s full_scope_strict=%s search_text=%s",
+        "SHORTLIST complete_scope query=%s scoped_count=%s evaluated_count=%s full_scope_strict=%s search_text=%s",
         query,
         scoped_candidate_count,
         len(initial_candidate_pool),
