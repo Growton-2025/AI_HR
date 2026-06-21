@@ -1,6 +1,6 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List, Set
+from typing import List, Optional, Set
 from pydantic import BaseModel, Field
 
 from backend.api import schemas, deps
@@ -116,6 +116,7 @@ async def warm_all_data(current_user: schemas.User = Depends(deps.get_current_us
 class BulkAssignRequest(BaseModel):
     master_candidate_ids: List[int] = Field(default_factory=list)
     recruiter_user_id: int
+    role_id: Optional[int] = None
 
 
 class RecruiterUpdateRequest(BaseModel):
@@ -224,6 +225,24 @@ async def bulk_assign_master_to_recruiter(
             )
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Recruiter not found or archived")
+
+            selected_role = None
+            if body.role_id is not None:
+                cur.execute(
+                    """
+                    SELECT id, name
+                    FROM recruitment_roles
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (body.role_id, body.recruiter_user_id),
+                )
+                selected_role = cur.fetchone()
+                if not selected_role:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Selected role does not belong to this recruiter",
+                    )
+
             for idx, mid in enumerate(ordered_unique, start=1):
                 sp = f"bulk_assign_{idx}"
                 try:
@@ -234,9 +253,27 @@ async def bulk_assign_master_to_recruiter(
                         recruiter_user_id=body.recruiter_user_id,
                         admin_user_id=admin.id,
                     )
+                    role_assigned = False
+                    if selected_role:
+                        cur.execute(
+                            """
+                            INSERT INTO recruitment_role_candidates
+                                (role_id, candidate_id, priority, feedback)
+                            VALUES (%s, %s, '--', '')
+                            ON CONFLICT (role_id, candidate_id) DO NOTHING
+                            RETURNING candidate_id
+                            """,
+                            (selected_role[0], cid),
+                        )
+                        role_assigned = cur.fetchone() is not None
                     cur.execute(f"RELEASE SAVEPOINT {sp}")
                     results.append(
-                        {"master_id": mid, "recruiter_candidate_id": cid, "op": op}
+                        {
+                            "master_id": mid,
+                            "recruiter_candidate_id": cid,
+                            "op": op,
+                            "role_assigned": role_assigned,
+                        }
                     )
                 except ValueError as ve:
                     try:
@@ -267,7 +304,15 @@ async def bulk_assign_master_to_recruiter(
     from backend.api.routes.candidates import invalidate_candidate_count_caches
 
     invalidate_candidate_count_caches(reload_profiles=True)
-    return {"results": results}
+    if selected_role:
+        from backend.api.routes import roles as roles_routes
+
+        roles_routes.invalidate_role_detail_cache(role_id=selected_role[0])
+    return {
+        "results": results,
+        "role_id": selected_role[0] if selected_role else None,
+        "role_name": selected_role[1] if selected_role else None,
+    }
 
 
 @router.delete("/recruiters/{user_id}", dependencies=[Depends(check_admin)])

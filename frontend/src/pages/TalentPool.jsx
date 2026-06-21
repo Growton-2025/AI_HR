@@ -1836,6 +1836,9 @@ export default function TalentPool() {
   const [showAddToListModal, setShowAddToListModal] = useState(false);
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [assignTargetRecruiterId, setAssignTargetRecruiterId] = useState('');
+  const [assignTargetRoleId, setAssignTargetRoleId] = useState('');
+  const [assignRecruiterRoles, setAssignRecruiterRoles] = useState([]);
+  const [assignRolesLoading, setAssignRolesLoading] = useState(false);
   const [assignBusy, setAssignBusy] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadFile, setUploadFile] = useState(null);
@@ -1959,6 +1962,30 @@ export default function TalentPool() {
       fetchRecruiters();
     }
   }, [role, fetchRecruiters]);
+
+  useEffect(() => {
+    if (!showAssignModal || !assignTargetRecruiterId) {
+      setAssignRecruiterRoles([]);
+      setAssignTargetRoleId('');
+      return undefined;
+    }
+
+    let cancelled = false;
+    setAssignRolesLoading(true);
+    axios.get(`${API_BASE}/roles?owner_user_id=${encodeURIComponent(assignTargetRecruiterId)}`, { timeout: 60000 })
+      .then(res => {
+        if (!cancelled) setAssignRecruiterRoles(res.data?.roles || []);
+      })
+      .catch(error => {
+        if (!cancelled) {
+          setAssignRecruiterRoles([]);
+          toast.error(error.response?.data?.detail || 'Could not load recruiter roles');
+        }
+      })
+      .finally(() => { if (!cancelled) setAssignRolesLoading(false); });
+
+    return () => { cancelled = true; };
+  }, [showAssignModal, assignTargetRecruiterId]);
 
   useEffect(() => {
     if (
@@ -2792,6 +2819,7 @@ export default function TalentPool() {
         {
           master_candidate_ids: rawIds,
           recruiter_user_id: Number(assignTargetRecruiterId),
+          role_id: assignTargetRoleId ? Number(assignTargetRoleId) : null,
         },
         { timeout: 120000 },
       );
@@ -2806,9 +2834,12 @@ export default function TalentPool() {
           `Assigned ${results.length - errs.length} of ${results.length}. ${errs.map(e => `#${e.master_id}: ${e.error}`).join('; ')}`,
         );
       } else {
-        toast.success(results.length <= 1 ? 'Profiles assigned' : `Assigned ${results.length} profiles`);
+        const roleSuffix = res.data?.role_name ? ` to ${res.data.role_name}` : ' to recruiter pool';
+        toast.success(results.length <= 1 ? `Profile assigned${roleSuffix}` : `Assigned ${results.length} profiles${roleSuffix}`);
       }
       setShowAssignModal(false);
+      setAssignTargetRoleId('');
+      setAssignRecruiterRoles([]);
       setSelectedIds(new Set());
       invalidateTalentPoolCaches();
       fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
@@ -4091,22 +4122,41 @@ export default function TalentPool() {
 
       {showAssignModal && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.65)', zIndex: 10002, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-          <div style={{ background: '#fff', borderRadius: 20, maxWidth: 420, width: '100%', padding: 24 }}>
+          <div style={{ background: '#fff', borderRadius: 20, maxWidth: 460, width: '100%', padding: 24, boxShadow: '0 24px 60px rgba(15,23,42,0.28)' }}>
             <h3 style={{ margin: '0 0 12px', fontSize: 18, fontWeight: 800 }}>Assign to recruiter</h3>
-            <p style={{ color: '#64748b', fontSize: 13, marginBottom: 16 }}>{selectedIds.size} master profile(s) will be copied to the recruiter&apos;s pool.</p>
+            <p style={{ color: '#64748b', fontSize: 13, marginBottom: 18 }}>{selectedIds.size} master profile(s) will be copied to the recruiter&apos;s pool and can also be placed directly into one of their roles.</p>
+            <label style={{ display: 'block', color: '#334155', fontSize: 12, fontWeight: 750, marginBottom: 14 }}>Recruiter
             <select
               value={assignTargetRecruiterId}
               onChange={(e) => setAssignTargetRecruiterId(e.target.value)}
-              style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #e2e8f0', marginBottom: 18, fontSize: 13 }}
+              style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #e2e8f0', marginTop: 6, fontSize: 13 }}
             >
               <option value="">Choose recruiter…</option>
               {recruiters.map(r => (
                 <option key={r.id} value={r.id}>{r.full_name || r.email}</option>
               ))}
             </select>
+            </label>
+
+            <label style={{ display: 'block', color: '#334155', fontSize: 12, fontWeight: 750, marginBottom: 20 }}>Recruiter role
+              <select
+                value={assignTargetRoleId}
+                onChange={(e) => setAssignTargetRoleId(e.target.value)}
+                disabled={!assignTargetRecruiterId || assignRolesLoading}
+                style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #e2e8f0', marginTop: 6, fontSize: 13, background: '#fff' }}
+              >
+                <option value="">{assignRolesLoading ? 'Loading roles…' : 'Recruiter pool only (no role)'}</option>
+                {assignRecruiterRoles.map(recruiterRole => (
+                  <option key={recruiterRole.id} value={recruiterRole.id}>{recruiterRole.name} · {recruiterRole.candidate_count || 0} candidates</option>
+                ))}
+              </select>
+              {assignTargetRecruiterId && !assignRolesLoading && assignRecruiterRoles.length === 0 && (
+                <span style={{ display: 'block', color: '#94a3b8', fontSize: 11, marginTop: 6 }}>This recruiter has no roles yet; the profiles will remain in their pool.</span>
+              )}
+            </label>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-              <button type="button" onClick={() => setShowAssignModal(false)} style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', fontWeight: 700 }}>Cancel</button>
-              <button type="button" disabled={assignBusy} onClick={runBulkAssign} style={{ padding: '10px 16px', borderRadius: 10, border: 'none', background: '#0f172a', color: '#fff', fontWeight: 700 }}>{assignBusy ? '…' : 'Assign'}</button>
+              <button type="button" onClick={() => { setShowAssignModal(false); setAssignTargetRoleId(''); setAssignRecruiterRoles([]); }} style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', fontWeight: 700 }}>Cancel</button>
+              <button type="button" disabled={assignBusy || !assignTargetRecruiterId || assignRolesLoading} onClick={runBulkAssign} style={{ padding: '10px 16px', borderRadius: 10, border: 'none', background: '#0f172a', color: '#fff', fontWeight: 700, opacity: assignBusy || !assignTargetRecruiterId || assignRolesLoading ? 0.6 : 1 }}>{assignBusy ? 'Assigning…' : assignTargetRoleId ? 'Assign to role' : 'Assign to pool'}</button>
             </div>
           </div>
         </div>

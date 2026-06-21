@@ -58,6 +58,13 @@ class SmartleadBot:
             print(f"❌ Failed to fetch email accounts: {response.text}")
         return None
 
+    def list_email_accounts(self):
+        """Return the Smartlead workspace's connected sender accounts."""
+        url = f"{self.base_url}/api/v1/email-accounts?api_key={self.api_key}&limit=100"
+        response = requests.get(url, timeout=15)
+        data = self._handle_response(response, "Email Account Fetch")
+        return data if isinstance(data, list) else []
+
     def add_email_account(self, mailbox_id_or_email):
         """Step 2: Attach the sender email (Mailbox) - Accepts ID or Email Address"""
         if not self.campaign_id: return
@@ -72,7 +79,18 @@ class SmartleadBot:
         url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/email-accounts?api_key={self.api_key}"
         payload = {"email_account_ids": [mailbox_id]}
         
-        self._handle_response(requests.post(url, json=payload), "Mailbox Attachment")
+        return self._handle_response(requests.post(url, json=payload, timeout=15), "Mailbox Attachment")
+
+    def remove_email_account(self, mailbox_id):
+        """Remove one sender from this campaign's rotation pool."""
+        if not self.campaign_id:
+            return None
+        url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/email-accounts?api_key={self.api_key}"
+        payload = {"email_account_ids": [int(mailbox_id)]}
+        return self._handle_response(
+            requests.delete(url, json=payload, timeout=15),
+            "Mailbox Removal",
+        )
 
     def set_email_sequence(self, subject, body):
         """Step 3: Set the email content"""
@@ -89,7 +107,7 @@ class SmartleadBot:
             }]
         }
         
-        self._handle_response(requests.post(url, json=payload), "Email Sequence")
+        return self._handle_response(requests.post(url, json=payload, timeout=15), "Email Sequence")
 
     def set_schedule(self, tz="Asia/Kolkata", start_hour="10:00", end_hour="18:00", start_time=None, days_of_the_week=[1, 2, 3, 4, 5]):
         """Step 4: Configure the sending schedule"""
@@ -127,7 +145,7 @@ class SmartleadBot:
             "schedule_start_time": schedule_start_time
         }
         
-        self._handle_response(requests.post(url, json=payload), "Schedule Configuration")
+        return self._handle_response(requests.post(url, json=payload, timeout=15), "Schedule Configuration")
 
     def update_campaign_settings(self, follow_up_percentage=50):
         """Step 4.5: Update campaign settings (Critical for New Leads)"""
@@ -137,7 +155,7 @@ class SmartleadBot:
         url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/settings?api_key={self.api_key}"
         payload = {"follow_up_percentage": follow_up_percentage}
         
-        self._handle_response(requests.post(url, json=payload), "Settings Update")
+        return self._handle_response(requests.post(url, json=payload, timeout=15), "Settings Update")
 
     def add_leads(self, leads_list):
         """Step 5: Add leads to the campaign"""
@@ -147,7 +165,7 @@ class SmartleadBot:
         url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/leads?api_key={self.api_key}"
         payload = {"lead_list": leads_list}
         
-        self._handle_response(requests.post(url, json=payload), "Lead Addition")
+        return self._handle_response(requests.post(url, json=payload, timeout=30), "Lead Addition")
 
     def get_campaign_analytics(self):
         """Get campaign stats (Sent, Replied, etc)"""
@@ -288,4 +306,4 @@ class SmartleadBot:
         url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/status?api_key={self.api_key}"
         payload = {"status": "START"}
         
-        self._handle_response(requests.post(url, json=payload), "Campaign Start")
+        return self._handle_response(requests.post(url, json=payload, timeout=15), "Campaign Start")

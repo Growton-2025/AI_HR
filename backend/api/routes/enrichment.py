@@ -280,7 +280,10 @@ async def ai_column_run(
 
 
 def clean_val(val):
-    if not val or str(val).lower() in [
+    if val is None:
+        return None
+    cleaned = str(val).strip().strip("\ufeff\u200b").strip()
+    if not cleaned or cleaned.lower() in [
         "none found",
         "not found",
         "undefined",
@@ -289,7 +292,7 @@ def clean_val(val):
         "n/a",
     ]:
         return None
-    return val
+    return cleaned
 
 
 @router.post("/enrich/{candidate_id}")
@@ -415,51 +418,105 @@ async def receive_results(request: Request):
     """Clay callback — fan out contact updates by normalized LinkedIn."""
     data = await request.json()
 
-    first = data.get("first_name", "N/A")
-    last = data.get("last_name", "N/A")
+    first = clean_val(data.get("first_name")) or "N/A"
+    last = clean_val(data.get("last_name")) or "N/A"
     email = clean_val(data.get("result_email"))
     phone = clean_val(data.get("mobile_phone"))
-    li_url = data.get("linkedin_url", "N/A")
+    li_url = clean_val(data.get("linkedin_url"))
 
-    logger.info("Clay result %s %s linkedin=%s", first, last, li_url)
+    logger.info(
+        "Clay result %s %s linkedin=%s has_email=%s has_phone=%s",
+        first,
+        last,
+        li_url or "N/A",
+        bool(email),
+        bool(phone),
+    )
 
-    norm = normalize_linkedin(li_url) if li_url and li_url != "N/A" else None
+    norm = normalize_linkedin(li_url)
+    if not norm:
+        logger.warning("Clay callback ignored: missing or invalid linkedin_url")
+        return {
+            "status": "invalid_linkedin",
+            "matched_candidates": 0,
+            "updated_candidates": 0,
+        }
 
-    if norm:
+    matched_ids = []
+    if email or phone:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
-            if conn:
-                with conn.cursor() as cur:
+            if not conn:
+                raise HTTPException(status_code=503, detail="Database connection failed")
+            with conn.cursor() as cur:
+                # normalized_linkedin was added after some legacy imports. Compare the
+                # raw URL in Python too so those candidates and legacy duplicate rows
+                # still receive Clay results.
+                cur.execute(
+                    """
+                    SELECT id, linkedin, normalized_linkedin
+                    FROM candidates
+                    WHERE COALESCE(is_archived, FALSE) = FALSE
+                      AND (normalized_linkedin = %s OR linkedin IS NOT NULL)
+                    """,
+                    (norm,),
+                )
+                matched_ids = [
+                    row[0]
+                    for row in cur.fetchall()
+                    if row[2] == norm or normalize_linkedin(row[1]) == norm
+                ]
+
+                if matched_ids:
                     cur.execute(
                         """
                         UPDATE candidates SET
-                          email = CASE WHEN %s IS NOT NULL AND TRIM(%s) <> ''
-                            THEN COALESCE(NULLIF(TRIM(email), ''), %s) ELSE email END,
-                          mobile_phone = CASE WHEN %s IS NOT NULL AND TRIM(%s) <> ''
-                            THEN COALESCE(
-                              NULLIF(TRIM(COALESCE(mobile_phone, phone)), ''),
-                              %s
-                            )
-                            ELSE mobile_phone END,
+                          email = CASE WHEN %s IS NOT NULL AND (
+                            email IS NULL OR TRIM(email) = '' OR
+                            LOWER(TRIM(email)) IN ('n/a', 'not available', 'not found', 'none found', 'undefined', 'null')
+                          ) THEN %s ELSE email END,
+                          mobile_phone = CASE WHEN %s IS NOT NULL AND (
+                            NULLIF(TRIM(COALESCE(mobile_phone, phone)), '') IS NULL OR
+                            LOWER(TRIM(COALESCE(mobile_phone, phone))) IN ('n/a', 'not available', 'not found', 'none found', 'undefined', 'null')
+                          ) THEN %s ELSE mobile_phone END,
+                          normalized_linkedin = CASE
+                            WHEN normalized_linkedin IS NULL THEN %s
+                            ELSE normalized_linkedin
+                          END,
                           updated_at = NOW()
-                        WHERE normalized_linkedin = %s
-                          AND COALESCE(is_archived, FALSE) = FALSE
+                        WHERE id = ANY(%s)
                         """,
-                        (email, email or "", email, phone, phone or "", phone, norm),
+                        (email, email, phone, phone, norm, matched_ids),
                     )
                     conn.commit()
 
-        query.update_candidate_contact(
-            li_url or "",
-            email,
-            phone,
-            normalized_linkedin=norm,
-        )
-        try:
-            from backend.api.routes import browse as browse_mod
+    query.update_candidate_contact(
+        li_url or "",
+        email,
+        phone,
+        normalized_linkedin=norm,
+    )
+    if matched_ids:
+        query.refresh_profiles_in_cache(matched_ids)
+    try:
+        from backend.api.routes import browse as browse_mod
 
-            browse_mod._invalidate_browse_cache()
-        except Exception:
-            pass
-        query.initialize_cache()
+        browse_mod._invalidate_browse_cache()
+    except Exception:
+        pass
 
-    return {"status": "success"}
+    if not email and not phone:
+        logger.warning("Clay callback contained no email or phone for linkedin=%s", li_url)
+        callback_status = "no_contact"
+    elif not matched_ids:
+        logger.warning("Clay callback matched no candidate for linkedin=%s", li_url)
+        callback_status = "no_match"
+    else:
+        callback_status = "updated"
+
+    return {
+        "status": callback_status,
+        "matched_candidates": len(matched_ids),
+        "updated_candidates": len(matched_ids) if email or phone else 0,
+        "has_email": bool(email),
+        "has_phone": bool(phone),
+    }

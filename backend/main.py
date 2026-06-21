@@ -24,6 +24,7 @@ def _apply_pool_migrations_blocking() -> None:
     from backend.db.connection import get_db_connection, return_db_connection
     from backend.db.ai_column_migrate import ensure_ai_column_migrations
     from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations
+    from backend.db.outreach_migrate import ensure_outreach_migrations
 
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
@@ -32,6 +33,7 @@ def _apply_pool_migrations_blocking() -> None:
     try:
         ensure_candidate_pool_migrations(conn)
         ensure_ai_column_migrations(conn)
+        ensure_outreach_migrations(conn)
     finally:
         return_db_connection(conn)
 

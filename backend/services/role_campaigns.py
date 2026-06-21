@@ -14,8 +14,11 @@ def campaign_payload(row) -> Dict[str, Any]:
             "campaign_status": "missing",
             "campaign_error": "",
             "campaign_configured": False,
+            "sender_account_id": "",
             "sender_email": "",
             "subject": "",
+            "initial_body": "",
+            "started": False,
         }
     return {
         "campaign_id": row[0],
@@ -23,8 +26,11 @@ def campaign_payload(row) -> Dict[str, Any]:
         "campaign_status": row[2] or "pending",
         "campaign_error": row[3] or "",
         "campaign_configured": bool(row[4] and row[5] and row[6]),
+        "sender_account_id": row[7] or "",
         "sender_email": row[4] or "",
         "subject": row[5] or "",
+        "initial_body": row[6] or "",
+        "started": bool(row[8]),
     }
 
 

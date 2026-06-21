@@ -18,6 +18,20 @@ from backend.pipeline.query import PROFILES_BY_ID, refresh_profiles_in_cache
 _ROLE_DETAIL_CACHE: Dict[str, tuple] = {}
 _ROLE_DETAIL_CACHE_TTL_SECONDS = 30
 
+
+def invalidate_role_detail_cache(role_id: Optional[int] = None) -> None:
+    """Drop cached role details after assignments change."""
+    if role_id is None:
+        _ROLE_DETAIL_CACHE.clear()
+        return
+    stale_keys = [
+        key
+        for key, cached in _ROLE_DETAIL_CACHE.items()
+        if cached and cached[1].get("id") == role_id
+    ]
+    for key in stale_keys:
+        _ROLE_DETAIL_CACHE.pop(key, None)
+
 def fetch_candidates_from_db(candidate_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Fetch full candidate profiles from DB for IDs not in memory cache"""
     if not candidate_ids:

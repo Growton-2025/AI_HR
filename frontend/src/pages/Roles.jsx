@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2 } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
+import RoleEmailSendModal from '../components/RoleEmailSendModal'
 
 function Roles() {
     const {
@@ -44,8 +45,6 @@ function Roles() {
     })))
 
     const [newRoleName, setNewRoleName] = useState('')
-    const [jobDescriptionDraft, setJobDescriptionDraft] = useState('')
-    const [isSavingJobDescription, setIsSavingJobDescription] = useState(false)
     const [expandedSummary, setExpandedSummary] = useState(null)
     const [uploadRole, setUploadRole] = useState(null)
     const [uploadFile, setUploadFile] = useState(null)
@@ -65,6 +64,9 @@ function Roles() {
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
 
     const [isSendingOutreach, setIsSendingOutreach] = useState(false)
+    const [emailSetup, setEmailSetup] = useState(null)
+    const [emailSetupLoading, setEmailSetupLoading] = useState(false)
+    const [emailSetupModalOpen, setEmailSetupModalOpen] = useState(false)
     const [isSendingLI, setIsSendingLI] = useState(false)
     const [isSyncing, setIsSyncing] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
@@ -99,8 +101,23 @@ function Roles() {
     }, [viewingRole])
 
     useEffect(() => {
-        setJobDescriptionDraft(viewingRole?.job_description || '')
-    }, [viewingRole?.id, viewingRole?.job_description])
+        if (!viewingRole?.id) {
+            setEmailSetup(null)
+            return undefined
+        }
+        let cancelled = false
+        setEmailSetupLoading(true)
+        axios.get(`${API_BASE}/outreach/roles/${viewingRole.id}/email-setup`)
+            .then(res => { if (!cancelled) setEmailSetup(res.data) })
+            .catch(error => {
+                if (!cancelled) {
+                    setEmailSetup(null)
+                    console.error('Failed to load role email setup:', error)
+                }
+            })
+            .finally(() => { if (!cancelled) setEmailSetupLoading(false) })
+        return () => { cancelled = true }
+    }, [viewingRole?.id])
 
     // Silent sync function with useCallback to prevent stale closures
     const silentSync = useCallback(async () => {
@@ -270,23 +287,6 @@ function Roles() {
         }
     }
 
-    const handleSaveJobDescription = async () => {
-        if (!viewingRole?.name) return
-        setIsSavingJobDescription(true)
-        try {
-            await axios.patch(`${API_BASE}/roles/${encodeURIComponent(viewingRole.name)}`, {
-                job_description: jobDescriptionDraft
-            })
-            await fetchRoleDetails(viewingRole.name)
-            await fetchRoles({ force: true })
-            toast.success('Job description saved')
-        } catch (error) {
-            toast.error(error.response?.data?.detail || 'Failed to save job description')
-        } finally {
-            setIsSavingJobDescription(false)
-        }
-    }
-
     const handleLookupHrCampaign = async () => {
         if (!viewingRole?.name) return
         const res = await lookupHeyReachCampaign(viewingRole.name)
@@ -298,58 +298,41 @@ function Roles() {
     }
 
     const handleSendOutreach = async () => {
-
         if (!viewingRole?.candidates || viewingRole.candidates.length === 0) {
-            toast.error('No candidates to send outreach to')
+            toast.error('No candidates assigned to this role')
+            return
+        }
+
+        if (!emailSetup?.campaign_configured) {
+            setEmailSetupModalOpen(true)
             return
         }
 
         setIsSendingOutreach(true)
         try {
-            const token = localStorage.getItem('token')
-
-            // Filter invalid candidates just in case
-            const validCandidates = viewingRole.candidates.filter(c => c && c.id)
-            if (validCandidates.length === 0) {
-                toast.error('No valid candidates found to contact')
-                setIsSendingOutreach(false)
-                return
-            }
-
-            const candidateIds = validCandidates.map(c => parseInt(c.id)).filter(id => !isNaN(id))
             const roleId = parseInt(viewingRole.id)
-
             if (isNaN(roleId)) {
                 toast.error('Invalid Role ID')
-                setIsSendingOutreach(false)
                 return
             }
 
-            const response = await fetch('/api/outreach/trigger', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}`
-                },
-                body: JSON.stringify({
-                    candidate_ids: candidateIds.map(id => parseInt(id)),
-                    role_id: parseInt(viewingRole.id),
-                    role_name: viewingRole.name
-                })
-            })
-
-            if (response.ok) {
-                const data = await response.json()
-                toast.success(`Campaign created! Sending to ${data.candidates_count} candidates`)
-                // Refresh status
-                const roleId = parseInt(viewingRole.id)
-                setTimeout(() => fetchOutreachStatus(roleId), 1000)
+            const response = await axios.post(`${API_BASE}/outreach/roles/${roleId}/email/send-shortlisted`)
+            const data = response.data || {}
+            if (data.enrolled_count > 0) {
+                toast.success(`Enrolled ${data.enrolled_count} shortlisted candidate${data.enrolled_count === 1 ? '' : 's'} in Smartlead`)
+            } else if (data.already_enrolled_count > 0) {
+                toast.info(`${data.already_enrolled_count} shortlisted candidate${data.already_enrolled_count === 1 ? ' is' : 's are'} already enrolled`)
             } else {
-                const error = await response.json()
-                toast.error(error.detail || 'Failed to send outreach')
+                toast.info('No shortlisted candidates with email addresses are ready to send')
             }
+            if (data.skipped_missing_email_count > 0) {
+                toast.warning(`${data.skipped_missing_email_count} shortlisted candidate${data.skipped_missing_email_count === 1 ? '' : 's'} skipped because email is missing or invalid`)
+            }
+            setEmailSetup(current => current ? { ...current, started: true } : current)
+            setTimeout(() => fetchOutreachStatus(roleId), 800)
         } catch (error) {
-            toast.error('Failed to send outreach')
+            if (error.response?.status === 409) setEmailSetupModalOpen(true)
+            toast.error(error.response?.data?.detail || 'Failed to send shortlisted email outreach')
             console.error(error)
         } finally {
             setIsSendingOutreach(false)
@@ -805,6 +788,14 @@ function Roles() {
                     </button>
                 </div>
                 {uploadUi}
+                {emailSetupModalOpen && (
+                    <RoleEmailSendModal
+                        roleId={viewingRole.id}
+                        roleName={viewingRole.name}
+                        onClose={() => setEmailSetupModalOpen(false)}
+                        onSaved={setEmailSetup}
+                    />
+                )}
 
                 <div className="result-banner">
                     <div className="result-banner-title">
@@ -829,52 +820,6 @@ function Roles() {
                     </div>
                 </div>
 
-                <div style={{
-                    background: '#fff',
-                    border: '1px solid #e2e8f0',
-                    borderRadius: '10px',
-                    padding: '16px',
-                    marginBottom: '20px',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '10px'
-                }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
-                        <div>
-                            <div style={{ fontSize: '13px', fontWeight: 800, color: '#0f172a' }}>Role job description</div>
-                            <div style={{ fontSize: '12px', color: '#64748b', marginTop: '3px' }}>
-                                Smart-column fit scoring uses this role context.
-                            </div>
-                        </div>
-                        <button
-                            className="btn btn-primary btn-sm"
-                            onClick={handleSaveJobDescription}
-                            disabled={isSavingJobDescription}
-                            style={{ height: '36px', padding: '0 16px' }}
-                        >
-                            {isSavingJobDescription ? 'Saving...' : 'Save JD'}
-                        </button>
-                    </div>
-                    <textarea
-                        value={jobDescriptionDraft}
-                        onChange={(event) => setJobDescriptionDraft(event.target.value)}
-                        rows={6}
-                        placeholder="Paste the role description, responsibilities, and must-have requirements."
-                        style={{
-                            width: '100%',
-                            resize: 'vertical',
-                            boxSizing: 'border-box',
-                            padding: '12px',
-                            borderRadius: '8px',
-                            border: '1px solid #cbd5e1',
-                            fontFamily: 'inherit',
-                            fontSize: '13px',
-                            lineHeight: 1.55,
-                            color: '#0f172a'
-                        }}
-                    />
-                </div>
-
                 {/* Optimized Action Bar */}
                 <div style={{
                     display: 'flex',
@@ -887,29 +832,40 @@ function Roles() {
                     <div style={{
                         display: 'flex',
                         flexDirection: 'column',
-                        gap: '8px',
-                        padding: '12px',
+                        gap: '10px',
+                        padding: '13px 14px',
                         background: '#ffffff',
                         borderRadius: '10px',
                         border: '1px solid #e2e8f0',
                         boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                        flex: '0 0 auto'
+                        flex: '1 1 360px',
+                        minWidth: 0,
                     }}>
-                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Email Outreach</span>
-                        <button
-                            className="btn btn-primary btn-sm"
-                            onClick={handleSendOutreach}
-                            disabled={isSendingOutreach || !viewingRole.candidates?.length}
-                            style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '8px',
-                                padding: '8px 20px',
-                                height: '36px'
-                            }}
-                        >
-                            <Mail size={14} /> {isSendingOutreach ? 'Processing...' : 'Send Outreach'}
-                        </button>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                            <span style={{ fontSize: '11px', fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Email Outreach · Smartlead</span>
+                            {emailSetup?.campaign_id && <span style={{ fontSize: 10, color: '#64748b', background: '#f1f5f9', borderRadius: 999, padding: '3px 7px' }}>Campaign {emailSetup.campaign_id}</span>}
+                        </div>
+
+                        {emailSetupLoading ? <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#64748b', fontSize: 12 }}><Loader2 size={13} className="animate-spin" /> Loading setup…</div> : emailSetup?.campaign_configured ? <div style={{ minWidth: 0 }}>
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#334155' }}>
+                                <Mail size={13} />
+                                <strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.sender_email}</strong>
+                            </div>
+                            <div title={emailSetup.subject} style={{ marginTop: 5, fontSize: 12, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.subject}</div>
+                            <div title={emailSetup.initial_body} style={{ marginTop: 3, fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.initial_body}</div>
+                        </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>
+                            {emailSetup?.campaign_error || 'Choose a sender and write the first email before sending.'}
+                        </div>}
+
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                            <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading || isSendingOutreach} style={{ height: 34, padding: '0 12px' }}>
+                                <Settings2 size={13} /> {emailSetup?.campaign_configured ? 'Edit setup' : 'Configure'}
+                            </button>
+                            <button className="btn btn-primary btn-sm" onClick={handleSendOutreach} disabled={isSendingOutreach || emailSetupLoading || !viewingRole.candidates?.length} style={{ height: 34, padding: '0 14px' }}>
+                                {isSendingOutreach ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
+                                {isSendingOutreach ? 'Sending…' : 'Send Shortlisted'}
+                            </button>
+                        </div>
                     </div>
 
                     {/* LINKEDIN OUTREACH SECTION */}

@@ -52,6 +52,12 @@ def ensure_outreach_migrations(conn) -> None:
             ):
                 cur.execute(f"ALTER TABLE role_smartlead_campaigns {column_sql}")
 
+            for column_sql in (
+                "ADD COLUMN IF NOT EXISTS initial_message TEXT",
+                "ADD COLUMN IF NOT EXISTS initial_message_at TIMESTAMP",
+            ):
+                cur.execute(f"ALTER TABLE candidate_outreach {column_sql}")
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS role_heyreach_campaigns (

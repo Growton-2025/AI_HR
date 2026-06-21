@@ -15,6 +15,11 @@ from backend.db.connection import (
 from backend.integrations.smartlead import SmartleadBot
 from backend.integrations.heyreach import HeyReachBot
 from backend.services.linkedin_normalize import normalize_linkedin
+from backend.services.role_campaigns import (
+    campaign_payload,
+    fetch_role_campaign,
+    provision_role_campaign,
+)
 
 router = APIRouter()
 
@@ -345,6 +350,12 @@ class ShortlistOutreachRequest(BaseModel):
     )
 
 
+class RoleEmailSetupRequest(BaseModel):
+    sender_account_id: int
+    subject: str
+    initial_body: str
+
+
 # --- Hardcoded Email Template ---
 EMAIL_TEMPLATE = {
     "subject": "Exciting Opportunity at {role_name}",
@@ -415,7 +426,328 @@ def get_candidate_details(candidate_ids: List[int]):
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {e}")
 
 
+def _get_accessible_role(cur, role_id: int, current_user: schemas.User):
+    if (current_user.role or "").strip().lower() == "admin":
+        cur.execute(
+            "SELECT id, name, user_id FROM recruitment_roles WHERE id = %s",
+            (role_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, name, user_id FROM recruitment_roles WHERE id = %s AND user_id = %s",
+            (role_id, current_user.id),
+        )
+    role = cur.fetchone()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return role
+
+
+def _render_role_template(value: str, role_name: str) -> str:
+    return (value or "").replace("{{role_name}}", role_name)
+
+
+def _render_candidate_template(value: str, role_name: str, candidate: Dict) -> str:
+    return (
+        _render_role_template(value, role_name)
+        .replace("{{first_name}}", candidate.get("first_name") or "")
+        .replace("{{last_name}}", candidate.get("last_name") or "")
+    )
+
+
+def _is_valid_email(value: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (value or "").strip()))
+
+
+def _classify_role_email_candidates(candidates: List[Dict], existing_ids=None) -> Dict[str, List[Dict]]:
+    existing_ids = set(existing_ids or [])
+    shortlisted = [candidate for candidate in candidates if candidate.get("status") == "shortlisted"]
+    missing_email = [candidate for candidate in shortlisted if not _is_valid_email(candidate.get("email"))]
+    eligible = [candidate for candidate in shortlisted if _is_valid_email(candidate.get("email"))]
+    pending = [candidate for candidate in eligible if candidate.get("id") not in existing_ids]
+    return {
+        "shortlisted": shortlisted,
+        "missing_email": missing_email,
+        "eligible": eligible,
+        "pending": pending,
+    }
+
+
 # --- API Endpoints ---
+
+
+@router.get("/smartlead/email-accounts")
+async def list_smartlead_email_accounts(
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    try:
+        accounts = get_smartlead_bot().list_email_accounts()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load Smartlead senders: {exc}")
+
+    safe_accounts = []
+    for account in accounts:
+        account_id = account.get("id")
+        email = account.get("from_email") or account.get("username")
+        if account_id is None or not email:
+            continue
+        warmup = account.get("warmup_details") or {}
+        safe_accounts.append(
+            {
+                "id": account_id,
+                "email": email,
+                "name": account.get("from_name") or "",
+                "connected": account.get("is_smtp_success") is not False,
+                "warmup_status": warmup.get("status") or "",
+            }
+        )
+    return {"accounts": safe_accounts}
+
+
+@router.get("/roles/{role_id}/email-setup")
+async def get_role_email_setup(
+    role_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            _get_accessible_role(cur, role_id, current_user)
+            return campaign_payload(fetch_role_campaign(cur, role_id))
+
+
+@router.put("/roles/{role_id}/email-setup")
+async def save_role_email_setup(
+    role_id: int,
+    request: RoleEmailSetupRequest,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    subject = (request.subject or "").strip()
+    initial_body = (request.initial_body or "").strip()
+    if not subject or not initial_body:
+        raise HTTPException(status_code=400, detail="Subject and initial email are required")
+    if len(subject) > 500 or len(initial_body) > 20000:
+        raise HTTPException(status_code=400, detail="Subject or initial email is too long")
+
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            role = _get_accessible_role(cur, role_id, current_user)
+            existing = fetch_role_campaign(cur, role_id)
+
+    bot = get_smartlead_bot()
+    try:
+        accounts = bot.list_email_accounts()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not validate Smartlead sender: {exc}")
+    selected_account = next(
+        (account for account in accounts if str(account.get("id")) == str(request.sender_account_id)),
+        None,
+    )
+    if not selected_account:
+        raise HTTPException(status_code=400, detail="Selected Smartlead sender does not exist")
+    if selected_account.get("is_smtp_success") is False:
+        raise HTTPException(status_code=400, detail="Selected Smartlead sender is not connected")
+    sender_email = selected_account.get("from_email") or selected_account.get("username")
+
+    campaign = provision_role_campaign(role_id, role[1])
+    campaign_id = campaign.get("campaign_id")
+    if not campaign_id:
+        raise HTTPException(
+            status_code=502,
+            detail=campaign.get("campaign_error") or "Could not create Smartlead campaign",
+        )
+
+    bot.campaign_id = int(campaign_id)
+    old_sender_id = str(existing[7]) if existing and existing[7] else ""
+    try:
+        if old_sender_id != str(request.sender_account_id):
+            if bot.add_email_account(request.sender_account_id) is None:
+                raise RuntimeError("Could not attach the selected Smartlead sender")
+
+        rendered_subject = _render_role_template(subject, role[1])
+        rendered_body = _render_role_template(initial_body, role[1])
+        if bot.set_email_sequence(rendered_subject, rendered_body) is None:
+            raise RuntimeError("Could not update the Smartlead email sequence")
+
+        if not existing or not existing[4]:
+            start_time = datetime.now(tz_module.utc) + timedelta(minutes=3)
+            if bot.set_schedule(
+                tz=os.getenv("SMARTLEAD_DEFAULT_TIMEZONE", "Asia/Kolkata"),
+                start_hour="00:00",
+                end_hour="23:59",
+                start_time=start_time,
+                days_of_the_week=[0, 1, 2, 3, 4, 5, 6],
+            ) is None:
+                raise RuntimeError("Could not configure the Smartlead schedule")
+            if bot.update_campaign_settings(follow_up_percentage=50) is None:
+                raise RuntimeError("Could not configure Smartlead campaign settings")
+
+        if old_sender_id and old_sender_id != str(request.sender_account_id):
+            if bot.remove_email_account(old_sender_id) is None:
+                raise RuntimeError("New sender was attached, but the previous sender could not be removed")
+    except Exception as exc:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE role_smartlead_campaigns
+                        SET provisioning_status = 'failed', provisioning_error = %s, updated_at = NOW()
+                        WHERE recruitment_role_id = %s
+                        """,
+                        (str(exc)[:1000], role_id),
+                    )
+                    conn.commit()
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE role_smartlead_campaigns
+                SET sender_account_id = %s, sender_email = %s, subject = %s,
+                    initial_body = %s, configured_at = NOW(),
+                    provisioning_status = 'configured', provisioning_error = NULL,
+                    updated_at = NOW()
+                WHERE recruitment_role_id = %s
+                """,
+                (str(request.sender_account_id), sender_email, subject, initial_body, role_id),
+            )
+            row = fetch_role_campaign(cur, role_id)
+            conn.commit()
+            return campaign_payload(row)
+
+
+@router.post("/roles/{role_id}/email/send-shortlisted")
+async def send_role_email_to_shortlisted(
+    role_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            role = _get_accessible_role(cur, role_id, current_user)
+            setup = fetch_role_campaign(cur, role_id)
+            if not setup or not (setup[0] and setup[4] and setup[5] and setup[6] and setup[7]):
+                raise HTTPException(status_code=409, detail="Configure Smartlead email outreach first")
+
+            cur.execute(
+                """
+                SELECT c.id, c.name, c.first_name, c.last_name, c.email, c.status
+                FROM recruitment_role_candidates rc
+                JOIN candidates c ON c.id = rc.candidate_id
+                WHERE rc.role_id = %s AND COALESCE(c.is_archived, FALSE) = FALSE
+                ORDER BY c.id
+                """,
+                (role_id,),
+            )
+            all_candidates = [
+                {
+                    "id": row[0],
+                    "name": row[1] or "",
+                    "first_name": row[2] or (row[1] or "Candidate").split()[0],
+                    "last_name": row[3] or " ".join((row[1] or "").split()[1:]),
+                    "email": (row[4] or "").strip(),
+                    "status": (row[5] or "").strip().lower(),
+                }
+                for row in cur.fetchall()
+            ]
+            classified = _classify_role_email_candidates(all_candidates)
+            shortlisted = classified["shortlisted"]
+            missing_email = classified["missing_email"]
+            eligible = classified["eligible"]
+
+            existing_ids = set()
+            if eligible:
+                cur.execute(
+                    """
+                    SELECT candidate_id
+                    FROM candidate_outreach
+                    WHERE recruitment_role_id = %s AND campaign_id = %s
+                      AND candidate_id = ANY(%s)
+                      AND COALESCE(status, '') <> 'failed'
+                    """,
+                    (role_id, str(setup[0]), [candidate["id"] for candidate in eligible]),
+                )
+                existing_ids = {row[0] for row in cur.fetchall()}
+
+    pending = _classify_role_email_candidates(all_candidates, existing_ids)["pending"]
+    bot = get_smartlead_bot()
+    bot.campaign_id = int(setup[0])
+
+    if pending:
+        result = bot.add_leads(
+            [
+                {
+                    "first_name": candidate["first_name"],
+                    "last_name": candidate["last_name"],
+                    "email": candidate["email"],
+                }
+                for candidate in pending
+            ]
+        )
+        if result is None:
+            raise HTTPException(status_code=502, detail="Smartlead rejected the shortlisted candidates")
+
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                for candidate in pending:
+                    initial_message = _render_candidate_template(setup[6], role[1], candidate)
+                    cur.execute(
+                        """
+                        INSERT INTO candidate_outreach
+                            (candidate_id, recruitment_role_id, campaign_id, campaign_name,
+                             status, initial_message, initial_message_at, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, 'in_campaign', %s, NOW(), NOW(), NOW())
+                        ON CONFLICT (candidate_id, recruitment_role_id)
+                        DO UPDATE SET campaign_id = EXCLUDED.campaign_id,
+                                      campaign_name = EXCLUDED.campaign_name,
+                                      status = 'in_campaign',
+                                      initial_message = EXCLUDED.initial_message,
+                                      initial_message_at = NOW(), updated_at = NOW()
+                        """,
+                        (candidate["id"], role_id, str(setup[0]), setup[1], initial_message),
+                    )
+                conn.commit()
+
+    if not setup[8] and eligible:
+        if bot.start_campaign() is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Candidates were enrolled, but the Smartlead campaign could not be started. Retry safely.",
+            )
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE role_smartlead_campaigns
+                        SET started_at = NOW(), updated_at = NOW()
+                        WHERE recruitment_role_id = %s
+                        """,
+                        (role_id,),
+                    )
+                    conn.commit()
+
+    return {
+        "success": True,
+        "campaign_id": str(setup[0]),
+        "processed_count": len(all_candidates),
+        "shortlisted_count": len(shortlisted),
+        "eligible_count": len(eligible),
+        "enrolled_count": len(pending),
+        "already_enrolled_count": len(existing_ids),
+        "skipped_missing_email_count": len(missing_email),
+        "skipped_not_shortlisted_count": len(all_candidates) - len(shortlisted),
+    }
 
 
 @router.post("/trigger")
