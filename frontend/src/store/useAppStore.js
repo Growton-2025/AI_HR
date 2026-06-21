@@ -10,6 +10,7 @@ const RATE_LIMIT_DEFAULT_RETRY_MS = 5000
 const RATE_LIMIT_MAX_RETRY_MS = 30000
 const TALENT_POOL_CACHE_FRESH_MS = 30 * 1000
 let rateLimitUntilMs = 0
+const roleDetailsInFlight = new Map()
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 const isDev = import.meta.env.DEV
@@ -21,6 +22,7 @@ function shouldLogApiTiming(url = '') {
         '/candidates/browse',
         '/candidates/browse/summary',
         '/candidates/browse/meta',
+        '/roles/',
         '/ai-columns',
         '/calls',
     ].some(path => String(url).includes(path))
@@ -1140,12 +1142,28 @@ export const useAppStore = create(persist((set, get) => ({
 
         const request = axios.get(`${API_BASE}/roles`)
             .then(res => {
+                const fetchedRoles = res.data.roles || []
                 set({
-                    roles: res.data.roles,
+                    roles: fetchedRoles,
                     rolesLastFetchedAt: Date.now(),
                     rolesRequest: null
                 })
-                return { success: true, data: res.data.roles, cached: false }
+
+                // Warm small/medium role details after the list paints. Opening
+                // those roles then uses the same instant cache-first experience
+                // as Talent Pool without preloading very large role payloads.
+                setTimeout(() => {
+                    fetchedRoles
+                        .filter(role => Number(role.candidate_count || 0) <= 250)
+                        .slice(0, 5)
+                        .forEach(role => {
+                            if (!get().roleDetailsCache[role.name]) {
+                                void get()._fetchRoleDetailsBackground(role.name)
+                            }
+                        })
+                }, 0)
+
+                return { success: true, data: fetchedRoles, cached: false }
             })
             .catch(error => {
                 console.error('Failed to fetch roles:', error)
@@ -1167,18 +1185,24 @@ export const useAppStore = create(persist((set, get) => ({
             // Instant render with full cached data
             set({ viewingRole: cachedRole })
         } else {
-            // Fallback to shell
-            set({ viewingRole: { ...role, candidates: [] } })
+            // Preserve the list metadata while clearly marking candidate details as loading.
+            set({ viewingRole: { ...role, candidates: null } })
         }
 
         // Fetch full details in background (always refresh)
         get()._fetchRoleDetailsBackground(role.name)
     },
 
-    _fetchRoleDetailsBackground: async (roleName) => {
-        // Simple single fetch - no aggressive polling
-        try {
-            const res = await axios.get(`${API_BASE}/roles/${encodeURIComponent(roleName)}`)
+    _fetchRoleDetailsBackground: async (roleName, options = {}) => {
+        const force = options.force === true
+        if (!force && roleDetailsInFlight.has(roleName)) {
+            return roleDetailsInFlight.get(roleName)
+        }
+
+        const request = (async () => {
+          try {
+            const query = force ? `?refresh=true&cb=${Date.now()}` : ''
+            const res = await axios.get(`${API_BASE}/roles/${encodeURIComponent(roleName)}${query}`)
             const updatedRole = res.data
 
             // Update cache
@@ -1193,6 +1217,7 @@ export const useAppStore = create(persist((set, get) => ({
             if (get().viewingRole?.name === roleName) {
                 set({ viewingRole: updatedRole })
             }
+            return { success: true, data: updatedRole }
         } catch (error) {
             // Handle deleted roles gracefully
             if (error.response?.status === 404) {
@@ -1209,12 +1234,23 @@ export const useAppStore = create(persist((set, get) => ({
             } else {
                 console.error('Failed to fetch role details:', error)
             }
+            return { success: false, error: error.response?.data?.detail || 'Failed to fetch role details' }
+          }
+        })()
+
+        if (!force) roleDetailsInFlight.set(roleName, request)
+        try {
+            return await request
+        } finally {
+            if (!force && roleDetailsInFlight.get(roleName) === request) {
+                roleDetailsInFlight.delete(roleName)
+            }
         }
     },
 
     // Kept for direct calls if needed, but openRole is preferred for UI
-    fetchRoleDetails: async (roleName) => {
-        return get()._fetchRoleDetailsBackground(roleName)
+    fetchRoleDetails: async (roleName, options = {}) => {
+        return get()._fetchRoleDetailsBackground(roleName, options)
     },
 
     createRole: async (name) => {

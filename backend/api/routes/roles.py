@@ -7,12 +7,16 @@ from backend.api import schemas, deps
 from backend.db.connection import get_db_connection, return_db_connection
 from backend.api.routes.candidate_imports import build_upload_preview_response, commit_upload_file
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Use lazy import to avoid circular dependency
-from backend.pipeline.query import PROFILES_BY_ID
+from backend.pipeline.query import PROFILES_BY_ID, refresh_profiles_in_cache
+
+_ROLE_DETAIL_CACHE: Dict[str, tuple] = {}
+_ROLE_DETAIL_CACHE_TTL_SECONDS = 30
 
 def fetch_candidates_from_db(candidate_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Fetch full candidate profiles from DB for IDs not in memory cache"""
@@ -354,96 +358,171 @@ async def delete_role(
 async def get_role(
     role_name: str,
     role_id: Optional[int] = Query(None),
+    refresh: bool = Query(False),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
-    """Get role details with candidates for an accessible role."""
+    """Get role details with candidates using one DB round trip and a short cache."""
+    cache_key = f"{current_user.id}:{current_user.role}:{role_id or role_name}"
+    cached = _ROLE_DETAIL_CACHE.get(cache_key)
+    if not refresh and cached and time.monotonic() - cached[0] < _ROLE_DETAIL_CACHE_TTL_SECONDS:
+        return cached[1]
+
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-    
+
     try:
         with conn.cursor() as cur:
-            resolved_role = _resolve_role(cur, current_user, role_name=role_name, role_id=role_id)
+            if role_id:
+                role_filter = "r.id = %s"
+                params = [role_id]
+                if not _is_admin(current_user):
+                    role_filter += " AND r.user_id = %s"
+                    params.append(current_user.id)
+                role_order = "r.created_at DESC"
+            elif _is_admin(current_user):
+                role_filter = "r.name = %s"
+                params = [role_name]
+                role_order = "CASE WHEN r.user_id = %s THEN 0 ELSE 1 END, r.created_at DESC"
+                params.append(current_user.id)
+            else:
+                role_filter = "r.user_id = %s AND r.name = %s"
+                params = [current_user.id, role_name]
+                role_order = "r.created_at DESC"
+
+            cur.execute(
+                f"""
+                WITH selected_role AS (
+                    SELECT r.id, r.name, r.job_description, r.user_id
+                    FROM recruitment_roles r
+                    WHERE {role_filter}
+                    ORDER BY {role_order}
+                    LIMIT 1
+                )
+                SELECT sr.id, sr.name, sr.job_description, sr.user_id,
+                       u.name, u.email,
+                       (SELECT COUNT(*) FROM candidate_uploads cu WHERE cu.role_id = sr.id),
+                       (SELECT MAX(cu.completed_at) FROM candidate_uploads cu WHERE cu.role_id = sr.id),
+                       COUNT(c.id) OVER (),
+                       c.id, rc.priority, rc.feedback,
+                       c.name, c.linkedin, c.location, c.headline, c.about,
+                       c.email,
+                       COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), ''),
+                       c.status
+                FROM selected_role sr
+                LEFT JOIN users u ON u.id = sr.user_id
+                LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
+                LEFT JOIN candidates c ON c.id = rc.candidate_id
+                    AND COALESCE(c.is_archived, FALSE) = FALSE
+                ORDER BY c.id NULLS LAST
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise HTTPException(status_code=404, detail="Role not found")
+
+            candidate_ids = [row[9] for row in rows if row[9] is not None]
+            if refresh and candidate_ids:
+                refresh_profiles_in_cache(candidate_ids)
+
+            candidates = []
+            for row in rows:
+                candidate_id = row[9]
+                if candidate_id is None:
+                    continue
+
+                cached_profile = PROFILES_BY_ID.get(candidate_id)
+                if cached_profile:
+                    candidate = cached_profile.copy()
+                else:
+                    # The global cache may still be warming. Return enough current
+                    # DB data for the role table immediately instead of doing more
+                    # remote round trips.
+                    candidate = {
+                        "id": candidate_id,
+                        "name": row[12] or "",
+                        "linkedin": row[13] or "",
+                        "location": row[14] or "",
+                        "headline": row[15] or "",
+                        "about": row[16] or "",
+                        "summary": row[16] or row[15] or "",
+                        "email": row[17] or "",
+                        "mobile_phone": row[18] or "",
+                        "status": row[19] or "To be started",
+                        "roles": [],
+                    }
+                candidate["priority"] = row[10]
+                candidate["feedback"] = row[11]
+                candidates.append(candidate)
+
+            role = rows[0]
+            response = {
+                "id": role[0],
+                "name": role[1],
+                "job_description": role[2] or "",
+                "candidate_count": role[8] or 0,
+                "upload_count": role[6] or 0,
+                "latest_upload_at": role[7].isoformat() if role[7] else None,
+                "owner_user_id": role[3],
+                "owner_name": role[4] or "",
+                "owner_email": role[5] or "",
+                "candidates": [_json_safe(candidate) for candidate in candidates],
+            }
+            _ROLE_DETAIL_CACHE[cache_key] = (time.monotonic(), response)
+            return response
+    finally:
+        return_db_connection(conn)
+
+
+@router.get("/{role_name}/contacts")
+async def get_role_contacts(
+    role_name: str,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Lightweight polling endpoint for Clay/import contact updates."""
+    cache_key = f"{current_user.id}:{current_user.role}:{role_name}"
+    cached_role = _ROLE_DETAIL_CACHE.get(cache_key)
+    if cached_role and time.monotonic() - cached_role[0] < 300:
+        contacts = []
+        for candidate in cached_role[1].get("candidates", []):
+            candidate_id = candidate.get("id")
+            current = PROFILES_BY_ID.get(candidate_id) or candidate
+            contacts.append(
+                {
+                    "id": candidate_id,
+                    "email": current.get("email") or "",
+                    "mobile_phone": current.get("mobile_phone") or current.get("phone") or "",
+                }
+            )
+        return {"contacts": contacts}
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        with conn.cursor() as cur:
+            resolved_role = _resolve_role(cur, current_user, role_name=role_name)
             if not resolved_role:
                 raise HTTPException(status_code=404, detail="Role not found")
 
             cur.execute(
                 """
-                SELECT r.id, r.name, r.job_description, COUNT(DISTINCT c.id) AS candidate_count,
-                       COUNT(DISTINCT cu.id) AS upload_count,
-                       MAX(cu.completed_at) AS latest_upload_at,
-                       r.user_id,
-                       u.name AS owner_name,
-                       u.email AS owner_email
-                FROM recruitment_roles r
-                LEFT JOIN users u ON u.id = r.user_id
-                LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
-                LEFT JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
-                LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
-                WHERE r.id = %s
-                GROUP BY r.id, r.name, r.user_id, u.name, u.email
+                SELECT c.id, c.email,
+                       COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), '')
+                FROM recruitment_role_candidates rc
+                JOIN candidates c ON c.id = rc.candidate_id
+                WHERE rc.role_id = %s
+                  AND COALESCE(c.is_archived, FALSE) = FALSE
                 """,
                 (resolved_role[0],),
             )
-            role = cur.fetchone()
-            if not role:
-                raise HTTPException(status_code=404, detail="Role not found")
-            
-            role_id = role[0]
-            
-            # Fetch assigned candidates
-            cur.execute("""
-                SELECT candidate_id, priority, feedback 
-                FROM recruitment_role_candidates 
-                WHERE role_id = %s
-            """, (role_id,))
-            
-            assignments = cur.fetchall()
-            candidates = []
-            
-            missing_ids = []
-            
-            # First pass: try to get from memory cache
-            for row in assignments:
-                cid, priority, feedback = row
-                if cid in PROFILES_BY_ID:
-                    cand = PROFILES_BY_ID[cid].copy()
-                    cand["priority"] = priority
-                    cand["feedback"] = feedback
-                    candidates.append(cand)
-                else:
-                    missing_ids.append(cid)
-            
-            # Second pass: fetch missing from DB
-            if missing_ids:
-                logger.info(f"Fetching {len(missing_ids)} missing candidates from DB: {missing_ids}")
-                db_candidates = fetch_candidates_from_db(missing_ids)
-                
-                # Re-iterate assignments to maintain order? Or just append?
-                # Let's map db results back to assignments for correct priority/feedback
-                for row in assignments:
-                    cid, priority, feedback = row
-                    if cid in missing_ids and cid in db_candidates:
-                        cand = db_candidates[cid].copy()
-                        cand["priority"] = priority
-                        cand["feedback"] = feedback
-                        candidates.append(cand)
-            
-            # Refresh contact info
-            refreshed_candidates = refresh_candidate_contact_info(candidates)
-            safe_candidates = [_json_safe(candidate) for candidate in refreshed_candidates]
-            
             return {
-                "id": role_id,
-                "name": role[1],
-                "job_description": role[2] or "",
-                "candidate_count": role[3],
-                "upload_count": role[4],
-                "latest_upload_at": role[5].isoformat() if role[5] else None,
-                "owner_user_id": role[6],
-                "owner_name": role[7] or "",
-                "owner_email": role[8] or "",
-                "candidates": safe_candidates
+                "contacts": [
+                    {"id": row[0], "email": row[1] or "", "mobile_phone": row[2] or ""}
+                    for row in cur.fetchall()
+                ]
             }
     finally:
         return_db_connection(conn)

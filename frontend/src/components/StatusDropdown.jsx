@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import axios from 'axios';
 import { ChevronDown } from 'lucide-react';
 import { API_BASE } from '../store/useAppStore';
@@ -30,16 +31,57 @@ export const STATUS_STYLES = {
 export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, disabled = false }) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [menuPosition, setMenuPosition] = useState(null);
   const dropdownRef = useRef(null);
+  const menuRef = useRef(null);
+
+  const toggleMenu = () => {
+    if (loading) return;
+    if (isOpen) {
+      setIsOpen(false);
+      return;
+    }
+
+    const rect = dropdownRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const menuWidth = 190;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+    const openUp = spaceBelow < 260 && spaceAbove > spaceBelow;
+
+    setMenuPosition({
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - menuWidth - 8)),
+      top: openUp ? undefined : rect.bottom + 4,
+      bottom: openUp ? window.innerHeight - rect.top + 4 : undefined,
+      maxHeight: Math.max(140, Math.min(300, (openUp ? spaceAbove : spaceBelow) - 12)),
+      width: menuWidth,
+    });
+    setIsOpen(true);
+  };
 
   useEffect(() => {
     const handleClickOutside = (event) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+      if (
+        dropdownRef.current &&
+        !dropdownRef.current.contains(event.target) &&
+        !menuRef.current?.contains(event.target)
+      ) {
         setIsOpen(false);
       }
     };
+    const handleViewportChange = (event) => {
+      if (event?.type === 'scroll' && menuRef.current?.contains(event.target)) return;
+      setIsOpen(false);
+    };
     document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    window.addEventListener('resize', handleViewportChange);
+    window.addEventListener('scroll', handleViewportChange, true);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('resize', handleViewportChange);
+      window.removeEventListener('scroll', handleViewportChange, true);
+    };
   }, []);
 
   const handleUpdate = async (newStatus) => {
@@ -79,7 +121,7 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, d
   return (
     <div style={{ position: 'relative' }} ref={dropdownRef}>
       <button
-        onClick={() => !loading && setIsOpen(!isOpen)}
+        onClick={toggleMenu}
         disabled={loading}
         style={{
           display: 'inline-flex', alignItems: 'center', gap: '6px',
@@ -98,13 +140,17 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, d
         <ChevronDown size={12} style={{ opacity: 0.5 }} />
       </button>
 
-      {isOpen && (
+      {isOpen && menuPosition && createPortal(
         <div style={{
-          position: 'absolute', top: '100%', left: 0, marginTop: '4px',
+          position: 'fixed',
+          top: menuPosition.top,
+          bottom: menuPosition.bottom,
+          left: menuPosition.left,
+          width: menuPosition.width,
           background: '#fff', border: '1px solid #e2e8f0', borderRadius: '12px',
           boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
-          zIndex: 50, padding: '6px', minWidth: '180px', maxHeight: '300px', overflowY: 'auto'
-        }}>
+          zIndex: 10050, padding: '6px', maxHeight: menuPosition.maxHeight, overflowY: 'auto'
+        }} ref={menuRef}>
           {RECRUITMENT_STAGES.map(stage => {
             const style = STATUS_STYLES[stage.toLowerCase()] || { dot: '#94a3b8' };
             const isActive = stage === String(status ?? '');
@@ -128,7 +174,8 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, d
               </button>
             );
           })}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

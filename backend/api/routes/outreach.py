@@ -1782,7 +1782,9 @@ async def trigger_heyreach_outreach(
                     """
                     SELECT id, first_name, last_name, name, linkedin
                     FROM candidates
-                    WHERE id = ANY(%s) AND linkedin IS NOT NULL
+                    WHERE id = ANY(%s)
+                      AND linkedin IS NOT NULL
+                      AND LOWER(TRIM(COALESCE(status, ''))) = 'shortlisted'
                 """,
                     (request.candidate_ids,),
                 )
@@ -1805,7 +1807,8 @@ async def trigger_heyreach_outreach(
 
     if not candidates:
         raise HTTPException(
-            status_code=404, detail="No candidates with valid LinkedIn profiles found"
+            status_code=404,
+            detail="No shortlisted candidates with valid LinkedIn profiles found",
         )
 
     print(f"DEBUG: Found {len(candidates)} candidates for HeyReach outreach")

@@ -68,6 +68,7 @@ function Roles() {
     const [isSendingLI, setIsSendingLI] = useState(false)
     const [isSyncing, setIsSyncing] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
+    const [refreshingProfileIds, setRefreshingProfileIds] = useState({})
     const [isLoadingRole, setIsLoadingRole] = useState(false)
     const { heyreachCampaignId, setHeyreachCampaignId, lookupHeyReachCampaign } = useAppStore(useShallow((state) => ({
         heyreachCampaignId: state.heyreachCampaignId,
@@ -125,14 +126,142 @@ function Roles() {
         }
     }, [viewingRole?.id])
 
+    // Keep contact cells in sync with Clay without reloading the full role.
+    // This polls one lightweight role-scoped endpoint and stops after two minutes.
+    useEffect(() => {
+        const candidates = viewingRole?.candidates
+        if (!viewingRole?.name || !Array.isArray(candidates) || candidates.length === 0) return undefined
+        if (!candidates.some(candidate => !candidate.email || !candidate.mobile_phone)) return undefined
+
+        let cancelled = false
+        let timer = null
+        let attempts = 0
+
+        const pollContacts = async () => {
+            attempts += 1
+            try {
+                const res = await axios.get(
+                    `${API_BASE}/roles/${encodeURIComponent(viewingRole.name)}/contacts?cb=${Date.now()}`,
+                    { headers: { 'Cache-Control': 'no-cache' } }
+                )
+                if (cancelled) return
+
+                const contactById = new Map(
+                    (res.data?.contacts || []).map(contact => [Number(contact.id), contact])
+                )
+                let hasMissingContacts = false
+
+                useAppStore.setState(state => {
+                    if (state.viewingRole?.name !== viewingRole.name) return state
+
+                    const updatedCandidates = (state.viewingRole.candidates || []).map(candidate => {
+                        const contact = contactById.get(Number(candidate.id))
+                        const updated = contact ? {
+                            ...candidate,
+                            email: contact.email || candidate.email || '',
+                            mobile_phone: contact.mobile_phone || candidate.mobile_phone || '',
+                        } : candidate
+                        if (!updated.email || !updated.mobile_phone) hasMissingContacts = true
+                        return updated
+                    })
+                    const updatedRole = { ...state.viewingRole, candidates: updatedCandidates }
+
+                    return {
+                        viewingRole: updatedRole,
+                        roleDetailsCache: {
+                            ...state.roleDetailsCache,
+                            [viewingRole.name]: updatedRole,
+                        },
+                    }
+                })
+
+                if (hasMissingContacts && attempts < 30 && !cancelled) {
+                    timer = setTimeout(pollContacts, 2000)
+                }
+            } catch {
+                if (attempts < 30 && !cancelled) timer = setTimeout(pollContacts, 2000)
+            }
+        }
+
+        timer = setTimeout(pollContacts, 1500)
+        return () => {
+            cancelled = true
+            if (timer) clearTimeout(timer)
+        }
+    }, [viewingRole?.id, viewingRole?.candidates?.length])
+
     // Local fetchOutreachStatus removed in favor of global store action
+
+    const mergeCandidateContact = (candidateId, contact = {}) => {
+        useAppStore.setState(state => {
+            if (!state.viewingRole?.candidates) return state
+            const updatedCandidates = state.viewingRole.candidates.map(candidate => (
+                Number(candidate.id) === Number(candidateId)
+                    ? {
+                        ...candidate,
+                        email: contact.email || candidate.email || '',
+                        mobile_phone: contact.mobile_phone || contact.phone || candidate.mobile_phone || '',
+                    }
+                    : candidate
+            ))
+            const updatedRole = { ...state.viewingRole, candidates: updatedCandidates }
+            return {
+                viewingRole: updatedRole,
+                roleDetailsCache: {
+                    ...state.roleDetailsCache,
+                    [updatedRole.name]: updatedRole,
+                },
+            }
+        })
+    }
+
+    const handleRefreshProfile = async (candidate) => {
+        if (!candidate?.id || refreshingProfileIds[candidate.id]) return
+        setRefreshingProfileIds(current => ({ ...current, [candidate.id]: true }))
+
+        try {
+            const enrichment = await axios.post(`${API_BASE}/enrich/${candidate.id}`)
+            const immediateEmail = enrichment.data?.email || ''
+            const immediatePhone = enrichment.data?.phone || ''
+            if (immediateEmail || immediatePhone) {
+                mergeCandidateContact(candidate.id, { email: immediateEmail, phone: immediatePhone })
+                toast.success(`Refreshed ${candidate.name || 'candidate'} profile`)
+                return
+            }
+
+            toast.info(`Refreshing ${candidate.name || 'candidate'} from Clay…`)
+            for (let attempt = 0; attempt < 20; attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000))
+                const contacts = await axios.get(
+                    `${API_BASE}/roles/${encodeURIComponent(viewingRole.name)}/contacts?cb=${Date.now()}`,
+                    { headers: { 'Cache-Control': 'no-cache' } }
+                )
+                const contact = (contacts.data?.contacts || []).find(
+                    item => Number(item.id) === Number(candidate.id)
+                )
+                if (contact?.email || contact?.mobile_phone) {
+                    mergeCandidateContact(candidate.id, contact)
+                    toast.success(`Clay data updated for ${candidate.name || 'candidate'}`)
+                    return
+                }
+            }
+
+            toast.warning('Clay finished, but its result has not reached Hayasa yet. Check the Clay callback step.')
+        } catch (error) {
+            toast.error(error.response?.data?.detail || `Failed to refresh ${candidate.name || 'candidate'}`)
+        } finally {
+            setRefreshingProfileIds(current => ({ ...current, [candidate.id]: false }))
+        }
+    }
 
     const handleManualRefresh = async () => {
         if (!viewingRole?.name) return
         setIsRefreshing(true)
         try {
-            await fetchRoleDetails(viewingRole.name)
+            const refreshed = await fetchRoleDetails(viewingRole.name, { force: true })
+            if (!refreshed?.success) throw new Error(refreshed?.error || 'Refresh failed')
             await fetchOutreachStatus(viewingRole.id)
+            await fetchRoles({ force: true })
             toast.success('Refreshed role data')
         } catch (error) {
             toast.error('Failed to refresh')
@@ -241,9 +370,14 @@ function Roles() {
 
         setIsSendingLI(true)
         try {
-            const validCandidates = viewingRole.candidates.filter(c => c && c.id && c.linkedin)
+            const validCandidates = viewingRole.candidates.filter(c => (
+                c &&
+                c.id &&
+                c.linkedin &&
+                String(c.status || '').trim().toLowerCase() === 'shortlisted'
+            ))
             if (validCandidates.length === 0) {
-                toast.error('No candidates with LinkedIn profiles found')
+                toast.error('No shortlisted candidates with LinkedIn profiles found')
                 setIsSendingLI(false)
                 return
             }
@@ -674,10 +808,24 @@ function Roles() {
 
                 <div className="result-banner">
                     <div className="result-banner-title">
-                        {viewingRole.candidate_count ?? viewingRole.candidates?.length ?? 0} Candidate(s)
+                        {viewingRole.candidates === null
+                            ? 'Loading candidates…'
+                            : `${viewingRole.candidate_count ?? viewingRole.candidates?.length ?? 0} Candidate(s)`}
                     </div>
-                    <div className="result-banner-subtitle">
-                        {Number(viewingRole.upload_count || 0)} role upload{Number(viewingRole.upload_count || 0) === 1 ? '' : 's'}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                        <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={handleManualRefresh}
+                            disabled={isRefreshing || viewingRole.candidates === null}
+                            title="Reload candidates and the latest Clay enrichment output"
+                            style={{ height: '36px', padding: '0 14px' }}
+                        >
+                            <RefreshCcw size={14} className={isRefreshing ? 'animate-spin' : ''} />
+                            {isRefreshing ? 'Refreshing…' : 'Refresh candidates'}
+                        </button>
+                        <div className="result-banner-subtitle">
+                            {Number(viewingRole.upload_count || 0)} role upload{Number(viewingRole.upload_count || 0) === 1 ? '' : 's'}
+                        </div>
                     </div>
                 </div>
 
@@ -836,7 +984,7 @@ function Roles() {
                                     height: '36px'
                                 }}
                             >
-                                <Linkedin size={14} /> {isSendingLI ? 'Sending...' : 'Send LinkedIn'}
+                                <Linkedin size={14} /> {isSendingLI ? 'Sending...' : 'Send Shortlisted'}
                             </button>
                         </div>
                     </div>
@@ -896,19 +1044,19 @@ function Roles() {
                         <p>No candidates assigned yet. Start by screening for talent!</p>
                     </div>
                 ) : (
-                    <div className="table-wrapper" style={{ maxHeight: '600px', overflowY: 'auto' }}>
-                        <table className="data-table">
+                    <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px' }}>
+                        <table className="data-table role-candidates-table">
                             <thead>
                                 <tr>
-                                    <th style={{ width: '30px', minWidth: '30px' }}>#</th>
-                                    <th style={{ minWidth: '140px', maxWidth: '180px' }}>Candidate</th>
+                                    <th className="role-sticky-index">#</th>
+                                    <th className="role-sticky-candidate">Candidate</th>
+                                    <th className="role-sticky-status">Status</th>
                                     <th style={{ minWidth: '150px', maxWidth: '180px' }}>Role</th>
                                     <th style={{ minWidth: '140px' }}>Email</th>
                                     <th style={{ minWidth: '100px' }}>Phone</th>
                                     <th style={{ minWidth: '120px', width: '120px' }}>Details</th>
                                     <th style={{ minWidth: '70px', width: '70px' }}>Priority</th>
                                     <th style={{ minWidth: '140px', maxWidth: '160px' }}>Feedback</th>
-                                    <th style={{ minWidth: '150px' }}>Status</th>
                                     <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Delivery</div></th>
                                     <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Hub</div></th>
                                     <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Delivery</div></th>
@@ -930,8 +1078,8 @@ function Roles() {
 
                                     return (
                                         <tr key={candidate.id || idx}>
-                                            <td>{idx + 1}</td>
-                                            <td>
+                                            <td className="role-sticky-index">{idx + 1}</td>
+                                            <td className="role-sticky-candidate">
                                                 <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                                                     <span style={{ fontWeight: 600, color: "#1e293b" }}>{candidate.name || "N/A"}</span>
                                                     {candidate.linkedin && (
@@ -939,7 +1087,38 @@ function Roles() {
                                                             <Linkedin size={12} />
                                                         </a>
                                                     )}
+                                                    <button
+                                                        className="icon-btn"
+                                                        onClick={() => handleRefreshProfile(candidate)}
+                                                        disabled={Boolean(refreshingProfileIds[candidate.id])}
+                                                        title="Refresh this profile and retrieve its latest Clay contact data"
+                                                        style={{ color: '#2563eb', gap: '4px', padding: '5px 7px', whiteSpace: 'nowrap' }}
+                                                    >
+                                                        <RefreshCcw
+                                                            size={13}
+                                                            className={refreshingProfileIds[candidate.id] ? 'animate-spin' : ''}
+                                                        />
+                                                        <span style={{ fontSize: '11px', fontWeight: 700 }}>
+                                                            {refreshingProfileIds[candidate.id] ? 'Refreshing' : 'Refresh'}
+                                                        </span>
+                                                    </button>
                                                 </div>
+                                            </td>
+                                            <td className="role-sticky-status">
+                                                <StatusDropdown
+                                                    status={candidate.status}
+                                                    candidateId={candidate.id}
+                                                    onUpdate={(id, newStatus) => {
+                                                        useAppStore.setState(state => ({
+                                                            viewingRole: {
+                                                                ...state.viewingRole,
+                                                                candidates: state.viewingRole.candidates.map(c =>
+                                                                    c.id === id ? { ...c, status: newStatus } : c
+                                                                )
+                                                            }
+                                                        }))
+                                                    }}
+                                                />
                                             </td>
                                             <td>
                                                 <div style={{ lineHeight: "1.2" }}>
@@ -975,24 +1154,6 @@ function Roles() {
                                             <td>{getPriorityBadge(candidate.priority)}</td>
                                             <td title={feedback} style={{ fontSize: "13px", color: "#64748b", whiteSpace: "normal", lineHeight: "1.4" }}>
                                                 {truncatedFeedback || "—"}
-                                            </td>
-
-                                            {/* Candidate Status */}
-                                            <td>
-                                                <StatusDropdown
-                                                    status={candidate.status}
-                                                    candidateId={candidate.id}
-                                                    onUpdate={(id, newStatus) => {
-                                                        useAppStore.setState(state => ({
-                                                            viewingRole: {
-                                                                ...state.viewingRole,
-                                                                candidates: state.viewingRole.candidates.map(c =>
-                                                                    c.id === id ? { ...c, status: newStatus } : c
-                                                                )
-                                                            }
-                                                        }))
-                                                    }}
-                                                />
                                             </td>
 
                                             {/* Email Delivery */}
