@@ -3,6 +3,11 @@ name: Deploy Backend to Azure
 on:
   workflow_dispatch:
 
+# Share the production deployment lock with dev_growton-backend-v2.yml.
+concurrency:
+  group: growton-backend-v2-production
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest

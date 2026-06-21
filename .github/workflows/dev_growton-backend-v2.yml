@@ -15,6 +15,13 @@ on:
       - '.github/workflows/dev_growton-backend-v2.yml'
   workflow_dispatch:
 
+# OneDeploy allows only one active deployment per App Service/slot. This group
+# is intentionally shared with azure-backend.yml so manual fallback deployments
+# queue behind the canonical dev deployment instead of returning HTTP 409.
+concurrency:
+  group: growton-backend-v2-production
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
