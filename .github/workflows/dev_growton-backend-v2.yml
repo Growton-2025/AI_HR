@@ -69,6 +69,15 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_7ED39A8FB036492EA6D22A14F028AF86 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_108A9CA4A8DC4786AAA41FB14BF0CD92 }}
 
+      # Stop the App Service to release any file locks before deploying
+      - name: Stop App Service
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            RG=$(az webapp list --query "[?name=='growton-backend-v2'].resourceGroup" -o tsv)
+            echo "Stopping growton-backend-v2 in resource group $RG"
+            az webapp stop --name growton-backend-v2 --resource-group $RG
+
       # Deploy the downloaded backend artifact directory explicitly so the supported
       # App Service/Oryx deployment path stays deterministic across runs.
       - name: 'Deploy to Azure Web App'
@@ -79,3 +88,12 @@ jobs:
           slot-name: 'Production'
           package: backend-artifact
           startup-command: 'WEB_CONCURRENCY=4 bash startup.sh'
+
+      - name: Start App Service
+        uses: azure/cli@v2
+        if: always() # Ensure we start the app service even if the deployment fails
+        with:
+          inlineScript: |
+            RG=$(az webapp list --query "[?name=='growton-backend-v2'].resourceGroup" -o tsv)
+            echo "Starting growton-backend-v2 in resource group $RG"
+            az webapp start --name growton-backend-v2 --resource-group $RG
