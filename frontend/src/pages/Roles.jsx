@@ -1369,8 +1369,13 @@ function Roles() {
                                     <div className="role-card-meta">
                                         <User size={12} /> {role.candidate_count} assigned candidates
                                     </div>
-                                    <div style={{ marginTop: 6, fontSize: 11, fontWeight: 700, color: role.activation_status === 'active' ? '#15803d' : '#b45309' }}>
-                                        {role.activation_status === 'active' ? '● Active' : '● Inactive'}
+                                    <div style={{ marginTop: 8, display: 'flex', gap: '12px', alignItems: 'center' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.smartlead_status === 'configured' ? '#15803d' : (role.smartlead_status === 'skipped' ? '#94a3b8' : '#b45309') }} title={`Email: ${role.smartlead_status || 'missing'}`}>
+                                            <Mail size={12} /> {role.smartlead_status === 'configured' ? 'Active' : (role.smartlead_status === 'skipped' ? 'Skipped' : 'Inactive')}
+                                        </div>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.heyreach_status === 'configured' ? '#15803d' : '#b45309' }} title={`LinkedIn: ${role.heyreach_status || 'missing'}`}>
+                                            <Linkedin size={12} /> {role.heyreach_status === 'configured' ? 'Active' : 'Inactive'}
+                                        </div>
                                     </div>
                                 </div>
                             </div>
