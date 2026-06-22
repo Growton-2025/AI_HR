@@ -89,6 +89,9 @@ def ensure_outreach_migrations(conn) -> None:
                 "ADD COLUMN IF NOT EXISTS li_enrollment_claimed_at TIMESTAMP",
                 "ADD COLUMN IF NOT EXISTS li_enrollment_error TEXT",
                 "ADD COLUMN IF NOT EXISTS li_enrolled_at TIMESTAMP",
+                "ADD COLUMN IF NOT EXISTS email_enrollment_claimed_at TIMESTAMP",
+                "ADD COLUMN IF NOT EXISTS email_enrollment_error TEXT",
+                "ADD COLUMN IF NOT EXISTS email_enrolled_at TIMESTAMP",
             ):
                 cur.execute(f"ALTER TABLE candidate_outreach {column_sql}")
     finally:

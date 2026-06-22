@@ -36,9 +36,19 @@ class SearchRequest(BaseModel):
 class RoleCreate(BaseModel):
     name: str
     job_description: Optional[str] = None
+    heyreach_campaign_id: int
+    smartlead_sender_account_id: int
+    email_subject: str
+    email_body: str
 
 class RoleUpdate(BaseModel):
     job_description: Optional[str] = None
+
+class RoleActivationSetup(BaseModel):
+    heyreach_campaign_id: int
+    smartlead_sender_account_id: int
+    email_subject: str
+    email_body: str
 
 class AssignmentDetail(BaseModel):
     candidate_id: int

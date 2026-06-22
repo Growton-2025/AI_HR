@@ -1,11 +1,17 @@
 
 from datetime import date, datetime
+import asyncio
 from decimal import Decimal
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from backend.api import schemas, deps
 from backend.db.connection import get_db_connection, return_db_connection
 from backend.api.routes.candidate_imports import build_upload_preview_response, commit_upload_file
+from backend.services.role_activation import (
+    activate_role,
+    fetch_role_activation,
+    retry_role_activation,
+)
 import logging
 import time
 
@@ -262,13 +268,19 @@ async def get_roles(
                            MAX(cu.completed_at) as latest_upload_at,
                            r.user_id,
                            u.name as owner_name,
-                           u.email as owner_email
+                           u.email as owner_email,
+                           sc.provisioning_status, sc.provisioning_error,
+                           hc.provisioning_status, hc.provisioning_error
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
                     LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
                     LEFT JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
                     LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
-                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email
+                    LEFT JOIN role_smartlead_campaigns sc ON sc.recruitment_role_id = r.id
+                    LEFT JOIN role_heyreach_campaigns hc ON hc.recruitment_role_id = r.id
+                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email,
+                             sc.provisioning_status, sc.provisioning_error,
+                             hc.provisioning_status, hc.provisioning_error
                     ORDER BY r.created_at DESC
                 """)
             else:
@@ -280,14 +292,20 @@ async def get_roles(
                            MAX(cu.completed_at) as latest_upload_at,
                            r.user_id,
                            u.name as owner_name,
-                           u.email as owner_email
+                           u.email as owner_email,
+                           sc.provisioning_status, sc.provisioning_error,
+                           hc.provisioning_status, hc.provisioning_error
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
                     LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
                     LEFT JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
                     LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
+                    LEFT JOIN role_smartlead_campaigns sc ON sc.recruitment_role_id = r.id
+                    LEFT JOIN role_heyreach_campaigns hc ON hc.recruitment_role_id = r.id
                     WHERE r.user_id = %s
-                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email
+                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email,
+                             sc.provisioning_status, sc.provisioning_error,
+                             hc.provisioning_status, hc.provisioning_error
                     ORDER BY r.created_at DESC
                 """, (target_user_id,))
             
@@ -305,6 +323,10 @@ async def get_roles(
                     "owner_user_id": row[6],
                     "owner_name": row[7] or "",
                     "owner_email": row[8] or "",
+                    "activation_status": "active" if row[9] == "configured" and row[11] == "configured" else "inactive",
+                    "activation_error": " | ".join(value for value in (row[10], row[12]) if value),
+                    "smartlead_status": row[9] or "missing",
+                    "heyreach_status": row[11] or "missing",
                 })
     finally:
         return_db_connection(conn)
@@ -315,14 +337,19 @@ async def get_roles(
 @router.post("")
 async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Depends(deps.get_current_user)):
     """Create a new role for the current user"""
+    if not role.name.strip() or not role.email_subject.strip() or not role.email_body.strip():
+        raise HTTPException(status_code=400, detail="Role name, email subject, and email body are required")
+    if role.heyreach_campaign_id <= 0 or role.smartlead_sender_account_id <= 0:
+        raise HTTPException(status_code=400, detail="Valid HeyReach campaign and Smartlead sender IDs are required")
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
     try:
         with conn.cursor() as cur:
-            logger.info(f"Checking for role '{role.name}' for user_id: {current_user.id}")
-            cur.execute("SELECT id FROM recruitment_roles WHERE user_id = %s AND name = %s", (current_user.id, role.name))
+            role_name = role.name.strip()
+            logger.info(f"Checking for role '{role_name}' for user_id: {current_user.id}")
+            cur.execute("SELECT id FROM recruitment_roles WHERE user_id = %s AND name = %s", (current_user.id, role_name))
             if cur.fetchone():
                 logger.warning(f"Role '{role.name}' already exists for user_id: {current_user.id}")
                 raise HTTPException(status_code=400, detail="Role already exists")
@@ -330,18 +357,128 @@ async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Dep
             cur.execute("""
                 INSERT INTO recruitment_roles (user_id, name, job_description)
                 VALUES (%s, %s, %s) RETURNING id, name, job_description
-            """, (current_user.id, role.name, (role.job_description or "").strip() or None))
+            """, (current_user.id, role_name, (role.job_description or "").strip() or None))
             result = cur.fetchone()
             conn.commit()
-            
-            return {
-                "message": f"Role '{result[1]}' created",
-                "id": result[0],
-                "name": result[1],
-                "job_description": result[2] or "",
-            }
     finally:
         return_db_connection(conn)
+    try:
+        activation = await asyncio.to_thread(
+            activate_role,
+            result[0],
+            result[1],
+            role.heyreach_campaign_id,
+            role.smartlead_sender_account_id,
+            role.email_subject.strip(),
+            role.email_body.strip(),
+        )
+    except Exception as exc:
+        logger.exception("Role %s activation failed", result[0])
+        activation = {
+            "activation_status": "inactive",
+            "activation_error": str(exc)[:1000],
+            "smartlead_status": "failed",
+            "heyreach_status": "failed",
+        }
+    return {
+        "message": f"Role '{result[1]}' created",
+        "id": result[0],
+        "name": result[1],
+        "job_description": result[2] or "",
+        **activation,
+    }
+
+
+@router.post("/id/{role_id}/activate")
+async def retry_role_activation_endpoint(
+    role_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            role = _resolve_role(cur, current_user, role_id=role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+    finally:
+        return_db_connection(conn)
+    activation = await asyncio.to_thread(retry_role_activation, role[0], role[1])
+    invalidate_role_detail_cache(role_id)
+    return activation
+
+
+@router.post("/id/{role_id}/deactivate")
+async def deactivate_role_endpoint(
+    role_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            role = _resolve_role(cur, current_user, role_id=role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+            
+            cur.execute("UPDATE role_smartlead_campaigns SET provisioning_status = 'deactivated' WHERE recruitment_role_id = %s", (role[0],))
+            cur.execute("UPDATE role_heyreach_campaigns SET provisioning_status = 'deactivated' WHERE recruitment_role_id = %s", (role[0],))
+            conn.commit()
+            activation_setup = fetch_role_activation(cur, role[0])
+    finally:
+        return_db_connection(conn)
+    invalidate_role_detail_cache(role_id)
+    return {"id": role[0], "name": role[1], **activation_setup}
+
+
+@router.get("/id/{role_id}/activation")
+async def get_role_activation_setup(
+    role_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            role = _resolve_role(cur, current_user, role_id=role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+            return {"id": role[0], "name": role[1], **fetch_role_activation(cur, role_id)}
+    finally:
+        return_db_connection(conn)
+
+
+@router.put("/id/{role_id}/activation")
+async def configure_existing_role_activation(
+    role_id: int,
+    setup: schemas.RoleActivationSetup,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    if setup.heyreach_campaign_id <= 0 or setup.smartlead_sender_account_id <= 0:
+        raise HTTPException(status_code=400, detail="Valid campaign and sender IDs are required")
+    if not setup.email_subject.strip() or not setup.email_body.strip():
+        raise HTTPException(status_code=400, detail="Email subject and body are required")
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            role = _resolve_role(cur, current_user, role_id=role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+    finally:
+        return_db_connection(conn)
+    activation = await asyncio.to_thread(
+        activate_role,
+        role[0], role[1], setup.heyreach_campaign_id,
+        setup.smartlead_sender_account_id,
+        setup.email_subject.strip(), setup.email_body.strip(),
+    )
+    invalidate_role_detail_cache(role_id)
+    return activation
 
 @router.delete("/{role_name}")
 async def delete_role(
@@ -483,6 +620,7 @@ async def get_role(
                 "owner_email": role[5] or "",
                 "candidates": [_json_safe(candidate) for candidate in candidates],
             }
+            response.update(fetch_role_activation(cur, role[0]))
             _ROLE_DETAIL_CACHE[cache_key] = (time.monotonic(), response)
             return response
     finally:
@@ -492,41 +630,29 @@ async def get_role(
 @router.get("/{role_name}/contacts")
 async def get_role_contacts(
     role_name: str,
+    role_id: Optional[int] = Query(None),
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Lightweight polling endpoint for Clay/import contact updates."""
-    cache_key = f"{current_user.id}:{current_user.role}:{role_name}"
-    cached_role = _ROLE_DETAIL_CACHE.get(cache_key)
-    if cached_role and time.monotonic() - cached_role[0] < 300:
-        contacts = []
-        for candidate in cached_role[1].get("candidates", []):
-            candidate_id = candidate.get("id")
-            current = PROFILES_BY_ID.get(candidate_id) or candidate
-            contacts.append(
-                {
-                    "id": candidate_id,
-                    "email": current.get("email") or "",
-                    "mobile_phone": current.get("mobile_phone") or current.get("phone") or "",
-                }
-            )
-        return {"contacts": contacts}
-
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
     try:
         with conn.cursor() as cur:
-            resolved_role = _resolve_role(cur, current_user, role_name=role_name)
+            resolved_role = _resolve_role(cur, current_user, role_name=role_name, role_id=role_id)
             if not resolved_role:
                 raise HTTPException(status_code=404, detail="Role not found")
 
             cur.execute(
                 """
                 SELECT c.id, c.email,
-                       COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), '')
+                       COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), ''),
+                       co.status, co.li_status, co.email_enrollment_error, co.li_enrollment_error
                 FROM recruitment_role_candidates rc
                 JOIN candidates c ON c.id = rc.candidate_id
+                LEFT JOIN candidate_outreach co
+                  ON co.candidate_id = c.id AND co.recruitment_role_id = rc.role_id
                 WHERE rc.role_id = %s
                   AND COALESCE(c.is_archived, FALSE) = FALSE
                 """,
@@ -534,7 +660,11 @@ async def get_role_contacts(
             )
             return {
                 "contacts": [
-                    {"id": row[0], "email": row[1] or "", "mobile_phone": row[2] or ""}
+                    {
+                        "id": row[0], "email": row[1] or "", "mobile_phone": row[2] or "",
+                        "email_status": row[3] or "not_started", "linkedin_status": row[4] or "not_started",
+                        "email_error": row[5] or "", "linkedin_error": row[6] or "",
+                    }
                     for row in cur.fetchall()
                 ]
             }

@@ -412,21 +412,43 @@ async def websocket_search(websocket: WebSocket):
                                 break
 
                         elif msg_type == "progress":
-                            if not await send_event({
+                            progress_payload: Dict[str, Any] = {
                                 "type": "progress",
                                 "current": item.get("current"),
-                                "total": item.get("total")
-                            }):
+                                "total": item.get("total"),
+                            }
+                            if item.get("phase"):
+                                progress_payload["phase"] = item["phase"]
+                            if item.get("message"):
+                                progress_payload["message"] = item["message"]
+                            if item.get("passed") is not None:
+                                progress_payload["passed"] = item["passed"]
+                            if not await send_event(progress_payload):
                                 break
 
                         elif msg_type == "profile_chunk":
-                            if not await send_event({
+                            chunk_payload: Dict[str, Any] = {
                                 "type": "candidate",
                                 "data": item.get("data"),
                                 "current": item.get("current"),
                                 "total": item.get("total"),
                                 "reviewed": item.get("reviewed"),
                                 "verified": item.get("verified"),
+                            }
+                            if item.get("phase"):
+                                chunk_payload["phase"] = item["phase"]
+                            if not await send_event(chunk_payload):
+                                break
+
+                        elif msg_type == "candidate_batch":
+                            # Batch of candidates from the scoring phase (before reasoning)
+                            if not await send_event({
+                                "type": "candidate_batch",
+                                "phase": item.get("phase", "scoring"),
+                                "data": item.get("data", []),
+                                "reviewed": item.get("reviewed"),
+                                "passed": item.get("passed"),
+                                "total_pool": item.get("total_pool"),
                             }):
                                 break
 

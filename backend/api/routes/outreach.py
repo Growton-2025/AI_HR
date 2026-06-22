@@ -6,7 +6,7 @@ import time
 import asyncio
 from datetime import datetime, timedelta, timezone as tz_module
 from typing import List, Optional, Dict
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from backend.api import schemas, deps
 from backend.db.connection import (
@@ -20,6 +20,9 @@ from backend.services.role_campaigns import (
     fetch_role_campaign,
     provision_role_campaign,
 )
+from backend.services.role_activation import fetch_role_activation
+from backend.services.heyreach_role_campaigns import dispatch_due_linkedin
+from backend.services.smartlead_role_dispatcher import dispatch_due_email
 
 router = APIRouter()
 
@@ -37,6 +40,9 @@ _email_chat_cache: Dict[int, Dict] = {}
 _email_chat_lock = threading.Lock()
 _EMAIL_CACHE_TTL = 3600        # 1 hour for emails (last longer than LI)
 _EMAIL_CACHE_STALE_THRESHOLD = 300 # 5 minutes threshold for bg refresh
+
+_smartlead_accounts_cache: Dict[str, object] = {"accounts": [], "ts": 0.0}
+_SMARTLEAD_ACCOUNTS_TTL = 300
 
 
 
@@ -356,6 +362,39 @@ class RoleEmailSetupRequest(BaseModel):
     initial_body: str
 
 
+class BulkRoleShortlistRequest(BaseModel):
+    assignments: List[schemas.AssignmentDetail]
+
+
+def _dispatch_role_outreach_now():
+    """Best-effort fast path; lifecycle workers retain the durable retry path."""
+    dispatch_due_email()
+    dispatch_due_linkedin()
+
+
+def _refresh_role_shortlist_caches(candidate_id: int, role_id: int):
+    """Refresh shared caches after the shortlist response has been returned."""
+    try:
+        from backend.pipeline import query
+        query.refresh_profiles_in_cache([candidate_id])
+        from backend.api.routes.roles import invalidate_role_detail_cache
+        invalidate_role_detail_cache(role_id)
+    except Exception as exc:
+        print(f"SHORTLIST CACHE REFRESH WARNING: {exc}")
+
+
+def _refresh_bulk_role_shortlist_caches(candidate_ids: List[int], role_id: int):
+    try:
+        from backend.pipeline import query
+        query.refresh_profiles_in_cache(candidate_ids)
+        from backend.api.routes.roles import invalidate_role_detail_cache
+        from backend.api.routes.candidates import invalidate_candidate_count_caches
+        invalidate_role_detail_cache(role_id)
+        invalidate_candidate_count_caches()
+    except Exception as exc:
+        print(f"BULK SHORTLIST CACHE REFRESH WARNING: {exc}")
+
+
 # --- Hardcoded Email Template ---
 EMAIL_TEMPLATE = {
     "subject": "Exciting Opportunity at {role_name}",
@@ -459,6 +498,19 @@ def _is_valid_email(value: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", (value or "").strip()))
 
 
+def _candidate_role_queue_state(candidate: Dict) -> Dict[str, object]:
+    has_email = _is_valid_email(candidate.get("email"))
+    has_linkedin = bool((candidate.get("linkedin") or "").strip())
+    needs_enrichment = bool(
+        (not has_email or not candidate.get("phone")) and has_linkedin
+    )
+    return {
+        "email_status": "scheduled" if has_email else "waiting_for_email",
+        "linkedin_status": "scheduled" if has_linkedin else "skipped_missing_linkedin",
+        "needs_enrichment": needs_enrichment,
+    }
+
+
 def _classify_role_email_candidates(candidates: List[Dict], existing_ids=None) -> Dict[str, List[Dict]]:
     existing_ids = set(existing_ids or [])
     shortlisted = [candidate for candidate in candidates if candidate.get("status") == "shortlisted"]
@@ -480,9 +532,16 @@ def _classify_role_email_candidates(candidates: List[Dict], existing_ids=None) -
 async def list_smartlead_email_accounts(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
+    if (
+        _smartlead_accounts_cache["accounts"]
+        and time.monotonic() - float(_smartlead_accounts_cache["ts"]) < _SMARTLEAD_ACCOUNTS_TTL
+    ):
+        return {"accounts": _smartlead_accounts_cache["accounts"], "cached": True}
     try:
         accounts = get_smartlead_bot().list_email_accounts()
     except Exception as exc:
+        if _smartlead_accounts_cache["accounts"]:
+            return {"accounts": _smartlead_accounts_cache["accounts"], "cached": True, "stale": True}
         raise HTTPException(status_code=502, detail=f"Could not load Smartlead senders: {exc}")
 
     safe_accounts = []
@@ -501,7 +560,8 @@ async def list_smartlead_email_accounts(
                 "warmup_status": warmup.get("status") or "",
             }
         )
-    return {"accounts": safe_accounts}
+    _smartlead_accounts_cache.update(accounts=safe_accounts, ts=time.monotonic())
+    return {"accounts": safe_accounts, "cached": False}
 
 
 @router.get("/roles/{role_id}/email-setup")
@@ -747,6 +807,236 @@ async def send_role_email_to_shortlisted(
         "already_enrolled_count": len(existing_ids),
         "skipped_missing_email_count": len(missing_email),
         "skipped_not_shortlisted_count": len(all_candidates) - len(shortlisted),
+    }
+
+
+@router.post("/roles/{role_id}/candidates/{candidate_id}/shortlist")
+async def shortlist_role_candidate(
+    role_id: int,
+    candidate_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Shortlist one role candidate and durably queue both outreach channels."""
+    candidate = None
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            role = _get_accessible_role(cur, role_id, current_user)
+            activation = fetch_role_activation(cur, role_id)
+            if activation.get("activation_status") != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=activation.get("activation_error") or "Activate this role before shortlisting candidates",
+                )
+            cur.execute(
+                """
+                SELECT c.id, c.name, c.first_name, c.last_name, c.email,
+                       COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), ''),
+                       c.linkedin
+                FROM recruitment_role_candidates rc
+                JOIN candidates c ON c.id=rc.candidate_id
+                WHERE rc.role_id=%s AND c.id=%s AND COALESCE(c.is_archived, FALSE)=FALSE
+                """,
+                (role_id, candidate_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Candidate is not assigned to this role")
+            candidate = {
+                "id": row[0], "name": row[1] or "", "first_name": row[2] or "",
+                "last_name": row[3] or "", "email": (row[4] or "").strip(),
+                "phone": row[5] or "", "linkedin": row[6] or "",
+            }
+            queue_state = _candidate_role_queue_state(candidate)
+            email_status = queue_state["email_status"]
+            linkedin_status = queue_state["linkedin_status"]
+            cur.execute("UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=%s", (candidate_id,))
+            cur.execute(
+                """
+                INSERT INTO candidate_outreach
+                    (candidate_id, recruitment_role_id, status, li_status, li_scheduled_for, created_at, updated_at)
+                VALUES (%s, %s, %s, %s,
+                        CASE WHEN %s='scheduled' THEN NOW() ELSE NULL END, NOW(), NOW())
+                ON CONFLICT (candidate_id, recruitment_role_id) DO UPDATE
+                SET status = CASE WHEN candidate_outreach.email_enrolled_at IS NULL
+                                  THEN EXCLUDED.status ELSE candidate_outreach.status END,
+                    li_status = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                    THEN EXCLUDED.li_status ELSE candidate_outreach.li_status END,
+                    li_scheduled_for = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                            AND EXCLUDED.li_status='scheduled' THEN NOW()
+                                            ELSE candidate_outreach.li_scheduled_for END,
+                    updated_at=NOW()
+                """,
+                (candidate_id, role_id, email_status, linkedin_status, linkedin_status),
+            )
+            conn.commit()
+
+    contact_enriching = False
+    if _candidate_role_queue_state(candidate)["needs_enrichment"]:
+        try:
+            from backend.services.clay import trigger_clay
+            first_name = candidate["first_name"] or (candidate["name"] or "Candidate").split()[0]
+            last_name = candidate["last_name"] or " ".join((candidate["name"] or "").split()[1:])
+            background_tasks.add_task(trigger_clay, first_name, last_name, candidate["linkedin"])
+            contact_enriching = True
+        except Exception as exc:
+            print(f"SHORTLIST CLAY WARNING: {exc}")
+
+    background_tasks.add_task(_dispatch_role_outreach_now)
+    background_tasks.add_task(_refresh_role_shortlist_caches, candidate_id, role_id)
+    return {
+        "success": True,
+        "candidate_id": candidate_id,
+        "name": candidate["name"],
+        "email": candidate["email"],
+        "phone": candidate["phone"],
+        "linkedin": candidate["linkedin"],
+        "contact_enriching": contact_enriching,
+        "email_outreach": email_status,
+        "linkedin_outreach": linkedin_status,
+    }
+
+
+@router.post("/roles/{role_id}/shortlist-selected")
+async def shortlist_selected_for_role(
+    role_id: int,
+    request: BulkRoleShortlistRequest,
+    background_tasks: BackgroundTasks,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Assign, shortlist, enrich, and queue selected profiles in one transaction."""
+    requested = {
+        int(item.candidate_id): item
+        for item in request.assignments
+        if item.candidate_id is not None
+    }
+    if not requested:
+        raise HTTPException(status_code=400, detail="Select at least one candidate")
+
+    candidates = []
+    added_ids = []
+    already_assigned_ids = []
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        with conn.cursor() as cur:
+            role = _get_accessible_role(cur, role_id, current_user)
+            activation = fetch_role_activation(cur, role_id)
+            if activation.get("activation_status") != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=activation.get("activation_error") or "Activate this role before adding shortlisted profiles",
+                )
+
+            requested_ids = list(requested)
+            cur.execute(
+                """
+                SELECT id, name, first_name, last_name, email,
+                       COALESCE(NULLIF(TRIM(mobile_phone), ''), NULLIF(TRIM(phone), ''), ''),
+                       linkedin
+                FROM candidates
+                WHERE id = ANY(%s) AND COALESCE(is_archived, FALSE)=FALSE
+                """,
+                (requested_ids,),
+            )
+            candidates = [
+                {
+                    "id": row[0], "name": row[1] or "", "first_name": row[2] or "",
+                    "last_name": row[3] or "", "email": (row[4] or "").strip(),
+                    "phone": row[5] or "", "linkedin": row[6] or "",
+                }
+                for row in cur.fetchall()
+            ]
+            valid_ids = [candidate["id"] for candidate in candidates]
+
+            if valid_ids:
+                cur.execute(
+                    "SELECT candidate_id FROM recruitment_role_candidates WHERE role_id=%s AND candidate_id=ANY(%s)",
+                    (role_id, valid_ids),
+                )
+                existing_ids = {int(row[0]) for row in cur.fetchall()}
+                already_assigned_ids = sorted(existing_ids)
+
+                for candidate_id in valid_ids:
+                    if candidate_id in existing_ids:
+                        continue
+                    item = requested[candidate_id]
+                    cur.execute(
+                        """
+                        INSERT INTO recruitment_role_candidates (role_id, candidate_id, priority, feedback)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (role_id, candidate_id) DO NOTHING
+                        RETURNING candidate_id
+                        """,
+                        (role_id, candidate_id, item.priority or "--", item.feedback or ""),
+                    )
+                    inserted = cur.fetchone()
+                    if inserted:
+                        added_ids.append(int(inserted[0]))
+                    else:
+                        already_assigned_ids.append(candidate_id)
+
+                cur.execute(
+                    "UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=ANY(%s)",
+                    (valid_ids,),
+                )
+                for candidate in candidates:
+                    queue_state = _candidate_role_queue_state(candidate)
+                    email_status = queue_state["email_status"]
+                    linkedin_status = queue_state["linkedin_status"]
+                    cur.execute(
+                        """
+                        INSERT INTO candidate_outreach
+                            (candidate_id, recruitment_role_id, status, li_status, li_scheduled_for, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s,
+                                CASE WHEN %s='scheduled' THEN NOW() ELSE NULL END, NOW(), NOW())
+                        ON CONFLICT (candidate_id, recruitment_role_id) DO UPDATE
+                        SET status = CASE WHEN candidate_outreach.email_enrolled_at IS NULL
+                                          THEN EXCLUDED.status ELSE candidate_outreach.status END,
+                            li_status = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                            THEN EXCLUDED.li_status ELSE candidate_outreach.li_status END,
+                            li_scheduled_for = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                                    AND EXCLUDED.li_status='scheduled' THEN NOW()
+                                                    ELSE candidate_outreach.li_scheduled_for END,
+                            updated_at=NOW()
+                        """,
+                        (candidate["id"], role_id, email_status, linkedin_status, linkedin_status),
+                    )
+            conn.commit()
+
+    enriching = [
+        candidate for candidate in candidates
+        if _candidate_role_queue_state(candidate)["needs_enrichment"]
+    ]
+    background_tasks.add_task(_dispatch_role_outreach_now)
+    if enriching:
+        from backend.services.clay import trigger_clay
+        for candidate in enriching:
+            first_name = candidate["first_name"] or (candidate["name"] or "Candidate").split()[0]
+            last_name = candidate["last_name"] or " ".join((candidate["name"] or "").split()[1:])
+            background_tasks.add_task(trigger_clay, first_name, last_name, candidate["linkedin"])
+    valid_ids = [candidate["id"] for candidate in candidates]
+    background_tasks.add_task(_refresh_bulk_role_shortlist_caches, valid_ids, role_id)
+
+    email_queued = sum(1 for candidate in candidates if _is_valid_email(candidate["email"]))
+    linkedin_queued = sum(1 for candidate in candidates if candidate["linkedin"])
+    return {
+        "success": True,
+        "role_id": role_id,
+        "role_name": role[1],
+        "requested_count": len(requested),
+        "processed_count": len(candidates),
+        "added_count": len(added_ids),
+        "already_assigned_count": len(set(already_assigned_ids)),
+        "skipped_count": len(requested) - len(candidates),
+        "enriching_count": len(enriching),
+        "email_queued_count": email_queued,
+        "email_waiting_count": len(candidates) - email_queued,
+        "linkedin_queued_count": linkedin_queued,
+        "linkedin_skipped_count": len(candidates) - linkedin_queued,
+        "candidate_ids": valid_ids,
     }
 
 

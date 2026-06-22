@@ -59,7 +59,7 @@ function Screening() {
         clearSelections,
         roles,
         fetchRoles,
-        assignCandidatesToRole,
+        shortlistEnrichAndAddToRole,
     } = useAppStore(useShallow((state) => ({
         searchQuery: state.searchQuery,
         setSearchQuery: state.setSearchQuery,
@@ -81,7 +81,7 @@ function Screening() {
         clearSelections: state.clearSelections,
         roles: state.roles,
         fetchRoles: state.fetchRoles,
-        assignCandidatesToRole: state.assignCandidatesToRole,
+        shortlistEnrichAndAddToRole: state.shortlistEnrichAndAddToRole,
     })))
 
     const [inputQuery, setInputQuery] = useState(searchQuery)
@@ -104,8 +104,10 @@ function Screening() {
     }, [fetchRoles])
 
     useEffect(() => {
-        if (!destinationRole && roles.length > 0) {
-            setDestinationRole(roles[0].name)
+        const activeRoles = roles.filter(role => role.activation_status === 'active')
+        const stillValid = activeRoles.some(role => String(role.id) === String(destinationRole))
+        if (!stillValid) {
+            setDestinationRole(activeRoles[0]?.id ? String(activeRoles[0].id) : '')
         }
     }, [destinationRole, roles])
 
@@ -168,7 +170,7 @@ function Screening() {
             priority: '--',
             feedback: '',
         }))
-        const result = await assignCandidatesToRole(destinationRole, assignments)
+        const result = await shortlistEnrichAndAddToRole(Number(destinationRole), assignments)
         setIsAddingToRole(false)
 
         if (!result.success) {
@@ -176,7 +178,9 @@ function Screening() {
             return
         }
 
-        toast.success(result.data?.message || `Added ${candidateIds.length} profile(s) to ${destinationRole}`)
+        const data = result.data || {}
+        toast.success(`${data.processed_count || candidateIds.length} shortlisted and added · ${data.enriching_count || 0} enriching · ${data.email_waiting_count || 0} waiting for email`)
+        if (data.skipped_count > 0) toast.warning(`${data.skipped_count} unavailable profile(s) skipped`)
         clearSelections()
     }
 
@@ -518,9 +522,10 @@ function Screening() {
                         value={destinationRole}
                         onChange={(event) => setDestinationRole(event.target.value)}
                     >
+                        <option value="">Choose an active role…</option>
                         {roles.map(role => (
-                            <option key={role.id || role.name} value={role.name}>
-                                {role.name}{Number.isFinite(Number(role.candidate_count)) ? ` (${role.candidate_count} profiles)` : ''}
+                            <option key={role.id || role.name} value={role.id} disabled={role.activation_status !== 'active'}>
+                                {role.name}{Number.isFinite(Number(role.candidate_count)) ? ` (${role.candidate_count} profiles)` : ''}{role.activation_status === 'active' ? '' : ' · activate first'}
                             </option>
                         ))}
                     </select>
@@ -530,7 +535,7 @@ function Screening() {
                         disabled={isAddingToRole || !destinationRole}
                     >
                         {isAddingToRole ? <Loader2 size={16} className="animate-spin" /> : null}
-                        <span>{isAddingToRole ? 'Adding...' : 'Add Selected to Role'}</span>
+                        <span>{isAddingToRole ? 'Shortlisting...' : 'Shortlist, Enrich & Add'}</span>
                     </button>
                     <button className="btn btn-secondary" onClick={clearSelections} disabled={isAddingToRole}>
                         Cancel

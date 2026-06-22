@@ -26,7 +26,8 @@ def dispatch_due_linkedin(limit: int = 20) -> int:
                 JOIN candidates c ON c.id=co.candidate_id
                 JOIN role_heyreach_campaigns hc ON hc.recruitment_role_id=co.recruitment_role_id
                 WHERE ((co.li_status='scheduled' AND co.li_scheduled_for <= NOW())
-                    OR (co.li_status='enrolling' AND co.li_enrollment_claimed_at < NOW() - INTERVAL '10 minutes'))
+                    OR (co.li_status='enrolling' AND co.li_enrollment_claimed_at < NOW() - INTERVAL '10 minutes')
+                    OR (co.li_status='failed' AND co.updated_at < NOW() - INTERVAL '5 minutes'))
                   AND co.li_enrolled_at IS NULL
                   AND hc.provisioning_status='configured'
                 ORDER BY co.li_scheduled_for
@@ -48,8 +49,6 @@ def dispatch_due_linkedin(limit: int = 20) -> int:
     completed = 0
     for candidate_id, role_id, campaign_id, account_id, first_name, last_name, name, linkedin, message, started_at, claimed_from_status in claimed:
         try:
-            if not started_at:
-                bot.start_campaign(int(campaign_id))
             result = None
             # Recovery after a worker/database interruption: check the external
             # campaign before retrying the side effect.

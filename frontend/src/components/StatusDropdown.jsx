@@ -28,7 +28,7 @@ export const STATUS_STYLES = {
   'shared with customer': { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
 };
 
-export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, disabled = false }) {
+export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, updateStatus, disabled = false }) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [menuPosition, setMenuPosition] = useState(null);
@@ -87,7 +87,8 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, d
   const handleUpdate = async (newStatus) => {
     setLoading(true);
     try {
-      await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus });
+      if (updateStatus) await updateStatus(candidateId, newStatus);
+      else await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus });
       if (newStatus === 'Shortlisted' && onShortlisted) {
         onShortlisted(candidateId);
       }

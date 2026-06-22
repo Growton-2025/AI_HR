@@ -908,9 +908,9 @@ export const useAppStore = create(persist((set, get) => ({
 
             const data = JSON.parse(event.data)
 
-            // Keep-alive ping from backend — reset the fallback timer but do nothing else
+            // A transport heartbeat is not search progress. Do not let pings keep
+            // a hung model stage alive forever; real status/progress events reset it.
             if (data.type === 'ping') {
-                armFallbackTimer(120000)
                 return
             }
 
@@ -921,7 +921,11 @@ export const useAppStore = create(persist((set, get) => ({
                 return
             }
 
-            armFallbackTimer(120000)
+            // Real progress signals (candidate, progress, progress_start, complete) get
+            // the full 120s window. Plain status messages (e.g. "Expanding geographies")
+            // only get 45s — enough for LLM calls, not enough to mask indefinite CPU blocking.
+            const isProgressSignal = ['candidate', 'complete', 'progress', 'progress_start'].includes(data.type)
+            armFallbackTimer(isProgressSignal ? 120000 : 45000)
 
             switch (data.type) {
                 case 'status':
@@ -938,22 +942,42 @@ export const useAppStore = create(persist((set, get) => ({
                         const reviewed = Number(data.reviewed ?? data.current ?? 0)
                         const total = Number(data.total || state.searchTotal || 0)
                         const verified = Number(data.verified ?? countVerifiedSearchCandidates(nextResults))
+                        const pendingCount = nextResults.filter(c => c?.shortlist_status === 'pending_reasoning').length
+                        const verifiedCount = nextResults.filter(c => c?.shortlist_status !== 'pending_reasoning').length
+
+                        let statusMsg
+                        if (data.phase === 'scoring') {
+                            // Early candidate from scoring phase — no reasoning yet
+                            statusMsg = `${nextResults.length} candidate${nextResults.length === 1 ? '' : 's'} passed filter — generating reasoning...`
+                        } else if (total > 0 && reviewed > 0) {
+                            statusMsg = verifiedCount > 0
+                                ? `${verifiedCount} verified · ${pendingCount} pending reasoning (${reviewed}/${total})`
+                                : `Generated reasoning for ${reviewed} of ${total}. ${searchFoundMessage(nextResults.length, verified)}`
+                        } else {
+                            statusMsg = `Scoring ${total || nextResults.length} profile${(total || nextResults.length) === 1 ? '' : 's'}...`
+                        }
+
                         return {
                             searchResults: nextResults,
                             searchProgress: total > 0 && reviewed > 0 ? Math.round((reviewed / total) * 100) : state.searchProgress,
-                            statusMessage: total > 0 && reviewed > 0
-                                ? `Generated reasoning for ${reviewed} of ${total}. ${searchFoundMessage(nextResults.length, verified)}`
-                                : `Scoring ${total || nextResults.length} profile${(total || nextResults.length) === 1 ? '' : 's'}...`,
+                            statusMessage: statusMsg,
                         }
                     })
                     break
 
-                case 'progress':
-                    set({
-                        searchProgress: Math.round((data.current / data.total) * 100),
-                        statusMessage: `Scored ${data.current} of ${data.total} profiles...`
-                    })
+                case 'progress': {
+                    const pCurrent = Number(data.current) || 0
+                    const pTotal = Number(data.total) || 1
+                    const pPct = Math.round((pCurrent / pTotal) * 100)
+                    const pMsg = data.phase === 'filtering'
+                        ? (data.message || `Evaluating candidate pool ${pCurrent}/${pTotal}...`)
+                        : `Scored ${pCurrent} of ${pTotal} profiles...`
+                    set(state => ({
+                        searchProgress: Math.max(state.searchProgress, pPct),
+                        statusMessage: pMsg,
+                    }))
                     break
+                }
 
                 case 'complete':
                     finished = true
@@ -975,6 +999,21 @@ export const useAppStore = create(persist((set, get) => ({
                     set({ _ws: null })
                     ws.close()
                     break
+
+                case 'candidate_batch': {
+                    // Batch of pre-reasoning candidates from the scoring phase — merge all at once
+                    const batchItems = Array.isArray(data.data) ? data.data : []
+                    if (batchItems.length) {
+                        set(state => {
+                            const nextResults = mergeSearchCandidates(state.searchResults, batchItems)
+                            return {
+                                searchResults: nextResults,
+                                statusMessage: `${nextResults.length} candidate${nextResults.length === 1 ? '' : 's'} passed filter — generating reasoning...`,
+                            }
+                        })
+                    }
+                    break
+                }
 
                 case 'error':
                     finished = true
@@ -1095,8 +1134,6 @@ export const useAppStore = create(persist((set, get) => ({
                 const candidate = state.searchResults.find(c => c.id === id)
                 if (candidate) {
                     newSelected[id] = candidate
-                    // Trigger Enrichment in Background
-                    axios.post(`${API_BASE}/enrich/${id}`).catch(err => console.error("Enrichment trigger failed", err))
                 }
             }
             return { selectedCandidates: newSelected }
@@ -1253,23 +1290,46 @@ export const useAppStore = create(persist((set, get) => ({
         return get()._fetchRoleDetailsBackground(roleName, options)
     },
 
-    createRole: async (name) => {
-        const newRole = { id: Date.now(), name, candidate_count: 0 }
+    createRole: async (setup) => {
+        const name = setup.name
+        const newRole = { id: Date.now(), name, candidate_count: 0, activation_status: 'activating' }
         const prevRoles = [...get().roles]
 
         // Optimistic Update
         set({ roles: [newRole, ...prevRoles] })
 
         try {
-            const res = await axios.post(`${API_BASE}/roles`, { name })
+            const res = await axios.post(`${API_BASE}/roles`, setup, { timeout: 180000 })
             // Refresh with real server data in background
             get().fetchRoles({ force: true })
             return { success: true, data: res.data }
         } catch (error) {
-            // Rollback on error
+            const detail = error.response?.data?.detail || ''
+            const mayHaveCompleted = !error.response
+                || error.code === 'ECONNABORTED'
+                || String(detail).toLowerCase().includes('already exists')
+
+            // External provisioning can complete after the browser connection
+            // times out. Recover the durable role instead of inviting a duplicate.
+            if (mayHaveCompleted) {
+                try {
+                    const verification = await axios.get(`${API_BASE}/roles`, { timeout: 60000 })
+                    const fetchedRoles = verification.data?.roles || []
+                    const created = fetchedRoles.find(role =>
+                        String(role.name || '').trim().toLowerCase() === String(name || '').trim().toLowerCase()
+                    )
+                    if (created) {
+                        set({ roles: fetchedRoles, rolesLastFetchedAt: Date.now() })
+                        return { success: true, data: created, recovered: true }
+                    }
+                } catch (verificationError) {
+                    console.error('Failed to verify timed-out role creation:', verificationError)
+                }
+            }
+
             set({ roles: prevRoles })
             console.error('Failed to create role:', error)
-            return { success: false, error: error.response?.data?.detail || 'Failed to create role' }
+            return { success: false, error: detail || error.message || 'Failed to create role' }
         }
     },
 
@@ -1344,6 +1404,93 @@ export const useAppStore = create(persist((set, get) => ({
         } catch (error) {
             set({ roles: prevRoles, roleDetailsCache: previousCache, viewingRole: previousViewingRole })
             return { success: false, error: error.response?.data?.detail || 'Failed to assign candidates' }
+        }
+    },
+
+    shortlistEnrichAndAddToRole: async (roleId, assignments) => {
+        const role = get().roles.find(item => Number(item.id) === Number(roleId))
+        if (!role) return { success: false, error: 'Destination role not found' }
+        const previousRoles = [...get().roles]
+        const previousCache = { ...get().roleDetailsCache }
+        const previousSearchResults = [...get().searchResults]
+        const selectedProfiles = assignments.map(assignment => ({
+            ...(get().searchResults.find(candidate => Number(candidate.id) === Number(assignment.candidate_id)) || {}),
+            ...assignment,
+            status: 'Shortlisted',
+        }))
+        const cachedRole = previousCache[role.name] || { ...role, candidates: [] }
+        const existingIds = new Set((cachedRole.candidates || []).map(candidate => Number(candidate.id)))
+        const optimisticAdds = selectedProfiles.filter(candidate => !existingIds.has(Number(candidate.id)))
+        const optimisticRole = {
+            ...cachedRole,
+            candidates: [...(cachedRole.candidates || []), ...optimisticAdds],
+        }
+        set(state => ({
+            roles: state.roles.map(item => Number(item.id) === Number(roleId)
+                ? { ...item, candidate_count: Number(item.candidate_count || 0) + optimisticAdds.length }
+                : item),
+            roleDetailsCache: { ...state.roleDetailsCache, [role.name]: optimisticRole },
+            searchResults: state.searchResults.map(candidate =>
+                assignments.some(item => Number(item.candidate_id) === Number(candidate.id))
+                    ? { ...candidate, status: 'Shortlisted' }
+                    : candidate),
+        }))
+        try {
+            const res = await axios.post(
+                `${API_BASE}/outreach/roles/${roleId}/shortlist-selected`,
+                { assignments },
+                { timeout: 120000 },
+            )
+            void get().fetchRoles({ force: true })
+            void get()._fetchRoleDetailsBackground(role.name, { force: true })
+            get().invalidateTalentPoolCaches?.()
+            void get().fetchTalentPoolSummary?.({ force: true, freshnessMs: 0 })
+            void get().fetchAnalytics?.({ force: true })
+            return { success: true, data: res.data }
+        } catch (error) {
+            set({ roles: previousRoles, roleDetailsCache: previousCache, searchResults: previousSearchResults })
+            return { success: false, error: error.response?.data?.detail || error.message || 'Failed to shortlist selected profiles' }
+        }
+    },
+
+    // One-click add a single candidate to a role — skips enrichment if email+phone already present
+    quickAddCandidateToRole: async (candidateId, roleId) => {
+        const roles = get().roles
+        const role = roles.find(r => Number(r.id) === Number(roleId))
+        if (!role) return { success: false, error: 'Role not found' }
+        try {
+            const res = await axios.post(
+                `${API_BASE}/outreach/roles/${roleId}/shortlist-selected`,
+                { assignments: [{ candidate_id: candidateId, priority: '--', feedback: '' }] },
+                { timeout: 30000 },
+            )
+            // Update the candidate status in search results
+            set(state => ({
+                searchResults: state.searchResults.map(c =>
+                    Number(c.id) === Number(candidateId) ? { ...c, status: 'Shortlisted', _addedToRole: role.name } : c
+                ),
+            }))
+            void get().fetchRoles({ force: true })
+            return { success: true, data: res.data }
+        } catch (error) {
+            return { success: false, error: error.response?.data?.detail || error.message || 'Failed to add to role' }
+        }
+    },
+
+    deactivateRole: async (roleId) => {
+        try {
+            const res = await axios.post(`${API_BASE}/roles/id/${roleId}/deactivate`)
+            // Optimistically update the active role status
+            set(state => {
+                if (state.viewingRole && state.viewingRole.id === roleId) {
+                    return { viewingRole: { ...state.viewingRole, activation_status: 'inactive' } }
+                }
+                return state
+            })
+            void get().fetchRoles({ force: true })
+            return { success: true, data: res.data }
+        } catch (error) {
+            return { success: false, error: error.response?.data?.detail || error.message || 'Failed to deactivate role' }
         }
     },
 

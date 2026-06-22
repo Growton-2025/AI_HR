@@ -1,8 +1,9 @@
 import { useAppStore } from '../store/useAppStore'
-import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, ChevronLeft, ChevronRight } from 'lucide-react'
+import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, ChevronLeft, ChevronRight, Loader2, UserPlus, CheckCircle2 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useState, useEffect, useMemo } from 'react'
 import { renderTextWithLinks } from './AiColumnCellDrawer'
+import { toast } from 'sonner'
 
 function formatExperience(value) {
     const num = Number(value)
@@ -63,6 +64,33 @@ function ShortlistStatusBadge({ candidate }) {
             <ShieldCheck size={10} />
             {item.label}
         </span>
+    )
+}
+
+// Shimmer shown while LLM reasoning is being generated for this candidate
+function PendingReasoningShimmer() {
+    return (
+        <div style={{
+            margin: '8px 0 0',
+            background: 'linear-gradient(135deg, #faf5ff, #eff6ff)',
+            border: '1px solid #e0e7ff',
+            borderRadius: 10,
+            padding: '10px 14px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            color: '#6366f1',
+            fontSize: 12,
+            fontWeight: 600,
+        }}>
+            <Loader2 size={13} className="animate-spin" style={{ flexShrink: 0 }} />
+            Generating match reasoning…
+            <span style={{
+                marginLeft: 'auto', fontSize: 10, fontWeight: 700,
+                background: '#e0e7ff', color: '#4338ca',
+                borderRadius: 99, padding: '2px 8px',
+            }}>Passed evidence filter</span>
+        </div>
     )
 }
 
@@ -180,6 +208,78 @@ function EvidenceDrawer({ candidate }) {
     )
 }
 
+function QuickAddButton({ candidateId, alreadyAdded, addedRoleName }) {
+    const [busy, setBusy] = useState(false)
+    const [selectedRole, setSelectedRole] = useState('')
+    const { roles, quickAddCandidateToRole } = useAppStore(
+        useShallow(state => ({ roles: state.roles, quickAddCandidateToRole: state.quickAddCandidateToRole }))
+    )
+    const activeRoles = useMemo(() => (roles || []).filter(r => r.activation_status === 'active'), [roles])
+
+    // Default to first active role
+    const effectiveRole = selectedRole || (activeRoles[0]?.id ? String(activeRoles[0].id) : '')
+
+    const handleAdd = async (e) => {
+        e.stopPropagation()
+        if (!effectiveRole) { toast.error('No active role found — activate a role first'); return }
+        setBusy(true)
+        const result = await quickAddCandidateToRole(candidateId, effectiveRole)
+        setBusy(false)
+        if (result.success) {
+            const d = result.data || {}
+            const roleName = activeRoles.find(r => String(r.id) === String(effectiveRole))?.name || 'role'
+            const enrichingNote = d.enriching_count > 0 ? ' · enriching contact info' : d.email_queued_count > 0 ? ' · email queued' : ''
+            toast.success(`Added to ${roleName}${enrichingNote}`)
+        } else {
+            toast.error(result.error || 'Could not add to role')
+        }
+    }
+
+    if (alreadyAdded) {
+        return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: '#16a34a', fontWeight: 700, marginTop: 10 }}>
+                <CheckCircle2 size={13} /> Shortlisted{addedRoleName ? ` · ${addedRoleName}` : ''}
+            </div>
+        )
+    }
+
+    return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }} onClick={e => e.stopPropagation()}>
+            {activeRoles.length > 1 && (
+                <select
+                    value={effectiveRole}
+                    onChange={e => setSelectedRole(e.target.value)}
+                    disabled={busy}
+                    style={{
+                        fontSize: 11, padding: '3px 6px', borderRadius: 7,
+                        border: '1px solid #cbd5e1', background: '#f8fafc',
+                        color: '#334155', fontWeight: 600, cursor: 'pointer',
+                    }}
+                >
+                    {activeRoles.map(r => (
+                        <option key={r.id} value={r.id}>{r.name}</option>
+                    ))}
+                </select>
+            )}
+            <button
+                onClick={handleAdd}
+                disabled={busy || !effectiveRole}
+                style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 5,
+                    fontSize: 11, fontWeight: 700, padding: '4px 10px',
+                    borderRadius: 7, border: '1px solid #6366f1',
+                    background: busy ? '#e0e7ff' : '#f5f3ff',
+                    color: '#4f46e5', cursor: busy ? 'not-allowed' : 'pointer',
+                    transition: 'background 0.15s',
+                }}
+            >
+                {busy ? <Loader2 size={11} className="animate-spin" /> : <UserPlus size={11} />}
+                {busy ? 'Adding...' : activeRoles.length === 1 ? `Add to ${activeRoles[0]?.name || 'Role'}` : 'Add to Role'}
+            </button>
+        </div>
+    )
+}
+
 function CandidateCard({ candidate }) {
     const [expanded, setExpanded] = useState(false)
     const { selectedCandidates, toggleCandidateSelection } = useAppStore(
@@ -195,6 +295,7 @@ function CandidateCard({ candidate }) {
 
     // `answer` is the short 1-2 sentence verdict from the LLM (like AI Column primary_output)
     // `reasoning` is the detailed 2-4 sentence explanation
+    const isPending = candidate.shortlist_status === 'pending_reasoning'
     const answer = candidate.answer || candidate.reasoning || candidate.summary || ''
     const reasoning = candidate.reasoning || ''
     const hasDetailedReasoning = reasoning && reasoning !== answer && reasoning.length > 30
@@ -249,8 +350,10 @@ function CandidateCard({ candidate }) {
                 </div>
             </div>
 
+            {/* Pending shimmer OR full AI answer */}
+            {isPending && <PendingReasoningShimmer />}
             {/* AI Answer — styled like an AI Column cell */}
-            {answer && (
+            {!isPending && answer && (
                 <div style={{
                     margin: '8px 0 0',
                     background: 'linear-gradient(135deg, #faf5ff, #eff6ff)',
@@ -323,6 +426,12 @@ function CandidateCard({ candidate }) {
                     ))}
                 </div>
             )}
+
+            <QuickAddButton
+                candidateId={id}
+                alreadyAdded={candidate.status === 'Shortlisted' || !!candidate._addedToRole}
+                addedRoleName={candidate._addedToRole || null}
+            />
         </article>
     )
 }
@@ -334,12 +443,15 @@ function SearchResults() {
     const [pageSize, setPageSize] = useState(25)
 
     const rankedResults = useMemo(() => {
-        const statusRank = { shortlisted: 0, verified_match: 0 }
+        // pending_reasoning candidates sink to the bottom during streaming;
+        // once reasoning arrives they get a real match_score and float up.
+        const statusRank = { verified_match: 0, shortlisted: 0, pending_reasoning: 99 }
         return [...searchResults].sort((left, right) => {
-            const leftStatus = left.shortlist_status || (left.is_verified_match ? 'shortlisted' : 'shortlisted')
-            const rightStatus = right.shortlist_status || (right.is_verified_match ? 'shortlisted' : 'shortlisted')
-            const statusDelta = (statusRank[leftStatus] ?? 9) - (statusRank[rightStatus] ?? 9)
-            if (statusDelta !== 0) return statusDelta
+            const leftStatus = left.shortlist_status || 'shortlisted'
+            const rightStatus = right.shortlist_status || 'shortlisted'
+            const leftRank = statusRank[leftStatus] ?? 1
+            const rightRank = statusRank[rightStatus] ?? 1
+            if (leftRank !== rightRank) return leftRank - rightRank
             const scoreDelta = Number(right.match_score || 0) - Number(left.match_score || 0)
             if (scoreDelta !== 0) return scoreDelta
             return Number(right.total_experience_years || 0) - Number(left.total_experience_years || 0)

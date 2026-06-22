@@ -317,6 +317,328 @@ def test_current_company_scope_requires_latest_employer():
     assert query._strict_shortlist_score_candidate(past, criteria) is None
 
 
+def test_current_company_scope_uses_dates_not_role_insertion_order():
+    criteria = {
+        "required_companies": {
+            "operator": "OR",
+            "employment_scope": "current_employer",
+            "values": [{"company": "NewCo", "employment_scope": "current_employer"}],
+        }
+    }
+    profile = {
+        "id": 610,
+        "roles": [
+            {
+                "title": "SDR",
+                "company": "OldCo",
+                "start_date": "2019-01-01",
+                "end_date": "2021-01-01",
+            },
+            {
+                "title": "AE",
+                "company": "NewCo",
+                "start_date": "2024-01-01",
+                "end_date": "",
+            },
+        ],
+    }
+
+    assert query._strict_shortlist_score_candidate(profile, criteria)["shortlist_status"] == "shortlisted"
+
+
+def test_duplicate_title_column_cannot_replace_current_role_company_metadata():
+    profile = {
+        "id": 613,
+        "raw_fields": {
+            "experiences/0/companyName": "Razorpay",
+            "experiences/0/title": "Senior Sales Associate",
+            "experiences/0/title.1": "Keka HR",
+            "experiences/0/jobStartedOn": "2026-04-01 00:00:00",
+            "experiences/0/companyIndustry": "Computer Software",
+        },
+        "roles": [
+            {
+                "company": "Razorpay",
+                "title": "Senior Sales Associate",
+                "start_date": "2026-04-01T00:00:00+00:00",
+                "end_date": "2026-06-02T19:03:01+00:00",
+                "company_details": {
+                    "business_model": "Fintech",
+                    "product_service": "Payment gateway",
+                },
+            },
+            {
+                "company": "Keka HR",
+                "title": "BDR",
+                "start_date": "2025-08-01",
+                "end_date": "2026-04-01",
+                "company_details": {"business_model": "B2B"},
+            },
+        ],
+    }
+    criteria = {
+        "required_industries": {
+            "operator": "OR",
+            "values": ["fintech"],
+            "employment_scope": "current_employer",
+        }
+    }
+
+    scored = query._strict_shortlist_score_candidate(profile, criteria)
+
+    assert scored["shortlist_status"] == "shortlisted"
+    assert scored["contributing_roles_details"]["roles"][0]["company"] == "Razorpay"
+
+
+def test_same_company_and_start_date_merge_preserves_normalized_current_title():
+    profile = {
+        "id": 614,
+        "raw_fields": {
+            "experiences/0/companyName": "Highradius",
+            "experiences/0/title": "HighRadius",
+            "experiences/0/title.1": "Student Volunteer",
+            "experiences/0/jobStartedOn": "2026-01-01 00:00:00",
+            "experiences/0/jobDescription": "HighRadius FinTech solutions and outbound pipeline.",
+        },
+        "roles": [
+            {
+                "company": "Highradius",
+                "title": "Inside Sales (ABM)",
+                "start_date": "2026-01-01T00:00:00+00:00",
+                "end_date": "2026-06-02T16:32:50+00:00",
+                "company_details": {"business_model": "Fintech SaaS"},
+            }
+        ],
+    }
+
+    roles = query._profile_roles_with_raw_experience(profile)
+    current = query._current_roles({"roles": roles})
+
+    assert len(roles) == 1
+    assert current[0]["title"] == "Inside Sales (ABM)"
+    assert "FinTech solutions" in current[0]["details"]
+
+
+def test_current_company_attributes_cannot_match_a_past_employer():
+    criteria = {
+        "required_company_details": {
+            "operator": "OR",
+            "employment_scope": "current_employer",
+            "values": ["SaaS"],
+        }
+    }
+    profile = {
+        "id": 611,
+        "roles": [
+            {
+                "title": "SDR",
+                "company": "OldSaaSCo",
+                "start_date": "2019-01-01",
+                "end_date": "2021-01-01",
+                "company_details": {"business_model": "B2B SaaS"},
+            },
+            {
+                "title": "Consultant",
+                "company": "CurrentServicesCo",
+                "start_date": "2024-01-01",
+                "end_date": "",
+                "company_details": {"business_model": "IT services"},
+            },
+        ],
+    }
+
+    assert query._strict_shortlist_score_candidate(profile, criteria) is None
+
+
+def test_company_industry_cannot_match_customer_or_role_description_text():
+    criteria = {
+        "required_industries": {
+            "operator": "OR",
+            "employment_scope": "current_employer",
+            "values": ["fintech", "financial services"],
+        }
+    }
+    profile = {
+        "id": 615,
+        "roles": [{
+            "title": "Account Executive",
+            "company": "Engagement SaaS Co",
+            "start_date": "2025-01-01",
+            "end_date": "",
+            "details": "Help fintech companies improve customer engagement.",
+            "company_details": {
+                "industry": "Customer engagement software",
+                "product_service": "Marketing automation platform",
+                "business_model": "SaaS",
+                "customer_segment": ["Financial Services", "Retail"],
+            },
+        }],
+    }
+
+    assert query._strict_shortlist_score_candidate(profile, criteria) is None
+
+
+def test_company_product_descriptors_match_schema_grounded_exact_aliases():
+    criteria = {
+        "required_industries": {
+            "operator": "OR",
+            "employment_scope": "current_employer",
+            "values": ["Cross-border payment solutions"],
+        }
+    }
+    profile = {
+        "id": 616,
+        "roles": [{
+            "title": "Account Executive",
+            "company": "Airwallex",
+            "start_date": "2025-01-01",
+            "end_date": "",
+            "company_details": {
+                "industry": "Cross-border payment solutions",
+                "product_service": "Cross-border payment solutions",
+                "business_model": "B2B",
+            },
+        }],
+    }
+
+    assert query._strict_shortlist_score_candidate(profile, criteria)["shortlist_status"] == "shortlisted"
+
+
+def test_current_company_attribute_tenure_only_counts_current_role():
+    criteria = {
+        "required_company_details": {
+            "operator": "OR",
+            "employment_scope": "current_employer",
+            "values": ["SaaS"],
+            "min_years": 2,
+        }
+    }
+    profile = {
+        "id": 612,
+        "roles": [
+            {
+                "title": "SDR",
+                "company": "OldSaaSCo",
+                "start_date": "2018-01-01",
+                "end_date": "2023-01-01",
+                "duration_years": 5,
+                "company_details": {"business_model": "B2B SaaS"},
+            },
+            {
+                "title": "AE",
+                "company": "CurrentSaaSCo",
+                "start_date": "2025-01-01",
+                "end_date": "",
+                "duration_years": 1,
+                "company_details": {"business_model": "B2B SaaS"},
+            },
+        ],
+    }
+
+    assert query._strict_shortlist_score_candidate(profile, criteria) is None
+
+
+def test_current_company_language_and_global_scope_apply_to_company_attributes():
+    assert query._query_company_scope("Candidates whose current company is Google") == "current_employer"
+    assert query._query_company_scope("Candidates at their present employer in SaaS") == "current_employer"
+
+    plan = {
+        "filter_plan": {
+            "hard_filters": {
+                "required_company_details": {"operator": "OR", "values": ["SaaS"]},
+                "required_segments": {"operator": "OR", "values": ["Enterprise"]},
+            },
+            "company_scope": {"employment_scope": "current_employer"},
+        }
+    }
+    criteria = query._coerce_filter_plan_to_criteria(plan, "currently working at an enterprise SaaS company")
+
+    assert criteria["required_company_details"]["employment_scope"] == "current_employer"
+    assert criteria["required_segments"]["employment_scope"] == "current_employer"
+
+
+def test_filter_plan_sanitizes_echoed_schema_contract_metadata():
+    plan = {
+        "filter_plan": {
+            "hard_filters": {
+                "required_industries": {
+                    "shape": {"operator": "AND", "values": ["fintech"]},
+                    "evidence": "strict evidence match; missing evidence does not pass",
+                    "supports_min_years": False,
+                    "supports_employment_scope": True,
+                }
+            },
+            "company_scope": {"employment_scope": "current_employer"},
+        }
+    }
+
+    criteria = query._coerce_filter_plan_to_criteria(
+        plan,
+        "candidates who are currently working in fintech companies",
+    )
+
+    assert criteria["required_industries"] == {
+        "operator": "OR",
+        "values": ["fintech"],
+        "employment_scope": "current_employer",
+    }
+
+
+def test_industry_expansion_receives_observed_company_product_vocabulary(monkeypatch):
+    monkeypatch.setattr(query, "PROFILES_BY_ID", {
+        1: {
+            "roles": [{
+                "company": "Airwallex",
+                "company_details": {
+                    "industry": "Cross-border payment solutions",
+                    "product_service": "Cross-border payment solutions",
+                    "business_model": "B2B",
+                },
+            }]
+        }
+    })
+
+    terms = query._observed_company_terms_for_expansion("Industry")
+
+    assert "Cross-border payment solutions" in terms
+
+
+def test_fintech_base_domain_taxonomy_covers_characteristic_products():
+    terms = query.INDUSTRY_DOMAIN_TAXONOMY["fintech"]
+
+    assert "payment gateway" in terms
+    assert "cross-border payment" in terms
+    assert "digital banking" in terms
+    assert "regtech" in terms
+
+
+def test_prompt_catalog_keeps_complete_discovered_schema():
+    catalog = {
+        "version": "test",
+        "source": "database",
+        "tables": {
+            f"table_{table_idx}": {
+                "candidate_related": True,
+                "columns": [
+                    {"name": f"column_{column_idx}", "type": "text", "category": "candidate_fact"}
+                    for column_idx in range(45)
+                ],
+            }
+            for table_idx in range(26)
+        },
+        "raw_field_keys": [
+            {"path": f"custom.field_{idx}", "category": "candidate_fact"}
+            for idx in range(125)
+        ],
+    }
+
+    compact = query.compact_evidence_catalog_for_prompt(catalog)
+
+    assert len(compact["tables"]) == 26
+    assert len(compact["tables"][0]["columns"]) == 45
+    assert len(compact["raw_field_keys"]) == 125
+
+
 def test_series_c_and_above_uses_ordered_funding_stage():
     criteria = {"funding_stage_min": {"stage": "Series C", "employment_scope": "current_employer"}}
     series_d = {

@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2 } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2, PowerOff } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
+import RoleCreateModal from '../components/RoleCreateModal'
 
 function Roles() {
     const {
@@ -21,11 +22,11 @@ function Roles() {
         // Global Outreach Cache
         outreachStatusCache,
         fetchOutreachStatus,
-        triggerHeyReachOutreach,
         removeCandidateFromRole,
         invalidateTalentPoolCaches,
         fetchTalentPoolSummary,
-        fetchAnalytics
+        fetchAnalytics,
+        deactivateRole
     } = useAppStore(useShallow((state) => ({
         roles: state.roles,
         fetchRoles: state.fetchRoles,
@@ -37,14 +38,15 @@ function Roles() {
         openRole: state.openRole,
         outreachStatusCache: state.outreachStatusCache,
         fetchOutreachStatus: state.fetchOutreachStatus,
-        triggerHeyReachOutreach: state.triggerHeyReachOutreach,
         removeCandidateFromRole: state.removeCandidateFromRole,
         invalidateTalentPoolCaches: state.invalidateTalentPoolCaches,
         fetchTalentPoolSummary: state.fetchTalentPoolSummary,
         fetchAnalytics: state.fetchAnalytics,
+        deactivateRole: state.deactivateRole
     })))
 
-    const [newRoleName, setNewRoleName] = useState('')
+    const [createModalOpen, setCreateModalOpen] = useState(false)
+    const [activationRole, setActivationRole] = useState(null)
     const [expandedSummary, setExpandedSummary] = useState(null)
     const [uploadRole, setUploadRole] = useState(null)
     const [uploadFile, setUploadFile] = useState(null)
@@ -63,22 +65,14 @@ function Roles() {
     // Derived state for instant access
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
 
-    const [isSendingOutreach, setIsSendingOutreach] = useState(false)
     const [emailSetup, setEmailSetup] = useState(null)
     const [emailSetupLoading, setEmailSetupLoading] = useState(false)
     const [emailSetupModalOpen, setEmailSetupModalOpen] = useState(false)
-    const [isSendingLI, setIsSendingLI] = useState(false)
     const [isSyncing, setIsSyncing] = useState(false)
+    const [isDeactivating, setIsDeactivating] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
     const [refreshingProfileIds, setRefreshingProfileIds] = useState({})
     const [isLoadingRole, setIsLoadingRole] = useState(false)
-    const { heyreachCampaignId, setHeyreachCampaignId, lookupHeyReachCampaign } = useAppStore(useShallow((state) => ({
-        heyreachCampaignId: state.heyreachCampaignId,
-        setHeyreachCampaignId: state.setHeyreachCampaignId,
-        lookupHeyReachCampaign: state.lookupHeyReachCampaign,
-    })))
-
-
     // Initial Load
     useEffect(() => {
         fetchRoles()
@@ -148,7 +142,9 @@ function Roles() {
     useEffect(() => {
         const candidates = viewingRole?.candidates
         if (!viewingRole?.name || !Array.isArray(candidates) || candidates.length === 0) return undefined
-        if (!candidates.some(candidate => !candidate.email || !candidate.mobile_phone)) return undefined
+        if (!candidates.some(candidate => !candidate.email || !candidate.mobile_phone
+            || ['scheduled', 'waiting_for_email', 'email_enrolling'].includes(candidate.email_outreach_status)
+            || ['scheduled', 'enrolling'].includes(candidate.linkedin_outreach_status))) return undefined
 
         let cancelled = false
         let timer = null
@@ -171,12 +167,23 @@ function Roles() {
                 useAppStore.setState(state => {
                     if (state.viewingRole?.name !== viewingRole.name) return state
 
+                    const roleOutreach = { ...(state.outreachStatusCache[viewingRole.id] || {}) }
+                    for (const contact of (res.data?.contacts || [])) {
+                        roleOutreach[contact.id] = {
+                            ...(roleOutreach[contact.id] || {}),
+                            status: contact.email_status,
+                            li_status: contact.linkedin_status,
+                        }
+                    }
+
                     const updatedCandidates = (state.viewingRole.candidates || []).map(candidate => {
                         const contact = contactById.get(Number(candidate.id))
                         const updated = contact ? {
                             ...candidate,
                             email: contact.email || candidate.email || '',
                             mobile_phone: contact.mobile_phone || candidate.mobile_phone || '',
+                            email_outreach_status: contact.email_status || candidate.email_outreach_status,
+                            linkedin_outreach_status: contact.linkedin_status || candidate.linkedin_outreach_status,
                         } : candidate
                         if (!updated.email || !updated.mobile_phone) hasMissingContacts = true
                         return updated
@@ -189,14 +196,21 @@ function Roles() {
                             ...state.roleDetailsCache,
                             [viewingRole.name]: updatedRole,
                         },
+                        outreachStatusCache: {
+                            ...state.outreachStatusCache,
+                            [viewingRole.id]: roleOutreach,
+                        },
                     }
                 })
 
-                if (hasMissingContacts && attempts < 30 && !cancelled) {
+                const stillPending = (res.data?.contacts || []).some(contact =>
+                    ['scheduled', 'waiting_for_email', 'email_enrolling'].includes(contact.email_status)
+                    || ['scheduled', 'enrolling'].includes(contact.linkedin_status))
+                if ((hasMissingContacts || stillPending) && attempts < 150 && !cancelled) {
                     timer = setTimeout(pollContacts, 2000)
                 }
             } catch {
-                if (attempts < 30 && !cancelled) timer = setTimeout(pollContacts, 2000)
+                if (attempts < 150 && !cancelled) timer = setTimeout(pollContacts, 2000)
             }
         }
 
@@ -218,6 +232,8 @@ function Roles() {
                         ...candidate,
                         email: contact.email || candidate.email || '',
                         mobile_phone: contact.mobile_phone || contact.phone || candidate.mobile_phone || '',
+                        email_outreach_status: contact.email_outreach_status || candidate.email_outreach_status,
+                        linkedin_outreach_status: contact.linkedin_outreach_status || candidate.linkedin_outreach_status,
                     }
                     : candidate
             ))
@@ -287,111 +303,17 @@ function Roles() {
         }
     }
 
-    const handleLookupHrCampaign = async () => {
-        if (!viewingRole?.name) return
-        const res = await lookupHeyReachCampaign(viewingRole.name)
+    const handleDeactivate = async () => {
+        if (!viewingRole) return
+        setIsDeactivating(true)
+        const res = await deactivateRole(viewingRole.id)
         if (res.success) {
-            toast.success(`Found campaign ID: ${res.campaign_id}`)
+            toast.success("Role deactivated successfully.")
         } else {
-            toast.error(res.error || 'No matching campaign found in HeyReach')
+            toast.error(res.error || "Failed to deactivate role")
         }
+        setIsDeactivating(false)
     }
-
-    const handleSendOutreach = async () => {
-        if (!viewingRole?.candidates || viewingRole.candidates.length === 0) {
-            toast.error('No candidates assigned to this role')
-            return
-        }
-
-        if (!emailSetup?.campaign_configured) {
-            setEmailSetupModalOpen(true)
-            return
-        }
-
-        setIsSendingOutreach(true)
-        try {
-            const roleId = parseInt(viewingRole.id)
-            if (isNaN(roleId)) {
-                toast.error('Invalid Role ID')
-                return
-            }
-
-            const response = await axios.post(`${API_BASE}/outreach/roles/${roleId}/email/send-shortlisted`)
-            const data = response.data || {}
-            if (data.enrolled_count > 0) {
-                toast.success(`Enrolled ${data.enrolled_count} shortlisted candidate${data.enrolled_count === 1 ? '' : 's'} in Smartlead`)
-            } else if (data.already_enrolled_count > 0) {
-                toast.info(`${data.already_enrolled_count} shortlisted candidate${data.already_enrolled_count === 1 ? ' is' : 's are'} already enrolled`)
-            } else {
-                toast.info('No shortlisted candidates with email addresses are ready to send')
-            }
-            if (data.skipped_missing_email_count > 0) {
-                toast.warning(`${data.skipped_missing_email_count} shortlisted candidate${data.skipped_missing_email_count === 1 ? '' : 's'} skipped because email is missing or invalid`)
-            }
-            setEmailSetup(current => current ? { ...current, started: true } : current)
-            setTimeout(() => fetchOutreachStatus(roleId), 800)
-        } catch (error) {
-            if (error.response?.status === 409) setEmailSetupModalOpen(true)
-            toast.error(error.response?.data?.detail || 'Failed to send shortlisted email outreach')
-            console.error(error)
-        } finally {
-            setIsSendingOutreach(false)
-        }
-    }
-
-    const handleSendLinkedIn = async () => {
-        if (!viewingRole?.candidates || viewingRole.candidates.length === 0) {
-            toast.error('No candidates to send LinkedIn outreach to')
-            return
-        }
-
-        const campaignId = parseInt(heyreachCampaignId, 10)
-        if (isNaN(campaignId) || campaignId <= 0) {
-            toast.error('Enter a valid HeyReach campaign ID')
-            return
-        }
-
-        setIsSendingLI(true)
-        try {
-            const validCandidates = viewingRole.candidates.filter(c => (
-                c &&
-                c.id &&
-                c.linkedin &&
-                String(c.status || '').trim().toLowerCase() === 'shortlisted'
-            ))
-            if (validCandidates.length === 0) {
-                toast.error('No shortlisted candidates with LinkedIn profiles found')
-                setIsSendingLI(false)
-                return
-            }
-
-            const candidateIds = validCandidates.map(c => parseInt(c.id))
-            const roleId = parseInt(viewingRole.id)
-
-            const res = await triggerHeyReachOutreach({
-                candidate_ids: candidateIds,
-                role_id: roleId,
-                role_name: viewingRole.name,
-                campaign_id: campaignId,
-                sender_account_id: 113572 // From user snippet
-            })
-
-
-
-            if (res.success) {
-                toast.success(`LinkedIn Outreach triggered for ${res.data.success_count} candidates`)
-                setTimeout(() => fetchOutreachStatus(roleId), 1000)
-            } else {
-                toast.error(res.error || 'Failed to trigger LinkedIn outreach')
-            }
-        } catch (error) {
-            toast.error('Failed to send LinkedIn outreach')
-            console.error(error)
-        } finally {
-            setIsSendingLI(false)
-        }
-    }
-
 
     const handleSyncResponses = async () => {
         if (!viewingRole?.id) return
@@ -429,31 +351,92 @@ function Roles() {
         toast.success('Copied to clipboard')
     }
 
-    const handleCreateRole = () => {
-        if (!newRoleName.trim()) return
-        const name = newRoleName.trim()
-        setNewRoleName('')
+    const handleCreateRole = async (setup) => {
+        const res = await createRole(setup)
+        if (!res.success) return res
+        const createdRole = { ...res.data, candidate_count: 0, upload_count: 0 }
+        if (res.data?.activation_status === 'active') toast.success(`Role "${setup.name}" created and activated`)
+        else toast.warning(`Role "${setup.name}" was saved but needs activation: ${res.data?.activation_error || 'setup failed'}`)
+        return { ...res, createdRole }
+    }
 
-        // Optimistic UI handled by store
-        createRole(name).then(res => {
-            if (!res.success) {
-                setNewRoleName(name)
-                toast.error(res.error || 'Failed to create role')
-                return
-            }
-            const createdRole = {
-                id: res.data?.id,
-                name: res.data?.name || name,
-                candidate_count: 0,
-                upload_count: 0,
-            }
-            toast.success(`Role "${name}" created`, {
-                action: {
-                    label: 'Upload CSV',
-                    onClick: () => openRoleUploadPicker(createdRole),
-                },
+    const handleRetryActivation = async (role) => {
+        setActivationRole(role)
+    }
+
+    const handleActivateExisting = async (setup) => {
+        try {
+            const role = activationRole
+            const res = await axios.put(`${API_BASE}/roles/id/${role.id}/activation`, {
+                heyreach_campaign_id: setup.heyreach_campaign_id,
+                smartlead_sender_account_id: setup.smartlead_sender_account_id,
+                email_subject: setup.email_subject,
+                email_body: setup.email_body,
             })
-        })
+            await fetchRoles({ force: true })
+            if (viewingRole?.id === role.id) await fetchRoleDetails(role.name, { force: true })
+            if (res.data?.activation_status === 'active') {
+                toast.success(`${role.name} is active`)
+                return { success: true, data: res.data }
+            }
+            const message = res.data?.activation_error || 'Activation is still incomplete'
+            return { success: false, error: message }
+        } catch (error) {
+            // Provisioning touches two external systems and may outlive the browser
+            // connection. Verify durable state before reporting a false failure.
+            try {
+                const verification = await axios.get(`${API_BASE}/roles/id/${activationRole.id}/activation`)
+                if (verification.data?.activation_status === 'active') {
+                    await fetchRoles({ force: true })
+                    if (viewingRole?.id === activationRole.id) {
+                        await fetchRoleDetails(activationRole.name, { force: true })
+                    }
+                    toast.success(`${activationRole.name} is active`)
+                    return { success: true, data: verification.data }
+                }
+                return {
+                    success: false,
+                    error: verification.data?.activation_error
+                        || error.response?.data?.detail
+                        || error.message
+                        || 'Activation failed',
+                }
+            } catch (verificationError) {
+                return {
+                    success: false,
+                    error: error.response?.data?.detail
+                        || verificationError.response?.data?.detail
+                        || error.message
+                        || 'Activation failed',
+                }
+            }
+        }
+    }
+
+    const handleRoleStatusUpdate = async (candidateId, newStatus) => {
+        if (newStatus !== 'Shortlisted') {
+            return axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus })
+        }
+        try {
+            const res = await axios.post(
+                `${API_BASE}/outreach/roles/${viewingRole.id}/candidates/${candidateId}/shortlist`,
+                {},
+                { timeout: 60000 },
+            )
+            mergeCandidateContact(candidateId, {
+                email: res.data?.email,
+                phone: res.data?.phone,
+                email_outreach_status: res.data?.email_outreach,
+                linkedin_outreach_status: res.data?.linkedin_outreach,
+            })
+            toast.success(res.data?.contact_enriching ? 'Shortlisted · retrieving contact details' : 'Shortlisted · outreach queued')
+            setTimeout(() => fetchOutreachStatus(viewingRole.id), 1200)
+            return res
+        } catch (error) {
+            const apiError = error.response?.data
+            toast.error(apiError?.detail || (typeof apiError === 'string' ? apiError : '') || error.message || 'Could not start shortlist outreach')
+            throw error
+        }
     }
 
     const handleDeleteRole = (roleName) => {
@@ -773,6 +756,7 @@ function Roles() {
     if (viewingRole) {
         return (
             <div className="roles-page" style={{ width: '100%', position: 'relative', minHeight: '100vh', animation: 'fadeIn 0.2s ease-out' }}>
+                {activationRole && <RoleCreateModal role={activationRole} onClose={() => setActivationRole(null)} onSubmit={handleActivateExisting} />}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
                     <button className="btn btn-secondary" onClick={clearViewingRole}>
                         <ArrowLeft size={16} /> Back to Roles
@@ -820,7 +804,7 @@ function Roles() {
                     </div>
                 </div>
 
-                {/* Optimized Action Bar */}
+                {/* Automatic outreach status */}
                 <div style={{
                     display: 'flex',
                     flexWrap: 'wrap',
@@ -828,7 +812,6 @@ function Roles() {
                     gap: '12px',
                     marginBottom: '20px'
                 }}>
-                    {/* EMAIL OUTREACH SECTION */}
                     <div style={{
                         display: 'flex',
                         flexDirection: 'column',
@@ -842,7 +825,7 @@ function Roles() {
                         minWidth: 0,
                     }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                            <span style={{ fontSize: '11px', fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Email Outreach · Smartlead</span>
+                            <span style={{ fontSize: '11px', fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Automatic Outreach</span>
                             {emailSetup?.campaign_id && <span style={{ fontSize: 10, color: '#64748b', background: '#f1f5f9', borderRadius: 999, padding: '3px 7px' }}>Campaign {emailSetup.campaign_id}</span>}
                         </div>
 
@@ -854,21 +837,17 @@ function Roles() {
                             <div title={emailSetup.subject} style={{ marginTop: 5, fontSize: 12, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.subject}</div>
                             <div title={emailSetup.initial_body} style={{ marginTop: 3, fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.initial_body}</div>
                         </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>
-                            {emailSetup?.campaign_error || 'Choose a sender and write the first email before sending.'}
+                            {emailSetup?.campaign_error || 'This role is not fully activated.'}
                         </div>}
 
                         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                            <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading || isSendingOutreach} style={{ height: 34, padding: '0 12px' }}>
-                                <Settings2 size={13} /> {emailSetup?.campaign_configured ? 'Edit setup' : 'Configure'}
+                            <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading} style={{ height: 34, padding: '0 12px' }}>
+                                <Settings2 size={13} /> Edit email setup
                             </button>
-                            <button className="btn btn-primary btn-sm" onClick={handleSendOutreach} disabled={isSendingOutreach || emailSetupLoading || !viewingRole.candidates?.length} style={{ height: 34, padding: '0 14px' }}>
-                                {isSendingOutreach ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
-                                {isSendingOutreach ? 'Sending…' : 'Send Shortlisted'}
-                            </button>
+                            {viewingRole.activation_status !== 'active' && <button className="btn btn-primary btn-sm" onClick={() => handleRetryActivation(viewingRole)} style={{ height: 34 }}>Configure & activate</button>}
                         </div>
                     </div>
 
-                    {/* LINKEDIN OUTREACH SECTION */}
                     <div style={{
                         display: 'flex',
                         flexDirection: 'column',
@@ -881,68 +860,8 @@ function Roles() {
                         flex: '1 0 auto'
                     }}>
                         <span style={{ fontSize: '11px', fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.05em' }}>LinkedIn Outreach (HeyReach)</span>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                            <div style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '6px',
-                                background: '#ffffff',
-                                padding: '4px 10px',
-                                borderRadius: '6px',
-                                border: '1px solid #cbd5e1'
-                            }}>
-                                <span style={{ fontSize: '11px', fontWeight: 600, color: '#475569' }}>Campaign ID:</span>
-                                <input
-                                    type="text"
-                                    value={heyreachCampaignId}
-                                    onChange={(e) => setHeyreachCampaignId(e.target.value)}
-                                    placeholder="ID"
-                                    style={{
-                                        padding: '2px 6px',
-                                        border: 'none',
-                                        fontSize: '13px',
-                                        width: '60px',
-                                        outline: 'none',
-                                        fontWeight: 'bold',
-                                        color: '#0369a1'
-                                    }}
-                                />
-                                <button
-                                    className="btn-link"
-                                    onClick={handleLookupHrCampaign}
-                                    title="Auto-find campaign by role name"
-                                    style={{
-                                        padding: '4px',
-                                        color: '#0369a1',
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        cursor: 'pointer',
-                                        border: 'none',
-                                        background: 'none'
-                                    }}
-                                >
-                                    <RefreshCcw size={12} />
-                                </button>
-                            </div>
-
-                            <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={handleSendLinkedIn}
-                                disabled={isSendingLI || !viewingRole.candidates?.length}
-                                style={{
-                                    background: '#0a66c2',
-                                    color: 'white',
-                                    border: 'none',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '8px',
-                                    padding: '8px 24px',
-                                    height: '36px'
-                                }}
-                            >
-                                <Linkedin size={14} /> {isSendingLI ? 'Sending...' : 'Send Shortlisted'}
-                            </button>
-                        </div>
+                        <div style={{ fontSize: 12, color: '#334155' }}>Campaign ID: <strong>{viewingRole.heyreach_campaign_id || 'Not configured'}</strong></div>
+                        <div style={{ fontSize: 11, color: '#64748b' }}>Selecting Shortlisted automatically queues LinkedIn outreach.</div>
                     </div>
 
                     {/* UTILITIES SECTION */}
@@ -978,6 +897,18 @@ function Roles() {
                             >
                                 <RefreshCcw size={14} className={isRefreshing ? 'animate-spin' : ''} />
                             </button>
+                            {viewingRole.activation_status === 'active' && (
+                                <button
+                                    className="btn btn-secondary btn-sm"
+                                    onClick={handleDeactivate}
+                                    disabled={isDeactivating}
+                                    title="Deactivate role (pause campaigns)"
+                                    style={{ height: '36px', padding: '0 12px', color: '#ef4444' }}
+                                >
+                                    <PowerOff size={14} className={isDeactivating ? 'animate-spin' : ''} />
+                                    {isDeactivating ? 'Deactivating...' : 'Deactivate'}
+                                </button>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -1064,6 +995,7 @@ function Roles() {
                                                 <StatusDropdown
                                                     status={candidate.status}
                                                     candidateId={candidate.id}
+                                                    updateStatus={handleRoleStatusUpdate}
                                                     onUpdate={(id, newStatus) => {
                                                         useAppStore.setState(state => ({
                                                             viewingRole: {
@@ -1403,21 +1335,15 @@ function Roles() {
                 <div className="result-banner-subtitle">Organize and manage your top talent by role</div>
             </div>
 
-            {/* Quick Add UI */}
+            {createModalOpen && <RoleCreateModal onClose={() => setCreateModalOpen(false)} onSubmit={handleCreateRole} />}
+            {activationRole && <RoleCreateModal role={activationRole} onClose={() => setActivationRole(null)} onSubmit={handleActivateExisting} />}
+
+            {/* Create Role */}
             <div className="quick-add-container">
-                <input
-                    type="text"
-                    className="input-field role-name-input"
-                    placeholder="New Role Name (e.g. Senior Sales Director)"
-                    value={newRoleName}
-                    onChange={(e) => setNewRoleName(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleCreateRole()}
-                    style={{ flex: 1 }}
-                />
+                <div style={{ flex: 1, color: '#64748b', fontSize: 13 }}>Create the role and configure both outreach channels in one step.</div>
                 <button
                     className="btn btn-primary"
-                    onClick={handleCreateRole}
-                    disabled={!newRoleName.trim()}
+                    onClick={() => setCreateModalOpen(true)}
                 >
                     <Plus size={18} /> Add Role
                 </button>
@@ -1443,8 +1369,12 @@ function Roles() {
                                     <div className="role-card-meta">
                                         <User size={12} /> {role.candidate_count} assigned candidates
                                     </div>
+                                    <div style={{ marginTop: 6, fontSize: 11, fontWeight: 700, color: role.activation_status === 'active' ? '#15803d' : '#b45309' }}>
+                                        {role.activation_status === 'active' ? '● Active' : '● Inactive'}
+                                    </div>
                                 </div>
                             </div>
+                            {role.activation_status !== 'active' && <button className="btn btn-secondary btn-sm" onClick={(event) => { event.stopPropagation(); handleRetryActivation(role) }} title={role.activation_error || 'Configure activation'} style={{ margin: '0 8px 8px' }}>Configure & activate</button>}
                             <button className="role-delete-btn" onClick={() => handleDeleteRole(role.name)} title="Remove Role">
                                 <Trash2 size={16} />
                             </button>

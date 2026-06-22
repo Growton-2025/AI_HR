@@ -38,6 +38,20 @@ def _apply_pool_migrations_blocking() -> None:
         return_db_connection(conn)
 
 
+def _apply_outreach_migrations_blocking() -> None:
+    """Ensure durable outreach columns exist before role dispatchers start."""
+    from backend.db.connection import get_db_connection, return_db_connection
+    from backend.db.outreach_migrate import ensure_outreach_migrations
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise RuntimeError("Could not connect to DB for outreach migrations")
+    try:
+        ensure_outreach_migrations(conn)
+    finally:
+        return_db_connection(conn)
+
+
 async def warm_calls_backend():
     # Prime the DB-backed calls routes once so the first real page load
     # does not spend 10s+ initializing the pool and schema.
@@ -104,10 +118,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"AI COLUMN DAILY REFRESH SCHEDULER FAILED TO START: {e}")
 
+    try:
+        await asyncio.to_thread(_apply_outreach_migrations_blocking)
+        from backend.services import heyreach_role_campaigns, smartlead_role_dispatcher
+        heyreach_role_campaigns.start_dispatcher()
+        smartlead_role_dispatcher.start_dispatcher()
+    except Exception as e:
+        print(f"ROLE OUTREACH DISPATCHERS FAILED TO START: {e}")
+
     yield
 
     try:
         ai_columns.stop_daily_ai_column_refresh_scheduler()
+    except Exception:
+        pass
+
+    try:
+        from backend.services import heyreach_role_campaigns, smartlead_role_dispatcher
+        heyreach_role_campaigns.stop_dispatcher()
+        smartlead_role_dispatcher.stop_dispatcher()
     except Exception:
         pass
 

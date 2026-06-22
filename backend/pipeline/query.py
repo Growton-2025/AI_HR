@@ -248,6 +248,15 @@ STATIC_CULTURE_TAXONOMY = {
     "remote": ["remote-first", "fully remote", "distributed team"]
 }
 
+STATIC_INDUSTRY_DOMAIN_TAXONOMY = {
+    "fintech": [
+        "fintech", "financial technology", "payment gateway", "payment processing",
+        "payment solutions", "cross-border payment", "digital banking", "digital wallet",
+        "lending platform", "alternative lending", "peer-to-peer lending", "regtech",
+        "insurtech", "wealthtech", "robo-advisory", "financial wellness platform",
+    ],
+}
+
 STATIC_GEOGRAPHY_MAP = {
     "singapore": "apac", "malaysia": "apac", "indonesia": "apac", "thailand": "apac", "vietnam": "apac",
     "philippines": "apac", "australia": "apac", "new zealand": "apac", "japan": "apac", "south korea": "apac",
@@ -266,6 +275,7 @@ SALES_TAXONOMY = STATIC_SALES_TAXONOMY
 SEGMENT_SYNONYMS = STATIC_SEGMENT_SYNONYMS
 COMPANY_DETAILS_TAXONOMY = STATIC_COMPANY_DETAILS_TAXONOMY
 CULTURE_TAXONOMY = STATIC_CULTURE_TAXONOMY
+INDUSTRY_DOMAIN_TAXONOMY = STATIC_INDUSTRY_DOMAIN_TAXONOMY
 GEOGRAPHY_COUNTRY_TO_REGION_MAP = STATIC_GEOGRAPHY_MAP
 
 # --- Database Loading ---
@@ -627,6 +637,8 @@ def get_values_from_criteria(crit_val):
                     "operator", "scope", "employment_scope", "min_years", "min_function_years",
                     "years", "minimum_years", "field", "dimension", "type", "context",
                     "aliases", "expanded_terms", "accepted_terms", "countries", "regions",
+                    "shape", "value_shape", "evidence", "meaning", "comparison",
+                    "supports_min_years", "supports_employment_scope",
                 }
                 for key, value in crit_val.items():
                     if key in ignored_keys or value in (None, "", [], {}):
@@ -1166,8 +1178,11 @@ def _raw_experience_roles(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
         company = _shortlist_clean_text(raw_fields.get(f"experiences/{idx}/companyName"))
         title_primary = _shortlist_clean_text(raw_fields.get(f"experiences/{idx}/title"))
         title_alt = _shortlist_clean_text(raw_fields.get(f"experiences/{idx}/title.1"))
-        title = title_alt or title_primary
-        if company and _normalize_company_key(title) == _normalize_company_key(company) and title_alt:
+        # Prefer the canonical title. Some spreadsheets contain a duplicated
+        # title.1 header whose value is actually the next company name. Use the
+        # alternate only as a fallback or to repair a company-as-title value.
+        title = title_primary or title_alt
+        if company and _normalize_company_key(title_primary) == _normalize_company_key(company) and title_alt:
             title = title_alt
         details = _shortlist_clean_text(raw_fields.get(f"experiences/{idx}/jobDescription"))
         start_raw = raw_fields.get(f"experiences/{idx}/jobStartedOn")
@@ -1215,15 +1230,27 @@ def _profile_roles_with_raw_experience(profile: Dict[str, Any]) -> List[Dict[str
             role_title = _normalize_search_text(role.get("title"))
             if raw_company and role_company and raw_company != role_company:
                 continue
+            raw_start = _shortlist_parse_date(raw_role.get("start_date") or raw_role.get("start"))
+            role_start = _shortlist_parse_date(role.get("start_date") or role.get("start"))
+            same_company_start = bool(
+                raw_company
+                and role_company
+                and raw_company == role_company
+                and raw_start
+                and role_start
+                and raw_start.date() == role_start.date()
+            )
             title_matches = bool(raw_title and role_title and (raw_title == role_title or raw_title in role_title or role_title in raw_title))
             company_only = bool(raw_company and role_company and raw_company == role_company and not raw_title and not role_title)
             company_as_title = bool(raw_company and role_company and raw_company == role_company and raw_title == raw_company)
-            if title_matches or company_only or company_as_title:
+            if same_company_start or title_matches or company_only or company_as_title:
                 matched_existing = role
                 break
         if matched_existing:
-            matched_existing.setdefault("start_date", raw_role.get("start_date"))
-            matched_existing.setdefault("end_date", raw_role.get("end_date"))
+            if not matched_existing.get("start_date") and raw_role.get("start_date"):
+                matched_existing["start_date"] = raw_role.get("start_date")
+            if not matched_existing.get("end_date") and raw_role.get("end_date"):
+                matched_existing["end_date"] = raw_role.get("end_date")
             if not matched_existing.get("duration_years"):
                 matched_existing["duration_years"] = raw_role.get("duration_years") or 0.0
             if not matched_existing.get("details") and raw_role.get("details"):
@@ -1464,7 +1491,14 @@ def evaluate_scoped_duration(
     matched_values: List[str] = []
     evidence: List[Dict[str, Any]] = []
 
-    for role in _profile_roles_with_raw_experience(profile):
+    duration_roles = _profile_roles_with_raw_experience(profile)
+    if dimension in {"industry", "segment", "company_detail"} and _company_scope_current_only(
+        criterion if isinstance(criterion, dict) else {},
+        "any_employer",
+    ):
+        duration_roles = _current_roles({"roles": duration_roles})
+
+    for role in duration_roles:
         role_text = _scoped_duration_role_text(profile, role, dimension)
         if dimension == "geography" and not _has_market_action_text(role_text):
             continue
@@ -2045,7 +2079,6 @@ def build_db_evidence_catalog(*, force_refresh: bool = False, profiles: Optional
                     SELECT raw_fields
                     FROM candidates
                     WHERE raw_fields IS NOT NULL
-                    LIMIT 300
                     """
                 )
                 for (raw_fields,) in cur.fetchall():
@@ -2066,7 +2099,7 @@ def build_db_evidence_catalog(*, force_refresh: bool = False, profiles: Optional
             return_db_connection(conn)
 
     if not tables:
-        fallback_profiles = profiles or list(PROFILES_BY_ID.values())[:300]
+        fallback_profiles = profiles or list(PROFILES_BY_ID.values())
         core_fields = [
             "id", "name", "linkedin", "location", "city", "headline", "about",
             "total_experience_years", "max_people_managed", "avg_years_in_company",
@@ -2112,10 +2145,27 @@ def build_db_evidence_catalog(*, force_refresh: bool = False, profiles: Optional
     return catalog
 
 
-def compact_evidence_catalog_for_prompt(catalog: Dict[str, Any], *, max_tables: int = 24, max_raw_keys: int = 120) -> Dict[str, Any]:
+def compact_evidence_catalog_for_prompt(
+    catalog: Dict[str, Any],
+    *,
+    max_tables: Optional[int] = None,
+    max_raw_keys: Optional[int] = None,
+    max_columns_per_table: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return the executable schema supplied to the shortlist planner.
+
+    The catalog is cached, so retaining the complete schema here does not add a
+    database round-trip per query. Limits remain available for callers that need
+    a deliberately reduced diagnostic view.
+    """
     tables = []
-    for table, info in sorted((catalog.get("tables") or {}).items())[:max_tables]:
+    table_items = sorted((catalog.get("tables") or {}).items())
+    if max_tables is not None:
+        table_items = table_items[:max_tables]
+    for table, info in table_items:
         columns = info.get("columns") or []
+        if max_columns_per_table is not None:
+            columns = columns[:max_columns_per_table]
         tables.append(
             {
                 "table": table,
@@ -2125,15 +2175,18 @@ def compact_evidence_catalog_for_prompt(catalog: Dict[str, Any], *, max_tables: 
                         "name": column.get("name"),
                         "category": column.get("category"),
                     }
-                    for column in columns[:40]
+                    for column in columns
                 ],
             }
         )
+    raw_field_keys = catalog.get("raw_field_keys", [])
+    if max_raw_keys is not None:
+        raw_field_keys = raw_field_keys[:max_raw_keys]
     return {
         "version": catalog.get("version"),
         "source": catalog.get("source"),
         "tables": tables,
-        "raw_field_keys": catalog.get("raw_field_keys", [])[:max_raw_keys],
+        "raw_field_keys": raw_field_keys,
         "candidate_fact_policy": catalog.get("candidate_fact_policy"),
         "company_fact_policy": catalog.get("company_fact_policy"),
     }
@@ -2361,15 +2414,61 @@ def _company_scope_current_only(item: Dict[str, Any], default_scope: str = "any_
     return scope in {"current", "current_employer", "currently_at", "working_at", "working_for"}
 
 
+def _roles_for_employment_scope(
+    profile: Dict[str, Any],
+    criterion: Any,
+    default_scope: str = "any_employer",
+) -> List[Dict[str, Any]]:
+    criterion_obj = criterion if isinstance(criterion, dict) else {}
+    if _company_scope_current_only(criterion_obj, default_scope):
+        return _current_roles(profile)
+    return profile.get("roles") or []
+
+
 def _current_roles(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     roles = profile.get("roles") or []
     if not roles:
         return []
+
     explicit_current = [
         role for role in roles
         if _normalize_search_text(role.get("end_date") or role.get("end")) in {"present", "current", "now", "ongoing"}
     ]
-    return explicit_current[:1] or roles[:1]
+    if explicit_current:
+        return explicit_current
+
+    # An empty end date plus a real start date is the standard representation
+    # for an active role in most imported profiles. Prefer the newest open role;
+    # older incomplete records must not masquerade as concurrent current jobs.
+    open_ended = [
+        role for role in roles
+        if not str(role.get("end_date") or role.get("end") or "").strip()
+        and _shortlist_parse_date(role.get("start_date") or role.get("start"))
+    ]
+    if open_ended:
+        latest_open_start = max(
+            _shortlist_parse_date(role.get("start_date") or role.get("start")) or datetime.min
+            for role in open_ended
+        )
+        return [
+            role for role in open_ended
+            if (_shortlist_parse_date(role.get("start_date") or role.get("start")) or datetime.min) == latest_open_start
+        ]
+
+    # Some importers materialize "Present" as the import date. In that shape,
+    # newest start date is a safer current-role signal than DB insertion order.
+    dated_roles = [
+        role for role in roles
+        if _shortlist_parse_date(role.get("start_date") or role.get("start"))
+    ]
+    if dated_roles:
+        latest = max(
+            dated_roles,
+            key=lambda role: _shortlist_parse_date(role.get("start_date") or role.get("start")) or datetime.min,
+        )
+        return [latest]
+
+    return roles[:1]
 
 
 def _company_match_terms(item: Dict[str, Any]) -> List[str]:
@@ -3832,10 +3931,18 @@ async def enrich_criteria_with_company_web_facts(
 
 def _candidate_company_names_for_web(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[str]:
     counts: Dict[str, int] = {}
-    current_only = bool(criteria.get("funding_stage_min") and not criteria.get("required_geographies"))
+    scoped_criteria = [
+        criteria.get(key)
+        for key in EMPLOYMENT_SCOPED_CRITERIA_KEYS
+        if criteria.get(key)
+    ]
+    current_only = bool(scoped_criteria) and all(
+        _company_scope_current_only(item if isinstance(item, dict) else {}, "any_employer")
+        for item in scoped_criteria
+    )
     for profile in profiles:
         roles = profile.get("roles") or []
-        role_iter = roles[:1] if current_only else roles[:5]
+        role_iter = _current_roles(profile) if current_only else roles[:5]
         for role in role_iter:
             company = str(role.get("company") or "").strip()
             key = _normalize_company_key(company)
@@ -4654,7 +4761,10 @@ def _set_criteria_values(criteria: Dict[str, Any], key: str, values: List[str]) 
         return
     existing = criteria.get(key)
     if isinstance(existing, dict):
-        criteria[key] = {**existing, "values": cleaned}
+        # Values inside one criterion are aliases/alternatives. Independent
+        # requirements live in separate criterion keys and are ANDed by the
+        # strict scorer; preserving AND here would require every synonym.
+        criteria[key] = {**existing, "operator": "OR", "values": cleaned}
     else:
         criteria[key] = {"operator": "OR", "values": cleaned}
 
@@ -4768,14 +4878,35 @@ def _strict_presence_result(
                 if term:
                     found = ("enriched profile geography", _evidence_snippet(general_text, term), None, general_text)
         elif criteria_key in {"required_industries", "required_segments", "required_company_details", "required_culture_type"}:
-            chunks = build_profile_evidence_chunks(profile)
-            for chunk in chunks:
-                term = next((term for term in terms if _term_matches_text(term, chunk["text_l"])), None)
+            # These are employer attributes. Respect employment_scope and avoid
+            # satisfying them from unrelated candidate-level or past-role text.
+            role_scope = _roles_for_employment_scope(profile, criterion, default_company_scope)
+            company_field_map = {
+                "required_industries": ("industry", "product_service", "business_model"),
+                "required_segments": ("customer_segment",),
+                "required_company_details": (
+                    "industry", "product_service", "business_model", "funding_stage",
+                    "company_status", "ownership", "revenue",
+                ),
+                "required_culture_type": ("culture_type",),
+            }
+            allowed_fields = company_field_map[criteria_key]
+            for role_idx, role in enumerate(role_scope, start=1):
+                details = role.get("company_details") if isinstance(role.get("company_details"), dict) else {}
+                company_payload = {field: details.get(field) for field in allowed_fields}
+                company_text = " ".join(_flatten_value_for_evidence(company_payload, max_items=80))
+                company_text_l = _normalize_search_text(company_text)
+                term = next((term for term in terms if _term_matches_text(term, company_text_l)), None)
                 if term:
-                    found = (chunk["source"], _evidence_snippet(chunk["text"], term), chunk.get("role"), chunk["text"])
+                    found = (
+                        f"role {role_idx} company details",
+                        _evidence_snippet(company_text, term),
+                        role,
+                        company_text,
+                    )
                     break
             if not found:
-                for role in profile.get("roles") or []:
+                for role in role_scope:
                     web_text, web_item = _web_company_profile_text(role.get("company") or "", criteria_context or {})
                     term = next((term for term in terms if _term_matches_text(term, web_text)), None)
                     if term:
@@ -4983,6 +5114,10 @@ def _strict_shortlist_score_candidate(
     debug_reasons: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     profile_copy = copy.deepcopy({k: v for k, v in (profile or {}).items() if k != "embedding"})
+    # Normalize DB roles with any richer imported experience data before every
+    # strict check. This makes dates and current-employer semantics available to
+    # all criteria instead of only to duration helpers.
+    profile_copy["roles"] = _profile_roles_with_raw_experience(profile_copy)
     matched_criteria: List[Dict[str, Any]] = []
     evidence_log: List[Dict[str, Any]] = []
     contributing_roles: List[Dict[str, Any]] = []
@@ -5235,25 +5370,63 @@ async def generate_reasoning_for_profile(
     return _fallback_audit_payload_from_evidence(profile_safe)
 
 
+def _observed_company_terms_for_expansion(category: str, *, limit: int = 300) -> List[str]:
+    category_l = _normalize_search_text(category)
+    field_map = {
+        "industry": ("industry", "product_service", "business_model"),
+        "company attributes": ("industry", "product_service", "business_model", "funding_stage"),
+        "customer segments": ("customer_segment",),
+        "company culture": ("culture_type",),
+    }
+    fields = field_map.get(category_l)
+    if not fields:
+        return []
+
+    counts: Counter = Counter()
+    for profile in PROFILES_BY_ID.values():
+        for role in profile.get("roles") or []:
+            details = role.get("company_details") if isinstance(role.get("company_details"), dict) else {}
+            for field in fields:
+                raw = details.get(field)
+                values = raw if isinstance(raw, list) else [raw]
+                for value in values:
+                    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+                    if clean and clean.lower() not in {"unknown", "none", "n/a"} and len(clean) <= 160:
+                        counts[clean] += 1
+    return [term for term, _count in counts.most_common(limit)]
+
+
 async def _expand_keywords_with_llm(values: List[str], category: str, tracker: TokenCostTracker) -> List[str]:
     values = [str(value).strip() for value in values if str(value or "").strip()]
     if not values:
         return []
+    observed_terms = _observed_company_terms_for_expansion(category)
     prompt = PromptTemplate(
-        input_variables=["keywords", "category"],
+        input_variables=["keywords", "category", "observed_terms"],
         template="""
-        You are an expert business analyst. Generate a JSON list of 5-7 semantically similar keywords, synonyms, aliases, or alternate labels for the initial keywords.
+        You are an expert business analyst translating recruiter language into evidence terms. Generate a JSON list of semantically equivalent aliases and, for industry/company categories, product or service subcategories that are genuinely entailed by the initial concept.
         Category: {category}
-        Do not include explanatory text.
+        Prefer exact phrases that actually occur in Observed Database Terms. A broad domain may be evidenced by its characteristic product categories, even when the broad label itself is absent. Include every observed term that is a direct subtype or characteristic product of the initial concept, copying its spelling exactly. Preserve category boundaries: do not broaden a technology category to all of its customers or parent industry (for example, fintech is not equivalent to every bank, insurer, or generic financial-services company). Exclude merely adjacent industries and generic words.
+        Return up to 60 precise terms. Preserve the initial keywords. Do not include explanatory text.
+
+        Observed Database Terms: {observed_terms}
 
         Initial Keywords: {keywords}
         JSON List:
         """
     )
-    prompt_text = prompt.format(keywords=json.dumps(values), category=category)
-    response = await llm.ainvoke(prompt_text)
-    tracker.add_usage(llm.model_name, prompt_text, response.content, "Keyword Expansion")
-    return get_list_from_llm_json(safe_json_loads(response.content, []))
+    prompt_text = prompt.format(
+        keywords=json.dumps(values),
+        category=category,
+        observed_terms=json.dumps(observed_terms, ensure_ascii=False),
+    )
+    try:
+        response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
+        tracker.add_usage(llm.model_name, prompt_text, response.content, "Keyword Expansion")
+        return get_list_from_llm_json(safe_json_loads(response.content, []))
+    except asyncio.TimeoutError:
+        logger.warning("Shortlist %s keyword expansion timed out; using original terms", category)
+        return []
 
 
 async def _expand_locations_with_llm(values: List[str], tracker: TokenCostTracker) -> List[str]:
@@ -5270,9 +5443,13 @@ async def _expand_locations_with_llm(values: List[str], tracker: TokenCostTracke
         """
     )
     prompt_text = prompt.format(locations=json.dumps(values))
-    response = await llm.ainvoke(prompt_text)
-    tracker.add_usage(llm.model_name, prompt_text, response.content, "Location Expansion")
-    return get_list_from_llm_json(safe_json_loads(response.content, []))
+    try:
+        response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
+        tracker.add_usage(llm.model_name, prompt_text, response.content, "Location Expansion")
+        return get_list_from_llm_json(safe_json_loads(response.content, []))
+    except asyncio.TimeoutError:
+        logger.warning("Shortlist location expansion timed out; using original locations")
+        return []
 
 
 async def _expand_geographies_with_llm(values: List[str], tracker: TokenCostTracker) -> List[str]:
@@ -5290,9 +5467,13 @@ async def _expand_geographies_with_llm(values: List[str], tracker: TokenCostTrac
         """
     )
     prompt_text = prompt.format(geographies=json.dumps(values))
-    response = await llm.ainvoke(prompt_text)
-    tracker.add_usage(llm.model_name, prompt_text, response.content, "Geography Expansion")
-    return get_list_from_llm_json(safe_json_loads(response.content, {}))
+    try:
+        response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
+        tracker.add_usage(llm.model_name, prompt_text, response.content, "Geography Expansion")
+        return get_list_from_llm_json(safe_json_loads(response.content, {}))
+    except asyncio.TimeoutError:
+        logger.warning("Shortlist geography expansion timed out; using original geographies")
+        return []
 
 
 def _sort_strict_shortlist_candidates(candidates: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -5377,20 +5558,67 @@ FILTER_PLAN_CRITERIA_KEYS = {
     "top_n",
 }
 
+EMPLOYMENT_SCOPED_CRITERIA_KEYS = {
+    "required_companies",
+    "required_industries",
+    "required_segments",
+    "required_company_details",
+    "required_culture_type",
+    "funding_stage_min",
+}
+
+
+def _executable_criteria_contract() -> Dict[str, Any]:
+    common_text_shape = {
+        "shape": {"operator": "AND|OR", "values": ["string or typed object"]},
+        "evidence": "strict evidence match; missing evidence does not pass",
+    }
+    return {
+        "required_companies": {
+            **common_text_shape,
+            "value_shape": {"company": "name", "aliases": ["alias"], "employment_scope": "current_employer|any_employer"},
+        },
+        "competitors_of": {
+            "shape": [{"target": "company", "employment_scope": "current_employer|any_employer"}],
+            "evidence": "competitors are dynamically resolved then validated against known DB companies",
+        },
+        "required_functions": {**common_text_shape, "supports_min_years": True},
+        "min_function_years": {
+            "shape": [{"function": "function", "aliases": ["alias"], "min_years": "number"}],
+        },
+        "required_industries": {**common_text_shape, "supports_min_years": True, "supports_employment_scope": True},
+        "required_segments": {**common_text_shape, "supports_min_years": True, "supports_employment_scope": True},
+        "required_company_details": {**common_text_shape, "supports_min_years": True, "supports_employment_scope": True},
+        "required_culture_type": {**common_text_shape, "supports_employment_scope": True},
+        "required_geographies": {**common_text_shape, "supports_min_years": True, "meaning": "market/territory experience"},
+        "required_locations": {**common_text_shape, "meaning": "candidate current/base location"},
+        "excluded_geographies": common_text_shape,
+        "funding_stage_min": {
+            "shape": {"stage": "funding stage", "employment_scope": "current_employer|any_employer"},
+            "comparison": "ordered minimum",
+        },
+        "min_total_experience": {"shape": "number"},
+        "min_people_managed": {"shape": "integer"},
+        "min_tenure_in_latest_role": {"shape": "number"},
+        "avg_tenure_in_last_n_roles": {"shape": {"min_years": "number", "last_n": "integer"}},
+        "required_keywords": common_text_shape,
+        "top_n": {"shape": "integer or null"},
+    }
+
 
 def _build_schema_manifest(catalog: Dict[str, Any], *, scoped_candidate_count: int = 0) -> Dict[str, Any]:
     compact = compact_evidence_catalog_for_prompt(catalog)
     company_detail_fields = sorted({
         field
-        for profile in list(PROFILES_BY_ID.values())[:250]
-        for role in (profile.get("roles") or [])[:5]
+        for profile in PROFILES_BY_ID.values()
+        for role in (profile.get("roles") or [])
         if isinstance(role.get("company_details"), dict)
         for field in role["company_details"].keys()
     })
     funding_stages = sorted({
         str((role.get("company_details") or {}).get("funding_stage")).strip()
-        for profile in list(PROFILES_BY_ID.values())[:500]
-        for role in (profile.get("roles") or [])[:5]
+        for profile in PROFILES_BY_ID.values()
+        for role in (profile.get("roles") or [])
         if str((role.get("company_details") or {}).get("funding_stage") or "").strip()
     }, key=str.lower)
     geography_fields = [
@@ -5415,6 +5643,8 @@ def _build_schema_manifest(catalog: Dict[str, Any], *, scoped_candidate_count: i
         "company_detail_fields": company_detail_fields[:80],
         "funding_stages_seen": funding_stages[:40],
         "geography_evidence_fields": geography_fields,
+        "executable_criteria_contract": _executable_criteria_contract(),
+        "employment_scoped_criteria": sorted(EMPLOYMENT_SCOPED_CRITERIA_KEYS),
         "known_company_names_sample": sorted({str(name) for name in ALL_COMPANY_NAMES if str(name or "").strip()}, key=str.lower)[:250],
         "db_catalog": compact,
         "policies": {
@@ -5431,6 +5661,7 @@ def _build_terminology_pack() -> Dict[str, Any]:
         "base_sales_taxonomy": SALES_TAXONOMY,
         "base_segment_synonyms": SEGMENT_SYNONYMS,
         "base_company_details_taxonomy": COMPANY_DETAILS_TAXONOMY,
+        "base_industry_domain_taxonomy": INDUSTRY_DOMAIN_TAXONOMY,
         "base_culture_taxonomy": CULTURE_TAXONOMY,
         "base_geography_country_to_region": GEOGRAPHY_COUNTRY_TO_REGION_MAP,
         "region_to_countries": _region_to_countries(),
@@ -5447,7 +5678,13 @@ def _build_terminology_pack() -> Dict[str, Any]:
 
 def _query_company_scope(query: str) -> str:
     query_l = _normalize_search_text(query)
-    if re.search(r"\b(working|currently|current)\s+(?:for|at|in|with)\b", query_l):
+    if re.search(r"\b(?:current|present)\s+(?:company|employer|organisation|organization)\b", query_l):
+        return "current_employer"
+    if re.search(r"\b(?:working|employed)\s+(?:currently\s+)?(?:for|at|in|with)\b", query_l):
+        return "current_employer"
+    if re.search(r"\bcurrently\s+(?:working|employed)(?:\s+(?:for|at|in|with))?\b", query_l):
+        return "current_employer"
+    if re.search(r"\bcurrently\s+(?:for|at|with)\b", query_l):
         return "current_employer"
     if re.search(r"\b(ex[-\s]?|worked|from|previously|past)\s*(?:for|at|in|with)?\b", query_l):
         return "any_employer"
@@ -5650,6 +5887,8 @@ def _normalize_numeric_keyed_criterion_shape(criteria: Dict[str, Any], key: str)
         "operator", "scope", "employment_scope", "min_years", "min_function_years",
         "years", "minimum_years", "field", "dimension", "type", "context",
         "aliases", "expanded_terms", "accepted_terms", "countries", "regions",
+        "shape", "value_shape", "evidence", "meaning", "comparison",
+        "supports_min_years", "supports_employment_scope",
     }
     keyed_values: List[str] = []
     value_terms: List[str] = []
@@ -5676,6 +5915,32 @@ def _normalize_numeric_keyed_criterion_shape(criteria: Dict[str, Any], key: str)
     criterion["values"] = values
     if max_years and not _coerce_positive_float(criterion.get("min_years")):
         criterion["min_years"] = max_years
+
+
+def _sanitize_planner_criterion(value: Any) -> Any:
+    """Strip schema-reference metadata accidentally echoed by the planner."""
+    if not isinstance(value, dict):
+        return value
+
+    metadata_keys = {
+        "shape", "value_shape", "evidence", "meaning", "comparison",
+        "supports_min_years", "supports_employment_scope",
+    }
+    shape = value.get("shape")
+    if isinstance(shape, dict) and any(
+        key in shape for key in ("values", "value", "stage", "company", "target", "min_years")
+    ):
+        sanitized = copy.deepcopy(shape)
+        for key in ("scope", "employment_scope", "min_years"):
+            if value.get(key) not in (None, "", [], {}):
+                sanitized.setdefault(key, value.get(key))
+        return sanitized
+
+    return {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in metadata_keys
+    }
 
 
 def _query_years_near_terms(query: str, terms: List[str], context_terms: List[str]) -> Optional[float]:
@@ -5956,7 +6221,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
     for container in (source, hard_filters):
         for key in FILTER_PLAN_CRITERIA_KEYS:
             if key in container and container.get(key) not in (None, "", [], {}):
-                criteria[key] = copy.deepcopy(container.get(key))
+                criteria[key] = _sanitize_planner_criterion(container.get(key))
 
     for key in (
         "required_industries",
@@ -5976,6 +6241,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
             criteria[key] = {"operator": "OR", "values": [value]}
         elif isinstance(value, dict):
             _normalize_numeric_keyed_criterion_shape(criteria, key)
+            criteria[key]["operator"] = "OR"
 
     duration_rules = source.get("duration_rules")
     if isinstance(duration_rules, dict):
@@ -6057,15 +6323,24 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
     _prune_function_years_shadowed_by_scoped_tenure(criteria, query)
 
     company_scope = source.get("company_scope")
+    inferred_company_scope = _query_company_scope(query)
+    explicit_company_scope = None
     if isinstance(company_scope, dict):
-        scope = company_scope.get("employment_scope") or company_scope.get("scope")
-        if scope and criteria.get("required_companies"):
-            criteria["required_companies"] = _normalize_companies_with_scope(criteria["required_companies"], query)
-            if isinstance(criteria["required_companies"], dict):
-                criteria["required_companies"]["employment_scope"] = scope
-                for item in criteria["required_companies"].get("values") or []:
-                    if isinstance(item, dict):
-                        item["employment_scope"] = item.get("employment_scope") or scope
+        explicit_company_scope = company_scope.get("employment_scope") or company_scope.get("scope")
+
+    effective_company_scope = explicit_company_scope or inferred_company_scope
+    for scoped_key in EMPLOYMENT_SCOPED_CRITERIA_KEYS:
+        criterion = criteria.get(scoped_key)
+        if not criterion:
+            continue
+        if scoped_key == "required_companies":
+            criterion = _normalize_companies_with_scope(criterion, query)
+            criteria[scoped_key] = criterion
+        if isinstance(criterion, dict):
+            criterion["employment_scope"] = criterion.get("employment_scope") or effective_company_scope
+            for item in criterion.get("values") or []:
+                if isinstance(item, dict):
+                    item["employment_scope"] = item.get("employment_scope") or criterion["employment_scope"]
 
     if criteria.get("required_companies"):
         criteria["required_companies"] = _normalize_companies_with_scope(criteria["required_companies"], query)
@@ -6128,6 +6403,7 @@ async def _generate_schema_aware_filter_plan(
 You are a senior product-minded recruiting search planner. Generate an executable filter plan for a shortlist engine.
 
 You must be brave enough to produce filters for recruiter queries, but you must only use the schema and evidence policies below. Static mappings are only the base terminology; use product judgment to map recruiter language dynamically.
+The schema manifest is the complete discoverable database/raw-field schema and includes the exact executable criteria contract. Inspect it before planning. Map novel recruiter language to the closest evidence-backed executable dimensions instead of giving up merely because wording is unfamiliar. Never invent a field, criterion, candidate fact, or company fact.
 
 Schema manifest:
 {schema_manifest_json}
@@ -6138,12 +6414,15 @@ Terminology pack:
 Rules:
 - Return JSON only.
 - Use only these executable criteria keys when possible: required_companies, competitors_of, required_functions, min_function_years, required_industries, required_segments, required_company_details, required_culture_type, required_geographies, required_locations, excluded_geographies, funding_stage_min, min_total_experience, min_people_managed, min_tenure_in_latest_role, avg_tenure_in_last_n_roles, required_keywords, top_n.
+- In hard_filters, emit only executable values such as operator, values, min_years, stage, and employment_scope. Never copy schema-reference metadata keys such as shape, value_shape, evidence, meaning, comparison, or supports_* into hard_filters.
 - Current/base location filters only for phrases like "candidates in X", "based in X", "located in X".
 - Market/geography experience filters for phrases like "X experience", "X market", "worked in X", "sold into X", "covered X".
 - APAC/EMEA/etc. are market regions. Expand them through geography policy; do not treat them as candidate current location.
 - A country query can match explicit region evidence when the country belongs to that region.
 - Company geography can be inferred only from headquarters/offices/operations/location fields for companies the candidate worked at. Never infer from subsidiaries, customer presence, revenue, or broad company assumptions.
 - "working for/at/in COMPANY" means current_employer. "worked at/from/ex COMPANY" means any_employer.
+- "current company/employer", "present company/employer", and company attributes attached to "currently working" mean current_employer.
+- employment_scope applies to required companies, industries, customer segments, company details/business model/product, culture, and funding stage. Preserve that scope on every affected criterion.
 - "working for COMPANY competitors" means current_employer at a validated competitor.
 - "Series C and above" means funding_stage_min Series C with ordered funding comparison.
 - "outbound exp" should map to Sales Development/BDR/SDR/outbound prospecting unless the query explicitly asks AE/hunting/new-logo closing.
@@ -6206,7 +6485,7 @@ async def process_query_main(
     yield "Generating schema-aware filter plan..."
     try:
         active_candidate_count = len([p for p in PROFILES_BY_ID.values() if not p.get("is_archived")])
-        evidence_catalog = build_db_evidence_catalog(profiles=list(PROFILES_BY_ID.values())[:300])
+        evidence_catalog = build_db_evidence_catalog(profiles=list(PROFILES_BY_ID.values()))
         schema_manifest = _build_schema_manifest(evidence_catalog, scoped_candidate_count=active_candidate_count)
         terminology_pack = _build_terminology_pack()
         raw_filter_plan = await _generate_schema_aware_filter_plan(normalized_query, schema_manifest, terminology_pack, tracker)
@@ -6370,7 +6649,24 @@ async def process_query_main(
         if not competitor_search_was_run and criteria.get("required_industries"):
             yield "Expanding keywords..."
             values = _criteria_values_for_search(criteria, "required_industries")
-            _set_criteria_values(criteria, "required_industries", values + await _expand_keywords_with_llm(values, "Industry", tracker))
+            base_expanded: List[str] = []
+            unknown_industries: List[str] = []
+            for value in values:
+                canonical = _normalize_search_text(value)
+                if canonical in INDUSTRY_DOMAIN_TAXONOMY:
+                    base_expanded.extend(INDUSTRY_DOMAIN_TAXONOMY[canonical])
+                else:
+                    unknown_industries.append(value)
+            dynamic_expanded = (
+                await _expand_keywords_with_llm(unknown_industries, "Industry", tracker)
+                if unknown_industries
+                else []
+            )
+            _set_criteria_values(
+                criteria,
+                "required_industries",
+                values + base_expanded + dynamic_expanded + unknown_industries,
+            )
 
         if criteria.get("required_functions"):
             values = _criteria_values_for_search(criteria, "required_functions")
@@ -6605,7 +6901,9 @@ async def process_query_main(
         original_criteria["_web_company_facts"] = criteria.get("_web_company_facts")
 
     try:
-        initial_candidate_pool = attach_schema_evidence_to_profiles(initial_candidate_pool, evidence_catalog)
+        initial_candidate_pool = await asyncio.to_thread(
+            attach_schema_evidence_to_profiles, initial_candidate_pool, evidence_catalog
+        )
     except Exception:
         logger.debug("Could not attach schema evidence to shortlist pool", exc_info=True)
 
@@ -6617,20 +6915,76 @@ async def process_query_main(
         scan_full_scope_for_strict_filters,
         search_query_text,
     )
+    # --- Batched strict scoring — keeps the event loop free between batches ---
+    SCORING_BATCH_SIZE = 150
+
     if web_enabled and criteria.get("_web_company_facts"):
         yield "Scoring profiles with web-backed company data..."
     else:
         yield "Scoring profiles against enriched candidate data..."
-    final_candidates = []
+    yield {
+        "type": "progress",
+        "phase": "filtering",
+        "current": 0,
+        "total": len(initial_candidate_pool),
+        "passed": 0,
+        "message": f"Evaluating candidate pool 0/{len(initial_candidate_pool)}...",
+    }
+
+    final_candidates: List[Dict[str, Any]] = []
     reject_reasons: Counter = Counter()
-    for profile in initial_candidate_pool:
+    reviewed_count = 0
+
+    def _score_batch(batch: List[Dict[str, Any]]) -> tuple:
+        passed: List[Dict[str, Any]] = []
+        batch_reasons: List[str] = []
+        for profile in batch:
+            reasons: List[str] = []
+            scored = _strict_shortlist_score_candidate(profile, criteria, reasons)
+            if scored:
+                passed.append(scored)
+            else:
+                batch_reasons.extend(reasons or ["unknown"])
+        return passed, batch_reasons
+
+    for batch_start in range(0, len(initial_candidate_pool), SCORING_BATCH_SIZE):
         await _wait_if_paused()
-        reasons: List[str] = []
-        scored = _strict_shortlist_score_candidate(profile, criteria, reasons)
-        if scored:
-            final_candidates.append(scored)
-        else:
-            reject_reasons.update(reasons or ["unknown"])
+        batch = initial_candidate_pool[batch_start: batch_start + SCORING_BATCH_SIZE]
+
+        passed_batch, batch_reasons = await asyncio.to_thread(_score_batch, batch)
+
+        final_candidates.extend(passed_batch)
+        reject_reasons.update(batch_reasons)
+        reviewed_count += len(batch)
+
+        # Stream all passers from this batch as ONE profile_chunk event
+        # (avoids flooding the WebSocket with hundreds of frames on large pools)
+        if passed_batch:
+            safe_batch = []
+            for passing in passed_batch:
+                safe = {k: v for k, v in passing.items() if k != "embedding"}
+                safe["shortlist_status"] = "pending_reasoning"
+                safe["is_verified_match"] = False
+                safe_batch.append(safe)
+            yield {
+                "type": "candidate_batch",
+                "phase": "scoring",
+                "data": safe_batch,
+                "reviewed": reviewed_count,
+                "passed": len(final_candidates),
+                "total_pool": len(initial_candidate_pool),
+            }
+
+        yield {
+            "type": "progress",
+            "phase": "filtering",
+            "current": reviewed_count,
+            "total": len(initial_candidate_pool),
+            "passed": len(final_candidates),
+            "message": f"Evaluating candidate pool {reviewed_count}/{len(initial_candidate_pool)}...",
+        }
+
+    # -----------------------------------------------------------------
 
     logger.info(
         "SHORTLIST strict_filter_counts seen=%s passed=%s failed=%s reject_reason_counts=%s",
