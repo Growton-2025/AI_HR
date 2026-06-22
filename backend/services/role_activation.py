@@ -38,7 +38,7 @@ def fetch_role_activation(cur, role_id: int) -> Dict[str, Any]:
         }
     smartlead_status = row[1] or "missing"
     heyreach_status = row[8] or "missing"
-    active = smartlead_status == "configured" and heyreach_status == "configured"
+    active = heyreach_status == "configured" and smartlead_status in ("configured", "skipped")
     errors = [value for value in (row[2], row[9]) if value]
     return {
         "activation_status": "active" if active else "inactive",
@@ -149,6 +149,24 @@ def activate_role(
             str(exc)[:1000],
         )
 
+    # If Smartlead is optional and not provided, mark it skipped and finish.
+    if smartlead_sender_account_id <= 0:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO role_smartlead_campaigns
+                            (recruitment_role_id, campaign_name, provisioning_status, created_at, updated_at)
+                        VALUES (%s, %s, 'skipped', NOW(), NOW())
+                        ON CONFLICT (recruitment_role_id) DO UPDATE
+                        SET provisioning_status = 'skipped', updated_at = NOW()
+                        """,
+                        (role_id, role_name),
+                    )
+                    conn.commit()
+        return get_role_activation(role_id)
+
     # Always retain the requested Smartlead setup, even when a remote call fails.
     with get_db_connection_context(validate=False, register_pgvector=False) as conn:
         if conn:
@@ -257,20 +275,27 @@ def activate_role(
 
 def retry_role_activation(role_id: int, role_name: str) -> Dict[str, Any]:
     current = get_role_activation(role_id)
-    required = (
-        current.get("heyreach_campaign_id"),
-        current.get("smartlead_sender_account_id"),
-        current.get("email_subject"),
-        current.get("email_body"),
-    )
-    if not all(required):
-        current["activation_error"] = "The saved role setup is incomplete"
+    if not current.get("heyreach_campaign_id"):
+        current["activation_error"] = "HeyReach campaign ID is missing"
         return current
+        
+    smartlead_id = current.get("smartlead_sender_account_id") or "0"
+    try:
+        smartlead_id_int = int(smartlead_id)
+    except ValueError:
+        smartlead_id_int = 0
+        
+    if smartlead_id_int > 0:
+        required = (current.get("email_subject"), current.get("email_body"))
+        if not all(required):
+            current["activation_error"] = "The saved role setup is incomplete for Smartlead"
+            return current
+
     return activate_role(
         role_id,
         role_name,
         int(current["heyreach_campaign_id"]),
-        int(current["smartlead_sender_account_id"]),
-        current["email_subject"],
-        current["email_body"],
+        smartlead_id_int,
+        current.get("email_subject") or "",
+        current.get("email_body") or "",
     )

@@ -56,7 +56,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
         ...form,
         name: form.name.trim(),
         heyreach_campaign_id: Number(form.heyreach_campaign_id),
-        smartlead_sender_account_id: Number(form.smartlead_sender_account_id),
+        smartlead_sender_account_id: Number(form.smartlead_sender_account_id) || 0,
         email_subject: form.email_subject.trim(),
         email_body: form.email_body.trim(),
       })
@@ -69,8 +69,9 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
     }
   }
 
+  const isSmartleadSelected = Boolean(form.smartlead_sender_account_id)
   const invalid = !form.name.trim() || !Number(form.heyreach_campaign_id)
-    || !form.smartlead_sender_account_id || !form.email_subject.trim() || !form.email_body.trim()
+    || (isSmartleadSelected && (!form.email_subject.trim() || !form.email_body.trim()))
 
   return <div className="modal-overlay" onClick={onClose}>
     <div className="modal-content" style={{ maxWidth: 720, maxHeight: '90vh', padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={event => event.stopPropagation()}>
@@ -82,7 +83,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
         <label>Role name<input autoFocus={!role} disabled={Boolean(role)} className="input-field" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Senior Sales Director" style={{ width: '100%', marginTop: 6 }} /></label>
         <label>HeyReach campaign ID<input className="input-field" type="text" inputMode="numeric" pattern="[0-9]*" value={form.heyreach_campaign_id} onChange={e => setForm(f => ({ ...f, heyreach_campaign_id: e.target.value.replace(/\D/g, '') }))} placeholder="Paste campaign ID" style={{ width: '100%', marginTop: 6 }} /></label>
         <label>Smartlead sender<select className="input-field" disabled={loading} value={form.smartlead_sender_account_id} onChange={e => setForm(f => ({ ...f, smartlead_sender_account_id: e.target.value }))} style={{ width: '100%', marginTop: 6 }}>
-          <option value="">{loading ? 'Loading connected senders…' : 'Select a connected sender…'}</option>
+          <option value="">{loading ? 'Loading connected senders…' : 'Optional: Select a connected sender…'}</option>
           {accounts.map(account => <option key={account.id} value={account.id} disabled={!account.connected}>{account.email}{account.name ? ` · ${account.name}` : ''}{account.connected ? '' : ' · disconnected'}</option>)}
         </select></label>
         <label>Email subject<input className="input-field" maxLength={500} value={form.email_subject} onChange={e => setForm(f => ({ ...f, email_subject: e.target.value }))} style={{ width: '100%', marginTop: 6 }} /></label>

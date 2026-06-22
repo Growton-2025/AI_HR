@@ -337,10 +337,12 @@ async def get_roles(
 @router.post("")
 async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Depends(deps.get_current_user)):
     """Create a new role for the current user"""
-    if not role.name.strip() or not role.email_subject.strip() or not role.email_body.strip():
-        raise HTTPException(status_code=400, detail="Role name, email subject, and email body are required")
-    if role.heyreach_campaign_id <= 0 or role.smartlead_sender_account_id <= 0:
-        raise HTTPException(status_code=400, detail="Valid HeyReach campaign and Smartlead sender IDs are required")
+    if not role.name.strip():
+        raise HTTPException(status_code=400, detail="Role name is required")
+    if role.smartlead_sender_account_id > 0 and (not role.email_subject.strip() or not role.email_body.strip()):
+        raise HTTPException(status_code=400, detail="Email subject and body are required when Smartlead is selected")
+    if role.heyreach_campaign_id <= 0:
+        raise HTTPException(status_code=400, detail="A valid HeyReach campaign ID is required")
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -457,10 +459,10 @@ async def configure_existing_role_activation(
     setup: schemas.RoleActivationSetup,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
-    if setup.heyreach_campaign_id <= 0 or setup.smartlead_sender_account_id <= 0:
-        raise HTTPException(status_code=400, detail="Valid campaign and sender IDs are required")
-    if not setup.email_subject.strip() or not setup.email_body.strip():
-        raise HTTPException(status_code=400, detail="Email subject and body are required")
+    if setup.heyreach_campaign_id <= 0:
+        raise HTTPException(status_code=400, detail="A valid HeyReach campaign ID is required")
+    if setup.smartlead_sender_account_id > 0 and (not setup.email_subject.strip() or not setup.email_body.strip()):
+        raise HTTPException(status_code=400, detail="Email subject and body are required when Smartlead is selected")
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
