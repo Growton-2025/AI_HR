@@ -69,7 +69,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
     }
   }
 
-  const isSmartleadSelected = Boolean(form.smartlead_sender_account_id)
+  const isSmartleadSelected = Boolean(form.smartlead_sender_account_id && String(form.smartlead_sender_account_id) !== "0")
   const invalid = !form.name.trim() || !Number(form.heyreach_campaign_id)
     || (isSmartleadSelected && (!form.email_subject.trim() || !form.email_body.trim()))
 
