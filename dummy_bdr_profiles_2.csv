@@ -1,0 +1,122 @@
+firstName,lastName,fullName,linkedinPublicUrl,headline,addressWithCountry,about,Skills,experiences/0/companyName,experiences/0/companyWebsite,experiences/0/companyIndustry,experiences/0/companySize,experiences/0/title,experiences/0/jobStartedOn,experiences/0/jobEndedOn,experiences/0/jobLocation,experiences/0/jobDescription,experiences/1/companyName,experiences/1/companyWebsite,experiences/1/companyIndustry,experiences/1/companySize,experiences/0/title.1,experiences/1/jobStartedOn,experiences/1/jobEndedOn,experiences/1/jobLocation,experiences/1/jobDescription,experiences/2/companyName,experiences/2/companyWebsite,experiences/2/companyIndustry,experiences/2/companySize,experiences/2/title,experiences/2/jobStartedOn,experiences/2/jobEndedOn,experiences/2/jobLocation,experiences/2/jobDescription,experiences/3/companyName,experiences/3/companyWebsite,experiences/3/companyIndustry,experiences/3/companySize,experiences/3/title,experiences/3/jobStartedOn,experiences/3/jobEndedOn,experiences/3/jobLocation,experiences/3/jobDescription,experiences/4/companyName,experiences/4/companyWebsite,experiences/4/companyIndustry,experiences/4/companySize,experiences/4/title,experiences/4/jobStartedOn,experiences/4/jobEndedOn,experiences/4/jobLocation,experiences/4/jobDescription,experiences/5/companyName,experiences/5/companyWebsite,experiences/5/companyIndustry,experiences/5/companySize,experiences/5/title,experiences/5/jobStartedOn,experiences/5/jobEndedOn,experiences/5/jobLocation,experiences/5/jobDescription,experiences/6/companyName,experiences/6/companyWebsite,experiences/6/companyIndustry,experiences/6/companySize,experiences/6/title,experiences/6/jobStartedOn,experiences/6/jobEndedOn,experiences/6/jobLocation,experiences/6/jobDescription,experiences/7/companyName,experiences/7/companyWebsite,experiences/7/companyIndustry,experiences/7/companySize,experiences/7/title,experiences/7/jobStartedOn,experiences/7/jobEndedOn,experiences/7/jobLocation,experiences/7/jobDescription,experiences/8/companyName,experiences/8/companyWebsite,experiences/8/companyIndustry,experiences/8/companySize,experiences/8/title,experiences/8/jobStartedOn,experiences/8/jobEndedOn,experiences/8/jobLocation,experiences/8/jobDescription,experiences/9/companyName,experiences/9/companyWebsite,experiences/9/companyIndustry,experiences/9/companySize,experiences/9/title,experiences/9/jobStartedOn,experiences/9/jobEndedOn,experiences/9/jobLocation,experiences/9/jobDescription,experiences/10/companyName,experiences/10/companyWebsite,experiences/10/companyIndustry,experiences/10/companySize,experiences/10/title,experiences/10/jobStartedOn,experiences/10/jobEndedOn,experiences/10/jobLocation,experiences/10/jobDescription,experiences/11/companyName,experiences/11/companyWebsite,experiences/11/companyIndustry,experiences/11/companySize,experiences/11/title,experiences/11/jobStartedOn,experiences/11/jobEndedOn,experiences/11/jobLocation,experiences/11/jobDescription,experiences/12/companyName,experiences/12/companyWebsite,experiences/12/companyIndustry,experiences/12/companySize,experiences/12/title,experiences/12/jobStartedOn,experiences/12/jobEndedOn,experiences/12/jobLocation,experiences/12/jobDescription,experiences/13/companyName,experiences/13/companyWebsite,experiences/13/companyIndustry,experiences/13/companySize,experiences/13/title,experiences/13/jobStartedOn,experiences/13/jobEndedOn,experiences/13/jobLocation,experiences/13/jobDescription,experiences/14/companyName,experiences/14/companyWebsite,experiences/14/companyIndustry,experiences/14/companySize,experiences/14/title,experiences/14/jobStartedOn,experiences/14/jobEndedOn,experiences/14/jobLocation,experiences/14/jobDescription,experiences/15/companyName,experiences/15/companyWebsite,experiences/15/companyIndustry,experiences/15/companySize,experiences/15/title,experiences/15/jobStartedOn,experiences/15/jobEndedOn,experiences/15/jobLocation,experiences/15/jobDescription,experiences/16/companyName,experiences/16/companyWebsite,experiences/16/companyIndustry,experiences/16/companySize,experiences/16/title,experiences/16/jobStartedOn,experiences/16/jobEndedOn,experiences/16/jobLocation,experiences/16/jobDescription,experiences/17/companyName,experiences/17/companyWebsite,experiences/17/companyIndustry,experiences/17/companySize,experiences/17/title,experiences/17/jobStartedOn,experiences/17/jobEndedOn,experiences/17/jobLocation,experiences/17/jobDescription,experiences/18/companyName,experiences/18/companyWebsite,experiences/18/companyIndustry,experiences/18/companySize,experiences/18/title,experiences/18/jobStartedOn,experiences/18/jobEndedOn,experiences/18/jobLocation,experiences/18/jobDescription,experiences/19/companyName,experiences/19/companyWebsite,experiences/19/companyIndustry,experiences/19/companySize,experiences/19/title,experiences/19/jobStartedOn,experiences/19/jobEndedOn,experiences/19/jobLocation,experiences/19/jobDescription,experiences/20/companyName,experiences/20/companyWebsite,experiences/20/companyIndustry,experiences/20/companySize,experiences/20/title,experiences/20/jobStartedOn,experiences/20/jobEndedOn,experiences/20/jobLocation,experiences/20/jobDescription,totalExperienceYears,educations/0/period/endedOn/year,educations/0/period/startedOn/year,educations/0/subtitle,educations/0/title,educations/1/period/endedOn/year,educations/1/period/startedOn/year,educations/1/subtitle,educations/1/title,educations/2/period/endedOn/year,educations/2/period/startedOn/year,educations/2/subtitle,educations/2/title,educations/3/period/endedOn/year,educations/3/period/startedOn/year,educations/3/subtitle,educations/3/title,educations/4/period/endedOn/year,educations/4/period/startedOn/year,educations/4/subtitle,educations/4/title,languages/0/name,languages/0/proficiency,languages/1/name,languages/1/proficiency,Email,Mobile,Recruiter Summary,Experience,Current CTC,Expected CTC. ,Notice Period,Preferred  Location,Focused Geography,Shift timings,Outbound Exp,Targets,CV
+Archit Utkarsh,Hota,Archit Utkarsh Hota,https://www.linkedin.com/in/archit-utkarsh-hota/,Simplifying work through Google Workspace & Chrome OS,"Bengaluru, Karnataka India","What started as curiosity about how products solve real problems grew into a love for sales, connecting what teams need with what solutions can actually deliver.Over the past 5 years across SaaS, tech, and ed-tech, I have  driven outbound campaigns, qualified leads, managed demos, and helped deals move from “let’s talk” to “let’s sign.” Having worked as both as a pipeline builder &amp; a deal closer , I have learned that great sales come from empathy, curiosity, and consistent follow-through, asking a lot of WHY's &amp; How's and not just scripts and targets.I am big on research before outreach, storytelling during demos, and building trust over pressure. I like simplifying complex value props, and making sure every conversation adds value, even if it doesn’t end in a deal that day.Beyond hitting numbers, I care about momentum, that small discovery question, a sharp follow-up, or a tailored demo that nudges a deal forward. That’s the real fun in sales for me.Always up for learning from sharper minds, exploring how AI is reshaping sales, and finding better ways to help teams grow.If you are working on something exciting or building a revenue engine that needs energyI would love to connect and talk.","SalesLoft, zoominfo, Apollo, Consultative Selling, Negotiation and closing, Discovery & Qualification, Scrubbing, Product Demonstration, Enterprise Software, Consulting, Software as a Service (SaaS), Cold Calling, Business-to-Business (B2B), LinkedIn Sales Navigator, Sales Prospecting, Time Management, Sales Pipeline Development, Sales Acumen, Customer Acquisition, Lead Generation",Google,google.com,Computer Software,10001+,Senior Consultant,2024-10-01 00:00:00,,Bangalore Urban,,Marketstar,marketstar.com,Outsourcing/Offshoring,1001-5000,Senior Consultant - Google Enterprise,2024-10-01 00:00:00,,Bengaluru,,Interviewbit,,E-Learning,51-200,Senior Business Development Representative,2023-10-01 00:00:00,2024-10-01 00:00:00,"Bengaluru, Karnataka, India",,Byju'S,byjus.com,E-Learning,10001+,BYJU'S,2022-06-01 00:00:00,2023-05-01 00:00:00,,"Managing a Team of 12 people generating over 11 CR/year.
+Exceeded quarterly sales goals by 50%
+Contributed to 10% of overall revenue growth., Consistently surpassed monthly sales quotas by 130% through
+effective lead generation, relationship building, and closing
+strategies,
+Top performing associate for 6 straight months.
+Achieved a conversion rate of over 75% with inbound leads",Alumnus Software Limited,alumnux.com,Computer Software,51-200,Intern,2019-02-01 00:00:00,2019-03-01 00:00:00,Kolkata,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,7.3,,,"Bachelor of Technology, Computer Science",Amity University Kolkata,,,,,,,,,,,,,,,,,Bengali,PROFESSIONAL_WORKING,English,FULL_PROFESSIONAL,,+919804231998,"Achit Hota
+
+Marketstar-vendor Google-products(Google Chrome)
+
+Total yrs of experience -4.7 yrs
+
+inbound/outbound- outbound- 2.7yrs
+
+No. of years of experience in SAAS( 2.7 yr)
+
+Geographies targeted: US (2.7 yr), US shift timings- 6:30  pm to 3:30  a.m
+
+ ICP-Ideally reached out to IT Managers, CEOs
+
+- What is your current monthly KPI? MQL(market qualified leads) and MQL-12 sqls,
+
+How many completed meetings do you achieve every month?  16 qualified meetings (previous month); 120%-1 yr;6 months-175% achieved
+
+- You have a TAM of 1000 accounts. Your current SQLs / month is 4. How would you take it to 6/month? 
+
+Prioritising accounts, working with relevant POCs
+-
+- Only 3% of the calls you make are connected. The industry benchmark is 10%. How will you resolve the issue with the call connection? 3-4 contacts added
+
+Reaching out to the right person based on the relevance of the product, and updating contacts to get better call connections, multiple touch points
+
+- What tools have you used: Apollo, LinkedIn Sales Navigator, Zoominfo,
+
+Ticket sizes/ deal size: package deals-15K -30 K MRR
+Industry–SMBS
+
+Current CTC=15 LPA Fixed+ no variables
+
+Expected CTC- 18-20 LPA Fixed
+
+Reason to switch: no incentive structure
+
+Communication Skills- 8.5/10
+
+Notice period- 60 days, negotiable up to 30 days
+
+(no, offers in hand)
+
+Current Location-Bangalore
+
+Preferred Location-Bangalore
+","Total -4.7 yrs;SAAS( 2.7 yrs)
+","15 LPA Fixed+ no variables
+",18-20 LPA Fixed," 60 days, negotiable up to 30 days
+
+","Bangalore
+",US (2.7 yrs)," 6:30 PM to 3:30 AM
+", 6:30 PM to 3:30 AM,,https://drive.google.com/file/d/1KOJbe1ugOLxULrpiIDPMQXRG2WADtHKJ/view?usp=sharing
+Sanjeev,Naik,Sanjeev Naik,https://www.linkedin.com/in/sanjeev-naik-b6815818b/,"Inside Sales Manager – Enterprise AI | Driving Pipeline Generation, Deal Conversion & Revenue Growth | SaaS | Delivering Measurable Business Outcomes",Greater Bengaluru Area India,"I drive pipeline, conversion, and revenue growth at the intersection of AI and enterprise sales. Accelerating revenue growth for B2B SaaS companies across US, UK, and APAC markets. Proven track record of generating high-quality Sales Qualified Leads (SQLs) through strategic outbound prospecting, cold calling, email campaigns, and Account-Based Marketing (ABM). Expertise in engaging C-level executives including CFOs, CIOs, and VP-level stakeholders, conducting discovery calls, qualifying opportunities using BANT framework, and supporting complex enterprise SaaS sales cycles. Highly proficient in using Salesforce, Hub Spot, Sales loft, Outreach, Zoom Info, and LinkedIn Sales Navigator to execute scalable outbound sales cadences and consistently exceed pipeline generation targets.Enterprise Pipeline Generation and Revenue Growth • Outbound Prospecting and Enterprise Lead Generation • Account-Based Marketing (ABM) and Strategic Targeting • Cold Calling, Email Outreach, and Multi-Channel Sales Cadences • Lead Qualification, SQL Conversion, and Opportunity Development • Discovery Calls, Objection Handling, and Sales Qualification • ICP Identification and Strategic Account Research • C-Level Engagement and Enterprise Stakeholder Management • CRM Management and Pipeline Tracking (Salesforce, Hub-spot) • Sales Engagement Platforms: Sales-loft, Outreach, Zoom-info, LinkedIn Sales Navigator • International Sales Development: US, UK, and APAC Markets.","Technical Sales, Exceeding Targets, CRM Software, Sales Target Management, Email Marketing, Contract Labor, Contingent Workforce, Inside Sales, Microsoft Excel, Cloud Sales, Enterprise Software, Client Relations, Relationship Building, Cross-team Collaboration, SaaS Sales, Inbound Marketing, Communication, Working Experience, Skilled Multi-tasker, LinkedIn Sales Navigator",,,,,Inside Sales Manager,2026-03-01 00:00:00,,"Jersey City, NJ",,Highradius,highradius.com,Computer Software,1001-5000,Financial Technology Advisor,2024-04-01 00:00:00,2026-02-01 00:00:00,Hyderabad,,Netradyne,netradyne.com,Computer Software,501-1000,Snr Sales Development Representative,2023-06-01 00:00:00,2024-04-01 00:00:00,Bangalore Urban,,Soroco,soroco.com,Computer Software,201-500,Soroco,2022-03-01 00:00:00,2023-06-01 00:00:00,,"Sales Data Management: Efficiently maintained and updated sales activity in automation tools, ensuring accurate records of every account and opportunity to drive insightful reporting and informed decision-making.
+• Effective Product Presentation: Delivered compelling sales presentations highlighting key features, benefits, and value propositions, consistently aligning with prospects’ needs to nurture interest and secure meetings.
+• Lead Qualification & Conversion: Conducted comprehensive lead qualification by identifying the prospect’s business needs, timeline, and potential for ROI, leading to stronger alignment with solutions and increased conversion rates.
+• Relationship Building: Played a key role in generating new sales that translated into long-term client relationships, contributing to sustained revenue growth and customer retention.
+• Cold Calling & Email Campaigns: Drove outbound prospecting efforts through cold calls and email campaigns, averaging 80 calls and 50 emails per day, fostering opportunities for new business development.
+• Inbound/Outbound Communication: Focused on driving outbound communication efforts, ensuring efficient lead generation and campaign execution. Inbound calls constituted a 15% portion of the overall outreach strategy.
+• Customer Prospecting & Lead Generation: Actively prospected for new customers in the US region, generating initial interest through targeted phone calls and email outreach, resulting in increased lead acquisition and engagement. • Sales Data Management: Efficiently maintained and updated sales activity in automation tools, ensuring accurate records of every account and opportunity to drive insightful reporting and informed decision-making.",,,,,Dell Technologies,2020-12-01 00:00:00,2021-08-01 00:00:00,,"Customer Query Resolution: Efficiently handled and resolved customer queries related to hardware and application support by generating tickets and providing prompt assistance with quotes, billing, and purchase orders, ensuring seamless customer satisfaction. • Parts & Financial Credit Management: Monitored and verified parts availability and processed financial credits for the organization, facilitating smooth procurement operations and minimizing delays in supply chain management. • Communication & Coordination: Managed inbound, outbound, and email communications with customers, ensuring effective and timely responses. Focused on maintaining a high level of professionalism and accuracy in all interactions to enhance customer experience. • Prospecting & Lead Nurturing: Actively engaged in inbound and outbound communication to identify potential leads, nurturing relationships through consistent follow-ups and email campaigns, contributing to business growth and client acquisition.
+Skills: Business · Deal Closure Service Quality · Client Relations · Market Development · Exceeding Targets · Microsoft Excel · Technical Sales · Setting Appointments · Compliance Regulations · Cross-team Collaboration · Cloud Sales · Negotiation · Customer Loyalty · Contact Centers · Communication · Customer-Focused Service · Customer Experience · Inbound Marketing · Software Industry · Regulatory Compliance · Email Marketing · Sales · Sales Operations · Relationship Building · Customer Satisfaction · CRM Software · SaaS Sales · Enterprise Software · Customer Engagement.","Azuga, Inc.",azuga.com,Computer Software,201-500,"Azuga, Inc.",2019-04-01 00:00:00,2020-07-01 00:00:00,,"Lead Generation- Lead Follow-Up: Conducted diligent follow-ups on high-priority leads, ensuring continuous communication and engagement through both calls and emails.
+• Appointment Setting & Stakeholder Coordination: Focused on securing appointments with prospective clients and efficiently passing warm leads to internal stakeholders for further sales progression.
+• Call Volume Management: Consistently met and exceeded daily targets by completing up to 100 calls per day to drive lead generation and sales pipeline growth.
+• Communication & Prospecting: Managed inbound and outbound communications seamlessly, utilizing email and phone-based outreach strategies to nurture relationships and generate business opportunities.
+• Daily Operations: Kick-started each day with team meetings and key updates to align on priorities and sales targets. • Lead Prioritization & Prospecting: Initiated calls as the primary task, targeting key time zones (EST, CST, MST, PST) to maximize outreach and engagement within designated regions. • Lead Follow-Up: Conducted diligent follow-ups on high-priority leads, ensuring continuous communication and engagement through both calls and emails. • Appointment Setting & Stakeholder Coordination: Focused on securing appointments with prospective clients and efficiently passing warm leads to internal stakeholders for further sales progression. • Call Volume Management: Consistently met and exceeded daily targets by completing up to 100 calls per day to drive lead generation and sales pipeline growth. • Communication & Prospecting: Managed inbound and outbound communications seamlessly, utilizing email and phone-based outreach strategies to nurture relationships and generate business opportunities.",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,7.1,,,"Master of Arts, Sociology",Annamalai University,,,"Bachelor of Arts, Sociology",Annamalai University,,,"Diploma In Web Development, Animation, Interactive Technology, Video Graphics and Special Effects",Arena Animation,,,"Air Travel & Operations (Domestic & International), Aviation/Airway Management and Operations",Aviation Institute of Maintenance,,,"National Information Of Technology (NIIT), Computer Engineering",National Institute of Information Technology,,,,,sanjeevmnaik@gmail.com,+919845782272,"Sanjeev Naik
+
+Company/role: Beacon.Li--SR. SDR-Enterprise
+
+Tell me about your previous roles: 
+
+What was the company like when you joined? How big was the team, and who did you report to? Highradius-3 months of training; team size-300 employees;10 members in each team;reports to team leader;Beacon-jan 2025-jan 2026-10 members;70 employees in total;reporting to directly to founder
+;
+ I’d love to know if you were the very first person in that role or part of a larger, established group. -
+Specifically, what were your actual results—like how many leads you turned into real sales—3 accounts went for closure, HighRadius was only there for 3 quarters beacon, and many accounts closed
+
+Total yrs of experience -6+ yrs
+
+inbound/outbound- mostly inbound-30% ; 70%- outbound
+.
+No. of years of experience in SAAS(6 yrs)
+
+Geographies targeted: US (4 yrs), UK, India-2 yrs, EMEA, US Shift: 12 pm to 2 am.
+
+ ICP-Ideally reached out to C-level people, CXOs, CTOs, Eng head, and IT guys.
+
+What is your current monthly KPI? MQL(market qualified leads) and MQL-Beacon-15 meetings for POCs out of 75 meetings, Highradius-10 meetingsout of 5 meetings went for discovery-target-3 SQLs with 6 meetings per month                                                                                                                                    
+
+Number of Calls (Daily):80-100 calls
+Revenue Quota :1 million USD ARR-500% achieved
+Lead Gen (Monthly basis)-100 accounts
+
+How many completed meetings do you achieve every month? 80%- 90%
+
+- What tools have you used: Hubspot, Salesforce, Zoominfo, Salesloft, Apollo, Clay
+
+Ticket sizes/ deal size: package deals- 50,000 - 250 K USD ARR -Beacon, Highradius-20,000-40,000 USD ARR
+
+Industry– MM & Enterprise-Highradius; Beacon-SAAS tech Companies, Insurance Companies, Manufacturing Oil & Gas, HRMS Software Companies(Enterprise)
+
+Current CTC-= 22 LPA =16 LPA Fixed +6 LPA variables.
+
+Expected CTC-30% Hike
+
+Reason to switch: was on a one-year contract in the company, no incentive structure; Last working day: 31st January,2026
+
+Notice period: immediate joiner
+
+(yes, offers in hand)
+
+Current Location-Bangalore
+
+Preferred Location- Bangalore/Hyderabad
+
+Comm skills-8.5/10
+",Total -6+ yrs (SAAS),22 LPA =16 LPA Fixed +6 LPA variables.,30% Hike,immediate joiner,Bangalore/Hyderabad,"US (4 yrs), UK, India-2 yrs, EMEA",12:00 PM to 2:00 AM,12:00 PM to 2:00 AM,70%-outbound ; 30%-inbound,https://docs.google.com/document/d/1YlntNLogz96Q8xLfNkvyQRO6lvmtmXu8/edit?usp=sharing&ouid=118376179366632549791&rtpof=true&sd=true

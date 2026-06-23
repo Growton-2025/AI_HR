@@ -1,13 +1,14 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2, PowerOff } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { toast } from 'sonner'
-import StatusDropdown from '../components/StatusDropdown'
+import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
 import RoleCreateModal from '../components/RoleCreateModal'
+import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents'
 
 function Roles() {
     const {
@@ -61,6 +62,102 @@ function Roles() {
     const [uploadProgress, setUploadProgress] = useState(null)
     const [uploadEnrichmentMode, setUploadEnrichmentMode] = useState('none')
     const uploadFileRef = useRef(null)
+
+    // Filtering State
+    const [showFilters, setShowFilters] = useState(false)
+    const [showOutreach, setShowOutreach] = useState(false)
+    const [activeStatusTab, setActiveStatusTab] = useState('')
+    const [filters, setFilters] = useState({
+        title: [], titleInput: '',
+        company: [], companyInput: '',
+        city: [], cityInput: '',
+        product_service: [], productInput: '',
+        status: '',
+        min_exp: 0, max_exp: 40
+    })
+
+    const setFilter = useCallback((key, val) => {
+        setFilters(prev => {
+            const next = { ...prev, [key]: val }
+            if (key === 'status') {
+                setActiveStatusTab(val)
+            }
+            return next
+        })
+    }, [])
+
+    const clearFilters = useCallback(() => {
+        setFilters({
+            title: [], titleInput: '',
+            company: [], companyInput: '',
+            city: [], cityInput: '',
+            product_service: [], productInput: '',
+            status: '',
+            min_exp: 0, max_exp: 40
+        })
+        setActiveStatusTab('')
+    }, [])
+
+    const { filteredCandidates, statusCounts } = useMemo(() => {
+        if (!viewingRole?.candidates) return { filteredCandidates: [], statusCounts: {} };
+        
+        const counts = {};
+        viewingRole.candidates.forEach(c => {
+            const st = c.status || 'To be started';
+            counts[st] = (counts[st] || 0) + 1;
+        });
+
+        const splitFilterValues = (values = [], inputValue = '') => {
+            const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values];
+            return [...list, inputValue]
+                .flatMap((value) => String(value || '').split(','))
+                .map((value) => value.trim().toLowerCase())
+                .filter(Boolean);
+        };
+
+        const titleSearch = splitFilterValues(filters.title, filters.titleInput);
+        const companySearch = splitFilterValues(filters.company, filters.companyInput);
+        const citySearch = splitFilterValues(filters.city, filters.cityInput);
+        const productSearch = splitFilterValues(filters.product_service, filters.productInput);
+
+        const filtered = viewingRole.candidates.filter(c => {
+            // Status
+            const cStatus = c.status || 'To be started';
+            if (activeStatusTab && cStatus !== activeStatusTab) return false;
+
+            // Total Experience
+            const exp = Number(c.total_experience || 0);
+            if (exp < filters.min_exp || exp > filters.max_exp) return false;
+
+            // Title
+            if (titleSearch.length > 0) {
+                const cTitle = (c.current_title || c.title || c.headline || '').toLowerCase();
+                if (!titleSearch.some(term => cTitle.includes(term))) return false;
+            }
+
+            // Company
+            if (companySearch.length > 0) {
+                const cComp = (c.current_company || c.company || '').toLowerCase();
+                if (!companySearch.some(term => cComp.includes(term))) return false;
+            }
+
+            // City
+            if (citySearch.length > 0) {
+                const cCity = (c.location || c.city || '').toLowerCase();
+                if (!citySearch.some(term => cCity.includes(term))) return false;
+            }
+
+            // Product/Expertise
+            if (productSearch.length > 0) {
+                const cProd = (c.expertise || c.product_service || '').toLowerCase();
+                if (!productSearch.some(term => cProd.includes(term))) return false;
+            }
+
+            return true;
+        });
+
+        return { filteredCandidates: filtered, statusCounts: counts };
+    }, [viewingRole?.candidates, filters, activeStatusTab]);
 
     // Derived state for instant access
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
@@ -785,145 +882,122 @@ function Roles() {
                     />
                 )}
 
-                <div className="result-banner">
-                    <div className="result-banner-title">
-                        {viewingRole.candidates === null
-                            ? 'Loading candidates…'
-                            : `${viewingRole.candidate_count ?? viewingRole.candidates?.length ?? 0} Candidate(s)`}
+                {/* ── Compact toolbar bar ── */}
+                <div style={{
+                    display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
+                    padding: '12px 18px', marginBottom: '16px',
+                    background: '#fff', borderRadius: '14px',
+                    border: '1px solid #e2e8f0',
+                    boxShadow: '0 1px 3px rgba(15,23,42,0.04)'
+                }}>
+                    {/* Candidate count */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', lineHeight: 1 }}>
+                            {viewingRole.candidates === null ? '…' : (viewingRole.candidate_count ?? viewingRole.candidates?.length ?? 0)}
+                        </span>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: '#64748b' }}>Candidates</span>
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+
+                    <div style={{ width: '1px', height: 24, background: '#e2e8f0' }} />
+
+                    {/* Upload count */}
+                    <span style={{ fontSize: 11, fontWeight: 600, color: '#94a3b8' }}>
+                        {Number(viewingRole.upload_count || 0)} upload{Number(viewingRole.upload_count || 0) === 1 ? '' : 's'}
+                    </span>
+
+                    {/* Right-side actions */}
+                    <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <button
                             className="btn btn-secondary btn-sm"
                             onClick={handleManualRefresh}
                             disabled={isRefreshing || viewingRole.candidates === null}
-                            title="Reload candidates and the latest Clay enrichment output"
-                            style={{ height: '36px', padding: '0 14px' }}
+                            title="Reload candidates"
+                            style={{ height: 32, padding: '0 12px', fontSize: 11 }}
                         >
-                            <RefreshCcw size={14} className={isRefreshing ? 'animate-spin' : ''} />
-                            {isRefreshing ? 'Refreshing…' : 'Refresh candidates'}
+                            <RefreshCcw size={13} className={isRefreshing ? 'animate-spin' : ''} />
+                            {isRefreshing ? 'Refreshing…' : 'Refresh'}
                         </button>
-                        <div className="result-banner-subtitle">
-                            {Number(viewingRole.upload_count || 0)} role upload{Number(viewingRole.upload_count || 0) === 1 ? '' : 's'}
-                        </div>
+                        <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={handleSyncResponses}
+                            disabled={isSyncing}
+                            title="Sync replies from both platforms"
+                            style={{ height: 32, padding: '0 12px', fontSize: 11 }}
+                        >
+                            <RefreshCcw size={13} className={isSyncing ? 'animate-spin' : ''} />
+                            {isSyncing ? 'Syncing…' : 'Sync Responses'}
+                        </button>
+                        <button
+                            className={`btn ${showFilters ? 'btn-primary' : 'btn-secondary'} btn-sm`}
+                            onClick={() => setShowFilters(!showFilters)}
+                            style={{ height: 32, padding: '0 12px', fontSize: 11 }}
+                            title="Toggle Filters"
+                        >
+                            <Filter size={13} /> Filters
+                        </button>
+                        <button
+                            className={`btn btn-secondary btn-sm`}
+                            onClick={() => setShowOutreach(!showOutreach)}
+                            style={{ height: 32, padding: '0 12px', fontSize: 11, color: '#64748b' }}
+                            title="Toggle outreach configuration"
+                        >
+                            <Settings2 size={13} /> Config {showOutreach ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                        </button>
+                        {viewingRole.activation_status === 'active' && (
+                            <button
+                                className="btn btn-secondary btn-sm"
+                                onClick={handleDeactivate}
+                                disabled={isDeactivating}
+                                title="Deactivate role (pause campaigns)"
+                                style={{ height: 32, padding: '0 10px', fontSize: 11, color: '#ef4444' }}
+                            >
+                                <PowerOff size={13} className={isDeactivating ? 'animate-spin' : ''} />
+                            </button>
+                        )}
                     </div>
                 </div>
 
-                {/* Automatic outreach status */}
-                <div style={{
-                    display: 'flex',
-                    flexWrap: 'wrap',
-                    alignItems: 'stretch',
-                    gap: '12px',
-                    marginBottom: '20px'
-                }}>
+                {/* ── Collapsible Outreach Config ── */}
+                {showOutreach && (
                     <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '10px',
-                        padding: '13px 14px',
-                        background: '#ffffff',
-                        borderRadius: '10px',
-                        border: '1px solid #e2e8f0',
-                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                        flex: '1 1 360px',
-                        minWidth: 0,
+                        display: 'flex', flexWrap: 'wrap', alignItems: 'stretch',
+                        gap: '12px', marginBottom: '16px',
+                        animation: 'fadeIn 0.2s ease-out'
                     }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                            <span style={{ fontSize: '11px', fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Automatic Outreach</span>
-                            {emailSetup?.campaign_id && <span style={{ fontSize: 10, color: '#64748b', background: '#f1f5f9', borderRadius: 999, padding: '3px 7px' }}>Campaign {emailSetup.campaign_id}</span>}
-                        </div>
-
-                        {emailSetupLoading ? <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#64748b', fontSize: 12 }}><Loader2 size={13} className="animate-spin" /> Loading setup…</div> : emailSetup?.campaign_configured ? <div style={{ minWidth: 0 }}>
-                            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#334155' }}>
-                                <Mail size={13} />
-                                <strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.sender_email}</strong>
+                        <div style={{
+                            display: 'flex', flexDirection: 'column', gap: '10px',
+                            padding: '14px 16px', background: '#fff', borderRadius: '12px',
+                            border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+                            flex: '1 1 340px', minWidth: 0,
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                                <span style={{ fontSize: 11, fontWeight: 800, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Email Outreach</span>
+                                {emailSetup?.campaign_id && <span style={{ fontSize: 10, color: '#64748b', background: '#f1f5f9', borderRadius: 999, padding: '3px 7px' }}>Campaign {emailSetup.campaign_id}</span>}
                             </div>
-                            <div title={emailSetup.subject} style={{ marginTop: 5, fontSize: 12, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.subject}</div>
-                            <div title={emailSetup.initial_body} style={{ marginTop: 3, fontSize: 11, color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.initial_body}</div>
-                        </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>
-                            {emailSetup?.campaign_error || 'This role is not fully activated.'}
-                        </div>}
+                            {emailSetupLoading ? <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#64748b', fontSize: 12 }}><Loader2 size={13} className="animate-spin" /> Loading…</div> : emailSetup?.campaign_configured ? <div style={{ minWidth: 0 }}>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#334155' }}><Mail size={13} /><strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.sender_email}</strong></div>
+                                <div title={emailSetup.subject} style={{ marginTop: 4, fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.subject}</div>
+                            </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>{emailSetup?.campaign_error || 'Not fully activated.'}</div>}
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading} style={{ height: 30, padding: '0 10px', fontSize: 11 }}><Settings2 size={12} /> Edit setup</button>
+                                {viewingRole.activation_status !== 'active' && <button className="btn btn-primary btn-sm" onClick={() => handleRetryActivation(viewingRole)} style={{ height: 30, fontSize: 11 }}>Configure & activate</button>}
+                            </div>
+                        </div>
 
-                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                            <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading} style={{ height: 34, padding: '0 12px' }}>
-                                <Settings2 size={13} /> Edit email setup
-                            </button>
-                            {viewingRole.activation_status !== 'active' && <button className="btn btn-primary btn-sm" onClick={() => handleRetryActivation(viewingRole)} style={{ height: 34 }}>Configure & activate</button>}
+                        <div style={{
+                            display: 'flex', flexDirection: 'column', gap: '6px',
+                            padding: '14px 16px', background: '#f0f9ff', borderRadius: '12px',
+                            border: '1px solid #bae6fd', boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
+                            flex: '1 1 280px', minWidth: 0
+                        }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.05em' }}>LinkedIn Outreach (HeyReach)</span>
+                            <div style={{ fontSize: 12, color: '#334155' }}>Campaign ID: <strong>{viewingRole.heyreach_campaign_id || 'Not configured'}</strong></div>
+                            <div style={{ fontSize: 11, color: '#64748b' }}>Shortlisted → auto-queued for LinkedIn outreach.</div>
                         </div>
                     </div>
+                )}
 
-                    <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '8px',
-                        padding: '12px',
-                        background: '#f0f7ff',
-                        borderRadius: '10px',
-                        border: '1px solid #bae6fd',
-                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                        flex: '1 0 auto'
-                    }}>
-                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.05em' }}>LinkedIn Outreach (HeyReach)</span>
-                        <div style={{ fontSize: 12, color: '#334155' }}>Campaign ID: <strong>{viewingRole.heyreach_campaign_id || 'Not configured'}</strong></div>
-                        <div style={{ fontSize: 11, color: '#64748b' }}>Selecting Shortlisted automatically queues LinkedIn outreach.</div>
-                    </div>
-
-                    {/* UTILITIES SECTION */}
-                    <div style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '8px',
-                        padding: '12px',
-                        background: '#ffffff',
-                        borderRadius: '10px',
-                        border: '1px solid #e2e8f0',
-                        boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                        flex: '0 0 auto'
-                    }}>
-                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Utilities</span>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                            <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={handleSyncResponses}
-                                disabled={isSyncing}
-                                title="Sync replies from both platforms"
-                                style={{ height: '36px', padding: '0 16px' }}
-                            >
-                                <RefreshCcw size={14} className={isSyncing ? 'animate-spin' : ''} />
-                                {isSyncing ? 'Sync' : 'Sync Responses'}
-                            </button>
-                            <button
-                                className="btn btn-secondary btn-sm"
-                                onClick={handleManualRefresh}
-                                disabled={isRefreshing}
-                                title="Refresh role data"
-                                style={{ height: '36px', padding: '0 12px' }}
-                            >
-                                <RefreshCcw size={14} className={isRefreshing ? 'animate-spin' : ''} />
-                            </button>
-                            {viewingRole.activation_status === 'active' && (
-                                <button
-                                    className="btn btn-secondary btn-sm"
-                                    onClick={handleDeactivate}
-                                    disabled={isDeactivating}
-                                    title="Deactivate role (pause campaigns)"
-                                    style={{ height: '36px', padding: '0 12px', color: '#ef4444' }}
-                                >
-                                    <PowerOff size={14} className={isDeactivating ? 'animate-spin' : ''} />
-                                    {isDeactivating ? 'Deactivating...' : 'Deactivate'}
-                                </button>
-                            )}
-                        </div>
-                    </div>
-                </div>
-
-
-
-
-                <div className="role-table-note">
-                    Use Delivery to track campaign stage. Use Open Hub to read full conversations and reply.
-                </div>
-
+                {/* ── Main content area: Filters + Table ── */}
                 {isLoadingRole ? (
                     <div className="empty-state" style={{ marginTop: '24px' }}>
                         <Loader2 size={48} className="animate-spin" style={{ color: '#94a3b8', marginBottom: '16px' }} />
@@ -935,29 +1009,134 @@ function Roles() {
                         <p>No candidates assigned yet. Start by screening for talent!</p>
                     </div>
                 ) : (
-                    <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px' }}>
-                        <table className="data-table role-candidates-table">
-                            <thead>
-                                <tr>
-                                    <th className="role-sticky-index">#</th>
-                                    <th className="role-sticky-candidate">Candidate</th>
-                                    <th className="role-sticky-status">Status</th>
-                                    <th style={{ minWidth: '150px', maxWidth: '180px' }}>Role</th>
-                                    <th style={{ minWidth: '140px' }}>Email</th>
-                                    <th style={{ minWidth: '100px' }}>Phone</th>
-                                    <th style={{ minWidth: '120px', width: '120px' }}>Details</th>
-                                    <th style={{ minWidth: '70px', width: '70px' }}>Priority</th>
-                                    <th style={{ minWidth: '140px', maxWidth: '160px' }}>Feedback</th>
-                                    <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Delivery</div></th>
-                                    <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Hub</div></th>
-                                    <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Delivery</div></th>
-                                    <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Hub</div></th>
-                                    <th style={{ minWidth: '60px', width: '60px' }}>Actions</th>
+                    <div style={{ display: 'flex', gap: '20px', alignItems: 'flex-start' }}>
+                        {/* Sidebar Filters */}
+                        {showFilters && (
+                            <div className="sidebar-filters" style={{ width: '260px', flexShrink: 0, padding: '18px', background: 'rgba(255,255,255,0.92)', backdropFilter: 'blur(12px)', borderRadius: '14px', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(15,23,42,0.04)', display: 'flex', flexDirection: 'column', height: 'fit-content', position: 'sticky', top: '16px', transition: 'all 0.25s ease' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, paddingBottom: 10, borderBottom: '1px solid #e2e8f0' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                                        <Filter size={14} color="#0f172a" />
+                                        <span style={{ fontSize: 13, fontWeight: 800, color: '#0f172a' }}>Filters</span>
+                                    </div>
+                                    <button onClick={() => setShowFilters(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, color: '#94a3b8', display: 'flex' }}><X size={14} /></button>
+                                </div>
+                                <TagFilterInput label="Title" values={filters?.title || []} inputValue={filters?.titleInput || ''} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} />
+                                <TagFilterInput label="Current Company" values={filters?.company || []} inputValue={filters?.companyInput || ''} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} />
+                                <TagFilterInput label="City" values={filters?.city || []} inputValue={filters?.cityInput || ''} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} />
+                                <TagFilterInput label="Expertise / Product" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} />
+                                
+                                <SelectFilter label="Status" value={filters?.status || ''} onChange={v => { setFilter('status', v); setActiveStatusTab(v); }} options={RECRUITMENT_STAGES} placeholder="All Statuses" />
+                                
+                                <RangeSlider
+                                  label="Total Experience"
+                                  min={0}
+                                  max={40}
+                                  minValue={filters?.min_exp ?? 0}
+                                  maxValue={filters?.max_exp ?? 40}
+                                  onChange={(min, max) => {
+                                    setFilter('min_exp', min);
+                                    setFilter('max_exp', max);
+                                  }}
+                                />
 
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {viewingRole.candidates.map((candidate, idx) => {
+                                <div style={{ marginTop: 'auto', paddingTop: '20px' }}>
+                                  <button
+                                    onClick={clearFilters}
+                                    style={{
+                                      width: '100%', padding: '11px 12px', borderRadius: '12px',
+                                      background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)',
+                                      color: '#334155', fontSize: '12px', fontWeight: 700,
+                                      cursor: 'pointer', transition: 'all 0.2s',
+                                      boxShadow: '0 1px 2px rgba(15,23,42,0.03)'
+                                    }}
+                                    onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+                                    onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+                                  >
+                                    <RefreshCcw size={13} style={{ display: 'inline', marginRight: 6, verticalAlign: '-2px' }} />
+                                    Reset All Filters
+                                  </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Main Table Area */}
+                        <div style={{ flex: 1, minWidth: 0, transition: 'all 0.25s ease', display: 'flex', flexDirection: 'column' }}>
+                            {/* Status Tabs */}
+                            <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none', borderRadius: '10px 10px 0 0', border: '1px solid #e2e8f0' }}>
+                                {['', ...RECRUITMENT_STAGES].map(tab => {
+                                    const isActive = activeStatusTab === tab;
+                                    const count = tab === '' ? (viewingRole.candidates?.length || 0) : (statusCounts[tab] || 0);
+                                    const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
+
+                                    return (
+                                        <button key={tab || 'all'}
+                                            onClick={() => {
+                                                setFilter('status', tab);
+                                                setActiveStatusTab(tab);
+                                            }}
+                                            style={{
+                                                padding: '7px 14px', borderRadius: '999px', border: isActive ? '1px solid #111827' : '1px solid rgba(203, 213, 225, 0.9)',
+                                                background: isActive ? '#111827' : 'rgba(255,255,255,0.72)', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                                                color: isActive ? '#fff' : '#64748b', whiteSpace: 'nowrap',
+                                                display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'inherit',
+                                                transition: 'all 0.15s',
+                                                boxShadow: isActive ? '0 10px 18px rgba(15,23,42,0.12)' : 'none',
+                                            }}
+                                            onMouseEnter={e => {
+                                                if (!isActive) {
+                                                    e.currentTarget.style.borderColor = 'rgba(148, 163, 184, 0.75)';
+                                                    e.currentTarget.style.background = '#fff';
+                                                }
+                                            }}
+                                            onMouseLeave={e => {
+                                                if (!isActive) {
+                                                    e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)';
+                                                    e.currentTarget.style.background = 'rgba(255,255,255,0.72)';
+                                                }
+                                            }}
+                                        >
+                                            {tab === '' ? (
+                                                <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({viewingRole.candidates?.length || 0})</span>
+                                            ) : (
+                                                <>
+                                                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: isActive ? '#fff' : (style.dot || '#94a3b8') }} />
+                                                    {tab}
+                                                    <span style={{
+                                                        marginLeft: 4, padding: '1px 6px', borderRadius: 10, fontSize: 10,
+                                                        background: isActive ? 'rgba(255,255,255,0.14)' : '#e2e8f0',
+                                                        color: isActive ? '#fff' : '#64748b'
+                                                    }}>
+                                                        {count}
+                                                    </span>
+                                                </>
+                                            )}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+
+                            <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px', borderTop: 'none', borderRadius: '0 0 10px 10px' }}>
+                                <table className="data-table role-candidates-table">
+                                    <thead>
+                                        <tr>
+                                            <th className="role-sticky-index">#</th>
+                                            <th className="role-sticky-candidate">Candidate</th>
+                                            <th className="role-sticky-status">Status</th>
+                                            <th style={{ minWidth: '150px', maxWidth: '180px' }}>Role</th>
+                                            <th style={{ minWidth: '140px' }}>Email</th>
+                                            <th style={{ minWidth: '100px' }}>Phone</th>
+                                            <th style={{ minWidth: '120px', width: '120px' }}>Details</th>
+                                            <th style={{ minWidth: '70px', width: '70px' }}>Priority</th>
+                                            <th style={{ minWidth: '140px', maxWidth: '160px' }}>Feedback</th>
+                                            <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Delivery</div></th>
+                                            <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Hub</div></th>
+                                            <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Delivery</div></th>
+                                            <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Hub</div></th>
+                                            <th style={{ minWidth: '60px', width: '60px' }}>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {filteredCandidates.map((candidate, idx) => {
                                     const primaryRole = candidate.roles?.[0] || {
                                         title: candidate.current_title || candidate.title || candidate.headline || '',
                                         company: candidate.current_company || candidate.company || '',
@@ -1121,9 +1300,18 @@ function Roles() {
                                         </tr>
                                     )
                                 })}
+                                {filteredCandidates.length === 0 && (
+                                    <tr>
+                                        <td colSpan="14" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+                                            No candidates match the selected filters.
+                                        </td>
+                                    </tr>
+                                )}
                             </tbody>
                         </table>
                     </div>
+                </div>
+            </div>
                 )}
 
                 {/* Modals */}

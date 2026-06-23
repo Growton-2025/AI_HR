@@ -1,0 +1,58 @@
+{
+  "google": {
+    "company": "Google",
+    "product_service": "Search, Cloud Computing, AI, Advertising, Consumer Electronics",
+    "customer_segment": "General consumers, businesses, enterprises, advertisers",
+    "customer_presence": "Global",
+    "funding_stage": "Public",
+    "revenue": "Approximately $402.84 billion in 2025",
+    "culture_type": "Innovative, data-driven",
+    "headquarters": "Mountain View, California, USA",
+    "sources": [
+      {
+        "url": "https://www.companieshistory.com/google-competitors/",
+        "title": "Google Competitors 2026: Top Rivals, Market Share And Industry Analysis",
+        "note": "An analysis of Google's top competitors in 2026, including Microsoft, Amazon, Meta Platforms, Apple, and Nvidia."
+      },
+      {
+        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
+        "title": "Alphabet's Top Competitors & Peers",
+        "note": "A memo outlining Alphabet's main competitors and peers, including Apple, Microsoft, Meta Platforms, Amazon, Snap, and Oracle."
+      }
+    ],
+    "target": "Google",
+    "competitors": [
+      "{'name': 'Microsoft', 'product_service': 'Search (Bing), Cloud Computing (Azure), AI (Copilot)', 'customer_segment': 'General consumers, businesses, enterprises', 'customer_presence': 'Global'}",
+      "{'name': 'Amazon', 'product_service': 'E-commerce, Cloud Computing (AWS), AI (Alexa)', 'customer_segment': 'General consumers, businesses, enterprises', 'customer_presence': 'Global'}",
+      "{'name': 'Meta Platforms', 'product_service': 'Social Media (Facebook, Instagram, WhatsApp), AI (Llama)', 'customer_segment': 'General consumers, advertisers', 'customer_presence': 'Global'}",
+      "{'name': 'Apple', 'product_service': 'Consumer Electronics (iPhone, Mac), Services, AI (Siri)', 'customer_segment': 'General consumers, businesses', 'customer_presence': 'Global'}",
+      "{'name': 'Nvidia', 'product_service': 'Semiconductors (GPUs), AI Data Center Chips, AI Models (CUDA, DGX)', 'customer_segment': 'Businesses, enterprises, AI researchers', 'customer_presence': 'Global'}"
+    ],
+    "similar_companies": [],
+    "last_verified_at": "2026-06-16T09:06:24Z"
+  },
+  "oracle": {
+    "target": "Oracle",
+    "similar_companies": [],
+    "sources": [
+      {
+        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
+        "title": "Alphabet's Top Competitors & Peers",
+        "note": "A memo outlining Alphabet's main competitors and peers, including Oracle."
+      }
+    ],
+    "last_verified_at": "2026-06-16T09:06:24Z"
+  },
+  "salesforce": {
+    "target": "Salesforce",
+    "similar_companies": [],
+    "sources": [
+      {
+        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
+        "title": "Alphabet's Top Competitors & Peers",
+        "note": "A memo outlining Alphabet's main competitors and peers, including Salesforce."
+      }
+    ],
+    "last_verified_at": "2026-06-16T09:06:24Z"
+  }
+}
