@@ -160,7 +160,7 @@ def activate_role(
                             (recruitment_role_id, campaign_name, provisioning_status, created_at, updated_at)
                         VALUES (%s, %s, 'skipped', NOW(), NOW())
                         ON CONFLICT (recruitment_role_id) DO UPDATE
-                        SET provisioning_status = 'skipped', updated_at = NOW()
+                        SET provisioning_status = 'skipped', provisioning_error = NULL, updated_at = NOW()
                         """,
                         (role_id, role_name),
                     )
