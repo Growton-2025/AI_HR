@@ -205,3 +205,21 @@ export function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
     </div>
   );
 }
+
+export function uniqueSortedOptions(...groups) {
+  const seen = new Map();
+  for (const group of groups) {
+    const values = Array.isArray(group)
+      ? group
+      : group && typeof group === 'object'
+        ? Object.keys(group)
+        : [];
+    for (const value of values) {
+      const text = String(value || '').trim();
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (!seen.has(key)) seen.set(key, text);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}

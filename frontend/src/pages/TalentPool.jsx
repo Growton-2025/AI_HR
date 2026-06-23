@@ -16,7 +16,7 @@ import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components
 import AiColumnConfigModal from '../components/AiColumnConfigModal';
 import AiColumnCellDrawer from '../components/AiColumnCellDrawer';
 import Select, { components } from 'react-select';
-import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents';
+import { TagFilterInput, SelectFilter, RangeSlider, uniqueSortedOptions } from '../components/FilterComponents';
 import CsvMappingModal from '../components/CsvMappingModal';
 import HayasaBrand from '../components/HayasaBrand';
 
