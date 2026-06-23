@@ -3234,7 +3234,7 @@ def _score_hiring_company_relevance(profile: Dict[str, Any], criteria: Dict[str,
 
 
 def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    profile_copy = copy.deepcopy({k: v for k, v in profile.items() if k != "embedding"})
+    profile_copy = {k: v for k, v in profile.items() if k != "embedding"}
     shortlist_intelligence = build_shortlist_intelligence_pack(profile_copy, criteria)
     chunks = build_profile_evidence_chunks(profile_copy)
     matched_criteria: List[Dict[str, Any]] = []
@@ -3564,7 +3564,7 @@ def _prepare_shortlist_visible_candidate(
     verification_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a frontend-safe candidate row with visible shortlist status metadata."""
-    visible = copy.deepcopy({k: v for k, v in (profile or {}).items() if k != "embedding"})
+    visible = {k: v for k, v in (profile or {}).items() if k != "embedding"}
     visible["shortlist_status"] = status
     visible["is_verified_match"] = status == "verified_match"
     visible["verification_pending"] = verification_pending
@@ -3766,7 +3766,7 @@ def _dynamic_candidate_candidates(
             for role in roles[:5]:
                 role_company = role.get("company") or ""
                 if any(_company_matches(role_company, company) for company in company_names):
-                    profile_copy = copy.deepcopy({k: v for k, v in profile.items() if k != "embedding"})
+                    profile_copy = {k: v for k, v in profile.items() if k != "embedding"}
                     profile_copy.setdefault("evidence_log", []).append({
                         "criterion": "Dynamic retrieval",
                         "value": role_company,
@@ -4280,7 +4280,7 @@ def build_schema_aware_evidence_card(
     concept_pack: Dict[str, Any],
     catalog: Dict[str, Any],
 ) -> Dict[str, Any]:
-    profile_safe = copy.deepcopy({k: v for k, v in (profile or {}).items() if k != "embedding"})
+    profile_safe = {k: v for k, v in (profile or {}).items() if k != "embedding"}
     chunks = build_profile_evidence_chunks(profile_safe)
     intelligence = build_shortlist_intelligence_pack(profile_safe, criteria)
     matched: List[Dict[str, Any]] = []
@@ -4684,7 +4684,7 @@ async def audit_shortlist_evidence_batch_with_retry(
 def apply_evidence_batch_review(profile: Dict[str, Any], review: Dict[str, Any]) -> Dict[str, Any]:
     if not review:
         return profile
-    updated = copy.deepcopy(profile)
+    updated = dict(profile)
     status = _normalize_shortlist_status(review.get("shortlist_status")) or updated.get("shortlist_status") or "not_verified"
     updated["shortlist_status"] = status
     updated["is_verified_match"] = status == "verified_match"
@@ -4708,7 +4708,7 @@ def apply_evidence_batch_review(profile: Dict[str, Any], review: Dict[str, Any])
 def apply_shortlist_audit_result(profile: Dict[str, Any], audit: Dict[str, Any]) -> Dict[str, Any]:
     if not audit:
         return profile
-    updated = copy.deepcopy(profile)
+    updated = dict(profile)
     analyst_status = _normalize_shortlist_status(updated.get("shortlist_status")) or "not_verified"
     audit_status = _normalize_search_text(audit.get("auditor_status") or "needs_review") or "needs_review"
     final_status = _normalize_shortlist_status(audit.get("final_status")) or analyst_status
@@ -5113,7 +5113,7 @@ def _strict_shortlist_score_candidate(
     criteria: Dict[str, Any],
     debug_reasons: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    profile_copy = copy.deepcopy({k: v for k, v in (profile or {}).items() if k != "embedding"})
+    profile_copy = {k: v for k, v in (profile or {}).items() if k != "embedding"}
     # Normalize DB roles with any richer imported experience data before every
     # strict check. This makes dates and current-employer semantics available to
     # all criteria instead of only to duration helpers.
@@ -6942,7 +6942,7 @@ async def process_query_main(
             use_web_search=web_enabled,
         )
         await _wait_if_paused()
-        updated = copy.deepcopy(profile)
+        updated = dict(profile)
         if isinstance(review, dict):
             final_status = _normalize_shortlist_status(review.get("final_status")) or "not_verified"
             if final_status != "verified_match":
