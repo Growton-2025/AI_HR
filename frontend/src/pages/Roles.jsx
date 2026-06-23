@@ -429,7 +429,11 @@ function Roles() {
                 email_outreach_status: res.data?.email_outreach,
                 linkedin_outreach_status: res.data?.linkedin_outreach,
             })
-            toast.success(res.data?.contact_enriching ? 'Shortlisted · retrieving contact details' : 'Shortlisted · outreach queued')
+            if (res.data?.already_processed) {
+                toast.success('Candidate is already actively pushing in the outreach queue')
+            } else {
+                toast.success(res.data?.contact_enriching ? 'Shortlisted · retrieving contact details' : 'Shortlisted · outreach queued')
+            }
             setTimeout(() => fetchOutreachStatus(viewingRole.id), 1200)
             return res
         } catch (error) {

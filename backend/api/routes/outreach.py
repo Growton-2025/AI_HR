@@ -852,6 +852,51 @@ async def shortlist_role_candidate(
             queue_state = _candidate_role_queue_state(candidate)
             email_status = queue_state["email_status"]
             linkedin_status = queue_state["linkedin_status"]
+
+            # Guardrail: Check if already shortlisted for this role
+            cur.execute(
+                "SELECT status, li_status, campaign_id, heyreach_campaign_id FROM candidate_outreach WHERE candidate_id=%s AND recruitment_role_id=%s",
+                (candidate_id, role_id)
+            )
+            existing_outreach = cur.fetchone()
+
+            if existing_outreach:
+                e_stat, l_stat, existing_camp_id, existing_hr_camp_id = existing_outreach
+                
+                # Fetch current role campaigns
+                cur.execute("SELECT campaign_id FROM role_smartlead_campaigns WHERE recruitment_role_id=%s", (role_id,))
+                role_sl = cur.fetchone()
+                current_camp_id = role_sl[0] if role_sl else None
+                
+                cur.execute("SELECT campaign_id FROM role_heyreach_campaigns WHERE recruitment_role_id=%s", (role_id,))
+                role_hr = cur.fetchone()
+                current_hr_camp_id = role_hr[0] if role_hr else None
+
+                campaign_changed = (
+                    (existing_camp_id and current_camp_id and str(existing_camp_id) != str(current_camp_id)) or
+                    (existing_hr_camp_id and current_hr_camp_id and str(existing_hr_camp_id) != str(current_hr_camp_id))
+                )
+
+                if campaign_changed:
+                    print(f"🔄 Campaign ID changed for {candidate['name']} in role {role_id}. Resetting outreach state.")
+                    cur.execute("DELETE FROM candidate_outreach WHERE candidate_id=%s AND recruitment_role_id=%s", (candidate_id, role_id))
+                else:
+                    active_states = {"queued", "scheduled", "started", "in_campaign", "completed"}
+                    if e_stat in active_states or l_stat in active_states:
+                        print(f"⏩ Skipping outreach for {candidate['name']} in role {role_id} - already triggered earlier.")
+                        return {
+                            "success": True,
+                            "candidate_id": candidate_id,
+                            "name": candidate["name"],
+                            "email": candidate["email"],
+                            "phone": candidate["phone"],
+                            "linkedin": candidate["linkedin"],
+                            "contact_enriching": False,
+                            "email_outreach": "started" if e_stat else "not_started",
+                            "linkedin_outreach": "started" if l_stat else "not_started",
+                            "already_processed": True,
+                        }
+
             cur.execute("UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=%s", (candidate_id,))
             cur.execute(
                 """
@@ -978,11 +1023,46 @@ async def shortlist_selected_for_role(
                     else:
                         already_assigned_ids.append(candidate_id)
 
+                # Fetch current role campaigns
+                cur.execute("SELECT campaign_id FROM role_smartlead_campaigns WHERE recruitment_role_id=%s", (role_id,))
+                role_sl = cur.fetchone()
+                current_camp_id = role_sl[0] if role_sl else None
+                
+                cur.execute("SELECT campaign_id FROM role_heyreach_campaigns WHERE recruitment_role_id=%s", (role_id,))
+                role_hr = cur.fetchone()
+                current_hr_camp_id = role_hr[0] if role_hr else None
+
+                cur.execute(
+                    "SELECT candidate_id, status, li_status, campaign_id, heyreach_campaign_id FROM candidate_outreach WHERE recruitment_role_id=%s AND candidate_id=ANY(%s)",
+                    (role_id, valid_ids)
+                )
+                active_states = {"queued", "scheduled", "started", "in_campaign", "completed"}
+                active_outreach_ids = set()
+                ids_to_reset = []
+                for row in cur.fetchall():
+                    c_id, e_stat, l_stat, existing_camp_id, existing_hr_camp_id = row
+                    
+                    campaign_changed = (
+                        (existing_camp_id and current_camp_id and str(existing_camp_id) != str(current_camp_id)) or
+                        (existing_hr_camp_id and current_hr_camp_id and str(existing_hr_camp_id) != str(current_hr_camp_id))
+                    )
+                    
+                    if campaign_changed:
+                        ids_to_reset.append(int(c_id))
+                    elif e_stat in active_states or l_stat in active_states:
+                        active_outreach_ids.add(int(c_id))
+
+                if ids_to_reset:
+                    print(f"🔄 Bulk: Campaign ID changed for {len(ids_to_reset)} candidates in role {role_id}. Resetting outreach state.")
+                    cur.execute("DELETE FROM candidate_outreach WHERE recruitment_role_id=%s AND candidate_id=ANY(%s)", (role_id, ids_to_reset))
+
                 cur.execute(
                     "UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=ANY(%s)",
                     (valid_ids,),
                 )
                 for candidate in candidates:
+                    if candidate["id"] in active_outreach_ids:
+                        continue
                     queue_state = _candidate_role_queue_state(candidate)
                     email_status = queue_state["email_status"]
                     linkedin_status = queue_state["linkedin_status"]
@@ -1006,9 +1086,10 @@ async def shortlist_selected_for_role(
                     )
             conn.commit()
 
+    # Only enrich candidates who aren't already actively being pushed
     enriching = [
         candidate for candidate in candidates
-        if _candidate_role_queue_state(candidate)["needs_enrichment"]
+        if candidate["id"] not in active_outreach_ids and _candidate_role_queue_state(candidate)["needs_enrichment"]
     ]
     background_tasks.add_task(_dispatch_role_outreach_now)
     if enriching:

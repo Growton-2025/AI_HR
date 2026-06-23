@@ -94,36 +94,16 @@ function PendingReasoningShimmer() {
     )
 }
 
-function MatchChips({ matched, missing }) {
-    if (!matched?.length && !missing?.length) return null
-    return (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 8 }}>
-            {(matched || []).map((m, i) => {
-                const label = typeof m === 'string' ? m : (m.criterion && m.value ? `${m.criterion}: ${m.value}` : JSON.stringify(m))
-                return (
-                    <span key={i} style={{
-                        fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 99,
-                        background: '#dcfce7', color: '#166534', border: '1px solid #bbf7d0',
-                    }}>✓ {label}</span>
-                )
-            })}
-            {(missing || []).slice(0, 3).map((m, i) => {
-                const label = typeof m === 'string' ? m : (m.criterion && m.value ? `${m.criterion}: ${m.value}` : JSON.stringify(m))
-                return (
-                    <span key={i} style={{
-                        fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 99,
-                        background: '#fef3c7', color: '#92400e', border: '1px solid #fde68a',
-                    }}>⚠ {label}</span>
-                )
-            })}
-        </div>
-    )
-}
-
 function formatYears(value) {
     const num = Number(value)
     if (!Number.isFinite(num)) return '0 yrs'
     return `${Number.isInteger(num) ? num : num.toFixed(1)} yrs`
+}
+
+function truncateText(text, maxLen = 60) {
+    const s = String(text || '')
+    if (s.length > maxLen) return s.slice(0, maxLen - 3) + '...'
+    return s
 }
 
 function ScopedTenureChips({ items }) {
@@ -134,8 +114,8 @@ function ScopedTenureChips({ items }) {
                 <span key={`${item.key || item.label}-${index}`} style={{
                     fontSize: 10.5, fontWeight: 800, padding: '3px 8px', borderRadius: 99,
                     background: '#ecfdf5', color: '#047857', border: '1px solid #a7f3d0',
-                }}>
-                    {formatYears(item.duration)} {item.label || item.dimension}
+                }} title={item.label || item.dimension}>
+                    {formatYears(item.duration)} {truncateText(item.label || item.dimension, 45)}
                 </span>
             ))}
         </div>
@@ -185,7 +165,7 @@ function EvidenceDrawer({ candidate }) {
                 <div style={{ display: 'grid', gap: 6 }}>
                     {tenure.slice(0, 4).map((item, index) => (
                         <div key={`${item.key || item.label}-${index}`} style={{ fontSize: 12, color: '#334155', lineHeight: 1.45 }}>
-                            <strong>{item.label || item.dimension}</strong>: {formatYears(item.duration)} verified against {formatYears(item.required)} required
+                            <strong>{truncateText(item.label || item.dimension, 60)}</strong>: {formatYears(item.duration)} verified against {formatYears(item.required)} required
                         </div>
                     ))}
                 </div>
@@ -197,8 +177,8 @@ function EvidenceDrawer({ candidate }) {
                     background: '#f8fafc', border: '1px solid #e2e8f0',
                 }}>
                     <strong style={{ color: '#0f172a' }}>{item.id || 'evidence'}</strong>
-                    {item.criterion ? ` · ${item.criterion}` : ''}
-                    {item.source ? ` · ${item.source}` : ''}
+                    {item.criterion ? ` · ${truncateText(item.criterion, 60)}` : ''}
+                    {item.source ? ` · ${truncateText(item.source, 40)}` : ''}
                     <div style={{ marginTop: 5 }}>
                         <EvidenceText value={item.source_text || item.snippet || item.value} />
                     </div>
@@ -280,6 +260,76 @@ function QuickAddButton({ candidateId, alreadyAdded, addedRoleName }) {
     )
 }
 
+// Collapsible section with a pill-count badge in the header
+function CollapsibleSection({ icon, label, items, colorScheme, defaultOpen = false }) {
+    const [open, setOpen] = useState(defaultOpen)
+    if (!items || items.length === 0) return null
+    const { bg, color, border } = colorScheme
+    return (
+        <div style={{ marginTop: 7 }}>
+            <button
+                onClick={() => setOpen(o => !o)}
+                style={{
+                    display: 'flex', alignItems: 'center', gap: 6, background: 'none',
+                    border: 'none', cursor: 'pointer', padding: '2px 0', width: '100%',
+                }}
+            >
+                <span style={{ fontSize: 10, fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    {icon} {label}
+                </span>
+                <span style={{ fontSize: 10, fontWeight: 700, background: bg, color, border: `1px solid ${border}`, borderRadius: 99, padding: '1px 6px' }}>
+                    {items.length}
+                </span>
+                <span style={{ marginLeft: 'auto', color: '#94a3b8', display: 'flex', alignItems: 'center' }}>
+                    {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                </span>
+            </button>
+            {open && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 5, paddingLeft: 2 }}>
+                    {items.map((item, i) => (
+                        <span key={i} style={{ fontSize: 11, fontWeight: 600, padding: '2px 9px', borderRadius: 99, background: bg, color, border: `1px solid ${border}`, whiteSpace: 'nowrap' }}>
+                            {item}
+                        </span>
+                    ))}
+                </div>
+            )}
+        </div>
+    )
+}
+
+// Parse matched/missing criteria into structured groups
+function parseCriteriaGroups(matched, missing) {
+    const groups = { industries: [], functions: [], geographies: [], tenure: [], other_matched: [], other_missing: [] }
+
+    const splitValues = (val) => String(val || '').split(',').map(s => s.trim()).filter(Boolean)
+
+    matched.forEach(m => {
+        const criterion = typeof m === 'string' ? '' : (m.criterion || '')
+        const value = typeof m === 'string' ? m : (m.value || m.criterion || '')
+        const lower = criterion.toLowerCase()
+
+        if (lower.includes('industr') || lower.includes('saas') || lower.includes('product')) {
+            // Split comma-separated industry list into individual chips
+            splitValues(value).forEach(v => groups.industries.push(v))
+        } else if (lower.includes('function') || lower.includes('role') || lower.includes('sales dev') || lower.includes('tenure')) {
+            // Split comma-separated function list into individual chips
+            splitValues(value).forEach(v => groups.functions.push(v))
+        } else if (lower.includes('geograph') || lower.includes('location') || lower.includes('region') || lower.includes('country')) {
+            splitValues(value).forEach(v => groups.geographies.push(v))
+        } else if (lower.includes('experience') || lower.includes('years') || lower.includes('managed')) {
+            groups.tenure.push(`${criterion}: ${value}`.replace(/^:\s*/, ''))
+        } else {
+            groups.other_matched.push(`${criterion}${value ? ': ' + value : ''}`.replace(/^:\s*/, '') || String(m))
+        }
+    })
+
+    missing.slice(0, 4).forEach(m => {
+        const label = typeof m === 'string' ? m : (m.criterion && m.value ? `${m.criterion}: ${m.value}` : m.criterion || JSON.stringify(m))
+        groups.other_missing.push(label)
+    })
+    return groups
+}
+
 function CandidateCard({ candidate }) {
     const [expanded, setExpanded] = useState(false)
     const { selectedCandidates, toggleCandidateSelection } = useAppStore(
@@ -293,8 +343,6 @@ function CandidateCard({ candidate }) {
     const company = primaryRole.company || ''
     const location = candidate.location || candidate.city || 'Location unavailable'
 
-    // `answer` is the short 1-2 sentence verdict from the LLM (like AI Column primary_output)
-    // `reasoning` is the detailed 2-4 sentence explanation
     const isPending = candidate.shortlist_status === 'pending_reasoning'
     const answer = candidate.answer || candidate.reasoning || candidate.summary || ''
     const reasoning = candidate.reasoning || ''
@@ -305,6 +353,9 @@ function CandidateCard({ candidate }) {
     const matched = candidate.matched_criteria || []
     const missing = candidate.missing_criteria || []
     const hasEvidenceDetails = (candidate.evidence_log?.length || 0) > 0 || (candidate.scoped_tenure?.length || 0) > 0
+
+    const groups = parseCriteriaGroups(matched, missing)
+    const hasGroups = matched.length > 0 || missing.length > 0
 
     const scoreColor = score > 80 ? { bg: '#e7f6ec', color: '#166534' }
         : score > 60 ? { bg: '#f7f0e4', color: '#8b6b44' }
@@ -352,7 +403,6 @@ function CandidateCard({ candidate }) {
 
             {/* Pending shimmer OR full AI answer */}
             {isPending && <PendingReasoningShimmer />}
-            {/* AI Answer — styled like an AI Column cell */}
             {!isPending && answer && (
                 <div style={{
                     margin: '8px 0 0',
@@ -367,18 +417,9 @@ function CandidateCard({ candidate }) {
                     wordBreak: 'break-word',
                 }}>
                     {renderTextWithLinks(answer)}
-
-                    {/* Footer row: AI badge, confidence, source, expand toggle */}
-                    <div style={{
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                        flexWrap: 'wrap', gap: 6, marginTop: 8,
-                    }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                            <span style={{
-                                fontSize: 10, color: '#6366f1', fontWeight: 800,
-                                textTransform: 'uppercase', letterSpacing: '0.06em',
-                                display: 'flex', alignItems: 'center', gap: 4,
-                            }}>
+                            <span style={{ fontSize: 10, color: '#6366f1', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                                 AI Match Analysis
                             </span>
                             <ShortlistStatusBadge candidate={candidate} />
@@ -388,32 +429,64 @@ function CandidateCard({ candidate }) {
                         {(hasDetailedReasoning || hasEvidenceDetails) && (
                             <button
                                 onClick={() => setExpanded(e => !e)}
-                                style={{
-                                    background: 'none', border: 'none', cursor: 'pointer',
-                                    fontSize: 11, color: '#6366f1', fontWeight: 700,
-                                    display: 'flex', alignItems: 'center', gap: 3, padding: 0,
-                                }}
+                                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 11, color: '#6366f1', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 3, padding: 0 }}
                             >
                                 {expanded ? <><ChevronUp size={13} /> Less</> : <><ChevronDown size={13} /> Evidence</>}
                             </button>
                         )}
                     </div>
-
-                    {/* Expanded reasoning */}
-                    {expanded && hasDetailedReasoning && (
-                        <div style={{
-                            marginTop: 10, paddingTop: 10,
-                            borderTop: '1px solid rgba(99,102,241,0.15)',
-                            fontSize: 12.5, color: '#334155', lineHeight: 1.7,
-                        }}>
-                            {renderTextWithLinks(reasoning)}
-                        </div>
-                    )}
                     {expanded && <EvidenceDrawer candidate={candidate} />}
                 </div>
             )}
 
-            <MatchChips matched={matched} missing={missing} />
+            {/* Structured collapsible match criteria — replaces raw text blobs */}
+            {!isPending && hasGroups && (
+                <div style={{ marginTop: 8, padding: '8px 12px', background: '#f8fafc', border: '1px solid #e8edf3', borderRadius: 10 }}>
+                    <CollapsibleSection
+                        icon="🏭" label="Industries"
+                        items={groups.industries}
+                        colorScheme={{ bg: '#eff6ff', color: '#1e40af', border: '#bfdbfe' }}
+                        defaultOpen={groups.industries.length <= 4}
+                    />
+                    <CollapsibleSection
+                        icon="⚡" label="Functions"
+                        items={groups.functions}
+                        colorScheme={{ bg: '#f0fdf4', color: '#166534', border: '#bbf7d0' }}
+                        defaultOpen={groups.functions.length <= 4}
+                    />
+                    <CollapsibleSection
+                        icon="📍" label="Geographies"
+                        items={groups.geographies}
+                        colorScheme={{ bg: '#fef3c7', color: '#92400e', border: '#fde68a' }}
+                        defaultOpen={true}
+                    />
+                    {groups.tenure.length > 0 && (
+                        <CollapsibleSection
+                            icon="⏱" label="Experience"
+                            items={groups.tenure}
+                            colorScheme={{ bg: '#ecfdf5', color: '#047857', border: '#a7f3d0' }}
+                            defaultOpen={true}
+                        />
+                    )}
+                    {groups.other_matched.length > 0 && (
+                        <CollapsibleSection
+                            icon="✓" label="Other Matches"
+                            items={groups.other_matched}
+                            colorScheme={{ bg: '#ecfdf5', color: '#065f46', border: '#a7f3d0' }}
+                            defaultOpen={false}
+                        />
+                    )}
+                    {groups.other_missing.length > 0 && (
+                        <CollapsibleSection
+                            icon="⚠" label="Gaps"
+                            items={groups.other_missing}
+                            colorScheme={{ bg: '#fff7ed', color: '#9a3412', border: '#fed7aa' }}
+                            defaultOpen={true}
+                        />
+                    )}
+                </div>
+            )}
+
             <ScopedTenureChips items={candidate.scoped_tenure} />
 
             {candidate.contributing_roles_details?.roles?.length > 0 && (
@@ -443,8 +516,6 @@ function SearchResults() {
     const [pageSize, setPageSize] = useState(25)
 
     const rankedResults = useMemo(() => {
-        // pending_reasoning candidates sink to the bottom during streaming;
-        // once reasoning arrives they get a real match_score and float up.
         const statusRank = { verified_match: 0, shortlisted: 0, pending_reasoning: 99 }
         return [...searchResults].sort((left, right) => {
             const leftStatus = left.shortlist_status || 'shortlisted'
@@ -459,8 +530,7 @@ function SearchResults() {
     }, [searchResults])
 
     const totalPages = Math.max(1, Math.ceil(rankedResults.length / pageSize))
-    
-    // Ensure page is valid if results decrease
+
     useEffect(() => {
         if (page > totalPages) setPage(totalPages)
     }, [totalPages, page])
@@ -511,7 +581,7 @@ function SearchResults() {
                     <CandidateCard key={candidate.id} candidate={candidate} />
                 ))}
             </div>
-            
+
             {searchResults.length > 0 && (
                 <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderTop: '1px solid #eef2f7', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottomLeftRadius: '12px', borderBottomRightRadius: '12px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
