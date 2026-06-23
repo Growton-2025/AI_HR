@@ -323,7 +323,7 @@ async def get_roles(
                     "owner_user_id": row[6],
                     "owner_name": row[7] or "",
                     "owner_email": row[8] or "",
-                    "activation_status": "active" if row[9] == "configured" and row[11] == "configured" else "inactive",
+                    "activation_status": "active" if row[9] in ("configured", "skipped") and row[11] == "configured" else "inactive",
                     "activation_error": " | ".join(value for value in (row[10], row[12]) if value),
                     "smartlead_status": row[9] or "missing",
                     "heyreach_status": row[11] or "missing",
