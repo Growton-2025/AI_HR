@@ -1001,16 +1001,12 @@ export const useAppStore = create(persist((set, get) => ({
                     break
 
                 case 'candidate_batch': {
-                    // Batch of pre-reasoning candidates from the scoring phase — merge all at once
+                    // Batch of pre-reasoning candidates from the scoring phase.
+                    // We no longer display these in the table immediately to prevent "profile without reasoning" UI.
+                    // We just update the status message to show we are working on them.
                     const batchItems = Array.isArray(data.data) ? data.data : []
                     if (batchItems.length) {
-                        set(state => {
-                            const nextResults = mergeSearchCandidates(state.searchResults, batchItems)
-                            return {
-                                searchResults: nextResults,
-                                statusMessage: `${nextResults.length} candidate${nextResults.length === 1 ? '' : 's'} passed filter — generating reasoning...`,
-                            }
-                        })
+                        set({ statusMessage: `${batchItems.length} candidate${batchItems.length === 1 ? '' : 's'} passed filter — generating reasoning...` })
                     }
                     break
                 }

@@ -6931,102 +6931,7 @@ async def process_query_main(
         "message": f"Evaluating candidate pool 0/{len(initial_candidate_pool)}...",
     }
 
-    final_candidates: List[Dict[str, Any]] = []
-    reject_reasons: Counter = Counter()
-    reviewed_count = 0
-
-    def _score_batch(batch: List[Dict[str, Any]]) -> tuple:
-        passed: List[Dict[str, Any]] = []
-        batch_reasons: List[str] = []
-        for profile in batch:
-            reasons: List[str] = []
-            scored = _strict_shortlist_score_candidate(profile, criteria, reasons)
-            if scored:
-                passed.append(scored)
-            else:
-                batch_reasons.extend(reasons or ["unknown"])
-        return passed, batch_reasons
-
-    for batch_start in range(0, len(initial_candidate_pool), SCORING_BATCH_SIZE):
-        await _wait_if_paused()
-        batch = initial_candidate_pool[batch_start: batch_start + SCORING_BATCH_SIZE]
-
-        passed_batch, batch_reasons = await asyncio.to_thread(_score_batch, batch)
-
-        final_candidates.extend(passed_batch)
-        reject_reasons.update(batch_reasons)
-        reviewed_count += len(batch)
-
-        # Stream all passers from this batch as ONE profile_chunk event
-        # (avoids flooding the WebSocket with hundreds of frames on large pools)
-        if passed_batch:
-            safe_batch = []
-            for passing in passed_batch:
-                safe = {k: v for k, v in passing.items() if k != "embedding"}
-                safe["shortlist_status"] = "pending_reasoning"
-                safe["is_verified_match"] = False
-                safe_batch.append(safe)
-            yield {
-                "type": "candidate_batch",
-                "phase": "scoring",
-                "data": safe_batch,
-                "reviewed": reviewed_count,
-                "passed": len(final_candidates),
-                "total_pool": len(initial_candidate_pool),
-            }
-
-        yield {
-            "type": "progress",
-            "phase": "filtering",
-            "current": reviewed_count,
-            "total": len(initial_candidate_pool),
-            "passed": len(final_candidates),
-            "message": f"Evaluating candidate pool {reviewed_count}/{len(initial_candidate_pool)}...",
-        }
-
-    # -----------------------------------------------------------------
-
-    logger.info(
-        "SHORTLIST strict_filter_counts seen=%s passed=%s failed=%s reject_reason_counts=%s",
-        len(initial_candidate_pool),
-        len(final_candidates),
-        len(initial_candidate_pool) - len(final_candidates),
-        dict(reject_reasons.most_common(12)),
-    )
-
-    final_candidates = _sort_strict_shortlist_candidates(final_candidates, criteria)
-    strict_passed_count = len(final_candidates)
-    top_n = criteria.get("top_n")
-    if top_n not in (None, 0):
-        try:
-            final_candidates = final_candidates[: int(top_n)]
-        except Exception:
-            pass
-
-    if not final_candidates:
-        yield {
-            "type": "complete",
-            "data": [],
-            "summary": tracker.get_summary(),
-            "verified_count": 0,
-            "total_reviewed": len(initial_candidate_pool),
-            "filter_debug": {
-                "criteria": {k: v for k, v in criteria.items() if not k.startswith("_")},
-                "semantic_pool_count": len(initial_candidate_pool),
-                "full_scope_strict_scan": scan_full_scope_for_strict_filters,
-                "passed": 0,
-                "failed": len(initial_candidate_pool),
-                "reject_reason_counts": dict(reject_reasons.most_common(12)),
-            },
-        }
-        return
-
-    await _wait_if_paused()
-    yield {"type": "progress_start", "total": len(final_candidates), "total_considered": selected_candidate_count}
-    await _wait_if_paused()
-    yield "Generating match reasoning..."
-
-    original_order = {str(profile.get("id")): index for index, profile in enumerate(final_candidates)}
+    output_queue = asyncio.Queue()
 
     async def _with_reasoning(profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         await _wait_if_paused()
@@ -7070,34 +6975,162 @@ async def process_query_main(
             updated["answer"] = updated["reasoning"]
         return updated
 
-    processed_candidates: List[Dict[str, Any]] = []
+    async def _producer_task():
+        try:
+            final_candidates: List[Dict[str, Any]] = []
+            reject_reasons: Counter = Counter()
+            reviewed_count = 0
+            original_order = {}
+            
+            pending_tasks = set()
+            sem = asyncio.Semaphore(15)
+            
+            async def process_one(profile):
+                async with sem:
+                    try:
+                        visible = await _with_reasoning(profile)
+                        if visible:
+                            await _wait_if_paused()
+                            await output_queue.put({"type": "reasoned_profile", "data": visible, "total_passed": len(final_candidates)})
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.warning("Shortlist reasoning task failed: %s", e)
+
+            def _score_batch(batch: List[Dict[str, Any]]) -> tuple:
+                passed: List[Dict[str, Any]] = []
+                batch_reasons: List[str] = []
+                for profile in batch:
+                    reasons: List[str] = []
+                    scored = _strict_shortlist_score_candidate(profile, criteria, reasons)
+                    if scored:
+                        passed.append(scored)
+                    else:
+                        batch_reasons.extend(reasons or ["unknown"])
+                return passed, batch_reasons
+
+            for batch_start in range(0, len(initial_candidate_pool), SCORING_BATCH_SIZE):
+                await _wait_if_paused()
+                batch = initial_candidate_pool[batch_start: batch_start + SCORING_BATCH_SIZE]
+
+                passed_batch, batch_reasons = await asyncio.to_thread(_score_batch, batch)
+
+                final_candidates.extend(passed_batch)
+                reject_reasons.update(batch_reasons)
+                reviewed_count += len(batch)
+                
+                top_n = criteria.get("top_n")
+                if top_n not in (None, 0):
+                    try:
+                        top_n_val = int(top_n)
+                        if len(final_candidates) > top_n_val:
+                            passed_batch = passed_batch[:-(len(final_candidates) - top_n_val)]
+                            final_candidates = final_candidates[:top_n_val]
+                    except Exception:
+                        pass
+
+                for profile in passed_batch:
+                    original_order[str(profile.get("id"))] = len(original_order)
+                    task = asyncio.create_task(process_one(profile))
+                    pending_tasks.add(task)
+
+                pending_tasks = {t for t in pending_tasks if not t.done()}
+
+                if passed_batch:
+                    safe_batch = []
+                    for passing in passed_batch:
+                        safe = {k: v for k, v in passing.items() if k != "embedding"}
+                        safe["shortlist_status"] = "pending_reasoning"
+                        safe["is_verified_match"] = False
+                        safe_batch.append(safe)
+                    await output_queue.put({
+                        "type": "candidate_batch",
+                        "phase": "scoring",
+                        "data": safe_batch,
+                        "reviewed": reviewed_count,
+                        "passed": len(final_candidates),
+                        "total_pool": len(initial_candidate_pool),
+                    })
+
+                await output_queue.put({
+                    "type": "progress",
+                    "phase": "filtering",
+                    "current": reviewed_count,
+                    "total": len(initial_candidate_pool),
+                    "passed": len(final_candidates),
+                    "message": f"Evaluating candidate pool {reviewed_count}/{len(initial_candidate_pool)}...",
+                })
+                
+                if top_n not in (None, 0) and len(final_candidates) >= int(top_n):
+                    break
+                
+            if pending_tasks:
+                await output_queue.put({"type": "progress_start", "total": len(final_candidates), "total_considered": selected_candidate_count})
+                await output_queue.put("Generating match reasoning...")
+                await asyncio.wait(pending_tasks)
+                
+            logger.info(
+                "SHORTLIST strict_filter_counts seen=%s passed=%s failed=%s reject_reason_counts=%s",
+                len(initial_candidate_pool),
+                len(final_candidates),
+                len(initial_candidate_pool) - len(final_candidates),
+                dict(reject_reasons.most_common(12)),
+            )
+            await output_queue.put({
+                "type": "done",
+                "final_candidates": final_candidates,
+                "reject_reasons": reject_reasons,
+                "original_order": original_order
+            })
+        except asyncio.CancelledError:
+            for t in pending_tasks:
+                if not t.done():
+                    t.cancel()
+            raise
+        except Exception as e:
+            logger.error("Error in producer task: %s", exc_info=True)
+            await output_queue.put(None)
+
+    producer = asyncio.create_task(_producer_task())
+    
+    final_candidates = []
+    reject_reasons = Counter()
+    original_order = {}
+    processed_candidates = []
     running_verified = 0
 
-    for profile in final_candidates:
-        await _wait_if_paused()
-        try:
-            visible = await _with_reasoning(profile)
-        except asyncio.CancelledError:
-            continue
-        except Exception as e:
-            logger.warning("Shortlist reasoning task failed: %s", e)
-            continue
-        if not visible:
-            continue
-        await _wait_if_paused()
-        processed_candidates.append(visible)
-        running_verified += 1
-        yield {
-            "type": "profile_chunk",
-            "data": visible,
-            "current": len(processed_candidates),
-            "total": len(final_candidates),
-            "reviewed": len(processed_candidates),
-            "verified": running_verified,
-            "potential": 0,
-            "llm_reviewed": 0,
-            "audited": 0,
-        }
+    try:
+        while True:
+            msg = await output_queue.get()
+            if msg is None:
+                break
+            if isinstance(msg, dict):
+                if msg["type"] == "done":
+                    final_candidates = msg["final_candidates"]
+                    reject_reasons = msg["reject_reasons"]
+                    original_order = msg["original_order"]
+                    break
+                elif msg["type"] == "reasoned_profile":
+                    visible = msg["data"]
+                    processed_candidates.append(visible)
+                    running_verified += 1
+                    yield {
+                        "type": "profile_chunk",
+                        "data": visible,
+                        "current": len(processed_candidates),
+                        "total": msg.get("total_passed", len(final_candidates)),
+                        "reviewed": len(processed_candidates),
+                        "verified": running_verified,
+                        "potential": 0,
+                        "llm_reviewed": 0,
+                        "audited": 0,
+                    }
+                else:
+                    yield msg
+            else:
+                yield msg
+    finally:
+        producer.cancel()
 
     processed_candidates.sort(key=lambda profile: original_order.get(str(profile.get("id")), 10**9))
     verified_count = len(processed_candidates)
@@ -7119,9 +7152,9 @@ async def process_query_main(
             "criteria": {k: v for k, v in criteria.items() if not k.startswith("_")},
             "semantic_pool_count": len(initial_candidate_pool),
             "full_scope_strict_scan": scan_full_scope_for_strict_filters,
-            "passed": strict_passed_count,
+            "passed": len(final_candidates),
             "returned": len(processed_candidates),
-            "failed": len(initial_candidate_pool) - strict_passed_count,
+            "failed": len(initial_candidate_pool) - len(final_candidates),
             "reject_reason_counts": dict(reject_reasons.most_common(12)),
         },
     }
