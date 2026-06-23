@@ -4,6 +4,9 @@ import os
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
+class CampaignNotFoundError(Exception):
+    pass
+
 class SmartleadBot:
     def __init__(self, api_key=None, base_url="https://server.smartlead.ai"):
         self.api_key = api_key or os.getenv("SMARTLEAD_API_KEY")
@@ -26,6 +29,8 @@ class SmartleadBot:
         else:
             print(f"❌ {context} failed: {response.status_code}")
             print(f"Response: {response.text}")
+            if response.status_code == 404 and "campaign_id" in response.text.lower():
+                raise CampaignNotFoundError(response.text)
             return None
 
     def create_campaign(self, campaign_name):

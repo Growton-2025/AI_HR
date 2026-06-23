@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from backend.db.connection import get_db_connection_context
 from backend.integrations.heyreach import HeyReachBot
-from backend.integrations.smartlead import SmartleadBot
+from backend.integrations.smartlead import SmartleadBot, CampaignNotFoundError
 from backend.services.role_campaigns import fetch_role_campaign, provision_role_campaign
 
 
@@ -38,7 +38,7 @@ def fetch_role_activation(cur, role_id: int) -> Dict[str, Any]:
         }
     smartlead_status = row[1] or "missing"
     heyreach_status = row[8] or "missing"
-    active = heyreach_status == "configured" and smartlead_status in ("configured", "skipped")
+    active = heyreach_status in ("configured", "skipped") and smartlead_status in ("configured", "skipped") and not (heyreach_status == "skipped" and smartlead_status == "skipped")
     errors = [value for value in (row[2], row[9]) if value]
     return {
         "activation_status": "active" if active else "inactive",
@@ -119,35 +119,51 @@ def activate_role(
     email_body: str,
 ) -> Dict[str, Any]:
     """Idempotently configure both role channels, retaining failures for retry."""
-    try:
-        heyreach_sender = int(os.getenv("HEYREACH_DEFAULT_SENDER_ACCOUNT_ID", "113572") or 0)
-    except (TypeError, ValueError):
-        heyreach_sender = 0
-    _save_heyreach_setup(
-        role_id,
-        role_name,
-        heyreach_campaign_id,
-        heyreach_sender or None,
-        "provisioning",
-    )
-    try:
-        if not heyreach_sender:
-            raise RuntimeError("HEYREACH_DEFAULT_SENDER_ACCOUNT_ID is not configured")
-        leads = HeyReachBot().get_campaign_leads(int(heyreach_campaign_id))
-        if leads is None:
-            raise RuntimeError("HeyReach campaign could not be validated")
-        _save_heyreach_setup(
-            role_id, role_name, heyreach_campaign_id, heyreach_sender, "configured"
-        )
-    except Exception as exc:
+    if heyreach_campaign_id <= 0:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO role_heyreach_campaigns
+                            (recruitment_role_id, campaign_name, provisioning_status, created_at, updated_at)
+                        VALUES (%s, %s, 'skipped', NOW(), NOW())
+                        ON CONFLICT (recruitment_role_id) DO UPDATE
+                        SET provisioning_status = 'skipped', provisioning_error = NULL, updated_at = NOW()
+                        """,
+                        (role_id, role_name),
+                    )
+                    conn.commit()
+    else:
+        try:
+            heyreach_sender = int(os.getenv("HEYREACH_DEFAULT_SENDER_ACCOUNT_ID", "113572") or 0)
+        except (TypeError, ValueError):
+            heyreach_sender = 0
         _save_heyreach_setup(
             role_id,
             role_name,
             heyreach_campaign_id,
             heyreach_sender or None,
-            "failed",
-            str(exc)[:1000],
+            "provisioning",
         )
+        try:
+            if not heyreach_sender:
+                raise RuntimeError("HEYREACH_DEFAULT_SENDER_ACCOUNT_ID is not configured")
+            leads = HeyReachBot().get_campaign_leads(int(heyreach_campaign_id))
+            if leads is None:
+                raise RuntimeError("HeyReach campaign could not be validated")
+            _save_heyreach_setup(
+                role_id, role_name, heyreach_campaign_id, heyreach_sender, "configured"
+            )
+        except Exception as exc:
+            _save_heyreach_setup(
+                role_id,
+                role_name,
+                heyreach_campaign_id,
+                heyreach_sender or None,
+                "failed",
+                str(exc)[:1000],
+            )
 
     # If Smartlead is optional and not provided, mark it skipped and finish.
     if smartlead_sender_account_id <= 0:
@@ -256,6 +272,19 @@ def activate_role(
                         ),
                     )
                     conn.commit()
+        except CampaignNotFoundError:
+            with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                if conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE role_smartlead_campaigns
+                            SET campaign_id=NULL, provisioning_status='pending', provisioning_error='Smartlead campaign was deleted remotely. Please click Save again to recreate.', updated_at=NOW()
+                            WHERE recruitment_role_id=%s
+                            """,
+                            (role_id,)
+                        )
+                        conn.commit()
         except Exception as exc:
             with get_db_connection_context(validate=False, register_pgvector=False) as conn:
                 if conn:
@@ -275,15 +304,22 @@ def activate_role(
 
 def retry_role_activation(role_id: int, role_name: str) -> Dict[str, Any]:
     current = get_role_activation(role_id)
-    if not current.get("heyreach_campaign_id"):
-        current["activation_error"] = "HeyReach campaign ID is missing"
-        return current
         
     smartlead_id = current.get("smartlead_sender_account_id") or "0"
     try:
         smartlead_id_int = int(smartlead_id)
     except ValueError:
         smartlead_id_int = 0
+        
+    heyreach_id = current.get("heyreach_campaign_id") or "0"
+    try:
+        heyreach_id_int = int(heyreach_id)
+    except ValueError:
+        heyreach_id_int = 0
+        
+    if heyreach_id_int <= 0 and smartlead_id_int <= 0:
+        current["activation_error"] = "Both HeyReach and Smartlead setups are missing"
+        return current
         
     if smartlead_id_int > 0:
         required = (current.get("email_subject"), current.get("email_body"))
@@ -294,7 +330,7 @@ def retry_role_activation(role_id: int, role_name: str) -> Dict[str, Any]:
     return activate_role(
         role_id,
         role_name,
-        int(current["heyreach_campaign_id"]),
+        heyreach_id_int,
         smartlead_id_int,
         current.get("email_subject") or "",
         current.get("email_body") or "",
