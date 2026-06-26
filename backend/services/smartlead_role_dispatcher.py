@@ -63,6 +63,28 @@ def dispatch_due_email(limit: int = 20) -> int:
                 )
             conn.commit()
 
+    ai_columns_by_candidate = {}
+    if claimed:
+        roles = {row[1] for row in claimed}
+        c_ids = {row[0] for row in claimed}
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    for r_id in roles:
+                        view_scope = f"role_{r_id}"
+                        cur.execute(
+                            """
+                            SELECT c.candidate_id, d.name, c.primary_output
+                            FROM ai_column_cells c
+                            JOIN ai_column_definitions d ON d.id = c.column_definition_id
+                            WHERE d.view_scope = %s AND c.candidate_id = ANY(%s)
+                            """,
+                            (view_scope, list(c_ids))
+                        )
+                        for cid, col_name, val in cur.fetchall():
+                            if val:
+                                ai_columns_by_candidate.setdefault(cid, {})[col_name] = val
+
     completed = 0
     for candidate_id, role_id, campaign_id, campaign_name, body, started_at, first_name, last_name, name, email in claimed:
         try:
@@ -70,9 +92,12 @@ def dispatch_due_email(limit: int = 20) -> int:
             resolved_last = last_name or " ".join((name or "").split()[1:])
             bot = SmartleadBot()
             bot.campaign_id = int(campaign_id)
-            if bot.add_leads(
-                [{"first_name": resolved_first, "last_name": resolved_last, "email": email.strip()}]
-            ) is None:
+            
+            lead_data = {"first_name": resolved_first, "last_name": resolved_last, "email": email.strip()}
+            ai_data = ai_columns_by_candidate.get(candidate_id, {})
+            lead_data.update(ai_data)
+            
+            if bot.add_leads([lead_data]) is None:
                 raise RuntimeError("Smartlead rejected the candidate")
             if not started_at and bot.start_campaign() is None:
                 raise RuntimeError("Candidate enrolled, but Smartlead campaign could not start")

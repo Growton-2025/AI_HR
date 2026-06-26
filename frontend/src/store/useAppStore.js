@@ -571,14 +571,33 @@ export const useAppStore = create(persist((set, get) => ({
         try {
             await axios.patch(`${API_BASE}/candidates/${id}/notes`, { notes });
 
-            // Update cache
-            const cache = get().talentPoolCache;
-            if (cache && cache.candidates) {
-                const updatedCandidates = cache.candidates.map(c =>
-                    c.id === id ? { ...c, notes } : c
-                );
-                set({ talentPoolCache: { ...cache, candidates: updatedCandidates } });
-            }
+            set(state => {
+                const next = {};
+                const cache = state.talentPoolCache;
+                if (cache?.candidates) {
+                    next.talentPoolCache = {
+                        ...cache,
+                        candidates: cache.candidates.map(candidate =>
+                            Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                        ),
+                    };
+                }
+
+                if (state.viewingRole?.candidates) {
+                    const updatedRole = {
+                        ...state.viewingRole,
+                        candidates: state.viewingRole.candidates.map(candidate =>
+                            Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                        ),
+                    };
+                    next.viewingRole = updatedRole;
+                    next.roleDetailsCache = {
+                        ...state.roleDetailsCache,
+                        [updatedRole.name]: updatedRole,
+                    };
+                }
+                return next;
+            });
             return { success: true };
         } catch (e) {
             console.error('Failed to update notes:', e);
@@ -1543,7 +1562,7 @@ export const useAppStore = create(persist((set, get) => ({
         const cached = get().outreachStatusCache[roleId]
 
         try {
-            const res = await axios.get(`${API_BASE}/outreach/status/${roleId}`)
+            const res = await axios.get(`${API_BASE}/outreach/status/${roleId}?cb=${Date.now()}`)
             const newData = res.data
 
             // Update cache
@@ -1658,7 +1677,7 @@ export const useAppStore = create(persist((set, get) => ({
         company: [], companyInput: '',
         city: [], cityInput: '',
         product_service: [], productInput: '',
-        status: '', created_by: '',
+        status: [], statusInput: '', created_by: '',
         min_exp: 0, max_exp: 40,
     },
     tpActiveStatusTab: '',
@@ -2027,7 +2046,7 @@ export const useAppStore = create(persist((set, get) => ({
 
         const requestSeq = (state.talentPoolRequestSeq || 0) + 1
         console.log("[DEBUG STORE] fetchTalentPool dispatching requestSeq:", requestSeq, "for fullParams:", fullParams)
-        const request = axios.get(`${API_BASE}/candidates/browse?${fullParams}`)
+        const request = axios.get(`${API_BASE}/candidates/browse?${fullParams}&cb=${Date.now()}`)
             .then(res => {
                 const d = res.data;
                 const latestState = get()
@@ -2122,7 +2141,7 @@ export const useAppStore = create(persist((set, get) => ({
         }
 
         const requestSeq = (state.talentPoolIndexRequestSeq || 0) + 1
-        const request = axios.get(`${API_BASE}/candidates/browse?${indexQs}`)
+        const request = axios.get(`${API_BASE}/candidates/browse?${indexQs}&cb=${Date.now()}`)
             .then(res => {
                 const rows = res.data?.candidates || []
                 const latestState = get()

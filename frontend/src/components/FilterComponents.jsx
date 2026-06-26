@@ -1,8 +1,14 @@
-import React from 'react';
+import React, { useId } from 'react';
 import { X, ChevronDown } from 'lucide-react';
 
-export function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange, placeholder, icon: Icon }) {
+export function TagFilterInput({ label, values, inputValue, onInputChange, onTagsChange, placeholder, icon: Icon, suggestions = [] }) {
   const tagList = Array.isArray(values) ? values : [];
+  const suggestionsId = useId();
+  const suggestionOptions = [...new Set(
+    (Array.isArray(suggestions) ? suggestions : [])
+      .map(value => String(value || '').trim())
+      .filter(Boolean)
+  )];
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && inputValue.trim()) {
       e.preventDefault();
@@ -35,6 +41,7 @@ export function TagFilterInput({ label, values, inputValue, onInputChange, onTag
           <input
             type="text"
             value={inputValue}
+            list={suggestionOptions.length ? suggestionsId : undefined}
             onChange={e => onInputChange(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={tagList.length === 0 ? placeholder : "Add more..."}
@@ -57,6 +64,11 @@ export function TagFilterInput({ label, values, inputValue, onInputChange, onTag
               e.target.style.background = 'rgba(255,255,255,0.92)';
             }}
           />
+          {suggestionOptions.length > 0 && (
+            <datalist id={suggestionsId}>
+              {suggestionOptions.map(option => <option key={option} value={option} />)}
+            </datalist>
+          )}
         </div>
         {tagList.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
@@ -174,33 +186,6 @@ export function RangeSlider({ label, min, max, minValue, maxValue, onChange }) {
           className="dual-range-input"
         />
 
-        <style dangerouslySetInnerHTML={{
-          __html: `
-          .dual-range-input::-webkit-slider-thumb {
-            appearance: none;
-            pointer-events: auto;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #0f172a;
-            border: 2px solid #fff;
-            box-shadow: 0 6px 12px rgba(15,23,42,0.18);
-            cursor: pointer;
-            z-index: 10;
-          }
-          .dual-range-input::-moz-range-thumb {
-            appearance: none;
-            pointer-events: auto;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            background: #0f172a;
-            border: 2px solid #fff;
-            box-shadow: 0 6px 12px rgba(15,23,42,0.18);
-            cursor: pointer;
-            z-index: 10;
-          }
-        `}} />
       </div>
     </div>
   );

@@ -1275,7 +1275,7 @@ def calculate_functional_experience_duration(profile: Dict[str, Any], criteria_o
 
     matching_roles = []
     contributing_roles = []
-    for role in _profile_roles_with_raw_experience(profile):
+    for role in profile.get('roles', []):
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()}"
         if any(_term_matches_text(v, role_text) for v in req_terms):
             matching_roles.append(role)
@@ -1295,7 +1295,7 @@ def calculate_industry_experience_duration(profile: Dict[str, Any], criteria_obj
 
     matching_roles = []
     contributing_roles = []
-    for role in _profile_roles_with_raw_experience(profile):
+    for role in profile.get('roles', []):
         company_details = role.get('company_details', {})
         role_text = f"{(role.get('company') or '').lower()} {(company_details.get('industry', '') or '').lower()} {(company_details.get('product_service', '') or '').lower()}"
         if any(_term_matches_text(v, role_text) for v in req_terms):
@@ -1319,7 +1319,7 @@ def calculate_segment_experience_duration(profile: Dict[str, Any], criteria_obj:
 
     matching_roles = []
     contributing_roles = []
-    for role in _profile_roles_with_raw_experience(profile):
+    for role in profile.get('roles', []):
         company_segments = role.get("company_details", {}).get("customer_segment", [])
         company_segments_lower = ' '.join([cs.lower() for cs in company_segments])
         role_text = f"{(role.get('title') or '').lower()} {(role.get('details') or '').lower()} {company_segments_lower}"
@@ -1348,7 +1348,7 @@ def calculate_geography_experience_duration(profile: Dict[str, Any], criteria_ob
 
     matching_roles = []
     contributing_roles = []
-    for role in _profile_roles_with_raw_experience(profile):
+    for role in profile.get('roles', []):
         combined = _role_geography_text_for_profile(profile, role)
 
         if any(_term_matches_text(v, combined) for v in req_terms):
@@ -1369,7 +1369,7 @@ def calculate_company_details_experience_duration(profile: Dict[str, Any], crite
 
     matching_roles = []
     contributing_roles = []
-    for role in _profile_roles_with_raw_experience(profile):
+    for role in profile.get('roles', []):
         company_details = role.get('company_details', {})
         details_text = f"{(company_details.get('funding_stage') or '').lower()} {(company_details.get('business_model') or '').lower()} {(company_details.get('product_service') or '').lower()}"
         if any(v in details_text for v in req_values):
@@ -1491,7 +1491,7 @@ def evaluate_scoped_duration(
     matched_values: List[str] = []
     evidence: List[Dict[str, Any]] = []
 
-    duration_roles = _profile_roles_with_raw_experience(profile)
+    duration_roles = profile.get("roles", [])
     if dimension in {"industry", "segment", "company_detail"} and _company_scope_current_only(
         criterion if isinstance(criterion, dict) else {},
         "any_employer",
@@ -7253,30 +7253,32 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
         if conn:
             try:
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT
-                            COALESCE(NULLIF(u.name, ''), 'Unknown') AS recruiter,
-                            COUNT(DISTINCT rc.candidate_id) AS sourced,
-                            COUNT(DISTINCT rc.candidate_id) FILTER (
-                                WHERE c.status = 'Shortlisted'
-                            ) AS shortlisted,
-                            COUNT(DISTINCT rc.candidate_id) FILTER (
-                                WHERE c.status IN ('Followup / In conversation', 'In Conversation')
-                            ) AS in_conversation
-                        FROM recruitment_role_candidates rc
-                        JOIN recruitment_roles r ON rc.role_id = r.id
-                        JOIN users u ON r.user_id = u.id
-                        JOIN candidates c ON rc.candidate_id = c.id
-                        GROUP BY COALESCE(NULLIF(u.name, ''), 'Unknown')
-                        ORDER BY sourced DESC
-                    """)
-                    for name, sourced, shortlisted, in_conversation in cur.fetchall():
-                        recruiter_performance.append({
-                            "recruiter": name,
-                            "sourced": int(sourced or 0),
-                            "shortlisted": int(shortlisted or 0),
-                            "in_conversation": int(in_conversation or 0),
-                        })
+                    cur.execute("SELECT id, name FROM users")
+                    user_map = {row[0]: (row[1] or 'Unknown') for row in cur.fetchall()}
+                    
+                rp_dict = {}
+                for p in stats_profiles:
+                    owner_id = p.get("owner_user_id")
+                    rec_name = user_map.get(owner_id, "Unknown")
+                    if rec_name not in rp_dict:
+                        rp_dict[rec_name] = {"sourced": 0, "shortlisted": 0, "in_conversation": 0}
+                    
+                    rp_dict[rec_name]["sourced"] += 1
+                    st = (p.get("status") or "").strip().lower()
+                    if st == "shortlisted":
+                        rp_dict[rec_name]["shortlisted"] += 1
+                    elif st in ("followup / in conversation", "in conversation"):
+                        rp_dict[rec_name]["in_conversation"] += 1
+                        
+                for name, counts in rp_dict.items():
+                    recruiter_performance.append({
+                        "recruiter": name,
+                        "sourced": counts["sourced"],
+                        "shortlisted": counts["shortlisted"],
+                        "in_conversation": counts["in_conversation"],
+                    })
+                
+                recruiter_performance.sort(key=lambda x: x["sourced"], reverse=True)
             except Exception as e:
                 logger.error(f"Error fetching admin recruiter perf: {e}")
             finally:

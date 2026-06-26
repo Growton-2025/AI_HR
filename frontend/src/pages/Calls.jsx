@@ -6,7 +6,7 @@ import {
   Search, RefreshCw, MoreHorizontal, User, 
   Trash2, X, ChevronLeft, Send, MessageSquare, 
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
-  ClipboardList, Layers, PhoneIncoming
+  ClipboardList, Layers, PhoneIncoming, Loader2
 } from 'lucide-react';
 import { BACKEND_BASE, useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
@@ -660,6 +660,8 @@ export default function Calls() {
     callsLastQueryKey,
     callStats,
     fetchCallStats,
+    callStatsLastFetchedAt,
+    callsLastFetchedAt,
     updateCall,
     deleteCall,
     deleteCallList,
@@ -675,6 +677,8 @@ export default function Calls() {
     callsLastQueryKey: state.callsLastQueryKey,
     callStats: state.callStats,
     fetchCallStats: state.fetchCallStats,
+    callStatsLastFetchedAt: state.callStatsLastFetchedAt,
+    callsLastFetchedAt: state.callsLastFetchedAt,
     updateCall: state.updateCall,
     deleteCall: state.deleteCall,
     deleteCallList: state.deleteCallList,
@@ -865,8 +869,8 @@ export default function Calls() {
         : activeTab === 'completed'
           ? 'status=completed'
           : '';
-  const showCallsLoading = activeTab !== 'lists' && loading && callsLastQueryKey !== currentCallsQueryKey;
-  const showListsLoading = activeTab === 'lists' && !selectedList && loading && !callLists.length;
+  const showCallsLoading = activeTab !== 'lists' && (!callsLastFetchedAt || (loading && callsLastQueryKey !== currentCallsQueryKey));
+  const showListsLoading = activeTab === 'lists' && !selectedList && (!callsLastFetchedAt || (loading && !callLists.length));
 
   return (
     <div style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
@@ -900,7 +904,9 @@ export default function Calls() {
               </div>
               <span style={{ fontSize: '12px', fontWeight: 700, color: '#94a3b8', letterSpacing: '0.05em' }}>{stat.label}</span>
             </div>
-            <div style={{ fontSize: '32px', fontWeight: 800, color: '#0f172a' }}>{stat.value}</div>
+            <div style={{ fontSize: '32px', fontWeight: 800, color: '#0f172a' }}>
+              {!callStatsLastFetchedAt ? <Loader2 size={24} className="animate-spin" color="#cbd5e1" /> : stat.value}
+            </div>
           </div>
         ))}
       </div>

@@ -503,9 +503,9 @@ function resolveContactValue(...values) {
   return '';
 }
 
-function splitTalentPoolFilterValues(values = [], inputValue = '') {
+function splitTalentPoolFilterValues(values = [], _inputValue = '') {
   const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values];
-  return [...list, inputValue]
+  return [...list]
     .flatMap((value) => String(value || '').split(','))
     .map((value) => value.trim())
     .filter(Boolean);
@@ -1815,7 +1815,8 @@ export default function TalentPool() {
     return () => {
       cancelled = true;
     };
-  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, talentPoolRoleFilterId, setTalentPoolRoleFilter]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, talentPoolViewScope, talentPoolRecruiterFilterId, setTalentPoolRoleFilter]);
 
   const adminScopeInitRef = useRef(false);
 
@@ -2856,28 +2857,26 @@ export default function TalentPool() {
           />
         )}
 
-        <SelectFilter label="Status" value={filters?.status || ''} onChange={v => setFilter('status', v)} options={statusFilterOptions} placeholder="All Statuses" />
+        <TagFilterInput label="Status" values={filters?.status || []} inputValue={filters?.statusInput || ''} onInputChange={v => setFilter('statusInput', v)} onTagsChange={v => { setFilter('status', v); setActiveStatusTab(v.length === 1 ? v[0] : ''); }} placeholder="e.g. Shortlisted" icon={Filter} suggestions={statusFilterOptions} />
 
-        {scopeRoles.length > 0 && (
-          <div style={{ marginBottom: 18 }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: 8 }}>
-              <Folder size={13} /> Role
-            </label>
-            <select
-              value={talentPoolRoleFilterId || ''}
-              onChange={(e) => {
-                setTalentPoolRoleFilter(e.target.value);
-                setTpPagination(1, pageSize);
-              }}
-              style={{ width: '100%', padding: '10px 12px', borderRadius: 12, border: '1px solid rgba(203, 213, 225, 0.9)', background: '#fff', color: '#0f172a', fontSize: 12, fontWeight: 700 }}
-            >
-              <option value="">All roles</option>
-              {scopeRoles.map(r => (
-                <option key={r.id} value={r.id}>{r.name} ({Number(r.candidate_count || 0)})</option>
-              ))}
-            </select>
-          </div>
-        )}
+        <div style={{ marginTop: 14, marginBottom: 18 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: 8 }}>
+            <Folder size={13} /> Role
+          </label>
+          <select
+            value={talentPoolRoleFilterId || ''}
+            onChange={(e) => {
+              setTalentPoolRoleFilter(e.target.value);
+              setTpPagination(1, pageSize);
+            }}
+            style={{ width: '100%', padding: '10px 12px', borderRadius: 12, border: '1px solid rgba(203, 213, 225, 0.9)', background: '#fff', color: '#0f172a', fontSize: 12, fontWeight: 700 }}
+          >
+            <option value="">All roles</option>
+            {scopeRoles.map(r => (
+              <option key={r.id} value={r.id}>{r.name} ({Number(r.candidate_count || 0)})</option>
+            ))}
+          </select>
+        </div>
 
         <RangeSlider
           label="Total Experience"
@@ -3260,7 +3259,7 @@ export default function TalentPool() {
                 <button key={tab || 'all'}
                   onClick={() => {
                     startTransition(() => {
-                      setFilters(prev => ({ ...prev, status: '' }));
+                      setFilters(prev => ({ ...prev, status: tab ? [tab] : [], statusInput: '' }));
                       setActiveStatusTab(tab);
                     });
                     setPage(1);

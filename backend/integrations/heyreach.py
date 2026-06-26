@@ -193,6 +193,7 @@ class HeyReachBot:
         first_name: str,
         last_name: str,
         profile_url: str,
+        custom_fields: dict = None,
     ):
         """
         Push a single lead to a HeyReach campaign.
@@ -203,16 +204,20 @@ class HeyReachBot:
             "accept": "application/json",
         }
 
+        lead_data = {
+            "firstName": first_name,
+            "lastName": last_name,
+            "profileUrl": profile_url,
+        }
+        if custom_fields:
+            lead_data["customFields"] = custom_fields
+
         payload = {
             "campaignId": campaign_id,
             "accountLeadPairs": [
                 {
                     "accountId": account_id,
-                    "lead": {
-                        "firstName": first_name,
-                        "lastName": last_name,
-                        "profileUrl": profile_url,
-                    },
+                    "lead": lead_data,
                 }
             ],
             "resumePausedCampaign": True,

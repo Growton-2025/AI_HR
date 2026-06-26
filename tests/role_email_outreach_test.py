@@ -1,3 +1,9 @@
+import asyncio
+
+from fastapi import BackgroundTasks
+
+from backend.api import schemas
+from backend.api.routes import outreach
 from backend.api.routes.outreach import (
     _candidate_role_queue_state,
     _classify_role_email_candidates,
@@ -144,3 +150,87 @@ def test_bulk_shortlist_queue_state_allows_linkedin_while_email_waits():
     )
     assert no_linkedin["linkedin_status"] == "skipped_missing_linkedin"
     assert no_linkedin["needs_enrichment"] is False
+
+
+def test_repeated_shortlist_repairs_status_without_duplicate_outreach(monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.last_sql = ""
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=None):
+            self.last_sql = " ".join(sql.split())
+            self.statements.append((self.last_sql, params))
+
+        def fetchone(self):
+            if "FROM recruitment_role_candidates rc" in self.last_sql:
+                return (
+                    101, "Suvina Rai", "Suvina", "Rai",
+                    "suvina@example.com", "+971500000000",
+                    "https://linkedin.com/in/suvina",
+                )
+            if "FROM candidate_outreach" in self.last_sql:
+                return ("in_campaign", "in_campaign", "email-campaign", "linkedin-campaign")
+            if "FROM role_smartlead_campaigns" in self.last_sql:
+                return ("email-campaign",)
+            if "FROM role_heyreach_campaigns" in self.last_sql:
+                return ("linkedin-campaign",)
+            return None
+
+    class Connection:
+        def __init__(self):
+            self.cursor_instance = Cursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_instance
+
+        def commit(self):
+            self.commits += 1
+
+    class ConnectionContext:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    connection = Connection()
+    monkeypatch.setattr(
+        outreach,
+        "get_db_connection_context",
+        lambda **_kwargs: ConnectionContext(connection),
+    )
+    monkeypatch.setattr(outreach, "_get_accessible_role", lambda *_args: (44, "Enterprise AE"))
+    monkeypatch.setattr(
+        outreach,
+        "fetch_role_activation",
+        lambda *_args: {"activation_status": "active"},
+    )
+    background_tasks = BackgroundTasks()
+
+    result = asyncio.run(
+        outreach.shortlist_role_candidate(
+            role_id=44,
+            candidate_id=101,
+            background_tasks=background_tasks,
+            current_user=schemas.User(id=7, username="recruiter", role="recruiter"),
+        )
+    )
+
+    statements = [sql for sql, _params in connection.cursor_instance.statements]
+    assert result["already_processed"] is True
+    assert result["status"] == "Shortlisted"
+    assert connection.commits == 1
+    assert any("UPDATE candidates SET status='Shortlisted'" in sql for sql in statements)
+    assert not any("INSERT INTO candidate_outreach" in sql for sql in statements)
+    assert len(background_tasks.tasks) == 1

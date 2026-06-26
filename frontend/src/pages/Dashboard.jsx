@@ -136,6 +136,7 @@ const Dashboard = () => {
   }, [fetchAnalytics, fetchCallStats]);
 
   const isAdmin = user?.role === 'admin';
+  const loading = !hasLoadedRef.current && (analytics === null || callStats === null);
 
   const analyticsMetrics = analytics?.summary || {};
   const analyticsTotal = normalizeCount(analyticsMetrics.total_sourced);
@@ -193,11 +194,11 @@ const Dashboard = () => {
       <div style={{ 
         display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', 
         gap: '16px', marginBottom: '28px',
-        opacity: isRevalidating ? 0.7 : 1,
+        opacity: isRevalidating && hasLoadedRef.current ? 0.7 : 1,
         transition: 'opacity 0.2s'
       }}>
         {metricCards.map(m => (
-          <DashboardCard key={m.title} {...m} />
+          <DashboardCard key={m.title} {...m} loading={loading} />
         ))}
       </div>
 
@@ -234,7 +235,11 @@ const Dashboard = () => {
             ))}
           </div>
 
-          {current.data.length === 0 ? (
+          {loading ? (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '240px' }}>
+              <div className="shimmer" style={{ width: '200px', height: '200px', borderRadius: '50%', opacity: 0.1, background: '#cbd5e1' }} />
+            </div>
+          ) : current.data.length === 0 ? (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '240px', color: '#94a3b8', fontSize: '14px' }}>
               No data available yet.
             </div>
@@ -295,7 +300,19 @@ const Dashboard = () => {
           iconColor={activeMode === 0 ? '#8b6b44' : activeMode === 1 ? '#475569' : activeMode === 2 ? '#0f766e' : '#64748b'}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {(current.data.slice(0, 8)).map((item, i) => {
+            {loading ? (
+              Array.from({ length: 5 }).map((_, i) => (
+                <div key={i}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <div className="shimmer" style={{ width: '40%', height: '14px', borderRadius: '4px', background: '#e2e8f0' }} />
+                    <div className="shimmer" style={{ width: '20%', height: '14px', borderRadius: '4px', background: '#e2e8f0' }} />
+                  </div>
+                  <div className="shimmer" style={{ height: '6px', background: '#f1f5f9', borderRadius: '3px' }} />
+                </div>
+              ))
+            ) : current.data.length === 0 ? (
+              <div style={{ color: '#94a3b8', fontSize: '13px', fontStyle: 'italic' }}>No data</div>
+            ) : (current.data.slice(0, 8)).map((item, i) => {
               const rawPct = total > 0 ? (item.value / total) * 100 : 0;
               const displayPct = (rawPct > 0 && rawPct < 1) ? '<1' : Math.round(rawPct);
               const color = getEntryColor(item.name, i, current.colors);

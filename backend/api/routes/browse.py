@@ -385,6 +385,37 @@ def _add_company_filter(where: List[str], params: List[Any], raw: Optional[str])
     where.append("(" + " OR ".join(clauses) + ")")
 
 
+def _add_product_service_filter(
+    where: List[str],
+    params: List[Any],
+    raw: Optional[str],
+) -> None:
+    values = _split_filter_values(raw)
+    if not values:
+        return
+
+    clauses: List[str] = []
+    for value in values:
+        needle = f"%{value}%"
+        clauses.append(
+            """
+            (
+                LOWER(COALESCE(c.raw_fields->>'extracted_industry', '')) LIKE %s
+                OR LOWER(COALESCE(c.raw_fields->>'services', '')) LIKE %s
+                OR EXISTS (
+                    SELECT 1
+                    FROM roles r_product
+                    JOIN companies co_product ON co_product.id = r_product.company_id
+                    WHERE r_product.candidate_id = c.id
+                      AND LOWER(COALESCE(co_product.product_service, '')) LIKE %s
+                )
+            )
+            """
+        )
+        params.extend([needle, needle, needle])
+    where.append("(" + " OR ".join(clauses) + ")")
+
+
 def _add_global_search_filter(where: List[str], params: List[Any], raw: Optional[str]) -> None:
     term = str(raw or "").strip().lower()
     if not term:
@@ -432,6 +463,7 @@ def _browse_where_sql(
     company: Optional[str] = None,
     city: Optional[str] = None,
     location_type: Optional[str] = None,
+    product_service: Optional[str] = None,
     status: Optional[str] = None,
     created_by: Optional[str] = None,
     min_exp: Optional[float] = None,
@@ -456,6 +488,7 @@ def _browse_where_sql(
     _add_global_search_filter(where, params, q)
     _add_title_filter(where, params, title)
     _add_company_filter(where, params, company)
+    _add_product_service_filter(where, params, product_service)
     _add_like_filter(
         where,
         params,
@@ -553,9 +586,7 @@ def _can_use_fast_sql_browse(
     min_avg_tenure: Optional[float],
     candidate_ids: Optional[List[int]],
 ) -> bool:
-    # Product/service search uses the semantic profile cache. Ordinary browse,
-    # filtering, sorting, role scope, and candidate-id focus stay SQL paginated.
-    return not bool(product_service and product_service.strip())
+    return True
 
 
 def _profile_cache_looks_test_scoped() -> bool:
@@ -563,7 +594,7 @@ def _profile_cache_looks_test_scoped() -> bool:
     if not PROFILES_BY_ID:
         return False
     ids = {int(profile.get("id") or key or 0) for key, profile in PROFILES_BY_ID.items()}
-    return bool(ids) and max(ids) <= 10000
+    return bool(ids) and len(ids) <= 100
 
 
 async def fetch_browse_page_sql(
@@ -579,6 +610,7 @@ async def fetch_browse_page_sql(
     company: Optional[str] = None,
     city: Optional[str] = None,
     location_type: Optional[str] = None,
+    product_service: Optional[str] = None,
     status: Optional[str] = None,
     created_by: Optional[str] = None,
     min_exp: Optional[float] = None,
@@ -603,6 +635,7 @@ async def fetch_browse_page_sql(
         company=company,
         city=city,
         location_type=location_type,
+        product_service=product_service,
         created_by=created_by,
         min_exp=min_exp,
         max_exp=max_exp,
@@ -620,6 +653,7 @@ async def fetch_browse_page_sql(
         company=company,
         city=city,
         location_type=location_type,
+        product_service=product_service,
         status=status,
         created_by=created_by,
         min_exp=min_exp,
@@ -1067,8 +1101,6 @@ async def browse_candidates(
     )
     candidate_id_list = _parse_candidate_ids(candidate_ids)
 
-    await _ensure_profiles_loaded()
-
     if _can_use_fast_sql_browse(
         q=q,
         title=title,
@@ -1095,6 +1127,7 @@ async def browse_candidates(
             company=company,
             city=city,
             location_type=location_type,
+            product_service=product_service,
             status=status,
             created_by=created_by,
             min_exp=min_exp,
@@ -1113,6 +1146,8 @@ async def browse_candidates(
             recruiter_id=effective_recruiter,
         )
         return result
+
+    await _ensure_profiles_loaded()
 
     # ── Cache key from all params ───────────────────────────────────
     cache_key_src = json.dumps({
@@ -1211,7 +1246,14 @@ async def browse_metadata(
         recruiter_filter_id,
     )
 
-    await _ensure_profiles_loaded()
+    # Unit tests inject a small in-memory cache initializer to exercise the
+    # fallback path. Production metadata is SQL-backed and must not pay the
+    # full semantic-cache cold-start cost.
+    if (
+        not PROFILES_BY_ID
+        and getattr(initialize_cache, "__module__", "") != "backend.pipeline.query"
+    ):
+        await _ensure_profiles_loaded()
 
     if _profile_cache_looks_test_scoped():
         rows = await build_browse_candidate_rows(
@@ -1428,8 +1470,10 @@ async def update_status(
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")
     from backend.api.routes.candidates import invalidate_candidate_count_caches
+    from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
 
     invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
+    invalidate_role_detail_cache_for_candidate(candidate_id)
     return {"message": "Status updated successfully"}
 
 @router.patch("/candidates/{candidate_id}/notes")

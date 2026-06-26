@@ -377,8 +377,14 @@ def _refresh_role_shortlist_caches(candidate_id: int, role_id: int):
     try:
         from backend.pipeline import query
         query.refresh_profiles_in_cache([candidate_id])
-        from backend.api.routes.roles import invalidate_role_detail_cache
+        from backend.api.routes.roles import (
+            invalidate_role_detail_cache,
+            invalidate_role_detail_cache_for_candidate,
+        )
+        from backend.api.routes.candidates import invalidate_candidate_count_caches
         invalidate_role_detail_cache(role_id)
+        invalidate_role_detail_cache_for_candidate(candidate_id)
+        invalidate_candidate_count_caches()
     except Exception as exc:
         print(f"SHORTLIST CACHE REFRESH WARNING: {exc}")
 
@@ -883,6 +889,16 @@ async def shortlist_role_candidate(
                 else:
                     active_states = {"queued", "scheduled", "started", "in_campaign", "completed"}
                     if e_stat in active_states or l_stat in active_states:
+                        cur.execute(
+                            "UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=%s",
+                            (candidate_id,),
+                        )
+                        conn.commit()
+                        background_tasks.add_task(
+                            _refresh_role_shortlist_caches,
+                            candidate_id,
+                            role_id,
+                        )
                         print(f"⏩ Skipping outreach for {candidate['name']} in role {role_id} - already triggered earlier.")
                         return {
                             "success": True,
@@ -895,6 +911,7 @@ async def shortlist_role_candidate(
                             "email_outreach": "started" if e_stat else "not_started",
                             "linkedin_outreach": "started" if l_stat else "not_started",
                             "already_processed": True,
+                            "status": "Shortlisted",
                         }
 
             cur.execute("UPDATE candidates SET status='Shortlisted', updated_at=NOW() WHERE id=%s", (candidate_id,))
@@ -941,6 +958,7 @@ async def shortlist_role_candidate(
         "contact_enriching": contact_enriching,
         "email_outreach": email_status,
         "linkedin_outreach": linkedin_status,
+        "status": "Shortlisted",
     }
 
 
@@ -1621,15 +1639,51 @@ async def get_linkedin_chat_history(
     role_id: int,
     candidate_id: int,
     force: bool = False,
-    current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured LinkedIn chat history for a candidate.
 
     Uses an in-memory cache so the response is instant on repeat opens.
     A background thread always refreshes the cache after serving.
     """
+    import time
+    start_t = time.time()
+    
+    # ── HOT PATH CACHE CHECK ──
+    with _li_chat_lock:
+        cached = _li_chat_cache.get(candidate_id)
+        if cached:
+            cache_age = time.monotonic() - cached.get("ts", 0)
+            is_stale = cache_age > _LI_CACHE_STALE_THRESHOLD
+            already_refreshing = cached.get("refreshing", False)
+            if (not is_stale or already_refreshing) and not force:
+                final_msgs = cached.get("messages", [])
+                initial_li_message = cached.get("initial", None)
+                initial_li_message_at = cached.get("initial_at", None)
+                if initial_li_message:
+                    has_sent = any(msg.get("type") == "SENT" for msg in final_msgs)
+                    if not has_sent:
+                        clean_init = initial_li_message.strip()
+                        _JUNK_LI_INITIALS = {"hii", "hi", "hey", "hello", "test", "linkedin", "msg", "message", "helo", "hello!", "hi!"}
+                        if len(clean_init) >= 12 and clean_init.lower() not in _JUNK_LI_INITIALS:
+                            entry = {
+                                "type": "SENT",
+                                "email_body": clean_init,
+                                "time": initial_li_message_at.isoformat() if initial_li_message_at else None,
+                                "sender_name": "You",
+                            }
+                            if not final_msgs:
+                                final_msgs = [entry]
+                            elif not any((m.get("email_body") or "").strip() == clean_init for m in final_msgs):
+                                final_msgs = [entry] + final_msgs
+                try:
+                    final_msgs.sort(key=lambda x: x.get("time", ""))
+                except:
+                    pass
+                return {"messages": final_msgs, "syncing": already_refreshing}
     try:
+        t0 = time.time()
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            t1 = time.time()
             if not conn:
                 raise HTTPException(status_code=500, detail="Database connection failed")
             with conn.cursor() as cur:
@@ -1698,10 +1752,12 @@ async def get_linkedin_chat_history(
         # ---------------------------------------------------------------
         # Cache logic - optimized for performance
         # ---------------------------------------------------------------
-        # Strategy: Return cached data ASAP, refresh in background if needed
-        db_updated_at = outreach_row[0] if outreach_row else None
+        # Strategy: Return cached data ASAP, refresh in background if
+        li_chat_history_cache = outreach_row[8] if len(outreach_row) > 8 else None
 
+        t2 = time.time()
         with _li_chat_lock:
+            t3 = time.time()
             cached = _li_chat_cache.get(candidate_id)
             cache_ts = cached.get("ts", 0) if cached else 0
             cache_age = time.monotonic() - cache_ts
@@ -1743,6 +1799,9 @@ async def get_linkedin_chat_history(
         # ── Always-instant strategy ─────────────────────────────────────────
         # Return cached data immediately. Kick off a background refresh if
         # stale. The frontend handles freshness via SWR parallel fetching.
+
+        if (not is_stale or already_refreshing) and not force:
+            return {'messages': _prepend_initial(cached['messages'] if cached else []), 'syncing': already_refreshing}
 
         if not already_refreshing and (is_stale or not cached):
             # ── INSTANT DB CACHE RESTORE ─────────────────────────────────────
@@ -1796,10 +1855,14 @@ async def get_linkedin_chat_history(
                 "sender_name": "Candidate"
             }]
 
-        return {
+        result = {
             "messages": final_msgs,
             "syncing": not cached or is_stale or (cached and cached.get("refreshing")),
         }
+        t4 = time.time()
+        print(f"DEBUG TIMING: get_db_conn={t1-t0:.4f}s, db_query={t2-t1:.4f}s, lock_wait={t3-t2:.4f}s, rest={t4-t3:.4f}s")
+        return result
+
 
 
     except HTTPException:
@@ -1853,6 +1916,7 @@ def _clean_email_body(body: str) -> str:
 async def get_chat_history(
     role_id: int,
     candidate_id: int,
+    force: bool = False,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured chat history (Default to Email)"""
@@ -1892,7 +1956,7 @@ async def get_chat_history(
             cached = _email_chat_cache.get(candidate_id)
             cache_ts = cached.get("ts", 0) if cached else 0
             cache_age = time.monotonic() - cache_ts
-            is_stale = cache_age > _EMAIL_CACHE_STALE_THRESHOLD
+            is_stale = force or (cache_age > _EMAIL_CACHE_STALE_THRESHOLD)
             already_refreshing = cached and cached.get("refreshing", False)
 
         # ── Guard: junk initial messages or platform crosstalk
@@ -1921,6 +1985,9 @@ async def get_chat_history(
             if any((m.get("email_body") or "").strip() == clean_init for m in msgs):
                 return msgs
             return [entry] + msgs
+
+        if (not is_stale or already_refreshing) and not force:
+            return {'messages': _prepend_initial(cached['messages'] if cached else []), 'syncing': already_refreshing}
 
         if not already_refreshing and (is_stale or not cached):
             # Try instant restore from DB cache column

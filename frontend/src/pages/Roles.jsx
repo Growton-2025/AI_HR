@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, Send, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
@@ -9,6 +9,8 @@ import CsvMappingModal from '../components/CsvMappingModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
 import RoleCreateModal from '../components/RoleCreateModal'
 import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents'
+import CandidateConversationModal from '../components/CandidateConversationModal'
+import EditableCandidateNotes from '../components/EditableCandidateNotes'
 
 function Roles() {
     const {
@@ -25,10 +27,13 @@ function Roles() {
         fetchOutreachStatus,
         removeCandidateFromRole,
         invalidateTalentPoolCaches,
+        rolesLastFetchedAt,
         fetchTalentPoolSummary,
         fetchAnalytics,
-        deactivateRole
+        deactivateRole,
+        user
     } = useAppStore(useShallow((state) => ({
+        rolesLastFetchedAt: state.rolesLastFetchedAt,
         roles: state.roles,
         fetchRoles: state.fetchRoles,
         createRole: state.createRole,
@@ -43,12 +48,12 @@ function Roles() {
         invalidateTalentPoolCaches: state.invalidateTalentPoolCaches,
         fetchTalentPoolSummary: state.fetchTalentPoolSummary,
         fetchAnalytics: state.fetchAnalytics,
-        deactivateRole: state.deactivateRole
+        deactivateRole: state.deactivateRole,
+        user: state.user
     })))
 
     const [createModalOpen, setCreateModalOpen] = useState(false)
     const [activationRole, setActivationRole] = useState(null)
-    const [expandedSummary, setExpandedSummary] = useState(null)
     const [uploadRole, setUploadRole] = useState(null)
     const [uploadFile, setUploadFile] = useState(null)
     const [uploadHeaders, setUploadHeaders] = useState([])
@@ -72,9 +77,45 @@ function Roles() {
         company: [], companyInput: '',
         city: [], cityInput: '',
         product_service: [], productInput: '',
-        status: '',
+        status: [], statusInput: '',
         min_exp: 0, max_exp: 40
     })
+    const [roleFilteredCandidates, setRoleFilteredCandidates] = useState([])
+    const [roleStatusCounts, setRoleStatusCounts] = useState({})
+    const [roleFilterMeta, setRoleFilterMeta] = useState({
+        titles: [], companies: [], cities: [], products: [], statuses: []
+    })
+    const [isFilteringRole, setIsFilteringRole] = useState(false)
+    const roleFilterRequestSeqRef = useRef(0)
+    const roleFilterDebounceRef = useRef(null)
+
+    const splitFilterValues = useCallback((values = [], _inputValue = '') => {
+        const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values]
+        return [...list]
+            .flatMap(value => String(value || '').split(','))
+            .map(value => value.trim())
+            .filter(Boolean)
+    }, [])
+
+    const roleScopeParams = useCallback(() => {
+        const params = new URLSearchParams()
+        if (String(user?.role || '').toLowerCase() === 'admin' && viewingRole?.owner_user_id) {
+            params.set('view_scope', 'recruiter_pools')
+            params.set('recruiter_filter_id', viewingRole.owner_user_id)
+        }
+        if (viewingRole?.id) params.set('role_id', viewingRole.id)
+        return params
+    }, [user?.role, viewingRole?.id, viewingRole?.owner_user_id])
+
+    const hasActiveRoleFilters = useMemo(() => (
+        splitFilterValues(filters.title, filters.titleInput).length > 0
+        || splitFilterValues(filters.company, filters.companyInput).length > 0
+        || splitFilterValues(filters.city, filters.cityInput).length > 0
+        || splitFilterValues(filters.product_service, filters.productInput).length > 0
+        || Boolean(activeStatusTab || filters.status)
+        || Number(filters.min_exp || 0) > 0
+        || Number(filters.max_exp ?? 40) < 40
+    ), [activeStatusTab, filters, splitFilterValues])
 
     const setFilter = useCallback((key, val) => {
         setFilters(prev => {
@@ -96,68 +137,25 @@ function Roles() {
             min_exp: 0, max_exp: 40
         })
         setActiveStatusTab('')
-    }, [])
+        const baseCandidates = viewingRole?.candidates || []
+        setRoleFilteredCandidates(baseCandidates)
+        setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
+            const status = candidate.status || 'To be started'
+            counts[status] = (counts[status] || 0) + 1
+            return counts
+        }, {}))
+    }, [viewingRole?.candidates])
 
-    const { filteredCandidates, statusCounts } = useMemo(() => {
-        if (!viewingRole?.candidates) return { filteredCandidates: [], statusCounts: {} };
-        
-        const counts = {};
-        viewingRole.candidates.forEach(c => {
-            const st = c.status || 'To be started';
-            counts[st] = (counts[st] || 0) + 1;
-        });
-
-        const splitFilterValues = (values = [], inputValue = '') => {
-            const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values];
-            return [...list, inputValue]
-                .flatMap((value) => String(value || '').split(','))
-                .map((value) => value.trim().toLowerCase())
-                .filter(Boolean);
-        };
-
-        const titleSearch = splitFilterValues(filters.title, filters.titleInput);
-        const companySearch = splitFilterValues(filters.company, filters.companyInput);
-        const citySearch = splitFilterValues(filters.city, filters.cityInput);
-        const productSearch = splitFilterValues(filters.product_service, filters.productInput);
-
-        const filtered = viewingRole.candidates.filter(c => {
-            // Status
-            const cStatus = c.status || 'To be started';
-            if (activeStatusTab && cStatus !== activeStatusTab) return false;
-
-            // Total Experience
-            const exp = Number(c.total_experience || 0);
-            if (exp < filters.min_exp || exp > filters.max_exp) return false;
-
-            // Title
-            if (titleSearch.length > 0) {
-                const cTitle = (c.current_title || c.title || c.headline || '').toLowerCase();
-                if (!titleSearch.some(term => cTitle.includes(term))) return false;
-            }
-
-            // Company
-            if (companySearch.length > 0) {
-                const cComp = (c.current_company || c.company || '').toLowerCase();
-                if (!companySearch.some(term => cComp.includes(term))) return false;
-            }
-
-            // City
-            if (citySearch.length > 0) {
-                const cCity = (c.location || c.city || '').toLowerCase();
-                if (!citySearch.some(term => cCity.includes(term))) return false;
-            }
-
-            // Product/Expertise
-            if (productSearch.length > 0) {
-                const cProd = (c.expertise || c.product_service || '').toLowerCase();
-                if (!productSearch.some(term => cProd.includes(term))) return false;
-            }
-
-            return true;
-        });
-
-        return { filteredCandidates: filtered, statusCounts: counts };
-    }, [viewingRole?.candidates, filters, activeStatusTab]);
+    const filteredCandidates = roleFilteredCandidates
+    const statusCounts = roleStatusCounts
+    const roleStatusOptions = useMemo(
+        () => [...new Set([...(roleFilterMeta.statuses || []), ...RECRUITMENT_STAGES])],
+        [roleFilterMeta.statuses]
+    )
+    const roleFilteredTotal = useMemo(
+        () => Object.values(statusCounts).reduce((total, count) => total + Number(count || 0), 0),
+        [statusCounts]
+    )
 
     // Derived state for instant access
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
@@ -193,12 +191,137 @@ function Roles() {
 
     useEffect(() => {
         if (!viewingRole?.id) {
+            setRoleFilteredCandidates([])
+            setRoleStatusCounts({})
+            setRoleFilterMeta({ titles: [], companies: [], cities: [], products: [], statuses: [] })
+            return
+        }
+        const baseCandidates = viewingRole.candidates || []
+        setRoleFilteredCandidates(baseCandidates)
+        setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
+            const status = candidate.status || 'To be started'
+            counts[status] = (counts[status] || 0) + 1
+            return counts
+        }, {}))
+        setFilters({
+            title: [], titleInput: '',
+            company: [], companyInput: '',
+            city: [], cityInput: '',
+            product_service: [], productInput: '',
+            status: '',
+            min_exp: 0, max_exp: 40
+        })
+        setActiveStatusTab('')
+    }, [viewingRole?.id])
+
+    useEffect(() => {
+        if (!viewingRole?.id || !Array.isArray(viewingRole.candidates)) return
+        const currentById = new Map(viewingRole.candidates.map(candidate => [Number(candidate.id), candidate]))
+        setRoleFilteredCandidates(previous => {
+            if (!hasActiveRoleFilters) return viewingRole.candidates
+            return previous
+                .filter(candidate => currentById.has(Number(candidate.id)))
+                .map(candidate => ({ ...candidate, ...currentById.get(Number(candidate.id)) }))
+        })
+        if (!hasActiveRoleFilters) {
+            setRoleStatusCounts(viewingRole.candidates.reduce((counts, candidate) => {
+                const status = candidate.status || 'To be started'
+                counts[status] = (counts[status] || 0) + 1
+                return counts
+            }, {}))
+        }
+    }, [hasActiveRoleFilters, viewingRole?.candidates, viewingRole?.id])
+
+    useEffect(() => {
+        if (!viewingRole?.id) return undefined
+        let cancelled = false
+        const params = roleScopeParams()
+        axios.get(`${API_BASE}/candidates/browse/meta?${params.toString()}&cb=${Date.now()}`, { timeout: 60000 })
+            .then(response => {
+                if (cancelled) return
+                const data = response.data || {}
+                setRoleFilterMeta({
+                    titles: Array.isArray(data.titles) ? data.titles : [],
+                    companies: Array.isArray(data.companies) ? data.companies : [],
+                    cities: Array.isArray(data.cities) ? data.cities : [],
+                    products: Array.isArray(data.products) ? data.products : [],
+                    statuses: Array.isArray(data.statuses) ? data.statuses : [],
+                })
+            })
+            .catch(error => {
+                if (!cancelled) console.error('Failed to load role filter metadata:', error)
+            })
+        return () => { cancelled = true }
+    }, [roleScopeParams, viewingRole?.id])
+
+    useEffect(() => {
+        if (!viewingRole?.id) return undefined
+        window.clearTimeout(roleFilterDebounceRef.current)
+        const requestSeq = ++roleFilterRequestSeqRef.current
+        const params = roleScopeParams()
+        params.set('page', '1')
+        params.set('page_size', '5000')
+        params.set('sort_by', 'name')
+        params.set('sort_dir', 'asc')
+
+        const title = splitFilterValues(filters.title, filters.titleInput).join(',')
+        const company = splitFilterValues(filters.company, filters.companyInput).join(',')
+        const city = splitFilterValues(filters.city, filters.cityInput).join(',')
+        const product = splitFilterValues(filters.product_service, filters.productInput).join(',')
+        const status = activeStatusTab || filters.status
+        if (title) params.set('title', title)
+        if (company) params.set('company', company)
+        if (city) params.set('city', city)
+        if (product) params.set('product_service', product)
+        if (status) params.set('status', status)
+        if (Number(filters.min_exp || 0) > 0) params.set('min_exp', filters.min_exp)
+        if (Number(filters.max_exp ?? 40) < 40) params.set('max_exp', filters.max_exp)
+
+        if (!hasActiveRoleFilters) {
+            const baseCandidates = viewingRole.candidates || []
+            setRoleFilteredCandidates(baseCandidates)
+            setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
+                const stat = candidate.status || 'To be started'
+                counts[stat] = (counts[stat] || 0) + 1
+                return counts
+            }, {}))
+            setIsFilteringRole(false)
+            return undefined
+        }
+
+        roleFilterDebounceRef.current = window.setTimeout(async () => {
+            setIsFilteringRole(true)
+            try {
+                const response = await axios.get(`${API_BASE}/candidates/browse?${params.toString()}&cb=${Date.now()}`, { timeout: 60000 })
+                if (requestSeq !== roleFilterRequestSeqRef.current) return
+                setRoleFilteredCandidates(response.data?.candidates || [])
+                setRoleStatusCounts(response.data?.status_counts || {})
+            } catch (error) {
+                if (requestSeq === roleFilterRequestSeqRef.current) {
+                    console.error('Failed to filter role candidates:', error)
+                }
+            } finally {
+                if (requestSeq === roleFilterRequestSeqRef.current) setIsFilteringRole(false)
+            }
+        }, 120)
+
+        return () => window.clearTimeout(roleFilterDebounceRef.current)
+    }, [
+        activeStatusTab,
+        filters,
+        roleScopeParams,
+        splitFilterValues,
+        viewingRole?.id,
+    ])
+
+    useEffect(() => {
+        if (!viewingRole?.id) {
             setEmailSetup(null)
             return undefined
         }
         let cancelled = false
         setEmailSetupLoading(true)
-        axios.get(`${API_BASE}/outreach/roles/${viewingRole.id}/email-setup`)
+        axios.get(`${API_BASE}/outreach/roles/${viewingRole.id}/email-setup?cb=${Date.now()}`)
             .then(res => { if (!cancelled) setEmailSetup(res.data) })
             .catch(error => {
                 if (!cancelled) {
@@ -556,9 +679,12 @@ function Roles() {
     const handleRemoveCandidate = (candidateId, candidateName) => {
         if (!window.confirm(`Are you sure you want to remove ${candidateName} from this role?`)) return
 
+        setRoleFilteredCandidates(previous => previous.filter(candidate => Number(candidate.id) !== Number(candidateId)))
         toast.success(`${candidateName} removed from role`, { duration: 1000 })
         removeCandidateFromRole(viewingRole.name, candidateId).then(res => {
             if (!res.success) {
+                const restored = useAppStore.getState().viewingRole?.candidates || []
+                setRoleFilteredCandidates(restored)
                 toast.error(res.error || 'Failed to remove candidate')
             }
         })
@@ -657,79 +783,6 @@ function Roles() {
         }
     }
 
-    const getPriorityBadge = (priority) => {
-        if (!priority || priority === '--') return null
-        const colors = {
-            'High': '#ea4335',
-            'Medium': '#fbbc04',
-            'Low': '#34a853'
-        }
-        return (
-            <span style={{ color: colors[priority], fontWeight: 600 }}>{priority}</span>
-        )
-    }
-
-    const getStatusBadge = (status) => {
-        const styles = {
-            'in_campaign': { bg: '#f5f3ff', border: '#ddd6fe', color: '#6d28d9', text: 'In Campaign' },
-            'sent': { bg: '#eff6ff', border: '#bfdbfe', color: '#1d4ed8', text: 'Sent' },
-            'replied': { bg: '#f0fdf4', border: '#bbf7d0', color: '#15803d', text: 'Replied' },
-            'bounced': { bg: '#fef2f2', border: '#fecaca', color: '#b91c1c', text: 'Bounced' },
-            'pending': { bg: '#f8fafc', border: '#e2e8f0', color: '#64748b', text: 'Pending' }
-
-        }
-        const style = styles[status] || { bg: '#f8fafc', border: '#e2e8f0', color: '#64748b', text: 'Unknown' }
-        return (
-            <span style={{
-                padding: '4px 10px',
-                borderRadius: '4px',
-                fontSize: '11px',
-                fontWeight: 600,
-                background: style.bg,
-                border: `1px solid ${style.border}`,
-                color: style.color,
-                display: 'inline-flex',
-                alignItems: 'center',
-                whiteSpace: 'nowrap'
-            }}>
-                {style.text}
-            </span>
-        )
-    }
-
-
-
-    const getLiStatusBadge = (status, sentCount = 0) => {
-        const styles = {
-            'in_campaign': { bg: '#f5f3ff', border: '#ddd6fe', color: '#6d28d9', text: 'In Campaign' },
-            'connection_sent': { bg: '#f5f3ff', border: '#ddd6fe', color: '#6d28d9', text: 'Request Sent' },
-            'connection_accepted': { bg: '#f0fdf4', border: '#bbf7d0', color: '#15803d', text: 'Connected' },
-            'message_sent': { bg: '#fdf4ff', border: '#f5d0fe', color: '#a21caf', text: 'Message Sent' },
-            'replied': { bg: '#fff7ed', border: '#ffedd5', color: '#c2410c', text: 'Replied' }
-
-        }
-        const style = styles[status] || { bg: '#f8fafc', border: '#e2e8f0', color: '#64748b', text: '--' }
-        return (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <span style={{
-                    padding: '4px 10px',
-                    borderRadius: '4px',
-                    fontSize: '11px',
-                    fontWeight: 600,
-                    background: style.bg,
-                    border: `1px solid ${style.border}`,
-                    color: style.color,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    whiteSpace: 'nowrap'
-                }}>
-                    {style.text}
-                </span>
-                {sentCount > 0 && <span style={{ fontSize: '10px', color: '#64748b', fontWeight: 500 }}>{sentCount} message(s) sent</span>}
-            </div>
-        )
-    }
-
     const uploadUi = (
         <>
             <input
@@ -777,81 +830,50 @@ function Roles() {
 
 
     const [chattingWith, setChattingWith] = useState(null)
-    const [chatPlatform, setChatPlatform] = useState('email') // 'email' or 'linkedin'
-    const [chatMessages, setChatMessages] = useState([])
-    const [isFetchingChat, setIsFetchingChat] = useState(false)
-    const [replyMessage, setReplyMessage] = useState('')
-    const [isSendingReply, setIsSendingReply] = useState(false)
-    const chatEndRef = useRef(null)
 
-    useEffect(() => {
-        if (chatEndRef.current) {
-            chatEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    const updateCandidateInRole = useCallback((candidateId, patch) => {
+        if (patch.status) {
+            setRoleFilteredCandidates(previous => {
+                const current = previous.find(candidate => Number(candidate.id) === Number(candidateId))
+                if (!current) return previous
+                if (activeStatusTab && patch.status !== activeStatusTab) {
+                    return previous.filter(candidate => Number(candidate.id) !== Number(candidateId))
+                }
+                return previous.map(candidate =>
+                    Number(candidate.id) === Number(candidateId) ? { ...candidate, ...patch } : candidate
+                )
+            })
+            setRoleStatusCounts(previous => {
+                const current = roleFilteredCandidates.find(candidate => Number(candidate.id) === Number(candidateId))
+                const oldStatus = current?.status || 'To be started'
+                if (oldStatus === patch.status) return previous
+                return {
+                    ...previous,
+                    [oldStatus]: Math.max(0, Number(previous[oldStatus] || 0) - 1),
+                    [patch.status]: Number(previous[patch.status] || 0) + 1,
+                }
+            })
         }
-    }, [chatMessages])
-
-    const { fetchChatHistory, sendChatReply } = useAppStore(useShallow((state) => ({
-        fetchChatHistory: state.fetchChatHistory,
-        sendChatReply: state.sendChatReply,
-    })))
-
-    const handleOpenChat = async (candidate, platform = 'email') => {
-        setChattingWith(candidate)
-        setChatPlatform(platform)
-        setChatMessages([])
-        setIsFetchingChat(true)
-        try {
-            const res = await fetchChatHistory(viewingRole.id, candidate.id, platform)
-            if (res.success) {
-                // Messages are already chronological (oldest first) from backend sync/fetch logic
-                setChatMessages(res.messages)
-            } else {
-                toast.error(res.error || `Failed to load ${platform} chat history`)
+        useAppStore.setState(state => {
+            if (!state.viewingRole?.candidates) return state
+            const updatedRole = {
+                ...state.viewingRole,
+                candidates: state.viewingRole.candidates.map(candidate =>
+                    Number(candidate.id) === Number(candidateId) ? { ...candidate, ...patch } : candidate
+                ),
             }
-        } catch (error) {
-            toast.error(`Failed to fetch ${platform} chat`)
-        } finally {
-            setIsFetchingChat(false)
-        }
-    }
-
-    const handleSendReply = async () => {
-        if (!replyMessage.trim() || isSendingReply) return
-
-        const messageText = replyMessage.trim()
-        setReplyMessage('') // Clear immediately for better UX
-
-        // Add optimistic message to chat instantly
-        const optimisticMsg = {
-            type: 'SENT',
-            email_body: messageText,
-            time: new Date().toISOString(),
-            sender_name: 'You',
-            _pending: true
-        }
-        setChatMessages(prev => [...prev, optimisticMsg])
-
-        setIsSendingReply(true)
-        try {
-            const res = await sendChatReply(viewingRole.id, chattingWith.id, messageText, chatPlatform)
-            if (res.success) {
-                toast.success('Reply sent!', { duration: 2000 })
-                // Refresh chat after a short delay to get server-confirmed messages
-                setTimeout(() => handleOpenChat(chattingWith, chatPlatform), 2000)
-            } else {
-                // Remove the optimistic message on failure
-                setChatMessages(prev => prev.filter(m => m._pending !== true))
-                setReplyMessage(messageText) // Restore message on error
-                toast.error(res.error || 'Failed to send reply')
+            return {
+                viewingRole: updatedRole,
+                roleDetailsCache: {
+                    ...state.roleDetailsCache,
+                    [updatedRole.name]: updatedRole,
+                },
             }
-        } catch (error) {
-            setChatMessages(prev => prev.filter(m => m._pending !== true))
-            setReplyMessage(messageText)
-            toast.error('Failed to send reply')
-        } finally {
-            setIsSendingReply(false)
-        }
-    }
+        })
+        setChattingWith(current =>
+            Number(current?.id) === Number(candidateId) ? { ...current, ...patch } : current
+        )
+    }, [activeStatusTab, roleFilteredCandidates])
 
     // Role Detail View
     if (viewingRole) {
@@ -980,7 +1002,7 @@ function Roles() {
                             </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>{emailSetup?.campaign_error || 'Not fully activated.'}</div>}
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                                 <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading} style={{ height: 30, padding: '0 10px', fontSize: 11 }}><Settings2 size={12} /> Edit setup</button>
-                                {viewingRole.activation_status !== 'active' && <button className="btn btn-primary btn-sm" onClick={() => handleRetryActivation(viewingRole)} style={{ height: 30, fontSize: 11 }}>Configure & activate</button>}
+                                <button className={viewingRole.activation_status !== 'active' ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm"} onClick={() => handleRetryActivation(viewingRole)} style={{ height: 30, fontSize: 11 }}>{viewingRole.activation_status !== 'active' ? 'Configure & activate' : 'Update configuration'}</button>
                             </div>
                         </div>
 
@@ -993,6 +1015,7 @@ function Roles() {
                             <span style={{ fontSize: 11, fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.05em' }}>LinkedIn Outreach (HeyReach)</span>
                             <div style={{ fontSize: 12, color: '#334155' }}>Campaign ID: <strong>{viewingRole.heyreach_campaign_id || 'Not configured'}</strong></div>
                             <div style={{ fontSize: 11, color: '#64748b' }}>Shortlisted → auto-queued for LinkedIn outreach.</div>
+                            <button className={viewingRole.activation_status !== 'active' ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm"} onClick={() => handleRetryActivation(viewingRole)} style={{ height: 30, fontSize: 11, marginTop: 4, alignSelf: 'flex-start' }}>{viewingRole.activation_status !== 'active' ? 'Configure & activate' : 'Update configuration'}</button>
                         </div>
                     </div>
                 )}
@@ -1012,20 +1035,21 @@ function Roles() {
                     <div style={{ display: 'flex', gap: '20px', alignItems: 'flex-start' }}>
                         {/* Sidebar Filters */}
                         {showFilters && (
-                            <div className="sidebar-filters" style={{ width: '260px', flexShrink: 0, padding: '18px', background: 'rgba(255,255,255,0.92)', backdropFilter: 'blur(12px)', borderRadius: '14px', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(15,23,42,0.04)', display: 'flex', flexDirection: 'column', height: 'fit-content', position: 'sticky', top: '16px', transition: 'all 0.25s ease' }}>
+                            <div className="sidebar-filters role-filter-sidebar" style={{ width: '260px', flexShrink: 0, padding: '18px', background: '#fff', borderRadius: '14px', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(15,23,42,0.04)', display: 'flex', flexDirection: 'column', position: 'sticky', top: '16px', transition: 'all 0.25s ease' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, paddingBottom: 10, borderBottom: '1px solid #e2e8f0' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                                         <Filter size={14} color="#0f172a" />
                                         <span style={{ fontSize: 13, fontWeight: 800, color: '#0f172a' }}>Filters</span>
+                                        {isFilteringRole && <Loader2 size={12} className="animate-spin" style={{ color: '#64748b' }} />}
                                     </div>
                                     <button onClick={() => setShowFilters(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, color: '#94a3b8', display: 'flex' }}><X size={14} /></button>
                                 </div>
-                                <TagFilterInput label="Title" values={filters?.title || []} inputValue={filters?.titleInput || ''} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} />
-                                <TagFilterInput label="Current Company" values={filters?.company || []} inputValue={filters?.companyInput || ''} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} />
-                                <TagFilterInput label="City" values={filters?.city || []} inputValue={filters?.cityInput || ''} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} />
-                                <TagFilterInput label="Expertise / Product" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} />
+                                <TagFilterInput label="Title" values={filters?.title || []} inputValue={filters?.titleInput || ''} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} suggestions={roleFilterMeta.titles} />
+                                <TagFilterInput label="Current Company" values={filters?.company || []} inputValue={filters?.companyInput || ''} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} suggestions={roleFilterMeta.companies} />
+                                <TagFilterInput label="City" values={filters?.city || []} inputValue={filters?.cityInput || ''} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} suggestions={roleFilterMeta.cities} />
+                                <TagFilterInput label="Expertise / Product" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} suggestions={roleFilterMeta.products} />
                                 
-                                <SelectFilter label="Status" value={filters?.status || ''} onChange={v => { setFilter('status', v); setActiveStatusTab(v); }} options={RECRUITMENT_STAGES} placeholder="All Statuses" />
+                                <TagFilterInput label="Status" values={filters?.status || []} inputValue={filters?.statusInput || ''} onInputChange={v => setFilter('statusInput', v)} onTagsChange={v => { setFilter('status', v); setActiveStatusTab(v.length === 1 ? v[0] : ''); }} placeholder="e.g. Shortlisted" icon={Filter} suggestions={roleStatusOptions} />
                                 
                                 <RangeSlider
                                   label="Total Experience"
@@ -1063,15 +1087,16 @@ function Roles() {
                         <div style={{ flex: 1, minWidth: 0, transition: 'all 0.25s ease', display: 'flex', flexDirection: 'column' }}>
                             {/* Status Tabs */}
                             <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none', borderRadius: '10px 10px 0 0', border: '1px solid #e2e8f0' }}>
-                                {['', ...RECRUITMENT_STAGES].map(tab => {
+                                {['', ...roleStatusOptions].map(tab => {
                                     const isActive = activeStatusTab === tab;
-                                    const count = tab === '' ? (viewingRole.candidates?.length || 0) : (statusCounts[tab] || 0);
+                                    const count = tab === '' ? roleFilteredTotal : (statusCounts[tab] || 0);
                                     const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
 
                                     return (
                                         <button key={tab || 'all'}
                                             onClick={() => {
-                                                setFilter('status', tab);
+                                                setFilter('status', tab ? [tab] : []);
+                                                setFilter('statusInput', '');
                                                 setActiveStatusTab(tab);
                                             }}
                                             style={{
@@ -1096,7 +1121,7 @@ function Roles() {
                                             }}
                                         >
                                             {tab === '' ? (
-                                                <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({viewingRole.candidates?.length || 0})</span>
+                                                <span style={{ color: isActive ? '#fff' : '#0f172a' }}>All ({roleFilteredTotal})</span>
                                             ) : (
                                                 <>
                                                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: isActive ? '#fff' : (style.dot || '#94a3b8') }} />
@@ -1115,401 +1140,137 @@ function Roles() {
                                 })}
                             </div>
 
-                            <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px', borderTop: 'none', borderRadius: '0 0 10px 10px' }}>
+                            <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px', borderTop: 'none', borderRadius: '0 0 10px 10px', transition: 'opacity 0.2s', opacity: isFilteringRole ? 0.6 : 1 }}>
                                 <table className="data-table role-candidates-table">
                                     <thead>
                                         <tr>
-                                            <th className="role-sticky-index">#</th>
-                                            <th className="role-sticky-candidate">Candidate</th>
-                                            <th className="role-sticky-status">Status</th>
-                                            <th style={{ minWidth: '150px', maxWidth: '180px' }}>Role</th>
-                                            <th style={{ minWidth: '140px' }}>Email</th>
-                                            <th style={{ minWidth: '100px' }}>Phone</th>
-                                            <th style={{ minWidth: '120px', width: '120px' }}>Details</th>
-                                            <th style={{ minWidth: '70px', width: '70px' }}>Priority</th>
-                                            <th style={{ minWidth: '140px', maxWidth: '160px' }}>Feedback</th>
-                                            <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Delivery</div></th>
-                                            <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Mail size={14} /> Hub</div></th>
-                                            <th style={{ minWidth: '120px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Delivery</div></th>
-                                            <th style={{ minWidth: '180px' }}><div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Linkedin size={14} /> Hub</div></th>
-                                            <th style={{ minWidth: '60px', width: '60px' }}>Actions</th>
+                                            <th className="role-sticky-first-name">First Name</th>
+                                            <th className="role-sticky-last-name">Last Name</th>
+                                            <th style={{ minWidth: 170 }}>Title</th>
+                                            <th style={{ minWidth: 90 }}>LinkedIn</th>
+                                            <th style={{ minWidth: 170 }}>Current Company</th>
+                                            <th style={{ minWidth: 150 }}>Product/Service</th>
+                                            <th style={{ minWidth: 120 }}>City</th>
+                                            <th style={{ minWidth: 105 }}>Total Years</th>
+                                            <th style={{ minWidth: 95 }}>Avg Years</th>
+                                            <th style={{ minWidth: 190 }}>Email</th>
+                                            <th style={{ minWidth: 145 }}>Phone</th>
+                                            <th style={{ minWidth: 180 }}>Status</th>
+                                            <th style={{ minWidth: 210 }}>Response</th>
+                                            <th style={{ minWidth: 190 }}>Notes</th>
+                                            <th style={{ minWidth: 64, width: 64 }}>Remove</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {filteredCandidates.map((candidate, idx) => {
-                                    const primaryRole = candidate.roles?.[0] || {
-                                        title: candidate.current_title || candidate.title || candidate.headline || '',
-                                        company: candidate.current_company || candidate.company || '',
-                                    }
-                                    const summary = candidate.reasoning || candidate.summary || "N/A"
-                                    const truncatedSummary = summary.length > 30 ? summary.substring(0, 30) + "..." : summary
-                                    const feedback = candidate.feedback || ""
-                                    const truncatedFeedback = feedback.length > 80 ? feedback.substring(0, 80) + "..." : feedback
-
-                                    return (
-                                        <tr key={candidate.id || idx}>
-                                            <td className="role-sticky-index">{idx + 1}</td>
-                                            <td className="role-sticky-candidate">
-                                                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                                                    <span style={{ fontWeight: 600, color: "#1e293b" }}>{candidate.name || "N/A"}</span>
-                                                    {candidate.linkedin && (
-                                                        <a href={candidate.linkedin} target="_blank" rel="noopener noreferrer" className="linkedin-link" title="LinkedIn">
-                                                            <Linkedin size={12} />
-                                                        </a>
-                                                    )}
-                                                    <button
-                                                        className="icon-btn"
-                                                        onClick={() => handleRefreshProfile(candidate)}
-                                                        disabled={Boolean(refreshingProfileIds[candidate.id])}
-                                                        title="Refresh this profile and retrieve its latest Clay contact data"
-                                                        style={{ color: '#2563eb', gap: '4px', padding: '5px 7px', whiteSpace: 'nowrap' }}
-                                                    >
-                                                        <RefreshCcw
-                                                            size={13}
-                                                            className={refreshingProfileIds[candidate.id] ? 'animate-spin' : ''}
+                                            const roleOutreach = outreachStatus[candidate.id] || {}
+                                            const responseText = roleOutreach.li_response_text || roleOutreach.response_text || candidate.response || ''
+                                            const responseChannel = roleOutreach.li_response_text ? 'LinkedIn' : roleOutreach.response_text || candidate.response ? 'Email' : ''
+                                            const phone = candidate.phone || candidate.mobile_phone || ''
+                                            return (
+                                                <tr key={candidate.id || idx}>
+                                                    <td className="role-sticky-first-name">{candidate.first_name || candidate.name?.split(' ')[0] || '—'}</td>
+                                                    <td className="role-sticky-last-name">{candidate.last_name || candidate.name?.split(' ').slice(1).join(' ') || '—'}</td>
+                                                    <td className="role-truncate-cell" title={candidate.title || candidate.headline}>{candidate.title || candidate.headline || '—'}</td>
+                                                    <td>
+                                                        {candidate.linkedin ? (
+                                                            <a href={candidate.linkedin} target="_blank" rel="noopener noreferrer" className="role-linkedin-button" title="Open LinkedIn profile">
+                                                                <Linkedin size={15} /> Profile
+                                                            </a>
+                                                        ) : <span className="empty-val">Not linked</span>}
+                                                    </td>
+                                                    <td className="role-truncate-cell" title={candidate.company || candidate.current_company}>{candidate.company || candidate.current_company || '—'}</td>
+                                                    <td className="role-truncate-cell" title={candidate.product_service}>{candidate.product_service || '—'}</td>
+                                                    <td className="role-truncate-cell" title={candidate.city || candidate.location}>{candidate.city || candidate.location || '—'}</td>
+                                                    <td>{Number(candidate.total_experience_years || 0) > 0 ? `${Number(candidate.total_experience_years).toFixed(1)}y` : '—'}</td>
+                                                    <td>{Number(candidate.avg_tenure_years || candidate.avg_years_in_company || 0) > 0 ? `${Number(candidate.avg_tenure_years || candidate.avg_years_in_company).toFixed(1)}y` : '—'}</td>
+                                                    <td>
+                                                        {candidate.email ? (
+                                                            <div className="role-contact-value">
+                                                                <span title={candidate.email}>{candidate.email}</span>
+                                                                <button type="button" className="icon-btn" onClick={() => handleCopy(candidate.email)} title="Copy email"><Copy size={12} /></button>
+                                                            </div>
+                                                        ) : <span className="empty-val">Not available</span>}
+                                                    </td>
+                                                    <td>
+                                                        {phone ? (
+                                                            <div className="role-contact-value">
+                                                                <span title={phone}>{phone}</span>
+                                                                <button type="button" className="icon-btn" onClick={() => handleCopy(phone)} title="Copy phone"><Copy size={12} /></button>
+                                                            </div>
+                                                        ) : (
+                                                            <button
+                                                                type="button"
+                                                                className="role-refresh-contact"
+                                                                onClick={() => handleRefreshProfile(candidate)}
+                                                                disabled={Boolean(refreshingProfileIds[candidate.id])}
+                                                            >
+                                                                <RefreshCcw size={12} className={refreshingProfileIds[candidate.id] ? 'animate-spin' : ''} />
+                                                                {refreshingProfileIds[candidate.id] ? 'Fetching…' : 'Fetch contact'}
+                                                            </button>
+                                                        )}
+                                                    </td>
+                                                    <td>
+                                                        <StatusDropdown
+                                                            status={candidate.status}
+                                                            candidateId={candidate.id}
+                                                            onUpdate={(id, newStatus) => {
+                                                                handleRoleStatusUpdate(id, newStatus).then(() => {
+                                                                    updateCandidateInRole(id, { status: newStatus });
+                                                                }).catch((err) => {
+                                                                    updateCandidateInRole(id, { status: newStatus });
+                                                                });
+                                                            }}
                                                         />
-                                                        <span style={{ fontSize: '11px', fontWeight: 700 }}>
-                                                            {refreshingProfileIds[candidate.id] ? 'Refreshing' : 'Refresh'}
-                                                        </span>
-                                                    </button>
-                                                </div>
-                                            </td>
-                                            <td className="role-sticky-status">
-                                                <StatusDropdown
-                                                    status={candidate.status}
-                                                    candidateId={candidate.id}
-                                                    updateStatus={handleRoleStatusUpdate}
-                                                    onUpdate={(id, newStatus) => {
-                                                        useAppStore.setState(state => ({
-                                                            viewingRole: {
-                                                                ...state.viewingRole,
-                                                                candidates: state.viewingRole.candidates.map(c =>
-                                                                    c.id === id ? { ...c, status: newStatus } : c
-                                                                )
-                                                            }
-                                                        }))
-                                                    }}
-                                                />
-                                            </td>
-                                            <td>
-                                                <div style={{ lineHeight: "1.2" }}>
-                                                    <div>{primaryRole.title || "N/A"}</div>
-                                                    <div style={{ fontSize: "11px", color: "#64748b" }}>{primaryRole.company || "N/A"}</div>
-                                                </div>
-                                            </td>
-                                            <td>
-                                                {candidate.email ? (
-                                                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                                        <span className="contact-cell" title={candidate.email}>{candidate.email}</span>
-                                                        <button className="icon-btn" onClick={() => handleCopy(candidate.email)} title="Copy Email">
-                                                            <Copy size={12} />
+                                                    </td>
+                                                    <td>
+                                                        <button type="button" className="role-response-cell" onClick={() => setChattingWith({
+                                                            ...candidate,
+                                                            response: roleOutreach.response_text || candidate.response || '',
+                                                            li_response_text: roleOutreach.li_response_text || candidate.li_response_text || '',
+                                                            li_status: roleOutreach.li_status || candidate.li_status || '',
+                                                        })}>
+                                                            <span><MessageSquare size={13} /> Open conversation</span>
+                                                            <small title={responseText}>{responseText || 'No response yet'}</small>
+                                                            {responseChannel && <em>{responseChannel}</em>}
                                                         </button>
-                                                    </div>
-                                                ) : <span className="empty-val">Not available</span>}
-                                            </td>
-                                            <td>
-                                                {candidate.mobile_phone ? (
-                                                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                                        <span className="contact-cell" title={candidate.mobile_phone}>{candidate.mobile_phone}</span>
-                                                        <button className="icon-btn" onClick={() => handleCopy(candidate.mobile_phone)} title="Copy Phone">
-                                                            <Copy size={12} />
+                                                    </td>
+                                                    <td><EditableCandidateNotes candidateId={candidate.id} initialNotes={candidate.notes} /></td>
+                                                    <td style={{ textAlign: 'center' }}>
+                                                        <button
+                                                            type="button"
+                                                            className="icon-btn role-remove-candidate"
+                                                            onClick={event => { event.stopPropagation(); handleRemoveCandidate(candidate.id, candidate.name) }}
+                                                            title="Remove from role"
+                                                        >
+                                                            <Trash2 size={16} />
                                                         </button>
-                                                    </div>
-                                                ) : <span className="empty-val">Not available</span>}
-                                            </td>
-                                            <td>
-                                                <span className="summary-trigger" onClick={() => setExpandedSummary(candidate.id)}>
-                                                    {truncatedSummary}
-                                                </span>
-                                            </td>
-                                            <td>{getPriorityBadge(candidate.priority)}</td>
-                                            <td title={feedback} style={{ fontSize: "13px", color: "#64748b", whiteSpace: "normal", lineHeight: "1.4" }}>
-                                                {truncatedFeedback || "—"}
-                                            </td>
-
-                                            {/* Email Delivery */}
-                                            <td>
-                                                {outreachStatus[candidate.id] ?
-                                                    getStatusBadge(outreachStatus[candidate.id].status) :
-                                                    <span className="empty-val">Not started</span>
-                                                }
-                                            </td>
-
-                                            {/* Email Hub */}
-                                            <td>
-                                                {outreachStatus[candidate.id] ? (
-                                                    <div className="hub-cell">
-                                                        <button className="hub-link" onClick={() => handleOpenChat(candidate, 'email')}>
-                                                            <Mail size={12} /> Open Hub
-                                                        </button>
-                                                        {outreachStatus[candidate.id].response_text ? (
-                                                            <span className="hub-preview" title={outreachStatus[candidate.id].response_text}>
-                                                                {outreachStatus[candidate.id].response_text}
-                                                            </span>
-                                                        ) : (
-                                                            <span className="hub-muted">No reply yet</span>
-                                                        )}
-                                                    </div>
-                                                ) : <span className="empty-val">Not started</span>}
-                                            </td>
-
-                                            {/* LinkedIn Status */}
-                                            <td>
-                                                {outreachStatus[candidate.id] ?
-                                                    getLiStatusBadge(outreachStatus[candidate.id].li_status, outreachStatus[candidate.id].li_sent_count) :
-                                                    <span className="empty-val">Not started</span>
-                                                }
-                                            </td>
-
-                                            {/* LinkedIn Hub */}
-                                            <td>
-                                                {outreachStatus[candidate.id]?.li_status ? (
-                                                    <div className="hub-cell">
-                                                        <button className="hub-link hub-link-linkedin" onClick={() => handleOpenChat(candidate, 'linkedin')}>
-                                                            <Linkedin size={12} /> Open Hub
-                                                        </button>
-                                                        {outreachStatus[candidate.id].li_response_text ? (
-                                                            <span className="hub-preview" title={outreachStatus[candidate.id].li_response_text}>
-                                                                {outreachStatus[candidate.id].li_response_text}
-                                                            </span>
-                                                        ) : (
-                                                            <span className="hub-muted">No LinkedIn reply yet</span>
-                                                        )}
-                                                        {outreachStatus[candidate.id].li_response_received_at && (
-                                                            <span className="hub-time">
-                                                                {new Date(outreachStatus[candidate.id].li_response_received_at).toLocaleDateString()}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                ) : <span className="empty-val">Not started</span>}
-                                            </td>
-
-                                            {/* Actions */}
-                                            <td style={{ textAlign: 'center' }}>
-                                                <button
-                                                    className="icon-btn"
-                                                    onClick={(e) => { e.stopPropagation(); handleRemoveCandidate(candidate.id, candidate.name); }}
-                                                    title="Remove from role"
-                                                    style={{ color: '#ef4444' }}
-                                                    onMouseEnter={e => { e.currentTarget.style.background = '#fee2e2'; }}
-                                                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
-                                                >
-                                                    <Trash2 size={16} />
-                                                </button>
-                                            </td>
-                                        </tr>
-                                    )
-                                })}
-                                {filteredCandidates.length === 0 && (
-                                    <tr>
-                                        <td colSpan="14" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
-                                            No candidates match the selected filters.
-                                        </td>
-                                    </tr>
-                                )}
-                            </tbody>
-                        </table>
-                    </div>
+                                                    </td>
+                                                </tr>
+                                            )
+                                        })}
+                                        {filteredCandidates.length === 0 && (
+                                            <tr>
+                                                <td colSpan="13" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+                                                    No candidates match the selected filters.
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
                 </div>
             </div>
                 )}
 
-                {/* Modals */}
-                {expandedSummary && (
-                    <div className="modal-overlay" onClick={() => setExpandedSummary(null)}>
-                        <div className="modal-content" onClick={e => e.stopPropagation()}>
-                            <h3 className="modal-title">{typeof expandedSummary === 'object' ? expandedSummary.type : 'Matching Analysis'}</h3>
-                            <div className="modal-scroll-area">
-                                {typeof expandedSummary === 'object' ?
-                                    expandedSummary.content :
-                                    (viewingRole.candidates.find(c => c.id === expandedSummary)?.reasoning ||
-                                        viewingRole.candidates.find(c => c.id === expandedSummary)?.summary || 'N/A')
-                                }
-                            </div>
-                            <div className="modal-footer">
-                                <button className="btn btn-secondary" onClick={() => setExpandedSummary(null)}>Close</button>
-                            </div>
-                        </div>
-                    </div>
-                )}
-
-                {/* Chat Modal */}
                 {chattingWith && (
-                    <div className="modal-overlay" onClick={() => setChattingWith(null)} style={{ animation: 'fadeIn 0.2s ease-out' }}>
-                        <div className="modal-content" style={{
-                            maxWidth: '680px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            maxHeight: '88vh',
-                            animation: 'slideUpModal 0.25s cubic-bezier(0.16, 1, 0.3, 1)',
-                            padding: 0,
-                            overflow: 'hidden'
-                        }} onClick={e => e.stopPropagation()}>
-                            {/* Header */}
-                            <div style={{
-                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                padding: '20px 24px', borderBottom: '1px solid #e2e8f0',
-                                background: chatPlatform === 'linkedin' ? '#f0f9ff' : '#f8f5ff'
-                            }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                    {chatPlatform === 'email'
-                                        ? <div style={{ width: 38, height: 38, borderRadius: 10, background: '#ede9fe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Mail size={20} style={{ color: '#7c3aed' }} /></div>
-                                        : <div style={{ width: 38, height: 38, borderRadius: 10, background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Linkedin size={20} style={{ color: '#0284c7' }} /></div>}
-                                    <div>
-                                        <div style={{ fontWeight: 700, fontSize: 16, color: '#0f172a' }}>
-                                            {chatPlatform === 'email' ? 'Email Hub' : 'LinkedIn Hub'} · {chattingWith.name}
-                                        </div>
-                                        <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-                                            {chatPlatform === 'email' ? 'Smartlead conversation' : 'HeyReach conversation'}
-                                        </div>
-                                    </div>
-                                </div>
-                                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                    <button
-                                        className="icon-btn"
-                                        onClick={() => handleOpenChat(chattingWith, chatPlatform)}
-                                        disabled={isFetchingChat}
-                                        title="Refresh conversation"
-                                        style={{ width: 34, height: 34, borderRadius: 8 }}
-                                    >
-                                        <RefreshCcw size={15} className={isFetchingChat ? 'animate-spin' : ''} />
-                                    </button>
-                                    <button className="icon-btn" onClick={() => setChattingWith(null)} style={{ width: 34, height: 34, borderRadius: 8 }}>
-                                        <Plus size={16} style={{ transform: 'rotate(45deg)' }} />
-                                    </button>
-                                </div>
-                            </div>
-
-                            {/* Message area */}
-                            <div className="chat-area" style={{
-                                flex: 1,
-                                overflowY: 'auto',
-                                padding: '16px 20px',
-                                background: '#f8fafc',
-                                display: 'flex',
-                                flexDirection: 'column',
-                                gap: '10px',
-                                minHeight: '280px',
-                                maxHeight: '420px'
-                            }}>
-                                {isFetchingChat ? (
-                                    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', flex: 1 }}>
-                                        <Loader2 size={32} className="animate-spin" style={{ color: '#94a3b8' }} />
-                                    </div>
-                                ) : chatMessages.length === 0 ? (
-                                    <div style={{ textAlign: 'center', color: '#94a3b8', marginTop: '40px' }}>No messages found.</div>
-                                ) : (
-                                    chatMessages.map((msg, i) => {
-                                        const type = (msg.type || '').toUpperCase();
-                                        const isIncoming = ['INBOX', 'REPLY', 'REPLIED', 'LEAD', 'INCOMING'].includes(type);
-                                        const isOutgoing = !isIncoming;
-                                        const isPending = Boolean(msg._pending);
-
-                                        let body = msg.email_body || msg.text || msg.message || msg.content || msg.html_body || msg.body || '';
-
-                                        if (isIncoming) {
-                                            const quotedIndex = body.search(/On\s+.*,\s+.*wrote:/i);
-                                            if (quotedIndex !== -1) body = body.substring(0, quotedIndex);
-                                            const originalMsgIndex = body.search(/---+\s*Original\s*Message\s*---+/i);
-                                            if (originalMsgIndex !== -1) body = body.substring(0, originalMsgIndex);
-                                            const signatureMarkers = ["Best regards", "Regards", "Thanks,", "Thank you,", "Kind regards", "Sincerely"];
-                                            for (const marker of signatureMarkers) {
-                                                const sigIndex = body.lastIndexOf(marker);
-                                                if (sigIndex > body.length / 2) {
-                                                    body = body.substring(0, sigIndex);
-                                                    break;
-                                                }
-                                            }
-                                            body = body.trim();
-                                        }
-
-                                        return (
-                                            <div key={i} style={{
-                                                alignSelf: isOutgoing ? 'flex-end' : 'flex-start',
-                                                maxWidth: '85%',
-                                                display: 'flex',
-                                                flexDirection: 'column',
-                                                alignItems: isOutgoing ? 'flex-end' : 'flex-start',
-                                                animation: isPending ? 'none' : 'fadeIn 0.2s ease-out'
-                                            }}>
-                                                <div style={{
-                                                    padding: '12px 16px',
-                                                    borderRadius: isOutgoing ? '16px 16px 2px 16px' : '16px 16px 16px 2px',
-                                                    background: isOutgoing ? (chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed') : '#ffffff',
-                                                    color: isOutgoing ? 'white' : '#1e293b',
-                                                    boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-                                                    border: isOutgoing ? 'none' : '1px solid #e2e8f0',
-                                                    opacity: isPending ? 0.65 : 1,
-                                                    transition: 'opacity 0.3s ease'
-                                                }}>
-                                                    <div style={{ fontSize: '11px', opacity: 0.7, marginBottom: '4px', fontWeight: 600 }}>
-                                                        {isOutgoing ? 'Me' : (msg.sender_name || chattingWith.name)} • {msg.time ? new Date(msg.time).toLocaleString() : ''}
-                                                    </div>
-                                                    {isPending
-                                                        ? <div style={{ fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{body}</div>
-                                                        : <div style={{ fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: body }} />}
-                                                </div>
-                                                {isPending && (
-                                                    <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '3px', padding: '0 4px' }}>
-                                                        Sending...
-                                                    </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })
-                                )}
-                                <div ref={chatEndRef} />
-                            </div>
-                            {/* Reply box */}
-                            <div style={{ padding: '16px 20px 20px', borderTop: '1px solid #e2e8f0', background: '#fff' }}>
-                                <div style={{
-                                    display: 'flex', gap: '10px', alignItems: 'flex-end',
-                                    background: '#f8fafc', border: '1.5px solid #e2e8f0',
-                                    borderRadius: '14px', padding: '8px 12px',
-                                    transition: 'border-color 0.2s',
-                                }}
-                                    onFocusCapture={e => e.currentTarget.style.borderColor = chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed'}
-                                    onBlurCapture={e => e.currentTarget.style.borderColor = '#e2e8f0'}
-                                >
-                                    <textarea
-                                        className="input-field"
-                                        placeholder={`Reply via ${chatPlatform === 'linkedin' ? 'LinkedIn (HeyReach)' : 'Email (Smartlead)'}…`}
-                                        style={{
-                                            flex: 1, minHeight: '44px', maxHeight: '120px',
-                                            resize: 'none', border: 'none', background: 'transparent',
-                                            outline: 'none', padding: '4px 0',
-                                            fontSize: '14px', fontFamily: 'inherit', color: '#0f172a'
-                                        }}
-                                        value={replyMessage}
-                                        onChange={(e) => setReplyMessage(e.target.value)}
-                                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendReply(); }}}
-                                        onInput={(e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; }}
-                                    />
-                                    <button
-                                        onClick={handleSendReply}
-                                        disabled={!replyMessage.trim() || isSendingReply}
-                                        style={{
-                                            width: 40, height: 40, borderRadius: '50%', border: 'none',
-                                            flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                            background: !replyMessage.trim() || isSendingReply ? '#e2e8f0'
-                                                : chatPlatform === 'linkedin' ? '#0284c7' : '#7c3aed',
-                                            color: !replyMessage.trim() || isSendingReply ? '#94a3b8' : '#fff',
-                                            cursor: !replyMessage.trim() || isSendingReply ? 'not-allowed' : 'pointer',
-                                            transition: 'all 0.2s ease',
-                                            transform: isSendingReply ? 'scale(0.9)' : 'scale(1)',
-                                        }}
-                                    >
-                                        {isSendingReply
-                                            ? <Loader2 size={16} className="animate-spin" />
-                                            : <Send size={16} />}
-                                    </button>
-                                </div>
-                                <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 6, paddingLeft: 4 }}>
-                                    Press Enter to send · Shift+Enter for new line
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+                    <CandidateConversationModal
+                        candidate={chattingWith}
+                        roleId={viewingRole.id}
+                        onClose={() => setChattingWith(null)}
+                        updateStatus={handleRoleStatusUpdate}
+                        onStatusChanged={(candidateId, status) => updateCandidateInRole(candidateId, { status })}
+                    />
                 )}
 
             </div>
@@ -1523,7 +1284,9 @@ function Roles() {
             {uploadUi}
 
             <div className="result-banner">
-                <div className="result-banner-title">{roles.length} Active Role(s)</div>
+                <div className="result-banner-title">
+                    {(roles.length === 0 && !rolesLastFetchedAt) ? 'Loading...' : `${roles.length} Active Role(s)`}
+                </div>
                 <div className="result-banner-subtitle">Organize and manage your top talent by role</div>
             </div>
 
@@ -1544,7 +1307,12 @@ function Roles() {
 
             {/* Roles Grid */}
             <div className="roles-grid">
-                {roles.length === 0 ? (
+                {(roles.length === 0 && !rolesLastFetchedAt) ? (
+                    <div className="empty-state" style={{ border: 'none', background: 'transparent' }}>
+                        <Loader2 className="animate-spin" size={32} style={{ color: '#cbd5e1', marginBottom: '16px' }} />
+                        <p style={{ color: '#94a3b8' }}>Loading roles...</p>
+                    </div>
+                ) : roles.length === 0 ? (
                     <div className="empty-state">
                         <Folder size={48} style={{ color: '#e2e8f0', marginBottom: '16px' }} />
                         <p>No recruitment roles created yet.</p>
@@ -1571,7 +1339,7 @@ function Roles() {
                                     </div>
                                 </div>
                             </div>
-                            {role.activation_status !== 'active' && <button className="btn btn-secondary btn-sm" onClick={(event) => { event.stopPropagation(); handleRetryActivation(role) }} title={role.activation_error || 'Configure activation'} style={{ margin: '0 8px 8px' }}>Configure & activate</button>}
+                            <button className="btn btn-secondary btn-sm" onClick={(event) => { event.stopPropagation(); handleRetryActivation(role) }} title={role.activation_error || 'Configure activation'} style={{ margin: '0 8px 8px' }}>{role.activation_status === 'active' ? 'Update config' : 'Configure & activate'}</button>
                             <button className="role-delete-btn" onClick={() => handleDeleteRole(role.name)} title="Remove Role">
                                 <Trash2 size={16} />
                             </button>

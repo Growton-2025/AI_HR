@@ -45,6 +45,28 @@ def dispatch_due_linkedin(limit: int = 20) -> int:
                 )
             conn.commit()
 
+    ai_columns_by_candidate = {}
+    if claimed:
+        roles = {row[1] for row in claimed}
+        c_ids = {row[0] for row in claimed}
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if conn:
+                with conn.cursor() as cur:
+                    for r_id in roles:
+                        view_scope = f"role_{r_id}"
+                        cur.execute(
+                            """
+                            SELECT c.candidate_id, d.name, c.primary_output
+                            FROM ai_column_cells c
+                            JOIN ai_column_definitions d ON d.id = c.column_definition_id
+                            WHERE d.view_scope = %s AND c.candidate_id = ANY(%s)
+                            """,
+                            (view_scope, list(c_ids))
+                        )
+                        for cid, col_name, val in cur.fetchall():
+                            if val:
+                                ai_columns_by_candidate.setdefault(cid, {})[col_name] = val
+
     bot = HeyReachBot()
     completed = 0
     for candidate_id, role_id, campaign_id, account_id, first_name, last_name, name, linkedin, message, started_at, claimed_from_status in claimed:
@@ -62,10 +84,12 @@ def dispatch_due_linkedin(limit: int = 20) -> int:
                         result = {"alreadyEnrolled": True}
                         break
             if result is None:
+                custom_fields = ai_columns_by_candidate.get(candidate_id, {})
                 result = bot.push_lead(
                     int(campaign_id), int(account_id),
                     first_name or (name or "Candidate").split()[0],
                     last_name or " ".join((name or "").split()[1:]), linkedin,
+                    custom_fields=custom_fields
                 )
             if result is None:
                 raise RuntimeError("HeyReach rejected the candidate")

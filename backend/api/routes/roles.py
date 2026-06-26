@@ -38,6 +38,21 @@ def invalidate_role_detail_cache(role_id: Optional[int] = None) -> None:
     for key in stale_keys:
         _ROLE_DETAIL_CACHE.pop(key, None)
 
+
+def invalidate_role_detail_cache_for_candidate(candidate_id: int) -> None:
+    """Drop every cached role detail payload containing the candidate."""
+    candidate_id = int(candidate_id)
+    stale_keys = []
+    for key, cached in _ROLE_DETAIL_CACHE.items():
+        if not cached:
+            continue
+        candidates = cached[1].get("candidates") or []
+        if any(int(candidate.get("id") or 0) == candidate_id for candidate in candidates):
+            stale_keys.append(key)
+    for key in stale_keys:
+        _ROLE_DETAIL_CACHE.pop(key, None)
+
+
 def fetch_candidates_from_db(candidate_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Fetch full candidate profiles from DB for IDs not in memory cache"""
     if not candidate_ids:
@@ -263,9 +278,10 @@ async def get_roles(
             if user_role == "admin" and not owner_user_id:
                 logger.info("Fetching all roles for admin scope: %s", view_scope or "default")
                 cur.execute("""
-                    SELECT r.id, r.name, r.job_description, COUNT(DISTINCT c.id) as candidate_count,
-                           COUNT(DISTINCT cu.id) as upload_count,
-                           MAX(cu.completed_at) as latest_upload_at,
+                    SELECT r.id, r.name, r.job_description,
+                           COALESCE(c_counts.candidate_count, 0) as candidate_count,
+                           COALESCE(u_counts.upload_count, 0) as upload_count,
+                           u_counts.latest_upload_at,
                            r.user_id,
                            u.name as owner_name,
                            u.email as owner_email,
@@ -273,23 +289,29 @@ async def get_roles(
                            hc.provisioning_status, hc.provisioning_error
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
-                    LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
-                    LEFT JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
-                    LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
+                    LEFT JOIN (
+                        SELECT rc.role_id, COUNT(DISTINCT rc.candidate_id) as candidate_count
+                        FROM recruitment_role_candidates rc
+                        JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
+                        GROUP BY rc.role_id
+                    ) c_counts ON c_counts.role_id = r.id
+                    LEFT JOIN (
+                        SELECT role_id, COUNT(id) as upload_count, MAX(completed_at) as latest_upload_at
+                        FROM candidate_uploads
+                        GROUP BY role_id
+                    ) u_counts ON u_counts.role_id = r.id
                     LEFT JOIN role_smartlead_campaigns sc ON sc.recruitment_role_id = r.id
                     LEFT JOIN role_heyreach_campaigns hc ON hc.recruitment_role_id = r.id
-                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email,
-                             sc.provisioning_status, sc.provisioning_error,
-                             hc.provisioning_status, hc.provisioning_error
                     ORDER BY r.created_at DESC
                 """)
             else:
                 target_user_id = _role_owner_id(current_user, owner_user_id)
                 logger.info(f"Fetching roles for user_id: {target_user_id}")
                 cur.execute("""
-                    SELECT r.id, r.name, r.job_description, COUNT(DISTINCT c.id) as candidate_count,
-                           COUNT(DISTINCT cu.id) as upload_count,
-                           MAX(cu.completed_at) as latest_upload_at,
+                    SELECT r.id, r.name, r.job_description,
+                           COALESCE(c_counts.candidate_count, 0) as candidate_count,
+                           COALESCE(u_counts.upload_count, 0) as upload_count,
+                           u_counts.latest_upload_at,
                            r.user_id,
                            u.name as owner_name,
                            u.email as owner_email,
@@ -297,15 +319,20 @@ async def get_roles(
                            hc.provisioning_status, hc.provisioning_error
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
-                    LEFT JOIN recruitment_role_candidates rc ON r.id = rc.role_id
-                    LEFT JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
-                    LEFT JOIN candidate_uploads cu ON cu.role_id = r.id
+                    LEFT JOIN (
+                        SELECT rc.role_id, COUNT(DISTINCT rc.candidate_id) as candidate_count
+                        FROM recruitment_role_candidates rc
+                        JOIN candidates c ON c.id = rc.candidate_id AND COALESCE(c.is_archived, FALSE) = FALSE
+                        GROUP BY rc.role_id
+                    ) c_counts ON c_counts.role_id = r.id
+                    LEFT JOIN (
+                        SELECT role_id, COUNT(id) as upload_count, MAX(completed_at) as latest_upload_at
+                        FROM candidate_uploads
+                        GROUP BY role_id
+                    ) u_counts ON u_counts.role_id = r.id
                     LEFT JOIN role_smartlead_campaigns sc ON sc.recruitment_role_id = r.id
                     LEFT JOIN role_heyreach_campaigns hc ON hc.recruitment_role_id = r.id
                     WHERE r.user_id = %s
-                    GROUP BY r.id, r.name, r.job_description, r.user_id, u.name, u.email,
-                             sc.provisioning_status, sc.provisioning_error,
-                             hc.provisioning_status, hc.provisioning_error
                     ORDER BY r.created_at DESC
                 """, (target_user_id,))
             
@@ -546,7 +573,9 @@ async def get_role(
             cur.execute(
                 f"""
                 WITH selected_role AS (
-                    SELECT r.id, r.name, r.job_description, r.user_id
+                    SELECT r.id, r.name, r.job_description, r.user_id,
+                           (SELECT COUNT(*) FROM candidate_uploads cu WHERE cu.role_id = r.id) as upload_count,
+                           (SELECT MAX(cu.completed_at) FROM candidate_uploads cu WHERE cu.role_id = r.id) as latest_upload_at
                     FROM recruitment_roles r
                     WHERE {role_filter}
                     ORDER BY {role_order}
@@ -554,19 +583,44 @@ async def get_role(
                 )
                 SELECT sr.id, sr.name, sr.job_description, sr.user_id,
                        u.name, u.email,
-                       (SELECT COUNT(*) FROM candidate_uploads cu WHERE cu.role_id = sr.id),
-                       (SELECT MAX(cu.completed_at) FROM candidate_uploads cu WHERE cu.role_id = sr.id),
+                       sr.upload_count,
+                       sr.latest_upload_at,
                        COUNT(c.id) OVER (),
                        c.id, rc.priority, rc.feedback,
                        c.name, c.linkedin, c.location, c.headline, c.about,
                        c.email,
                        COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), ''), ''),
-                       c.status
+                       c.status,
+                       c.first_name,
+                       c.last_name,
+                       COALESCE(NULLIF(TRIM(c.city), ''), split_part(COALESCE(c.location, ''), ',', 1), ''),
+                       COALESCE(c.total_experience_years, 0),
+                       COALESCE(c.avg_years_in_company, 0),
+                       COALESCE(c.notes, ''),
+                       COALESCE(role_outreach.response_text, c.response, ''),
+                       COALESCE(primary_role.title, c.headline, ''),
+                       COALESCE(primary_role.company, c.raw_fields->>'import_company', '')
                 FROM selected_role sr
                 LEFT JOIN users u ON u.id = sr.user_id
                 LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
                 LEFT JOIN candidates c ON c.id = rc.candidate_id
                     AND COALESCE(c.is_archived, FALSE) = FALSE
+                LEFT JOIN LATERAL (
+                    SELECT r.title, company.name AS company
+                    FROM roles r
+                    LEFT JOIN companies company ON company.id = r.company_id
+                    WHERE r.candidate_id = c.id
+                    ORDER BY r.id ASC
+                    LIMIT 1
+                ) primary_role ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT co.response_text
+                    FROM candidate_outreach co
+                    WHERE co.candidate_id = c.id
+                      AND co.recruitment_role_id = sr.id
+                    ORDER BY co.updated_at DESC NULLS LAST
+                    LIMIT 1
+                ) role_outreach ON TRUE
                 ORDER BY c.id NULLS LAST
                 """,
                 tuple(params),
@@ -605,6 +659,32 @@ async def get_role(
                         "status": row[19] or "To be started",
                         "roles": [],
                     }
+                name_parts = (row[12] or "").strip().split()
+                first_name = (row[20] or "").strip() or (name_parts[0] if name_parts else "")
+                last_name = (row[21] or "").strip() or (" ".join(name_parts[1:]) if len(name_parts) > 1 else "")
+                title = row[27] or candidate.get("current_title") or candidate.get("title") or candidate.get("headline") or ""
+                company = row[28] or candidate.get("current_company") or candidate.get("company") or ""
+                candidate.update({
+                    "name": row[12] or candidate.get("name") or (f"{first_name} {last_name}".strip()),
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "linkedin": row[13] or candidate.get("linkedin") or "",
+                    "title": title,
+                    "current_title": title,
+                    "company": company,
+                    "current_company": company,
+                    "city": row[22] or candidate.get("city") or "",
+                    "location": row[14] or candidate.get("location") or "",
+                    "total_experience_years": round(float(row[23] or 0), 1),
+                    "avg_tenure_years": round(float(row[24] or 0), 1),
+                    "avg_years_in_company": round(float(row[24] or 0), 1),
+                    "email": row[17] or candidate.get("email") or "",
+                    "phone": row[18] or candidate.get("phone") or candidate.get("mobile_phone") or "",
+                    "mobile_phone": row[18] or candidate.get("mobile_phone") or candidate.get("phone") or "",
+                    "response": row[26] or candidate.get("response") or "",
+                    "notes": row[25] or "",
+                    "status": row[19] or candidate.get("status") or "To be started",
+                })
                 candidate["priority"] = row[10]
                 candidate["feedback"] = row[11]
                 candidates.append(candidate)
