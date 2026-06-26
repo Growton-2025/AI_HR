@@ -45,8 +45,8 @@ export default function CandidateConversationModal({
     setThreads(previous => ({
       ...previous,
       [targetPlatform]: result.success
-        ? { messages: result.messages || [], loaded: true, error: '' }
-        : { messages: [], loaded: true, error: result.error || 'Failed to load conversation' },
+        ? { messages: result.messages || [], loaded: true, error: '', syncing: Boolean(result.syncing) }
+        : { messages: [], loaded: true, error: result.error || 'Failed to load conversation', syncing: false },
     }))
     return result
   }, [candidate.id, fetchChatHistory, roleId])
@@ -65,6 +65,21 @@ export default function CandidateConversationModal({
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  // Fast poll whichever thread is currently syncing
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      if (threads.email?.syncing) {
+        void loadThread('email');
+      }
+      if (threads.linkedin?.syncing) {
+        void loadThread('linkedin');
+      }
+    }, 2000);
+
+    return () => clearInterval(intervalId);
+  }, [threads.email?.syncing, threads.linkedin?.syncing, loadThread]);
 
   const tabs = useMemo(() => ([
     { id: 'linkedin', label: 'LinkedIn', icon: Linkedin, hasResponse: Boolean(candidate.li_response_text) },
