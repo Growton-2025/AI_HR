@@ -489,6 +489,18 @@ async def receive_results(request: Request):
                     )
                     conn.commit()
 
+                    if phone:
+                        cur.execute(
+                            "SELECT DISTINCT role_id FROM recruitment_role_candidates WHERE candidate_id = ANY(%s)",
+                            (matched_ids,)
+                        )
+                        roles = cur.fetchall()
+                        if roles:
+                            from backend.services.auto_call_list import sync_shortlisted_to_call_list
+                            for role_row in roles:
+                                sync_shortlisted_to_call_list(cur, role_row[0], matched_ids)
+                            conn.commit()
+
     query.update_candidate_contact(
         li_url or "",
         email,

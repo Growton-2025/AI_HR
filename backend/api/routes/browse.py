@@ -1462,10 +1462,32 @@ async def update_status(
     prof = PROFILES_BY_ID.get(candidate_id)
     if not prof:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:
-        raise HTTPException(status_code=403, detail="Master library rows are read-only")
-    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    is_owner = prof.get("owner_user_id") == current_user.id
+    
+    if not is_admin and not is_owner:
+        has_role_access = False
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM recruitment_role_candidates rrc
+                    JOIN recruitment_roles rr ON rr.id = rrc.role_id
+                    WHERE rrc.candidate_id = %s AND rr.user_id = %s
+                    LIMIT 1
+                    """,
+                    (candidate_id, current_user.id)
+                )
+                has_role_access = bool(cur.fetchone())
+        finally:
+            return_db_connection(conn)
+            
+        if not has_role_access:
+            if prof.get("owner_user_id") is None:
+                raise HTTPException(status_code=403, detail="Master library rows are read-only")
+            else:
+                raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
     success = update_candidate_status(candidate_id, update.status)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")

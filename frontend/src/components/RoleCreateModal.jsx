@@ -20,6 +20,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
   const [form, setForm] = useState({
     name: role?.name || '', heyreach_campaign_id: '', smartlead_sender_account_id: '',
     email_subject: DEFAULT_SUBJECT, email_body: DEFAULT_BODY,
+    auto_create_call_list: false,
   })
 
   useEffect(() => {
@@ -59,6 +60,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
         smartlead_sender_account_id: Number(form.smartlead_sender_account_id) || 0,
         email_subject: form.email_subject.trim(),
         email_body: form.email_body.trim(),
+        auto_create_call_list: form.auto_create_call_list,
       })
       if (!result?.success) throw new Error(result?.error || (role ? 'Activation failed' : 'Failed to create role'))
       onClose()
@@ -71,7 +73,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
 
   const isSmartleadSelected = Boolean(form.smartlead_sender_account_id && String(form.smartlead_sender_account_id) !== "0")
   const isHeyreachSelected = Boolean(form.heyreach_campaign_id && Number(form.heyreach_campaign_id) > 0)
-  const invalid = !form.name.trim() || (!isSmartleadSelected && !isHeyreachSelected)
+  const invalid = !form.name.trim() || (!isSmartleadSelected && !isHeyreachSelected && !form.auto_create_call_list)
     || (isSmartleadSelected && (!form.email_subject.trim() || !form.email_body.trim()))
 
   return <div className="modal-overlay" onClick={onClose}>
@@ -89,6 +91,16 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
         </select></label>
         <label>Email subject<input className="input-field" maxLength={500} value={form.email_subject} onChange={e => setForm(f => ({ ...f, email_subject: e.target.value }))} style={{ width: '100%', marginTop: 6 }} /></label>
         <label>Email body<textarea className="input-field" rows={8} maxLength={20000} value={form.email_body} onChange={e => setForm(f => ({ ...f, email_body: e.target.value }))} style={{ width: '100%', marginTop: 6, resize: 'vertical' }} /></label>
+        {!role && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, cursor: 'pointer' }}>
+            <input 
+              type="checkbox" 
+              checked={form.auto_create_call_list} 
+              onChange={e => setForm(f => ({ ...f, auto_create_call_list: e.target.checked }))} 
+            />
+            <span style={{ fontSize: 14 }}>Auto-create call list and sync phone-enriched candidates</span>
+          </label>
+        )}
       </div>
       <div className="modal-footer" style={{ margin: 0, padding: '16px 22px', borderTop: '1px solid #e2e8f0', flexShrink: 0, background: 'var(--surface, #fff)' }}>
         <button className="btn btn-secondary" onClick={onClose}>Cancel</button>

@@ -176,11 +176,11 @@ def ensure_list_exists_for_owner(cur, list_id: int, owner: str):
     if not cur.fetchone():
         raise HTTPException(status_code=404, detail="Call list not found")
 
-def bulk_load_calls_cache():
+def bulk_load_calls_cache(shared_conn=None):
     """Warms the calls cache from DB."""
     global _calls_cache
-    with get_db_connection_context(validate=True, register_pgvector=False) as conn:
-        if not conn: return
+    
+    def _do_load(conn):
         try:
             with conn.cursor() as cur:
                 cur.execute(f"{CALLS_SELECT_QUERY} ORDER BY c.due_date ASC, c.created_at DESC")
@@ -192,13 +192,19 @@ def bulk_load_calls_cache():
         except Exception as e:
             print(f"WARNING: Failed to warm calls cache: {e}")
 
+    if shared_conn:
+        _do_load(shared_conn)
+    else:
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if conn:
+                _do_load(conn)
 
-def bulk_load_call_lists_cache():
+
+def bulk_load_call_lists_cache(shared_conn=None):
     """Warms the call lists cache from DB."""
     global _call_lists_cache
-    with get_db_connection_context(validate=True, register_pgvector=False) as conn:
-        if not conn:
-            return
+
+    def _do_load(conn):
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -224,11 +230,18 @@ def bulk_load_call_lists_cache():
         except Exception as e:
             print(f"WARNING: Failed to warm call lists cache: {e}")
 
+    if shared_conn:
+        _do_load(shared_conn)
+    else:
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if conn:
+                _do_load(conn)
 
-def warm_call_caches():
+
+def warm_call_caches(shared_conn=None):
     ensure_calls_schema_ready()
-    bulk_load_call_lists_cache()
-    bulk_load_calls_cache()
+    bulk_load_call_lists_cache(shared_conn)
+    bulk_load_calls_cache(shared_conn)
 
 
 def refresh_call_caches_async():
@@ -663,17 +676,14 @@ def get_call_lists(current_user: schemas.User = Depends(deps.get_current_user)):
     if cached_lists is not None:
         return cached_lists
 
-    warm_call_caches()
-    cached_lists = get_cached_call_lists(owner)
-    if cached_lists is not None:
-        return cached_lists
-
     conn = get_calls_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
 
     cur = None
     try:
+        refresh_call_caches_async()
+
         cur = conn.cursor()
         cur.execute("""
             SELECT cl.id, cl.name, cl.created_at, 
@@ -772,6 +782,15 @@ def add_candidates_to_list(
 
         cur = conn.cursor()
         ensure_list_exists_for_owner(cur, request.list_id, owner)
+
+        # Check for duplicates
+        cur.execute(
+            "SELECT COUNT(1) FROM calls WHERE list_id = %s AND candidate_id = ANY(%s::int[])",
+            (request.list_id, request.candidate_ids)
+        )
+        if cur.fetchone()[0] > 0:
+            raise HTTPException(status_code=400, detail="He or she is already there.")
+
         cur.execute(
             """
             INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
@@ -843,18 +862,32 @@ def get_calls(
 
     cur = None
     try:
+        refresh_call_caches_async()
+        
         cur = conn.cursor()
-        # If we reached here, cache was empty. Warm it up then return filtering the new cache.
-        bulk_load_calls_cache()
-        
-        # Now that it's warmed, try to filter again
-        with _calls_lock:
-            if _calls_cache is not None:
-                # Use recursive call but it's now synchronous and cache is filled
-                return get_calls(status, list_id, due_filter, current_user)
-        
-        # If warming failed to populate (e.g. no DB records), return empty list
-        return []
+        query = f"{CALLS_SELECT_QUERY} WHERE LOWER(COALESCE(cl.created_by, '')) = %s"
+        params: list[Any] = [owner]
+
+        if status:
+            query += " AND c.status = %s"
+            params.append(status)
+        if list_id:
+            query += " AND c.list_id = %s"
+            params.append(list_id)
+
+        if due_filter == "today":
+            query += " AND c.due_date <= CURRENT_DATE"
+        elif due_filter == "upcoming":
+            query += " AND c.due_date > CURRENT_DATE"
+
+        if status == "completed":
+            query += " ORDER BY c.completed_at DESC NULLS LAST"
+        else:
+            query += " ORDER BY c.due_date ASC NULLS FIRST, c.created_at DESC NULLS LAST"
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [call_row_to_dict(row) for row in rows]
     except Exception as e:
         if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1004,6 +1037,8 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
 
     cur = None
     try:
+        refresh_call_caches_async()
+
         cur = conn.cursor()
         cur.execute("""
             WITH owned_lists AS (

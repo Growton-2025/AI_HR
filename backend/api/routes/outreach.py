@@ -933,6 +933,10 @@ async def shortlist_role_candidate(
                 """,
                 (candidate_id, role_id, email_status, linkedin_status, linkedin_status),
             )
+            
+            from backend.services.auto_call_list import sync_shortlisted_to_call_list
+            sync_shortlisted_to_call_list(cur, role_id, [candidate_id])
+            
             conn.commit()
 
     contact_enriching = False
@@ -1102,6 +1106,11 @@ async def shortlist_selected_for_role(
                         """,
                         (candidate["id"], role_id, email_status, linkedin_status, linkedin_status),
                     )
+            
+            if valid_ids:
+                from backend.services.auto_call_list import sync_shortlisted_to_call_list
+                sync_shortlisted_to_call_list(cur, role_id, valid_ids)
+            
             conn.commit()
 
     # Only enrich candidates who aren't already actively being pushed

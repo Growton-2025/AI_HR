@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
@@ -11,6 +11,8 @@ import RoleCreateModal from '../components/RoleCreateModal'
 import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents'
 import CandidateConversationModal from '../components/CandidateConversationModal'
 import EditableCandidateNotes from '../components/EditableCandidateNotes'
+import AddToListModal from '../components/AddToListModal'
+
 
 function Roles() {
     const {
@@ -67,6 +69,11 @@ function Roles() {
     const [uploadProgress, setUploadProgress] = useState(null)
     const [uploadEnrichmentMode, setUploadEnrichmentMode] = useState('none')
     const uploadFileRef = useRef(null)
+
+    // Selection State
+    const [selectedIds, setSelectedIds] = useState(new Set())
+    const [allFilteredSelected, setAllFilteredSelected] = useState(false)
+    const [showAddToListModal, setShowAddToListModal] = useState(false)
 
     // Filtering State
     const [showFilters, setShowFilters] = useState(false)
@@ -212,6 +219,8 @@ function Roles() {
             min_exp: 0, max_exp: 40
         })
         setActiveStatusTab('')
+        setSelectedIds(new Set())
+        setAllFilteredSelected(false)
     }, [viewingRole?.id])
 
     useEffect(() => {
@@ -570,6 +579,27 @@ function Roles() {
         navigator.clipboard.writeText(text)
         toast.success('Copied to clipboard')
     }
+
+    const toggleSelection = useCallback((id) => {
+        if (allFilteredSelected) return; // Prevent individual toggles when 'select all' is active
+        setSelectedIds(prev => {
+            const next = new Set(prev)
+            if (next.has(id)) next.delete(id)
+            else next.add(id)
+            return next
+        })
+    }, [allFilteredSelected])
+
+    const handleSelectAll = useCallback((e) => {
+        if (e.target.checked) {
+            setAllFilteredSelected(true)
+            setSelectedIds(new Set(filteredCandidates.map(c => c.id)))
+        } else {
+            setAllFilteredSelected(false)
+            setSelectedIds(new Set())
+        }
+    }, [filteredCandidates])
+
 
     const handleCreateRole = async (setup) => {
         const res = await createRole(setup)
@@ -1144,6 +1174,14 @@ function Roles() {
                                 <table className="data-table role-candidates-table">
                                     <thead>
                                         <tr>
+                                            <th style={{ width: 40, textAlign: 'center' }}>
+                                                <input
+                                                    type="checkbox"
+                                                    onChange={handleSelectAll}
+                                                    checked={filteredCandidates.length > 0 && selectedIds.size === filteredCandidates.length}
+                                                    style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
+                                                />
+                                            </th>
                                             <th className="role-sticky-first-name">First Name</th>
                                             <th className="role-sticky-last-name">Last Name</th>
                                             <th style={{ minWidth: 170 }}>Title</th>
@@ -1169,6 +1207,14 @@ function Roles() {
                                             const phone = candidate.phone || candidate.mobile_phone || ''
                                             return (
                                                 <tr key={candidate.id || idx}>
+                                                    <td style={{ textAlign: 'center' }}>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={allFilteredSelected || selectedIds.has(candidate.id)}
+                                                            onChange={() => toggleSelection(candidate.id)}
+                                                            style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
+                                                        />
+                                                    </td>
                                                     <td className="role-sticky-first-name">{candidate.first_name || candidate.name?.split(' ')[0] || '—'}</td>
                                                     <td className="role-sticky-last-name">{candidate.last_name || candidate.name?.split(' ').slice(1).join(' ') || '—'}</td>
                                                     <td className="role-truncate-cell" title={candidate.title || candidate.headline}>{candidate.title || candidate.headline || '—'}</td>
@@ -1214,12 +1260,9 @@ function Roles() {
                                                         <StatusDropdown
                                                             status={candidate.status}
                                                             candidateId={candidate.id}
+                                                            updateStatus={handleRoleStatusUpdate}
                                                             onUpdate={(id, newStatus) => {
-                                                                handleRoleStatusUpdate(id, newStatus).then(() => {
-                                                                    updateCandidateInRole(id, { status: newStatus });
-                                                                }).catch((err) => {
-                                                                    updateCandidateInRole(id, { status: newStatus });
-                                                                });
+                                                                updateCandidateInRole(id, { status: newStatus });
                                                             }}
                                                         />
                                                     </td>
@@ -1273,7 +1316,65 @@ function Roles() {
                     />
                 )}
 
+                {showAddToListModal && (
+                    <AddToListModal
+                        selectedCount={allFilteredSelected ? roleFilteredTotal : selectedIds.size}
+                        onClose={() => setShowAddToListModal(false)}
+                        onSuccess={() => {
+                            setSelectedIds(new Set());
+                            setAllFilteredSelected(false);
+                            setShowAddToListModal(false);
+                        }}
+                        candidateIds={allFilteredSelected ? filteredCandidates.map(c => c.id) : Array.from(selectedIds)}
+                    />
+                )}
+
+                {(selectedIds.size > 0 || allFilteredSelected) && (
+                    <div style={{
+                        position: 'fixed', bottom: 30, left: '50%', transform: 'translateX(-50%)',
+                        background: '#0f172a', color: '#fff', padding: '12px 24px', borderRadius: '16px',
+                        display: 'flex', alignItems: 'center', gap: 20, boxShadow: '0 20px 25px -5px rgba(0,0,0,0.3)',
+                        zIndex: 1000, border: '1px solid rgba(255,255,255,0.1)', animation: 'slideUp 0.3s ease-out'
+                    }}>
+                        <span style={{ fontSize: 14, fontWeight: 600 }}>
+                            {allFilteredSelected ? `${roleFilteredTotal} filtered candidates selected` : `${selectedIds.size} candidates selected`}
+                        </span>
+                        <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.2)' }} />
+                        <button
+                            onClick={() => setAllFilteredSelected(prev => !prev)}
+                            style={{
+                                padding: '8px 16px', background: allFilteredSelected ? '#312e81' : '#fff', color: allFilteredSelected ? '#fff' : '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
+                                borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
+                            }}
+                        >
+                            <Check size={14} /> {allFilteredSelected ? 'Using All Filtered' : `Use All Filtered (${roleFilteredTotal})`}
+                        </button>
+                        {(selectedIds.size > 0 || allFilteredSelected) && (
+                            <button
+                                onClick={() => setShowAddToListModal(true)}
+                                style={{
+                                    padding: '8px 16px', background: '#fff', color: '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
+                                    borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                                    display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+                                onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+                            >
+                                <Phone size={14} /> Add to Call List
+                            </button>
+                        )}
+                        <button
+                            onClick={() => { setSelectedIds(new Set()); setAllFilteredSelected(false); }}
+                            style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                )}
+
             </div>
+
         )
     }
 
@@ -1333,8 +1434,11 @@ function Roles() {
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.smartlead_status === 'configured' ? '#15803d' : (role.smartlead_status === 'skipped' ? '#94a3b8' : '#b45309') }} title={`Email: ${role.smartlead_status || 'missing'}`}>
                                             <Mail size={12} /> {role.smartlead_status === 'configured' ? 'Active' : (role.smartlead_status === 'skipped' ? 'Skipped' : 'Inactive')}
                                         </div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.heyreach_status === 'configured' ? '#15803d' : '#b45309' }} title={`LinkedIn: ${role.heyreach_status || 'missing'}`}>
-                                            <Linkedin size={12} /> {role.heyreach_status === 'configured' ? 'Active' : 'Inactive'}
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.heyreach_status === 'configured' ? '#15803d' : (role.heyreach_status === 'skipped' ? '#94a3b8' : '#b45309') }} title={`LinkedIn: ${role.heyreach_status || 'missing'}`}>
+                                            <Linkedin size={12} /> {role.heyreach_status === 'configured' ? 'Active' : (role.heyreach_status === 'skipped' ? 'Skipped' : 'Inactive')}
+                                        </div>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: 11, fontWeight: 600, color: role.has_call_list ? '#15803d' : '#94a3b8' }} title={`Call List: ${role.has_call_list ? 'Active' : 'Inactive'}`}>
+                                            <Phone size={12} /> {role.has_call_list ? 'Active' : 'Inactive'}
                                         </div>
                                     </div>
                                 </div>

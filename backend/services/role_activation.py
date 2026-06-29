@@ -38,7 +38,14 @@ def fetch_role_activation(cur, role_id: int) -> Dict[str, Any]:
         }
     smartlead_status = row[1] or "missing"
     heyreach_status = row[8] or "missing"
-    active = heyreach_status in ("configured", "skipped") and smartlead_status in ("configured", "skipped") and not (heyreach_status == "skipped" and smartlead_status == "skipped")
+    has_call_list = False
+    cur.execute("SELECT linked_call_list_id FROM recruitment_roles WHERE id = %s", (role_id,))
+    list_row = cur.fetchone()
+    if list_row and list_row[0]:
+        has_call_list = True
+
+    outreach_active = heyreach_status in ("configured", "skipped") and smartlead_status in ("configured", "skipped") and not (heyreach_status == "skipped" and smartlead_status == "skipped")
+    active = outreach_active or has_call_list
     errors = [value for value in (row[2], row[9]) if value]
     return {
         "activation_status": "active" if active else "inactive",

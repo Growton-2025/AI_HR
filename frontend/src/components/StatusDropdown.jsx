@@ -90,7 +90,7 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, u
       if (updateStatus) await updateStatus(candidateId, newStatus);
       else await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus });
       if (newStatus === 'Shortlisted' && onShortlisted) {
-        onShortlisted(candidateId);
+        await onShortlisted(candidateId);
       }
       onUpdate(candidateId, newStatus);
     } catch (error) {

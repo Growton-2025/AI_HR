@@ -40,6 +40,7 @@ class RoleCreate(BaseModel):
     smartlead_sender_account_id: Optional[int] = 0
     email_subject: Optional[str] = ""
     email_body: Optional[str] = ""
+    auto_create_call_list: bool = False
 
 class RoleUpdate(BaseModel):
     job_description: Optional[str] = None

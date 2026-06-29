@@ -286,7 +286,8 @@ async def get_roles(
                            u.name as owner_name,
                            u.email as owner_email,
                            sc.provisioning_status, sc.provisioning_error,
-                           hc.provisioning_status, hc.provisioning_error
+                           hc.provisioning_status, hc.provisioning_error,
+                           r.linked_call_list_id
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
                     LEFT JOIN (
@@ -316,7 +317,8 @@ async def get_roles(
                            u.name as owner_name,
                            u.email as owner_email,
                            sc.provisioning_status, sc.provisioning_error,
-                           hc.provisioning_status, hc.provisioning_error
+                           hc.provisioning_status, hc.provisioning_error,
+                           r.linked_call_list_id
                     FROM recruitment_roles r
                     LEFT JOIN users u ON u.id = r.user_id
                     LEFT JOIN (
@@ -339,6 +341,9 @@ async def get_roles(
             rows = cur.fetchall()
             logger.info("Found %s roles", len(rows))
             for row in rows:
+                has_call_list = bool(row[13])
+                outreach_active = row[9] in ("configured", "skipped") and row[11] in ("configured", "skipped") and not (row[9] == "skipped" and row[11] == "skipped")
+                active = outreach_active or has_call_list
                 logger.info(f"  Role: {row[1]}, candidate_count: {row[3]}")
                 roles_list.append({
                     "id": row[0],
@@ -350,8 +355,9 @@ async def get_roles(
                     "owner_user_id": row[6],
                     "owner_name": row[7] or "",
                     "owner_email": row[8] or "",
-                    "activation_status": "active" if row[9] in ("configured", "skipped") and row[11] in ("configured", "skipped") and not (row[9] == "skipped" and row[11] == "skipped") else "inactive",
+                    "activation_status": "active" if active else "inactive",
                     "activation_error": " | ".join(value for value in (row[10], row[12]) if value),
+                    "has_call_list": has_call_list,
                     "smartlead_status": row[9] or "missing",
                     "heyreach_status": row[11] or "missing",
                 })
@@ -368,8 +374,8 @@ async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Dep
         raise HTTPException(status_code=400, detail="Role name is required")
     if role.smartlead_sender_account_id > 0 and (not role.email_subject.strip() or not role.email_body.strip()):
         raise HTTPException(status_code=400, detail="Email subject and body are required when Smartlead is selected")
-    if role.heyreach_campaign_id <= 0 and role.smartlead_sender_account_id <= 0:
-        raise HTTPException(status_code=400, detail="At least one of HeyReach campaign ID or Smartlead sender is required")
+    if role.heyreach_campaign_id <= 0 and role.smartlead_sender_account_id <= 0 and not role.auto_create_call_list:
+        raise HTTPException(status_code=400, detail="At least one of HeyReach campaign, Smartlead sender, or Auto-create call list is required")
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -384,10 +390,37 @@ async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Dep
                 raise HTTPException(status_code=400, detail="Role already exists")
             
             cur.execute("""
-                INSERT INTO recruitment_roles (user_id, name, job_description)
-                VALUES (%s, %s, %s) RETURNING id, name, job_description
-            """, (current_user.id, role_name, (role.job_description or "").strip() or None))
+                INSERT INTO recruitment_roles (user_id, name, job_description, auto_create_call_list)
+                VALUES (%s, %s, %s, %s) RETURNING id, name, job_description
+            """, (current_user.id, role_name, (role.job_description or "").strip() or None, role.auto_create_call_list))
             result = cur.fetchone()
+            role_id = result[0]
+
+            if role.auto_create_call_list:
+                call_list_name = f"{role_name} - call list"
+                owner = current_user.email or current_user.username
+                try:
+                    cur.execute("SELECT id FROM call_lists WHERE name = %s AND created_by = %s", (call_list_name, owner))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        call_list_id = existing_row[0]
+                    else:
+                        cur.execute(
+                            "INSERT INTO call_lists (name, created_by) VALUES (%s, %s) RETURNING id",
+                            (call_list_name, owner)
+                        )
+                        call_list_id = cur.fetchone()[0]
+                        
+                    cur.execute(
+                        "UPDATE recruitment_roles SET linked_call_list_id = %s WHERE id = %s",
+                        (call_list_id, role_id)
+                    )
+                    # Trigger call lists cache refresh asynchronously? Not strictly necessary here, but good.
+                    from backend.api.routes.calls import bulk_load_call_lists_cache
+                    import threading
+                    threading.Thread(target=bulk_load_call_lists_cache).start()
+                except Exception as e:
+                    logger.error(f"Failed to auto-create call list for role {role_id}: {e}")
             conn.commit()
     finally:
         return_db_connection(conn)
@@ -917,8 +950,13 @@ async def assign_candidates(
                      logger.error(f"Error assigning candidate {cid}: {e}")
             
             conn.commit()
-            from backend.api.routes.candidates import invalidate_candidate_count_caches
+            
+            if added_ids:
+                from backend.services.auto_call_list import sync_shortlisted_to_call_list
+                sync_shortlisted_to_call_list(cur, role_id, added_ids)
+                conn.commit()
 
+            from backend.api.routes.candidates import invalidate_candidate_count_caches
             invalidate_candidate_count_caches()
 
             added_count = len(added_ids)
