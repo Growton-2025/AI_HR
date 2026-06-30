@@ -1021,25 +1021,30 @@ function Roles() {
 
     const updateCandidateInRole = useCallback((candidateId, patch) => {
         if (patch.status) {
+            const storeCandidate = useAppStore.getState().viewingRole?.candidates?.find(candidate => Number(candidate.id) === Number(candidateId))
+            const oldStatus = storeCandidate?.status || 'To be started'
+            if (oldStatus !== patch.status) {
+                setRoleStatusCounts(previous => ({
+                    ...previous,
+                    [oldStatus]: Math.max(0, Number(previous[oldStatus] || 0) - 1),
+                    [patch.status]: Number(previous[patch.status] || 0) + 1,
+                }))
+            }
             setRoleFilteredCandidates(previous => {
                 const current = previous.find(candidate => Number(candidate.id) === Number(candidateId))
-                if (!current) return previous
-                if (activeStatusTab && patch.status !== activeStatusTab) {
+                if (!current) {
+                    if (activeStatusTab && activeStatusTab !== RESPONDED_TAB && patch.status === activeStatusTab && storeCandidate) {
+                        return [...previous, { ...storeCandidate, ...patch }]
+                            .sort((a, b) => Number(a.id || 0) - Number(b.id || 0))
+                    }
+                    return previous
+                }
+                if (activeStatusTab && activeStatusTab !== RESPONDED_TAB && patch.status !== activeStatusTab) {
                     return previous.filter(candidate => Number(candidate.id) !== Number(candidateId))
                 }
                 return previous.map(candidate =>
                     Number(candidate.id) === Number(candidateId) ? { ...candidate, ...patch } : candidate
                 )
-            })
-            setRoleStatusCounts(previous => {
-                const current = roleFilteredCandidates.find(candidate => Number(candidate.id) === Number(candidateId))
-                const oldStatus = current?.status || 'To be started'
-                if (oldStatus === patch.status) return previous
-                return {
-                    ...previous,
-                    [oldStatus]: Math.max(0, Number(previous[oldStatus] || 0) - 1),
-                    [patch.status]: Number(previous[patch.status] || 0) + 1,
-                }
             })
         }
         useAppStore.setState(state => {
@@ -1061,7 +1066,7 @@ function Roles() {
         setChattingWith(current =>
             Number(current?.id) === Number(candidateId) ? { ...current, ...patch } : current
         )
-    }, [activeStatusTab, roleFilteredCandidates])
+    }, [activeStatusTab])
 
     // Role Detail View
     if (viewingRole) {
@@ -1508,6 +1513,7 @@ function Roles() {
                                                             status={candidate.status}
                                                             candidateId={candidate.id}
                                                             updateStatus={handleRoleStatusUpdate}
+                                                            optimistic
                                                             onUpdate={(id, newStatus) => {
                                                                 updateCandidateInRole(id, { status: newStatus });
                                                             }}

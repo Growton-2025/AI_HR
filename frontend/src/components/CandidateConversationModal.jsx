@@ -149,6 +149,7 @@ export default function CandidateConversationModal({
               status={candidate.status}
               candidateId={candidate.id}
               updateStatus={updateStatus}
+              optimistic
               onUpdate={onStatusChanged}
             />
             <button type="button" className="btn btn-secondary btn-sm" onClick={handleRefresh} disabled={refreshing}>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 
@@ -6,6 +6,7 @@ export default function EditableCandidateNotes({ candidateId, initialNotes = '' 
   const [notes, setNotes] = useState(initialNotes || '')
   const [isEditing, setIsEditing] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const savingRef = useRef(false)
   const updateCandidateNotes = useAppStore(state => state.updateCandidateNotes)
 
   useEffect(() => {
@@ -13,14 +14,18 @@ export default function EditableCandidateNotes({ candidateId, initialNotes = '' 
   }, [initialNotes])
 
   const handleSave = async () => {
+    if (savingRef.current) return
     if (notes === (initialNotes || '')) {
       setIsEditing(false)
       return
     }
+    savingRef.current = true
     setIsSaving(true)
+    setIsEditing(false)
     const result = await updateCandidateNotes(candidateId, notes)
+    savingRef.current = false
     setIsSaving(false)
-    if (result.success) setIsEditing(false)
+    if (!result.success) setIsEditing(true)
   }
 
   return (

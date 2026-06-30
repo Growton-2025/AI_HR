@@ -568,40 +568,71 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
     updateCandidateNotes: async (id, notes) => {
+        const previousTalentPoolCandidate = get().talentPoolCache?.candidates?.find(candidate => Number(candidate.id) === Number(id));
+        const previousRoleCandidate = get().viewingRole?.candidates?.find(candidate => Number(candidate.id) === Number(id));
+        const previousRoleName = get().viewingRole?.name;
+
+        set(state => {
+            const next = {};
+            const cache = state.talentPoolCache;
+            if (cache?.candidates) {
+                next.talentPoolCache = {
+                    ...cache,
+                    candidates: cache.candidates.map(candidate =>
+                        Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                    ),
+                };
+            }
+
+            if (state.viewingRole?.candidates) {
+                const updatedRole = {
+                    ...state.viewingRole,
+                    candidates: state.viewingRole.candidates.map(candidate =>
+                        Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                    ),
+                };
+                next.viewingRole = updatedRole;
+                next.roleDetailsCache = {
+                    ...state.roleDetailsCache,
+                    [updatedRole.name]: updatedRole,
+                };
+            }
+            return next;
+        });
+
         try {
             await axios.patch(`${API_BASE}/candidates/${id}/notes`, { notes });
-
+            return { success: true };
+        } catch (e) {
             set(state => {
                 const next = {};
-                const cache = state.talentPoolCache;
-                if (cache?.candidates) {
+                if (previousTalentPoolCandidate && state.talentPoolCache?.candidates) {
                     next.talentPoolCache = {
-                        ...cache,
-                        candidates: cache.candidates.map(candidate =>
-                            Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                        ...state.talentPoolCache,
+                        candidates: state.talentPoolCache.candidates.map(candidate =>
+                            Number(candidate.id) === Number(id) ? { ...candidate, notes: previousTalentPoolCandidate.notes } : candidate
                         ),
                     };
                 }
-
-                if (state.viewingRole?.candidates) {
+                if (previousRoleCandidate && state.viewingRole?.candidates) {
                     const updatedRole = {
                         ...state.viewingRole,
                         candidates: state.viewingRole.candidates.map(candidate =>
-                            Number(candidate.id) === Number(id) ? { ...candidate, notes } : candidate
+                            Number(candidate.id) === Number(id) ? { ...candidate, notes: previousRoleCandidate.notes } : candidate
                         ),
                     };
                     next.viewingRole = updatedRole;
                     next.roleDetailsCache = {
                         ...state.roleDetailsCache,
-                        [updatedRole.name]: updatedRole,
+                        [previousRoleName || updatedRole.name]: updatedRole,
                     };
                 }
                 return next;
             });
-            return { success: true };
-        } catch (e) {
             console.error('Failed to update notes:', e);
-            return { success: false, error: e.response?.data?.detail || 'Failed to update notes' };
+            const error = e.response?.data?.detail || 'Failed to update notes';
+            toast.error(error);
+            return { success: false, error };
         }
     },
     deleteRecruiter: async (id) => {

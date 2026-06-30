@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import axios from 'axios';
 import { ChevronDown } from 'lucide-react';
+import { toast } from 'sonner';
 import { API_BASE } from '../store/useAppStore';
 
 export const RECRUITMENT_STAGES = [
@@ -28,7 +29,7 @@ export const STATUS_STYLES = {
   'shared with customer': { bg: '#ecfdf5', color: '#065f46', dot: '#059669' },
 };
 
-export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, updateStatus, disabled = false }) {
+export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, updateStatus, disabled = false, optimistic = false }) {
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [menuPosition, setMenuPosition] = useState(null);
@@ -85,19 +86,36 @@ export function StatusDropdown({ status, candidateId, onUpdate, onShortlisted, u
   }, []);
 
   const handleUpdate = async (newStatus) => {
+    const previousStatus = status;
+    if (newStatus === previousStatus) {
+      setIsOpen(false);
+      return;
+    }
+
     setLoading(true);
+    setIsOpen(false);
+    if (optimistic) {
+      onUpdate?.(candidateId, newStatus, { optimistic: true, previousStatus });
+    }
+
     try {
       if (updateStatus) await updateStatus(candidateId, newStatus);
       else await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus });
       if (newStatus === 'Shortlisted' && onShortlisted) {
         await onShortlisted(candidateId);
       }
-      onUpdate(candidateId, newStatus);
+      if (!optimistic) {
+        onUpdate?.(candidateId, newStatus, { confirmed: true, previousStatus });
+      }
     } catch (error) {
       console.error('Failed to update status:', error);
+      if (optimistic) {
+        onUpdate?.(candidateId, previousStatus, { rollback: true, failedStatus: newStatus, error });
+      }
+      const detail = error?.response?.data?.detail;
+      toast.error(detail || error?.message || 'Failed to update status');
     } finally {
       setLoading(false);
-      setIsOpen(false);
     }
   };
 

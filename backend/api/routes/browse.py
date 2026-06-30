@@ -153,6 +153,65 @@ class StatusUpdate(BaseModel):
 class NotesUpdate(BaseModel):
     notes: str
 
+def _authorize_candidate_update(
+    candidate_id: int,
+    current_user: schemas.User,
+    *,
+    allow_role_access: bool = False,
+) -> None:
+    """Authorize candidate edits even when the in-memory profile cache is cold."""
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    prof = PROFILES_BY_ID.get(candidate_id)
+    candidate_found = bool(prof)
+    owner_user_id = prof.get("owner_user_id") if prof else None
+    has_role_access = False
+
+    needs_db_lookup = not prof or (allow_role_access and not is_admin and owner_user_id != current_user.id)
+    if needs_db_lookup:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        try:
+            with conn.cursor() as cur:
+                if not prof:
+                    cur.execute(
+                        """
+                        SELECT owner_user_id, COALESCE(is_archived, FALSE)
+                        FROM candidates
+                        WHERE id = %s
+                        """,
+                        (candidate_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row or row[1]:
+                        raise HTTPException(status_code=404, detail="Candidate not found")
+                    candidate_found = True
+                    owner_user_id = row[0]
+
+                if allow_role_access and not is_admin and owner_user_id != current_user.id:
+                    cur.execute(
+                        """
+                        SELECT 1 FROM recruitment_role_candidates rrc
+                        JOIN recruitment_roles rr ON rr.id = rrc.role_id
+                        WHERE rrc.candidate_id = %s AND rr.user_id = %s
+                        LIMIT 1
+                        """,
+                        (candidate_id, current_user.id),
+                    )
+                    has_role_access = bool(cur.fetchone())
+        finally:
+            return_db_connection(conn)
+
+    if not candidate_found:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    if is_admin or owner_user_id == current_user.id or (allow_role_access and has_role_access):
+        return
+
+    if owner_user_id is None:
+        raise HTTPException(status_code=403, detail="Master library rows are read-only")
+    raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
+
 RECRUITMENT_STAGES = [
     'To be started', 'Shortlisted', 'Rejected', 'For Future', 
     'Reached out - Linkedin', 'Reached out - Phone', 'Not Interested', 
@@ -1459,35 +1518,8 @@ async def update_status(
     update: StatusUpdate,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
-    prof = PROFILES_BY_ID.get(candidate_id)
-    if not prof:
-        raise HTTPException(status_code=404, detail="Candidate not found")
-    is_admin = (current_user.role or "").strip().lower() == "admin"
-    is_owner = prof.get("owner_user_id") == current_user.id
-    
-    if not is_admin and not is_owner:
-        has_role_access = False
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT 1 FROM recruitment_role_candidates rrc
-                    JOIN recruitment_roles rr ON rr.id = rrc.role_id
-                    WHERE rrc.candidate_id = %s AND rr.user_id = %s
-                    LIMIT 1
-                    """,
-                    (candidate_id, current_user.id)
-                )
-                has_role_access = bool(cur.fetchone())
-        finally:
-            return_db_connection(conn)
-            
-        if not has_role_access:
-            if prof.get("owner_user_id") is None:
-                raise HTTPException(status_code=403, detail="Master library rows are read-only")
-            else:
-                raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
+    started = time.monotonic()
+    _authorize_candidate_update(candidate_id, current_user, allow_role_access=True)
     success = update_candidate_status(candidate_id, update.status)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")
@@ -1496,6 +1528,12 @@ async def update_status(
 
     invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
     invalidate_role_detail_cache_for_candidate(candidate_id)
+    logger.info(
+        "candidate status updated candidate_id=%s status=%s duration_ms=%.1f",
+        candidate_id,
+        update.status,
+        (time.monotonic() - started) * 1000,
+    )
     return {"message": "Status updated successfully"}
 
 @router.patch("/candidates/{candidate_id}/notes")
@@ -1506,15 +1544,18 @@ async def update_notes(
 ):
     from backend.pipeline.query import update_candidate_notes
 
-    prof = PROFILES_BY_ID.get(candidate_id)
-    if not prof:
-        raise HTTPException(status_code=404, detail="Candidate not found")
-    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:
-        raise HTTPException(status_code=403, detail="Master library rows are read-only")
-    if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed to update this candidate")
+    started = time.monotonic()
+    _authorize_candidate_update(candidate_id, current_user, allow_role_access=False)
     success = update_candidate_notes(candidate_id, update.notes)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update notes")
+    from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
+
     _invalidate_browse_cache()
+    invalidate_role_detail_cache_for_candidate(candidate_id)
+    logger.info(
+        "candidate notes updated candidate_id=%s duration_ms=%.1f",
+        candidate_id,
+        (time.monotonic() - started) * 1000,
+    )
     return {"message": "Notes updated successfully"}
