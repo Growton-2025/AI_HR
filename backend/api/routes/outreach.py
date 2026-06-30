@@ -1564,7 +1564,17 @@ async def get_outreach_status(
                         li_response_text,
                         li_sent_count,
                         li_response_received_at,
-                        li_conversation_id
+                        li_conversation_id,
+                        CASE
+                            WHEN jsonb_typeof(email_chat_history_cache) = 'array'
+                            THEN jsonb_array_length(email_chat_history_cache)
+                            ELSE 0
+                        END AS email_cached_message_count,
+                        CASE
+                            WHEN jsonb_typeof(li_chat_history_cache) = 'array'
+                            THEN jsonb_array_length(li_chat_history_cache)
+                            ELSE 0
+                        END AS li_cached_message_count
                     FROM candidate_outreach
                     WHERE {role_where}
                 """,
@@ -1573,6 +1583,14 @@ async def get_outreach_status(
 
                 statuses = {}
                 for row in cur.fetchall():
+                    email_message_count = max(
+                        int(row[2] or 0) + (1 if row[5] else 0),
+                        int(row[12] or 0),
+                    )
+                    li_message_count = max(
+                        int(row[9] or 0) + (1 if row[8] else 0),
+                        int(row[13] or 0),
+                    )
                     statuses[row[0]] = {
                         "candidate_id": row[0],
                         "status": row[1],
@@ -1586,6 +1604,9 @@ async def get_outreach_status(
                         "li_sent_count": row[9],
                         "li_response_received_at": row[10],
                         "li_conversation_id": row[11],
+                        "email_message_count": email_message_count,
+                        "li_message_count": li_message_count,
+                        "message_count": email_message_count + li_message_count,
                     }
         return statuses
     except HTTPException:

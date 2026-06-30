@@ -632,7 +632,16 @@ async def get_role(
                        COALESCE(c.notes, ''),
                        COALESCE(role_outreach.response_text, c.response, ''),
                        COALESCE(primary_role.title, c.headline, ''),
-                       COALESCE(primary_role.company, c.raw_fields->>'import_company', '')
+                       COALESCE(primary_role.company, c.raw_fields->>'import_company', ''),
+                       COALESCE(role_outreach.li_response_text, ''),
+                       COALESCE(role_outreach.status, ''),
+                       COALESCE(role_outreach.message_sent_count, 0),
+                       COALESCE(role_outreach.li_status, ''),
+                       COALESCE(role_outreach.li_sent_count, 0),
+                       COALESCE(role_outreach.li_conversation_id, ''),
+                       COALESCE(role_outreach.email_message_count, 0),
+                       COALESCE(role_outreach.li_message_count, 0),
+                       COALESCE(role_outreach.message_count, 0)
                 FROM selected_role sr
                 LEFT JOIN users u ON u.id = sr.user_id
                 LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
@@ -647,7 +656,50 @@ async def get_role(
                     LIMIT 1
                 ) primary_role ON TRUE
                 LEFT JOIN LATERAL (
-                    SELECT co.response_text
+                    SELECT
+                        co.response_text,
+                        co.li_response_text,
+                        co.status,
+                        co.message_sent_count,
+                        co.li_status,
+                        co.li_sent_count,
+                        co.li_conversation_id,
+                        GREATEST(
+                            COALESCE(co.message_sent_count, 0)
+                                + CASE WHEN NULLIF(TRIM(COALESCE(co.response_text, '')), '') IS NULL THEN 0 ELSE 1 END,
+                            CASE
+                                WHEN jsonb_typeof(co.email_chat_history_cache) = 'array'
+                                THEN jsonb_array_length(co.email_chat_history_cache)
+                                ELSE 0
+                            END
+                        ) AS email_message_count,
+                        GREATEST(
+                            COALESCE(co.li_sent_count, 0)
+                                + CASE WHEN NULLIF(TRIM(COALESCE(co.li_response_text, '')), '') IS NULL THEN 0 ELSE 1 END,
+                            CASE
+                                WHEN jsonb_typeof(co.li_chat_history_cache) = 'array'
+                                THEN jsonb_array_length(co.li_chat_history_cache)
+                                ELSE 0
+                            END
+                        ) AS li_message_count,
+                        GREATEST(
+                            COALESCE(co.message_sent_count, 0)
+                                + CASE WHEN NULLIF(TRIM(COALESCE(co.response_text, '')), '') IS NULL THEN 0 ELSE 1 END,
+                            CASE
+                                WHEN jsonb_typeof(co.email_chat_history_cache) = 'array'
+                                THEN jsonb_array_length(co.email_chat_history_cache)
+                                ELSE 0
+                            END
+                        )
+                        + GREATEST(
+                            COALESCE(co.li_sent_count, 0)
+                                + CASE WHEN NULLIF(TRIM(COALESCE(co.li_response_text, '')), '') IS NULL THEN 0 ELSE 1 END,
+                            CASE
+                                WHEN jsonb_typeof(co.li_chat_history_cache) = 'array'
+                                THEN jsonb_array_length(co.li_chat_history_cache)
+                                ELSE 0
+                            END
+                        ) AS message_count
                     FROM candidate_outreach co
                     WHERE co.candidate_id = c.id
                       AND co.recruitment_role_id = sr.id
@@ -715,6 +767,18 @@ async def get_role(
                     "phone": row[18] or candidate.get("phone") or candidate.get("mobile_phone") or "",
                     "mobile_phone": row[18] or candidate.get("mobile_phone") or candidate.get("phone") or "",
                     "response": row[26] or candidate.get("response") or "",
+                    "response_text": row[26] or candidate.get("response_text") or candidate.get("response") or "",
+                    "li_response_text": row[29] or candidate.get("li_response_text") or "",
+                    "email_outreach_status": row[30] or candidate.get("email_outreach_status") or "",
+                    "message_sent_count": int(row[31] or candidate.get("message_sent_count") or 0),
+                    "linkedin_outreach_status": row[32] or candidate.get("linkedin_outreach_status") or "",
+                    "li_status": row[32] or candidate.get("li_status") or "",
+                    "li_sent_count": int(row[33] or candidate.get("li_sent_count") or 0),
+                    "li_conversation_id": row[34] or candidate.get("li_conversation_id") or "",
+                    "email_message_count": int(row[35] or 0),
+                    "li_message_count": int(row[36] or 0),
+                    "message_count": int(row[37] or 0),
+                    "outreach_counts_loaded": True,
                     "notes": row[25] or "",
                     "status": row[19] or candidate.get("status") or "To be started",
                 })
@@ -958,6 +1022,7 @@ async def assign_candidates(
 
             from backend.api.routes.candidates import invalidate_candidate_count_caches
             invalidate_candidate_count_caches()
+            invalidate_role_detail_cache(role_id)
 
             added_count = len(added_ids)
             already_existing_count = len(set(already_existing_ids))

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
@@ -12,6 +12,40 @@ import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterC
 import CandidateConversationModal from '../components/CandidateConversationModal'
 import EditableCandidateNotes from '../components/EditableCandidateNotes'
 import AddToListModal from '../components/AddToListModal'
+
+const RESPONDED_TAB = '__responded__'
+const RESPONSE_TAB_LABEL = 'Responded'
+
+function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
+    const countsReady = options.countsReady !== false
+    const candidateCountsReady = countsReady || candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true
+    const rawMessageCount = candidateCountsReady ? (
+        outreach.message_count
+        ?? outreach.total_message_count
+        ?? outreach.li_message_count
+        ?? outreach.email_message_count
+        ?? candidate.message_count
+        ?? ((Number(candidate.message_sent_count || 0) || 0) + (Number(candidate.li_sent_count || 0) || 0))
+    ) : null
+    const messageCount = rawMessageCount == null ? null : (Number(rawMessageCount) || 0)
+    const responseText = (
+        outreach.li_response_text
+        || outreach.response_text
+        || candidate.li_response_text
+        || candidate.response_text
+        || candidate.response
+        || ''
+    )
+    const responseChannel = outreach.li_response_text || candidate.li_response_text
+        ? 'LinkedIn'
+        : (outreach.response_text || candidate.response_text || candidate.response ? 'Email' : '')
+    return {
+        responseText,
+        responseChannel,
+        messageCount,
+        hasResponse: Boolean(String(responseText || '').trim()) || Number(messageCount || 0) > 0 || Boolean(outreach.li_conversation_id),
+    }
+}
 
 
 function Roles() {
@@ -33,6 +67,7 @@ function Roles() {
         fetchTalentPoolSummary,
         fetchAnalytics,
         deactivateRole,
+        assignCandidatesToRole,
         user
     } = useAppStore(useShallow((state) => ({
         rolesLastFetchedAt: state.rolesLastFetchedAt,
@@ -51,6 +86,7 @@ function Roles() {
         fetchTalentPoolSummary: state.fetchTalentPoolSummary,
         fetchAnalytics: state.fetchAnalytics,
         deactivateRole: state.deactivateRole,
+        assignCandidatesToRole: state.assignCandidatesToRole,
         user: state.user
     })))
 
@@ -76,9 +112,10 @@ function Roles() {
     const [showAddToListModal, setShowAddToListModal] = useState(false)
 
     // Filtering State
-    const [showFilters, setShowFilters] = useState(false)
+    const [showFilters, setShowFilters] = useState(true)
     const [showOutreach, setShowOutreach] = useState(false)
     const [activeStatusTab, setActiveStatusTab] = useState('')
+    const [roleSearch, setRoleSearch] = useState('')
     const [filters, setFilters] = useState({
         title: [], titleInput: '',
         company: [], companyInput: '',
@@ -95,6 +132,14 @@ function Roles() {
     const [isFilteringRole, setIsFilteringRole] = useState(false)
     const roleFilterRequestSeqRef = useRef(0)
     const roleFilterDebounceRef = useRef(null)
+    const [addCandidateOpen, setAddCandidateOpen] = useState(false)
+    const [candidateSearch, setCandidateSearch] = useState('')
+    const [candidateSearchResults, setCandidateSearchResults] = useState([])
+    const [candidateSearchLoading, setCandidateSearchLoading] = useState(false)
+    const [selectedCandidateAdds, setSelectedCandidateAdds] = useState(new Set())
+    const [isAddingCandidates, setIsAddingCandidates] = useState(false)
+    const candidateSearchDebounceRef = useRef(null)
+    const [outreachCountLoadedRoles, setOutreachCountLoadedRoles] = useState(() => new Set())
 
     const splitFilterValues = useCallback((values = [], _inputValue = '') => {
         const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values]
@@ -115,20 +160,35 @@ function Roles() {
     }, [user?.role, viewingRole?.id, viewingRole?.owner_user_id])
 
     const hasActiveRoleFilters = useMemo(() => (
-        splitFilterValues(filters.title, filters.titleInput).length > 0
+        roleSearch.trim().length > 0
+        || splitFilterValues(filters.title, filters.titleInput).length > 0
         || splitFilterValues(filters.company, filters.companyInput).length > 0
         || splitFilterValues(filters.city, filters.cityInput).length > 0
         || splitFilterValues(filters.product_service, filters.productInput).length > 0
-        || Boolean(activeStatusTab || filters.status)
+        || splitFilterValues(filters.status, filters.statusInput).length > 0
+        || Boolean(activeStatusTab)
         || Number(filters.min_exp || 0) > 0
         || Number(filters.max_exp ?? 40) < 40
-    ), [activeStatusTab, filters, splitFilterValues])
+    ), [activeStatusTab, filters, roleSearch, splitFilterValues])
+
+    const hasServerRoleFilters = useMemo(() => (
+        roleSearch.trim().length > 0
+        || splitFilterValues(filters.title, filters.titleInput).length > 0
+        || splitFilterValues(filters.company, filters.companyInput).length > 0
+        || splitFilterValues(filters.city, filters.cityInput).length > 0
+        || splitFilterValues(filters.product_service, filters.productInput).length > 0
+        || splitFilterValues(filters.status, filters.statusInput).length > 0
+        || Boolean(activeStatusTab && activeStatusTab !== RESPONDED_TAB)
+        || Number(filters.min_exp || 0) > 0
+        || Number(filters.max_exp ?? 40) < 40
+    ), [activeStatusTab, filters, roleSearch, splitFilterValues])
 
     const setFilter = useCallback((key, val) => {
         setFilters(prev => {
             const next = { ...prev, [key]: val }
             if (key === 'status') {
-                setActiveStatusTab(val)
+                const nextValues = Array.isArray(val) ? val : (val ? [val] : [])
+                setActiveStatusTab(nextValues.length === 1 ? nextValues[0] : '')
             }
             return next
         })
@@ -140,10 +200,11 @@ function Roles() {
             company: [], companyInput: '',
             city: [], cityInput: '',
             product_service: [], productInput: '',
-            status: '',
+            status: [], statusInput: '',
             min_exp: 0, max_exp: 40
         })
         setActiveStatusTab('')
+        setRoleSearch('')
         const baseCandidates = viewingRole?.candidates || []
         setRoleFilteredCandidates(baseCandidates)
         setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
@@ -153,7 +214,6 @@ function Roles() {
         }, {}))
     }, [viewingRole?.candidates])
 
-    const filteredCandidates = roleFilteredCandidates
     const statusCounts = roleStatusCounts
     const roleStatusOptions = useMemo(
         () => [...new Set([...(roleFilterMeta.statuses || []), ...RECRUITMENT_STAGES])],
@@ -166,6 +226,26 @@ function Roles() {
 
     // Derived state for instant access
     const outreachStatus = (viewingRole?.id && outreachStatusCache[viewingRole.id]) ? outreachStatusCache[viewingRole.id] : {}
+    const profileOutreachCountsLoaded = Array.isArray(viewingRole?.candidates)
+        && viewingRole.candidates.length > 0
+        && viewingRole.candidates.every(candidate => candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true)
+    const outreachCountsLoaded = Boolean(
+        (viewingRole?.id && outreachCountLoadedRoles.has(String(viewingRole.id)))
+        || profileOutreachCountsLoaded
+    )
+    const filteredCandidates = useMemo(() => (
+        activeStatusTab === RESPONDED_TAB
+            ? roleFilteredCandidates.filter(candidate => candidateResponseSnapshot(candidate, outreachStatus[candidate.id] || {}, { countsReady: outreachCountsLoaded }).hasResponse)
+            : roleFilteredCandidates
+    ), [activeStatusTab, outreachCountsLoaded, outreachStatus, roleFilteredCandidates])
+    const respondedCount = useMemo(() => (
+        outreachCountsLoaded
+            ? roleFilteredCandidates.filter(candidate => candidateResponseSnapshot(candidate, outreachStatus[candidate.id] || {}, { countsReady: true }).hasResponse).length
+            : null
+    ), [outreachCountsLoaded, outreachStatus, roleFilteredCandidates])
+    const visibleStatusTabs = useMemo(() => (
+        roleStatusOptions.filter(status => Number(statusCounts[status] || 0) > 0 || RECRUITMENT_STAGES.includes(status))
+    ), [roleStatusOptions, statusCounts])
 
     const [emailSetup, setEmailSetup] = useState(null)
     const [emailSetupLoading, setEmailSetupLoading] = useState(false)
@@ -215,10 +295,11 @@ function Roles() {
             company: [], companyInput: '',
             city: [], cityInput: '',
             product_service: [], productInput: '',
-            status: '',
+            status: [], statusInput: '',
             min_exp: 0, max_exp: 40
         })
         setActiveStatusTab('')
+        setRoleSearch('')
         setSelectedIds(new Set())
         setAllFilteredSelected(false)
     }, [viewingRole?.id])
@@ -273,11 +354,15 @@ function Roles() {
         params.set('sort_by', 'name')
         params.set('sort_dir', 'asc')
 
+        const query = roleSearch.trim()
         const title = splitFilterValues(filters.title, filters.titleInput).join(',')
         const company = splitFilterValues(filters.company, filters.companyInput).join(',')
         const city = splitFilterValues(filters.city, filters.cityInput).join(',')
         const product = splitFilterValues(filters.product_service, filters.productInput).join(',')
-        const status = activeStatusTab || filters.status
+        const statusValues = splitFilterValues(filters.status, filters.statusInput)
+        const activeStatus = activeStatusTab && activeStatusTab !== RESPONDED_TAB ? activeStatusTab : ''
+        const status = activeStatus || statusValues.join(',')
+        if (query) params.set('q', query)
         if (title) params.set('title', title)
         if (company) params.set('company', company)
         if (city) params.set('city', city)
@@ -286,7 +371,7 @@ function Roles() {
         if (Number(filters.min_exp || 0) > 0) params.set('min_exp', filters.min_exp)
         if (Number(filters.max_exp ?? 40) < 40) params.set('max_exp', filters.max_exp)
 
-        if (!hasActiveRoleFilters) {
+        if (!hasServerRoleFilters) {
             const baseCandidates = viewingRole.candidates || []
             setRoleFilteredCandidates(baseCandidates)
             setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
@@ -318,9 +403,12 @@ function Roles() {
     }, [
         activeStatusTab,
         filters,
+        roleSearch,
         roleScopeParams,
         splitFilterValues,
         viewingRole?.id,
+        hasServerRoleFilters,
+        viewingRole?.candidates,
     ])
 
     useEffect(() => {
@@ -362,9 +450,20 @@ function Roles() {
     // Fetch outreach status when viewing role
     useEffect(() => {
         if (viewingRole?.id) {
-            fetchOutreachStatus(viewingRole.id)
+            let cancelled = false
+            const roleId = viewingRole.id
+            fetchOutreachStatus(roleId).finally(() => {
+                if (cancelled) return
+                setOutreachCountLoadedRoles(prev => {
+                    const next = new Set(prev)
+                    next.add(String(roleId))
+                    return next
+                })
+            })
+            return () => { cancelled = true }
         }
-    }, [viewingRole?.id])
+        return undefined
+    }, [fetchOutreachStatus, viewingRole?.id])
 
     // Keep contact cells in sync with Clay without reloading the full role.
     // This polls one lightweight role-scoped endpoint and stops after two minutes.
@@ -578,6 +677,65 @@ function Roles() {
         if (!text) return
         navigator.clipboard.writeText(text)
         toast.success('Copied to clipboard')
+    }
+
+    useEffect(() => {
+        if (!addCandidateOpen || !viewingRole?.id) return undefined
+        window.clearTimeout(candidateSearchDebounceRef.current)
+        candidateSearchDebounceRef.current = window.setTimeout(async () => {
+            const params = new URLSearchParams()
+            params.set('page', '1')
+            params.set('page_size', '25')
+            params.set('sort_by', 'name')
+            params.set('sort_dir', 'asc')
+            const query = candidateSearch.trim()
+            if (query) params.set('q', query)
+            if (String(user?.role || '').toLowerCase() === 'admin' && viewingRole?.owner_user_id) {
+                params.set('view_scope', 'recruiter_pools')
+                params.set('recruiter_filter_id', viewingRole.owner_user_id)
+            }
+            setCandidateSearchLoading(true)
+            try {
+                const res = await axios.get(`${API_BASE}/candidates/browse?${params.toString()}&cb=${Date.now()}`, { timeout: 60000 })
+                const assignedIds = new Set((viewingRole.candidates || []).map(candidate => Number(candidate.id)))
+                setCandidateSearchResults((res.data?.candidates || []).filter(candidate => !assignedIds.has(Number(candidate.id))))
+            } catch (error) {
+                console.error('Failed to search candidates for role assignment:', error)
+                setCandidateSearchResults([])
+            } finally {
+                setCandidateSearchLoading(false)
+            }
+        }, 180)
+        return () => window.clearTimeout(candidateSearchDebounceRef.current)
+    }, [addCandidateOpen, candidateSearch, user?.role, viewingRole?.candidates, viewingRole?.id, viewingRole?.owner_user_id])
+
+    const toggleCandidateAdd = useCallback((candidateId) => {
+        setSelectedCandidateAdds(previous => {
+            const next = new Set(previous)
+            if (next.has(candidateId)) next.delete(candidateId)
+            else next.add(candidateId)
+            return next
+        })
+    }, [])
+
+    const handleAddCandidatesToRole = async () => {
+        if (!viewingRole?.name || selectedCandidateAdds.size === 0) return
+        setIsAddingCandidates(true)
+        const assignments = Array.from(selectedCandidateAdds).map(candidateId => ({
+            candidate_id: Number(candidateId),
+            priority: '--',
+            feedback: '',
+        }))
+        const result = await assignCandidatesToRole(viewingRole.name, assignments)
+        setIsAddingCandidates(false)
+        if (!result.success) {
+            toast.error(result.error || 'Failed to add candidates')
+            return
+        }
+        toast.success(result.data?.message || `Added ${assignments.length} candidate${assignments.length === 1 ? '' : 's'}`)
+        setSelectedCandidateAdds(new Set())
+        setCandidateSearch('')
+        setAddCandidateOpen(false)
     }
 
     const toggleSelection = useCallback((id) => {
@@ -917,9 +1075,15 @@ function Roles() {
                     <h2 style={{ margin: 0, fontSize: '24px', fontWeight: 700, color: '#1e293b' }}>{viewingRole.name}</h2>
                     <button
                         className="btn btn-secondary"
+                        onClick={() => setAddCandidateOpen(true)}
+                        style={{ marginLeft: 'auto' }}
+                    >
+                        <UserPlus size={16} /> Add Candidate
+                    </button>
+                    <button
+                        className="btn btn-secondary"
                         onClick={() => openRoleUploadPicker(viewingRole)}
                         disabled={uploadPreviewBusy === viewingRole.name}
-                        style={{ marginLeft: 'auto' }}
                     >
                         <FileUp size={16} /> {uploadPreviewBusy === viewingRole.name ? 'Reading...' : 'Upload CSV'}
                     </button>
@@ -932,6 +1096,64 @@ function Roles() {
                         onClose={() => setEmailSetupModalOpen(false)}
                         onSaved={setEmailSetup}
                     />
+                )}
+                {addCandidateOpen && (
+                    <div className="modal-overlay" onClick={() => !isAddingCandidates && setAddCandidateOpen(false)}>
+                        <div className="role-add-candidate-modal" onClick={event => event.stopPropagation()}>
+                            <div className="role-add-candidate-header">
+                                <div>
+                                    <strong>Add Candidate</strong>
+                                    <span>{viewingRole.name}</span>
+                                </div>
+                                <button type="button" className="icon-btn" disabled={isAddingCandidates} onClick={() => setAddCandidateOpen(false)}>
+                                    <X size={18} />
+                                </button>
+                            </div>
+                            <div className="role-add-search">
+                                <Search size={16} />
+                                <input
+                                    autoFocus
+                                    value={candidateSearch}
+                                    onChange={event => setCandidateSearch(event.target.value)}
+                                    placeholder="Search candidates by name, company, title, or location"
+                                />
+                                {candidateSearchLoading && <Loader2 size={15} className="animate-spin" />}
+                            </div>
+                            <div className="role-add-results">
+                                {candidateSearchResults.map(candidate => {
+                                    const checked = selectedCandidateAdds.has(candidate.id)
+                                    return (
+                                        <button
+                                            key={candidate.id}
+                                            type="button"
+                                            className={`role-add-result ${checked ? 'selected' : ''}`}
+                                            onClick={() => toggleCandidateAdd(candidate.id)}
+                                        >
+                                            <input type="checkbox" checked={checked} onChange={() => toggleCandidateAdd(candidate.id)} onClick={event => event.stopPropagation()} />
+                                            <div>
+                                                <strong>{candidate.name || `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Unnamed candidate'}</strong>
+                                                <span>{candidate.title || candidate.headline || 'No title'}{candidate.company || candidate.current_company ? ` · ${candidate.company || candidate.current_company}` : ''}</span>
+                                            </div>
+                                            <small>{candidate.city || candidate.location || ''}</small>
+                                        </button>
+                                    )
+                                })}
+                                {!candidateSearchLoading && candidateSearchResults.length === 0 && (
+                                    <div className="role-add-empty">No available candidates found.</div>
+                                )}
+                            </div>
+                            <div className="role-add-footer">
+                                <span>{selectedCandidateAdds.size} selected</span>
+                                <div>
+                                    <button type="button" className="btn btn-secondary" disabled={isAddingCandidates} onClick={() => setAddCandidateOpen(false)}>Cancel</button>
+                                    <button type="button" className="btn btn-primary" disabled={isAddingCandidates || selectedCandidateAdds.size === 0} onClick={handleAddCandidatesToRole}>
+                                        {isAddingCandidates ? <Loader2 size={15} className="animate-spin" /> : <UserPlus size={15} />}
+                                        {isAddingCandidates ? 'Adding...' : 'Add to Role'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 )}
 
                 {/* ── Compact toolbar bar ── */}
@@ -1062,10 +1284,10 @@ function Roles() {
                         <p>No candidates assigned yet. Start by screening for talent!</p>
                     </div>
                 ) : (
-                    <div style={{ display: 'flex', gap: '20px', alignItems: 'flex-start' }}>
+                    <div className="role-dashboard-shell">
                         {/* Sidebar Filters */}
                         {showFilters && (
-                            <div className="sidebar-filters role-filter-sidebar" style={{ width: '260px', flexShrink: 0, padding: '18px', background: '#fff', borderRadius: '14px', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(15,23,42,0.04)', display: 'flex', flexDirection: 'column', position: 'sticky', top: '16px', transition: 'all 0.25s ease' }}>
+                            <div className="sidebar-filters role-filter-sidebar" style={{ width: '258px', flexShrink: 0, padding: '18px', background: '#fff', borderRadius: '8px', border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(15,23,42,0.04)', display: 'flex', flexDirection: 'column', position: 'sticky', top: '16px', transition: 'all 0.25s ease' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, paddingBottom: 10, borderBottom: '1px solid #e2e8f0' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                                         <Filter size={14} color="#0f172a" />
@@ -1076,8 +1298,8 @@ function Roles() {
                                 </div>
                                 <TagFilterInput label="Title" values={filters?.title || []} inputValue={filters?.titleInput || ''} onInputChange={v => setFilter('titleInput', v)} onTagsChange={v => setFilter('title', v)} placeholder="e.g. Engineer" icon={Briefcase} suggestions={roleFilterMeta.titles} />
                                 <TagFilterInput label="Current Company" values={filters?.company || []} inputValue={filters?.companyInput || ''} onInputChange={v => setFilter('companyInput', v)} onTagsChange={v => setFilter('company', v)} placeholder="e.g. Google" icon={Building2} suggestions={roleFilterMeta.companies} />
+                                <TagFilterInput label="Product / Service" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="All Products/Services" icon={BarChart2} suggestions={roleFilterMeta.products} />
                                 <TagFilterInput label="City" values={filters?.city || []} inputValue={filters?.cityInput || ''} onInputChange={v => setFilter('cityInput', v)} onTagsChange={v => setFilter('city', v)} placeholder="e.g. San Francisco" icon={MapPin} suggestions={roleFilterMeta.cities} />
-                                <TagFilterInput label="Expertise / Product" values={filters?.product_service || []} inputValue={filters?.productInput || ''} onInputChange={v => setFilter('productInput', v)} onTagsChange={v => setFilter('product_service', v)} placeholder="e.g. SaaS, Fintech" icon={BarChart2} suggestions={roleFilterMeta.products} />
                                 
                                 <TagFilterInput label="Status" values={filters?.status || []} inputValue={filters?.statusInput || ''} onInputChange={v => setFilter('statusInput', v)} onTagsChange={v => { setFilter('status', v); setActiveStatusTab(v.length === 1 ? v[0] : ''); }} placeholder="e.g. Shortlisted" icon={Filter} suggestions={roleStatusOptions} />
                                 
@@ -1115,16 +1337,42 @@ function Roles() {
 
                         {/* Main Table Area */}
                         <div style={{ flex: 1, minWidth: 0, transition: 'all 0.25s ease', display: 'flex', flexDirection: 'column' }}>
+                            <div className="role-table-toolbar">
+                                <div className="role-global-search">
+                                    <Search size={16} />
+                                    <input
+                                        type="search"
+                                        value={roleSearch}
+                                        onChange={event => setRoleSearch(event.target.value)}
+                                        placeholder="Global search across all columns..."
+                                    />
+                                    {isFilteringRole && <Loader2 size={15} className="animate-spin" />}
+                                </div>
+                                {!showFilters && (
+                                    <button className="btn btn-secondary btn-sm" onClick={() => setShowFilters(true)}>
+                                        <Filter size={13} /> Filters
+                                    </button>
+                                )}
+                                <button className="btn btn-secondary btn-sm" onClick={() => setAddCandidateOpen(true)}>
+                                    <UserPlus size={13} /> Add Candidate
+                                </button>
+                            </div>
                             {/* Status Tabs */}
                             <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none', borderRadius: '10px 10px 0 0', border: '1px solid #e2e8f0' }}>
-                                {['', ...roleStatusOptions].map(tab => {
+                                {['', RESPONDED_TAB, ...visibleStatusTabs].map(tab => {
                                     const isActive = activeStatusTab === tab;
-                                    const count = tab === '' ? roleFilteredTotal : (statusCounts[tab] || 0);
+                                    const count = tab === '' ? roleFilteredTotal : (tab === RESPONDED_TAB ? respondedCount : (statusCounts[tab] || 0));
                                     const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
+                                    const label = tab === RESPONDED_TAB ? RESPONSE_TAB_LABEL : tab;
 
                                     return (
                                         <button key={tab || 'all'}
                                             onClick={() => {
+                                                if (tab === RESPONDED_TAB) {
+                                                    setFilters(prev => ({ ...prev, status: [], statusInput: '' }));
+                                                    setActiveStatusTab(RESPONDED_TAB);
+                                                    return;
+                                                }
                                                 setFilter('status', tab ? [tab] : []);
                                                 setFilter('statusInput', '');
                                                 setActiveStatusTab(tab);
@@ -1155,13 +1403,13 @@ function Roles() {
                                             ) : (
                                                 <>
                                                     <span style={{ width: 6, height: 6, borderRadius: '50%', background: isActive ? '#fff' : (style.dot || '#94a3b8') }} />
-                                                    {tab}
+                                                    {label}
                                                     <span style={{
                                                         marginLeft: 4, padding: '1px 6px', borderRadius: 10, fontSize: 10,
                                                         background: isActive ? 'rgba(255,255,255,0.14)' : '#e2e8f0',
                                                         color: isActive ? '#fff' : '#64748b'
                                                     }}>
-                                                        {count}
+                                                        {count == null ? '…' : count}
                                                     </span>
                                                 </>
                                             )}
@@ -1202,8 +1450,7 @@ function Roles() {
                                     <tbody>
                                         {filteredCandidates.map((candidate, idx) => {
                                             const roleOutreach = outreachStatus[candidate.id] || {}
-                                            const responseText = roleOutreach.li_response_text || roleOutreach.response_text || candidate.response || ''
-                                            const responseChannel = roleOutreach.li_response_text ? 'LinkedIn' : roleOutreach.response_text || candidate.response ? 'Email' : ''
+                                            const responseState = candidateResponseSnapshot(candidate, roleOutreach, { countsReady: outreachCountsLoaded })
                                             const phone = candidate.phone || candidate.mobile_phone || ''
                                             return (
                                                 <tr key={candidate.id || idx}>
@@ -1273,9 +1520,14 @@ function Roles() {
                                                             li_response_text: roleOutreach.li_response_text || candidate.li_response_text || '',
                                                             li_status: roleOutreach.li_status || candidate.li_status || '',
                                                         })}>
-                                                            <span><MessageSquare size={13} /> Open conversation</span>
-                                                            <small title={responseText}>{responseText || 'No response yet'}</small>
-                                                            {responseChannel && <em>{responseChannel}</em>}
+                                                            <span>
+                                                                <MessageSquare size={13} /> Open conversation
+                                                                <b className={responseState.messageCount == null ? 'is-loading' : ''}>
+                                                                    {responseState.messageCount == null ? '…' : responseState.messageCount}
+                                                                </b>
+                                                            </span>
+                                                            <small title={responseState.responseText}>{responseState.responseText || 'No response yet'}</small>
+                                                            {responseState.responseChannel && <em>{responseState.responseChannel}</em>}
                                                         </button>
                                                     </td>
                                                     <td><EditableCandidateNotes candidateId={candidate.id} initialNotes={candidate.notes} /></td>
@@ -1294,7 +1546,7 @@ function Roles() {
                                         })}
                                         {filteredCandidates.length === 0 && (
                                             <tr>
-                                                <td colSpan="13" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+                                                <td colSpan="16" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
                                                     No candidates match the selected filters.
                                                 </td>
                                             </tr>
