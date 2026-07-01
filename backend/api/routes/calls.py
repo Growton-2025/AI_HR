@@ -100,17 +100,15 @@ def call_row_to_dict(row) -> dict:
     }
 
 
-def invalidate_calls_cache(conn=None):
+def invalidate_calls_cache():
+    """Clear the stats cache and kick off a background cache refresh.
+    Always uses a fresh pooled connection - never the write connection
+    (which may still have open cursors or be mid-transaction).
+    """
     global _stats_cache, _stats_cache_ts
     with _calls_lock:
         _stats_cache = {}
         _stats_cache_ts = {}
-    if conn:
-        try:
-            warm_call_caches(conn)
-            return
-        except Exception as e:
-            print(f"WARNING: Synchronous cache warmup failed: {e}")
     refresh_call_caches_async()
 
 def get_call_list_owner(current_user: schemas.User) -> str:
@@ -610,13 +608,19 @@ def create_call_list(request: CallListCreate, current_user: schemas.User = Depen
         )
         row = cur.fetchone()
         conn.commit()
-        invalidate_calls_cache(conn)
-        return {"id": row[0], "name": row[1], "created_at": row[2], "candidate_count": 0}
+        result = {"id": row[0], "name": row[1], "created_at": row[2], "candidate_count": 0}
+        if cur:
+            cur.close()
+        return_db_connection(conn)
+        conn = None
+        cur = None
+        invalidate_calls_cache()
+        return result
     except HTTPException:
-        conn.rollback()
+        if conn: conn.rollback()
         raise
     except Exception as e:
-        conn.rollback()
+        if conn: conn.rollback()
         error_msg = str(e).lower()
         if "unique" in error_msg and "name" in error_msg:
             raise HTTPException(status_code=400, detail="A list with this name already exists")
@@ -624,7 +628,8 @@ def create_call_list(request: CallListCreate, current_user: schemas.User = Depen
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 
 @router.post("/add-candidates")
@@ -669,18 +674,23 @@ def add_candidates_to_list(
         )
         inserted_count = len(cur.fetchall())
         conn.commit()
-        invalidate_calls_cache(conn)
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
         return {"success": True, "added_count": inserted_count}
     except HTTPException:
-        conn.rollback()
+        if conn: conn.rollback()
         raise
     except Exception as e:
-        conn.rollback()
+        if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 
 @router.get("", response_model=List[CallResponse])
@@ -842,15 +852,20 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                     )
 
         conn.commit()
-        invalidate_calls_cache(conn)
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
         return {"success": True}
     except Exception as e:
-        conn.rollback()
+        if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 
 @router.get("/stats")
@@ -978,17 +993,23 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
             raise HTTPException(status_code=404, detail="Call task not found")
 
         conn.commit()
-        invalidate_calls_cache(conn)
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
         return {"success": True, "list_id": deleted[0]}
     except HTTPException:
+        if conn: conn.rollback()
         raise
     except Exception as e:
-        conn.rollback()
+        if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 
 @router.delete("/lists/{list_id}")
@@ -1029,17 +1050,23 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
             raise HTTPException(status_code=404, detail="Call list not found")
 
         conn.commit()
-        invalidate_calls_cache(conn)
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
         return {"success": True, "deleted_call_count": deleted_call_count}
     except HTTPException:
+        if conn: conn.rollback()
         raise
     except Exception as e:
-        conn.rollback()
+        if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
 
 @router.post("/initiate")
@@ -1193,14 +1220,19 @@ def initiate_call(
         )
         updated_call = fetch_call_by_id(cur, call_id, owner)
         conn.commit()
-        invalidate_calls_cache(conn)
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
     except Exception as exc:
-        conn.rollback()
+        if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         if cur:
             cur.close()
-        return_db_connection(conn)
+        if conn:
+            return_db_connection(conn)
 
     return {
         "success": True,
@@ -1258,8 +1290,8 @@ async def sync_call_recording(
             cur = conn.cursor()
             updated_call = fetch_call_by_id(cur, call_id, owner)
             cur.close()
-            invalidate_calls_cache(conn)
             return_db_connection(conn)
+            invalidate_calls_cache()
             return updated_call
 
     raise HTTPException(

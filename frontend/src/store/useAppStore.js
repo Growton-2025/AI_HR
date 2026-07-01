@@ -2306,21 +2306,20 @@ export const useAppStore = create(persist((set, get) => ({
 
         const requestSeq = state.callsMutationSeq
         const request = axios.get(`${API_BASE}/calls/lists`, { timeout: CALL_REQUEST_TIMEOUT_MS })
-            .then(res => {
+            .then(res =>
+            {
                 const latestState = get()
                 const mergedLists = mergePendingCallLists(res.data, latestState.callLists)
-                if (latestState.callListsRequestSeq === requestSeq && latestState.callsMutationSeq === requestSeq) {
+                // Only commit if this is still the latest list request (dedup guard).
+                // We do NOT guard by callsMutationSeq here — that guard incorrectly
+                // discards fresh server data after any mutation bumped the seq.
+                if (latestState.callListsRequestSeq === requestSeq) {
                     set({
                         callLists: mergedLists,
                         callListsLastFetchedAt: Date.now(),
                         callListsRequest: null,
                         callListsRequestSeq: 0,
                         callListsBackoffUntil: 0,
-                    })
-                } else if (latestState.callListsRequestSeq === requestSeq) {
-                    set({
-                        callListsRequest: null,
-                        callListsRequestSeq: 0,
                     })
                 }
                 return { success: true, data: mergedLists, cached: false }
@@ -2585,8 +2584,10 @@ export const useAppStore = create(persist((set, get) => ({
 
         if (state.callsRequest && state.callsRequestQueryKey === queryKey && (!force || state.callsRequestSeq === state.callsMutationSeq)) {
             const existingRequestSeq = state.callsRequestSeq
-            return state.callsRequest.then(result => {
-                if (updateState && result?.success && get().callsMutationSeq === existingRequestSeq) {
+            return state.callsRequest.then(result =>
+            {
+                // When deduplicating, always update state if data arrives
+                if (updateState && result?.success) {
                     set({
                         calls: result.data || [],
                         callsLastFetchedAt: get().callsCacheFetchedAt[queryKey] || Date.now(),
@@ -2601,6 +2602,9 @@ export const useAppStore = create(persist((set, get) => ({
         const request = axios.get(`${API_BASE}/calls?${queryParams}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
                 const latestState = get()
+                // Only commit if this is still the latest request for this query key.
+                // Do NOT guard by callsMutationSeq — that discards fresh server data
+                // after any mutation (add/delete/etc.) bumps the seq.
                 if (latestState.callsRequestQueryKey === queryKey && latestState.callsRequestSeq === requestSeq) {
                     const fetchedAt = Date.now()
                     const nextState = {
@@ -2620,7 +2624,8 @@ export const useAppStore = create(persist((set, get) => ({
                             [queryKey]: 0,
                         },
                     }
-                    if (updateState && latestState.callsMutationSeq === requestSeq) {
+                    // Always update UI state when data arrives for the right query
+                    if (updateState) {
                         nextState.calls = res.data
                         nextState.callsLastFetchedAt = fetchedAt
                         nextState.callsLastQueryKey = queryKey
@@ -2892,18 +2897,15 @@ export const useAppStore = create(persist((set, get) => ({
         const request = axios.get(`${API_BASE}/calls/stats`, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
                 const latestState = get()
-                if (latestState.callStatsRequestSeq === requestSeq && latestState.callsMutationSeq === requestSeq) {
+                // Only commit if this is still the latest stats request.
+                // Do NOT guard by callsMutationSeq — that discards real stats after mutations.
+                if (latestState.callStatsRequestSeq === requestSeq) {
                     set({
                         callStats: res.data,
                         callStatsLastFetchedAt: Date.now(),
                         callStatsRequest: null,
                         callStatsRequestSeq: 0,
                         callStatsBackoffUntil: 0,
-                    })
-                } else if (latestState.callStatsRequestSeq === requestSeq) {
-                    set({
-                        callStatsRequest: null,
-                        callStatsRequestSeq: 0,
                     })
                 }
                 return { success: true, data: res.data, cached: false }

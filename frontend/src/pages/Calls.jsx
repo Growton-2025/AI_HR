@@ -923,7 +923,7 @@ export default function Calls() {
     try {
       if (activeTab === 'lists' && !selectedList) {
         const [listsRes] = await Promise.all([
-          fetchCallLists(),
+          fetchCallLists({ force: true }),
           statsPromise,
         ]);
         if (!listsRes?.success) {
@@ -1073,12 +1073,14 @@ export default function Calls() {
         : activeTab === 'completed'
           ? 'status=completed'
           : '';
-  // Show skeleton only when: no data has ever been loaded for this tab's query key
-  // (callsLastQueryKey !== currentCallsQueryKey means we're waiting for a different tab's fetch)
+  // Show skeleton only when actively loading and no data exists yet for this view
   const isWaitingForCurrentQuery = callsLastQueryKey !== currentCallsQueryKey;
-  const showCallsLoading = activeTab !== 'lists' && (loading || isWaitingForCurrentQuery) && !callsLastFetchedAt || 
-    (activeTab !== 'lists' && loading && isWaitingForCurrentQuery);
-  const showListsLoading = activeTab === 'lists' && !selectedList && loading && !callLists.length;
+  const showCallsLoading = (
+    activeTab !== 'lists' &&
+    (loading || isWaitingForCurrentQuery) &&
+    !callsLastFetchedAt
+  );
+  const showListsLoading = (activeTab === 'lists' && !selectedList && loading && !callLists.length);
 
   return (
     <div style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
