@@ -28,6 +28,10 @@ _calls_lock = threading.RLock()
 _call_lists_cache: Optional[List[dict]] = None
 _cache_refresh_lock = threading.Lock()
 _cache_refreshing = False
+# Monotonically increasing counter — incremented on every eviction.
+# warm_call_caches() captures this before its DB round-trip and
+# discards results if the counter changed (eviction happened mid-flight).
+_cache_generation: int = 0
 
 # In-memory Stats cache
 _stats_cache: dict[str, dict] = {}
@@ -116,13 +120,14 @@ def evict_call_from_cache(call_id: int):
     """Synchronously remove a single deleted call from _calls_cache so that
     GET /calls, GET /calls/lists, and GET /calls/stats immediately reflect the
     deletion — before the async background refresh finishes.
+    Also bumps _cache_generation so any in-flight background refresh
+    that read stale (pre-delete) data will discard its results.
     """
-    global _calls_cache
+    global _calls_cache, _stats_cache, _stats_cache_ts, _cache_generation
     with _calls_lock:
+        _cache_generation += 1
         if _calls_cache is not None:
             _calls_cache = [c for c in _calls_cache if c.get("id") != call_id]
-        # Wipe stats so they are recomputed from the patched cache
-        global _stats_cache, _stats_cache_ts
         _stats_cache = {}
         _stats_cache_ts = {}
 
@@ -130,9 +135,12 @@ def evict_call_from_cache(call_id: int):
 def evict_call_list_from_cache(list_id: int):
     """Synchronously remove a deleted call list and all its calls from the
     in-memory caches so every GET endpoint immediately sees up-to-date data.
+    Also bumps _cache_generation so any in-flight background refresh
+    that read stale (pre-delete) data will discard its results.
     """
-    global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
+    global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts, _cache_generation
     with _calls_lock:
+        _cache_generation += 1
         if _calls_cache is not None:
             _calls_cache = [c for c in _calls_cache if c.get("list_id") != list_id]
         if _call_lists_cache is not None:
@@ -252,24 +260,38 @@ def warm_call_caches(shared_conn=None):
     global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
 
     def _warm_from_connection(conn):
-        global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
+        global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts, _cache_generation
+        # Snapshot generation BEFORE reading from DB.
+        # If an eviction (delete) happens while we're querying,
+        # _cache_generation will be > gen_before, so we discard stale results.
+        with _calls_lock:
+            gen_before = _cache_generation
+
         call_lists_data = load_call_lists_cache_data(conn)
         calls_data = load_calls_cache_data(conn)
+
         with _calls_lock:
+            if _cache_generation != gen_before:
+                # An eviction happened while we were reading — our data is stale.
+                # Signal the runner to re-schedule a fresh refresh.
+                print("DEBUG: Background refresh discarded (eviction mid-flight). Will rerun.")
+                return True  # signal: needs rerun
             _call_lists_cache = call_lists_data
             _calls_cache = calls_data
             _stats_cache = {}
             _stats_cache_ts = {}
-        print(f"DEBUG: Bulk-warmed {len(call_lists_data)} call lists into memory.")
-        print(f"DEBUG: Bulk-warmed {len(calls_data)} calls into memory.")
+        print(f"DEBUG: Bulk-warmed {len(call_lists_data)} call lists and {len(calls_data)} calls into memory.")
+        return False  # signal: all good
 
     ensure_calls_schema_ready()
+    rerun_needed = False
     if shared_conn:
-        _warm_from_connection(shared_conn)
+        rerun_needed = _warm_from_connection(shared_conn) or False
     else:
         with get_db_connection_context(validate=True, register_pgvector=False) as conn:
             if conn:
-                _warm_from_connection(conn)
+                rerun_needed = _warm_from_connection(conn) or False
+    return rerun_needed
 
 
 def refresh_call_caches_async():
@@ -281,11 +303,16 @@ def refresh_call_caches_async():
 
     def _runner():
         global _cache_refreshing
+        rerun = False
         try:
-            warm_call_caches()
+            rerun = warm_call_caches() or False
         finally:
             with _cache_refresh_lock:
                 _cache_refreshing = False
+        # If warm_call_caches detected an eviction mid-flight, schedule a fresh run.
+        # We do this AFTER clearing _cache_refreshing so the new run isn't blocked.
+        if rerun:
+            refresh_call_caches_async()
 
     threading.Thread(target=_runner, daemon=True).start()
 
