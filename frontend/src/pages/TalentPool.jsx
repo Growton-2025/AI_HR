@@ -545,8 +545,10 @@ function buildTalentPoolParamsString({
   const productSearch = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput).join(',');
   if (!normalizedCandidateIds.length && productSearch) params.set('product_service', productSearch);
 
-  if (!normalizedCandidateIds.length && activeStatusTab) params.set('status', activeStatusTab);
-  else if (!normalizedCandidateIds.length && filters?.status) params.set('status', filters.status);
+  const statusValues = Array.isArray(filters?.status)
+    ? filters.status.filter(Boolean)
+    : (filters?.status ? [filters.status] : []);
+  if (!normalizedCandidateIds.length && statusValues.length) params.set('status', statusValues.join(','));
 
   const minExp = Number(filters?.min_exp);
   const maxExp = Number(filters?.max_exp);
@@ -3250,7 +3252,8 @@ export default function TalentPool() {
           {!isAiRunFocusActive && (
           <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: `1px solid ${surfaceBorder}`, display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none' }}>
             {['', ...RECRUITMENT_STAGES].map(tab => {
-              const isActive = activeStatusTab === tab;
+              const selectedStatuses = Array.isArray(filters?.status) ? filters.status : [];
+              const isActive = tab === '' ? selectedStatuses.length === 0 : selectedStatuses.includes(tab);
               const count = tab === '' ? (displayedTotal || 0) : (displayedStatusCounts?.[tab] || 0);
               const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
               const isLoadingCount = recruiterCountLoading || (loading && !displayedCandidates.length);
@@ -3258,9 +3261,13 @@ export default function TalentPool() {
               return (
                 <button key={tab || 'all'}
                   onClick={() => {
+                    const current = Array.isArray(filters?.status) ? filters.status : [];
+                    const nextStatus = !tab
+                      ? []
+                      : (current.includes(tab) ? current.filter(s => s !== tab) : [...current, tab]);
                     startTransition(() => {
-                      setFilters(prev => ({ ...prev, status: tab ? [tab] : [], statusInput: '' }));
-                      setActiveStatusTab(tab);
+                      setFilters(prev => ({ ...prev, status: nextStatus, statusInput: '' }));
+                      setActiveStatusTab(nextStatus.length === 1 ? nextStatus[0] : '');
                     });
                     setPage(1);
                   }}
@@ -3303,6 +3310,27 @@ export default function TalentPool() {
                 </button>
               );
             })}
+            {Array.isArray(filters?.status) && filters.status.length >= 2 && (
+              <button
+                onClick={() => {
+                  startTransition(() => {
+                    setFilters(prev => ({ ...prev, status: [], statusInput: '' }));
+                    setActiveStatusTab('');
+                  });
+                  setPage(1);
+                }}
+                style={{
+                  padding: '7px 12px', borderRadius: '999px', border: '1px dashed rgba(203, 213, 225, 0.9)',
+                  background: 'transparent', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                  color: '#64748b', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6,
+                  fontFamily: 'inherit', transition: 'all 0.15s',
+                }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = '#94a3b8'; e.currentTarget.style.color = '#0f172a'; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)'; e.currentTarget.style.color = '#64748b'; }}
+              >
+                Clear ({filters.status.length})
+              </button>
+            )}
           </div>
           )}
 

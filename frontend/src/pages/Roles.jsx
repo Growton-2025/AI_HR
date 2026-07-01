@@ -360,8 +360,7 @@ function Roles() {
         const city = splitFilterValues(filters.city, filters.cityInput).join(',')
         const product = splitFilterValues(filters.product_service, filters.productInput).join(',')
         const statusValues = splitFilterValues(filters.status, filters.statusInput)
-        const activeStatus = activeStatusTab && activeStatusTab !== RESPONDED_TAB ? activeStatusTab : ''
-        const status = activeStatus || statusValues.join(',')
+        const status = statusValues.join(',')
         if (query) params.set('q', query)
         if (title) params.set('title', title)
         if (company) params.set('company', company)
@@ -1031,15 +1030,18 @@ function Roles() {
                 }))
             }
             setRoleFilteredCandidates(previous => {
+                const activeStatuses = (Array.isArray(filters.status) ? filters.status : []).filter(Boolean)
+                const hasStatusFilter = activeStatusTab !== RESPONDED_TAB && activeStatuses.length > 0
+                const matchesFilter = activeStatuses.includes(patch.status)
                 const current = previous.find(candidate => Number(candidate.id) === Number(candidateId))
                 if (!current) {
-                    if (activeStatusTab && activeStatusTab !== RESPONDED_TAB && patch.status === activeStatusTab && storeCandidate) {
+                    if (hasStatusFilter && matchesFilter && storeCandidate) {
                         return [...previous, { ...storeCandidate, ...patch }]
                             .sort((a, b) => Number(a.id || 0) - Number(b.id || 0))
                     }
                     return previous
                 }
-                if (activeStatusTab && activeStatusTab !== RESPONDED_TAB && patch.status !== activeStatusTab) {
+                if (hasStatusFilter && !matchesFilter) {
                     return previous.filter(candidate => Number(candidate.id) !== Number(candidateId))
                 }
                 return previous.map(candidate =>
@@ -1066,7 +1068,7 @@ function Roles() {
         setChattingWith(current =>
             Number(current?.id) === Number(candidateId) ? { ...current, ...patch } : current
         )
-    }, [activeStatusTab])
+    }, [activeStatusTab, filters.status])
 
     // Role Detail View
     if (viewingRole) {
@@ -1365,7 +1367,11 @@ function Roles() {
                             {/* Status Tabs */}
                             <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 10, overflowX: 'auto', scrollbarWidth: 'none', borderRadius: '10px 10px 0 0', border: '1px solid #e2e8f0' }}>
                                 {['', RESPONDED_TAB, ...visibleStatusTabs].map(tab => {
-                                    const isActive = activeStatusTab === tab;
+                                    const selectedStatuses = Array.isArray(filters.status) ? filters.status : [];
+                                    const isResponded = activeStatusTab === RESPONDED_TAB;
+                                    const isActive = tab === ''
+                                        ? (!isResponded && selectedStatuses.length === 0)
+                                        : (tab === RESPONDED_TAB ? isResponded : selectedStatuses.includes(tab));
                                     const count = tab === '' ? roleFilteredTotal : (tab === RESPONDED_TAB ? respondedCount : (statusCounts[tab] || 0));
                                     const style = tab ? (STATUS_STYLES[tab.toLowerCase()] || {}) : { bg: '#f1f5f9', color: '#475569', dot: '#94a3b8' };
                                     const label = tab === RESPONDED_TAB ? RESPONSE_TAB_LABEL : tab;
@@ -1378,9 +1384,18 @@ function Roles() {
                                                     setActiveStatusTab(RESPONDED_TAB);
                                                     return;
                                                 }
-                                                setFilter('status', tab ? [tab] : []);
+                                                if (!tab) {
+                                                    setFilter('status', []);
+                                                    setFilter('statusInput', '');
+                                                    setActiveStatusTab('');
+                                                    return;
+                                                }
+                                                const current = isResponded ? [] : selectedStatuses;
+                                                const nextStatus = current.includes(tab)
+                                                    ? current.filter(s => s !== tab)
+                                                    : [...current, tab];
+                                                setFilter('status', nextStatus);
                                                 setFilter('statusInput', '');
-                                                setActiveStatusTab(tab);
                                             }}
                                             style={{
                                                 padding: '7px 14px', borderRadius: '999px', border: isActive ? '1px solid #111827' : '1px solid rgba(203, 213, 225, 0.9)',
@@ -1421,9 +1436,28 @@ function Roles() {
                                         </button>
                                     );
                                 })}
+                                {Array.isArray(filters.status) && filters.status.length >= 2 && (
+                                    <button
+                                        onClick={() => {
+                                            setFilter('status', []);
+                                            setFilter('statusInput', '');
+                                            setActiveStatusTab('');
+                                        }}
+                                        style={{
+                                            padding: '7px 12px', borderRadius: '999px', border: '1px dashed rgba(203, 213, 225, 0.9)',
+                                            background: 'transparent', cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                                            color: '#64748b', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6,
+                                            fontFamily: 'inherit', transition: 'all 0.15s',
+                                        }}
+                                        onMouseEnter={e => { e.currentTarget.style.borderColor = '#94a3b8'; e.currentTarget.style.color = '#0f172a'; }}
+                                        onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(203, 213, 225, 0.9)'; e.currentTarget.style.color = '#64748b'; }}
+                                    >
+                                        Clear ({filters.status.length})
+                                    </button>
+                                )}
                             </div>
 
-                            <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px', borderTop: 'none', borderRadius: '0 0 10px 10px', transition: 'opacity 0.2s', opacity: isFilteringRole ? 0.6 : 1 }}>
+                            <div className="table-wrapper role-candidates-table-wrapper" style={{ maxHeight: '600px', borderTop: 'none', borderRadius: '0 0 10px 10px' }}>
                                 <table className="data-table role-candidates-table">
                                     <thead>
                                         <tr>

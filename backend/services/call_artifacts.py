@@ -3,7 +3,7 @@ import re
 from typing import Any, Dict, Iterable, Optional
 
 
-TERMINAL_FREJUN_STATUSES = {
+TERMINAL_CALL_STATUSES = {
     "busy",
     "not-answered",
     "not_available",
@@ -208,7 +208,7 @@ def _resolve_transcript_speaker_label(
     if normalized in speaker_map:
         return speaker_map[normalized]
 
-    # FreJun transcript diarization is typically 2-party. For generic/unknown labels,
+    # Call transcript diarization is typically 2-party. For generic/unknown labels,
     # we pin the first distinct speaker to Recruiter and the second to the candidate.
     if len(speaker_map) == 0:
         speaker_map[normalized] = RECRUITER_TRANSCRIPT_LABEL
@@ -286,7 +286,7 @@ def extract_outcome(payload: Dict[str, Any], details: Dict[str, Any], status: Op
         return "Answered"
 
     normalized_status = normalize_status(status)
-    if normalized_status in TERMINAL_FREJUN_STATUSES:
+    if normalized_status in TERMINAL_CALL_STATUSES:
         return humanize_status(normalized_status)
 
     return None
@@ -313,10 +313,10 @@ def is_terminal_event(
             return True
         if duration not in (None, ""):
             return True
-        if normalized_status in TERMINAL_FREJUN_STATUSES:
+        if normalized_status in TERMINAL_CALL_STATUSES:
             return True
 
-    return normalized_status in TERMINAL_FREJUN_STATUSES
+    return normalized_status in TERMINAL_CALL_STATUSES
 
 
 def infer_recording_source(event_name: Optional[str], has_recording_url: bool, fallback_source: Optional[str] = None) -> Optional[str]:
@@ -327,14 +327,14 @@ def infer_recording_source(event_name: Optional[str], has_recording_url: bool, f
 
     normalized_event = (event_name or "").strip().lower()
     if normalized_event == "call.recording":
-        return "frejun_webhook_recording"
+        return "call_recording"
     if normalized_event == "call.summary":
-        return "frejun_webhook_summary"
+        return "call_summary"
     if normalized_event == "call.status":
-        return "frejun_webhook_status"
+        return "call_status"
     if normalized_event in {"recording_ready", "completed"}:
-        return "frejun_webhook_legacy"
-    return "frejun_webhook"
+        return "call_legacy"
+    return "call_webhook"
 
 
 def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -422,7 +422,7 @@ def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "event_name": event_name,
-        "frejun_status": normalized_status,
+        "call_status": normalized_status,
         "duration_seconds": duration_seconds,
         "recording_url": (recording_url or "").strip() or None,
         "summary_url": (summary_url or "").strip() or None,
@@ -453,9 +453,9 @@ def extract_payload_details(payload: Dict[str, Any]) -> Dict[str, Any]:
 def score_call_log_match(
     result: Dict[str, Any],
     *,
-    frejun_call_id: Optional[str],
-    frejun_event_id: Optional[str],
-    frejun_transaction_id: Optional[str],
+    provider_call_id: Optional[str],
+    provider_event_id: Optional[str],
+    provider_transaction_id: Optional[str],
     candidate_number: Optional[str],
 ) -> int:
     score = 0
@@ -464,11 +464,11 @@ def score_call_log_match(
     result_transaction_id = str(result.get("transaction_id") or "").strip()
     result_number = normalize_phone(result.get("candidate_number"))
 
-    if frejun_call_id and result_call_id and frejun_call_id == result_call_id:
+    if provider_call_id and result_call_id and provider_call_id == result_call_id:
         score += 1000
-    if frejun_event_id and result_event_id and frejun_event_id == result_event_id:
+    if provider_event_id and result_event_id and provider_event_id == result_event_id:
         score += 700
-    if frejun_transaction_id and result_transaction_id and frejun_transaction_id == result_transaction_id:
+    if provider_transaction_id and result_transaction_id and provider_transaction_id == result_transaction_id:
         score += 500
 
     normalized_candidate_number = normalize_phone(candidate_number)
@@ -484,9 +484,9 @@ def score_call_log_match(
 def select_best_call_log_result(
     results: list[Dict[str, Any]],
     *,
-    frejun_call_id: Optional[str],
-    frejun_event_id: Optional[str],
-    frejun_transaction_id: Optional[str],
+    provider_call_id: Optional[str],
+    provider_event_id: Optional[str],
+    provider_transaction_id: Optional[str],
     candidate_number: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     best_result = None
@@ -497,9 +497,9 @@ def select_best_call_log_result(
             continue
         score = score_call_log_match(
             result,
-            frejun_call_id=frejun_call_id,
-            frejun_event_id=frejun_event_id,
-            frejun_transaction_id=frejun_transaction_id,
+            provider_call_id=provider_call_id,
+            provider_event_id=provider_event_id,
+            provider_transaction_id=provider_transaction_id,
             candidate_number=candidate_number,
         )
         if score > best_score:

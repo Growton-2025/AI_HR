@@ -8,6 +8,29 @@ from backend.integrations import plivo_service
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+
+def _parse_int(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _recording_callback_is_final(form_data) -> bool:
+    duration = _parse_int(form_data.get("RecordingDuration"))
+    duration_ms = _parse_int(form_data.get("RecordingDurationMs"))
+    end_ms = _parse_int(form_data.get("RecordingEndMs"))
+
+    if duration is not None and duration < 0:
+        return False
+    if duration_ms is not None and duration_ms < 0:
+        return False
+    if end_ms is not None and end_ms < 0:
+        return False
+
+    return duration is not None or duration_ms is not None or end_ms is not None
+
+
 @router.post("/dial")
 async def plivo_dial(request: Request):
     form_data = await request.form()
@@ -19,8 +42,7 @@ async def plivo_dial(request: Request):
     
     username = from_uri.split(":")[1].split("@")[0] if from_uri and ":" in from_uri and "@" in from_uri else None
     if username and call_uuid:
-        plivo_service.last_calls[username] = call_uuid
-        plivo_service.latest_call_uuid = call_uuid
+        plivo_service.record_browser_dial(username, call_uuid, to_number)
         logger.info(f"Mapped {username} and latest call to {call_uuid}")
         
     to_number = plivo_service.normalize_number(to_number)
@@ -52,7 +74,19 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
     if call_uuid and recording_url:
         plivo_service.recordings[call_uuid] = recording_url
         logger.info(f"Stored recording for {call_uuid}")
-        background_tasks.add_task(plivo_service.process_call_insights, call_uuid, recording_url)
+        if _recording_callback_is_final(form_data):
+            background_tasks.add_task(plivo_service.process_call_insights, call_uuid, recording_url)
+        else:
+            logger.info(
+                "Recording callback for %s is not final yet; delaying processing until Plivo media is likely ready.",
+                call_uuid,
+            )
+            background_tasks.add_task(
+                plivo_service.process_call_insights,
+                call_uuid,
+                recording_url,
+                30,
+            )
         
     return Response(status_code=200)
 
@@ -76,6 +110,28 @@ async def get_credentials():
         "public_url": plivo_service.endpoint_public_url or None,
     }
 
+@router.get("/credentials/refresh")
+async def refresh_credentials():
+    """Force-regenerate Plivo app + endpoint credentials. Call this after changing NGROK_URL."""
+    result = await plivo_service.setup_plivo(force=True)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": result.get("code") or "plivo_unavailable",
+                "message": result.get("error") or "Unable to prepare Plivo softphone credentials",
+                "metadata": {
+                    "public_url": plivo_service.endpoint_public_url or None,
+                },
+            },
+        )
+    return {
+        "username": plivo_service.endpoint_username,
+        "password": plivo_service.endpoint_password,
+        "public_url": plivo_service.endpoint_public_url or None,
+        "refreshed": True,
+    }
+
 @router.get("/recording/{call_uuid}")
 async def get_recording(call_uuid: str):
     url = plivo_service.recordings.get(call_uuid)
@@ -96,6 +152,16 @@ async def get_insights(call_uuid: str):
 async def get_last_call_uuid(username: str):
     uuid = plivo_service.last_calls.get(username)
     return {"call_uuid": uuid}
+
+@router.get("/call-state/{username}")
+async def get_call_state(username: str):
+    state = plivo_service.last_call_states.get(username) or {}
+    return {
+        "call_uuid": state.get("call_uuid"),
+        "username": state.get("username") or username,
+        "to_number": state.get("to_number"),
+        "seen_at": state.get("seen_at"),
+    }
 
 @router.get("/test-dummy")
 async def test_dummy():

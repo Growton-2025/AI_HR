@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 import tempfile
 import asyncio
 import json
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +19,24 @@ endpoint_username = ""
 endpoint_password = ""
 endpoint_public_url = ""
 setup_error = ""
+_setup_lock = asyncio.Lock()
+_last_setup_ngrok_url = ""
 
 # Store recordings in memory: CallUUID -> RecordingUrl
 recordings = {}
 last_calls = {}
+last_call_states = {}
 call_insights = {}
 latest_call_uuid = None
 
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=120.0)
+openai_client = None
+
+
+def get_openai_client():
+    global openai_client
+    if openai_client is None:
+        openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=120.0)
+    return openai_client
 
 def get_ngrok_url():
     # Priority 1: Explicit environment override for hosted/production deployments
@@ -58,75 +69,152 @@ def normalize_number(number):
     else:
         return f"+{digits}" if digits else ""
 
-async def setup_plivo(force: bool = False):
-    global endpoint_username, endpoint_password, endpoint_public_url, setup_error
-    if endpoint_username and endpoint_password and not force:
-        return {
-            "success": True,
-            "username": endpoint_username,
-            "password": endpoint_password,
-            "public_url": endpoint_public_url,
-        }
 
-    ngrok_url = get_ngrok_url()
-    endpoint_public_url = ngrok_url or ""
-    if not ngrok_url:
-        endpoint_username = ""
-        endpoint_password = ""
-        setup_error = (
-            "Plivo softphone is not configured: set PUBLIC_URL or NGROK_URL, "
-            "or run ngrok so Plivo can reach /api/plivo/dial."
-        )
-        logger.error(setup_error)
-        return {"success": False, "error": setup_error, "code": "plivo_public_url_missing"}
-    
-    if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
-        endpoint_username = ""
-        endpoint_password = ""
-        setup_error = "Plivo softphone is not configured: PLIVO_AUTH_ID or PLIVO_AUTH_TOKEN is missing."
-        logger.error(setup_error)
-        return {"success": False, "error": setup_error, "code": "plivo_credentials_missing"}
-        
-    client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
-    app_name = f"Softphone_App_{int(time.time())}"
-    answer_url = f"{ngrok_url}/api/plivo/dial"
-    
+def record_browser_dial(username: str, call_uuid: str, to_number: str):
+    global latest_call_uuid
+    if not username or not call_uuid:
+        return
+
+    normalized_to = normalize_number(to_number)
+    state = {
+        "call_uuid": call_uuid,
+        "username": username,
+        "to_number": normalized_to,
+        "seen_at": time.time(),
+    }
+    last_calls[username] = call_uuid
+    last_call_states[username] = state
+    latest_call_uuid = call_uuid
+
     try:
-        app_response = client.applications.create(
-            app_name=app_name,
-            answer_url=answer_url,
-            answer_method="POST"
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+        conn = get_calls_db_connection()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE calls
+            SET
+                plivo_call_uuid = %s,
+                plivo_status = 'dial_received',
+                updated_at = NOW()
+            WHERE id = (
+                SELECT id
+                FROM calls
+                WHERE plivo_endpoint_username = %s
+                  AND status IN ('pending', 'in_progress', 'completed')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+            )
+            """,
+            (call_uuid, username),
         )
-        app_id = app_response.app_id
-        logger.info(f"Created Plivo App: {app_id}")
+        conn.commit()
+        cur.close()
+        return_db_connection(conn)
+    except Exception as db_err:
+        logger.error(f"Failed to persist Plivo dial state for {username}: {db_err}")
+
+async def setup_plivo(force: bool = False):
+    global endpoint_username, endpoint_password, endpoint_public_url, setup_error, _last_setup_ngrok_url
+
+    # Auto-force re-setup when the ngrok/public URL has changed since last init
+    current_ngrok_url = get_ngrok_url() or ""
+    if endpoint_username and endpoint_password and not force:
+        if current_ngrok_url and current_ngrok_url != _last_setup_ngrok_url:
+            logger.warning(
+                "Ngrok URL changed from %r to %r — forcing Plivo re-setup.",
+                _last_setup_ngrok_url,
+                current_ngrok_url,
+            )
+            force = True
+        else:
+            return {
+                "success": True,
+                "username": endpoint_username,
+                "password": endpoint_password,
+                "public_url": endpoint_public_url,
+            }
+
+    async with _setup_lock:
+        # Re-check inside lock after acquiring it
+        current_ngrok_url = get_ngrok_url() or ""
+        if endpoint_username and endpoint_password and not force:
+            if current_ngrok_url and current_ngrok_url != _last_setup_ngrok_url:
+                force = True
+            else:
+                return {
+                    "success": True,
+                    "username": endpoint_username,
+                    "password": endpoint_password,
+                    "public_url": endpoint_public_url,
+                }
+
+        ngrok_url = current_ngrok_url
+        endpoint_public_url = ngrok_url or ""
+        if not ngrok_url:
+            endpoint_username = ""
+            endpoint_password = ""
+            setup_error = (
+                "Plivo softphone is not configured: set PUBLIC_URL or NGROK_URL, "
+                "or run ngrok so Plivo can reach /api/plivo/dial."
+            )
+            logger.error(setup_error)
+            return {"success": False, "error": setup_error, "code": "plivo_public_url_missing"}
         
-        username = f"user{int(time.time())}"
-        password = "TestPassword123!"
-        endpoint_response = client.endpoints.create(
-            username=username,
-            password=password,
-            alias=app_name,
-            app_id=app_id
-        )
-        logger.info(f"Created Plivo Endpoint: {endpoint_response}")
+        if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
+            endpoint_username = ""
+            endpoint_password = ""
+            setup_error = "Plivo softphone is not configured: PLIVO_AUTH_ID or PLIVO_AUTH_TOKEN is missing."
+            logger.error(setup_error)
+            return {"success": False, "error": setup_error, "code": "plivo_credentials_missing"}
+            
+        client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+        setup_suffix = f"{time.time_ns()}{uuid.uuid4().hex[:8]}"
+        app_name = f"Softphone_App_{setup_suffix}"
+        answer_url = f"{ngrok_url}/api/plivo/dial"
         
-        endpoint_username = getattr(endpoint_response, 'username', username)
-        endpoint_password = password
-        setup_error = ""
-        logger.info(f"Stored Credentials: {endpoint_username} / {endpoint_password}")
-        return {
-            "success": True,
-            "username": endpoint_username,
-            "password": endpoint_password,
-            "public_url": endpoint_public_url,
-        }
-        
-    except Exception as e:
-        endpoint_username = ""
-        endpoint_password = ""
-        setup_error = f"Failed to setup Plivo softphone components: {e}"
-        logger.error(setup_error)
-        return {"success": False, "error": setup_error, "code": "plivo_setup_failed"}
+        try:
+            app_response = await asyncio.to_thread(
+                client.applications.create,
+                app_name=app_name,
+                answer_url=answer_url,
+                answer_method="POST",
+            )
+            app_id = app_response.app_id
+            logger.info(f"Created Plivo App: {app_id}")
+            
+            username = f"user{uuid.uuid4().hex[:20]}"
+            password = "TestPassword123!"
+            endpoint_response = await asyncio.to_thread(
+                client.endpoints.create,
+                username=username,
+                password=password,
+                alias=app_name,
+                app_id=app_id,
+            )
+            logger.info(f"Created Plivo Endpoint: {endpoint_response}")
+            
+            endpoint_username = getattr(endpoint_response, 'username', username)
+            endpoint_password = password
+            _last_setup_ngrok_url = ngrok_url
+            setup_error = ""
+            logger.info(f"Stored Credentials: {endpoint_username} / {endpoint_password}")
+            return {
+                "success": True,
+                "username": endpoint_username,
+                "password": endpoint_password,
+                "public_url": endpoint_public_url,
+            }
+            
+        except Exception as e:
+            endpoint_username = ""
+            endpoint_password = ""
+            _last_setup_ngrok_url = ""
+            setup_error = f"Failed to setup Plivo softphone components: {e}"
+            logger.error(setup_error)
+            return {"success": False, "error": setup_error, "code": "plivo_setup_failed"}
 
 def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: str, candidate_id: str, transaction_id: str):
     logger.info(f"Initiating outbound Plivo call to {candidate_phone} for recruiter {recruiter_email}")
@@ -155,14 +243,23 @@ def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: st
         logger.error(f"Failed to initiate Plivo call: {e}")
         return {"success": False, "error": str(e)}
 
-async def process_call_insights(call_uuid: str, record_url: str):
+async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0):
     try:
+        existing_insights = call_insights.get(call_uuid)
+        if existing_insights and not existing_insights.get("error"):
+            logger.info(f"Skipping already generated insights for {call_uuid}")
+            return
+
+        if initial_delay_seconds > 0:
+            logger.info(f"Waiting {initial_delay_seconds}s before downloading recording for insights: {call_uuid}")
+            await asyncio.sleep(initial_delay_seconds)
+
         logger.info(f"Downloading recording for insights: {call_uuid}")
         
         max_retries = 6
         response = None
         for attempt in range(max_retries):
-            response = await asyncio.to_thread(requests.get, record_url)
+            response = await asyncio.to_thread(requests.get, record_url, timeout=30)
             if response.status_code == 200:
                 break
             logger.warning(f"Download failed with {response.status_code}. Retrying in 5s...")
@@ -177,8 +274,9 @@ async def process_call_insights(call_uuid: str, record_url: str):
             temp_audio_path = temp_audio.name
             
         logger.info("Transcribing audio...")
+        client = get_openai_client()
         with open(temp_audio_path, "rb") as audio_file:
-            transcript = await openai_client.audio.transcriptions.create(
+            transcript = await client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
                 timeout=300.0
@@ -201,7 +299,7 @@ async def process_call_insights(call_uuid: str, record_url: str):
         }}
         """
         
-        completion = await openai_client.chat.completions.create(
+        completion = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}]
         )
@@ -244,8 +342,8 @@ async def process_call_insights(call_uuid: str, record_url: str):
                         summary = %s,
                         status = 'completed',
                         updated_at = NOW()
-                    WHERE frejun_call_id = %s OR frejun_event_id = %s OR frejun_transaction_id = %s
-                """, (record_url, t_str, result_json.get("summary"), call_uuid, call_uuid, call_uuid))
+                    WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
+                """, (record_url, t_str, result_json.get("summary"), call_uuid, call_uuid))
                 conn.commit()
 
                 if cur.rowcount == 0:

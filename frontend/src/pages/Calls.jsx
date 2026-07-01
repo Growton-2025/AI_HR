@@ -37,6 +37,177 @@ const formatDateTime = (value) => {
   });
 };
 
+// Speaker-hint maps mirror backend/services/call_artifacts.py so the UI labels
+// transcripts consistently with the normalization layer.
+const RECRUITER_SPEAKER_HINTS = new Set([
+  'recruiter', 'agent', 'caller', 'interviewer', 'sales', 'sales rep',
+  'sales representative', 'user', 'assistant', 'speaker a', 'speaker 1',
+  'channel 0', 'channel 1',
+]);
+const CANDIDATE_SPEAKER_HINTS = new Set([
+  'candidate', 'callee', 'customer', 'client', 'prospect', 'lead',
+  'speaker b', 'speaker 2',
+]);
+
+const prettifyEmailName = (email) => {
+  const raw = String(email || '').trim();
+  if (!raw) return '';
+  const local = raw.split('@')[0] || '';
+  const cleaned = local.replace(/[._-]+/g, ' ').trim();
+  if (!cleaned) return '';
+  return cleaned
+    .split(/\s+/)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+};
+
+const recruiterDisplayName = (call) => {
+  if (!call) return 'Recruiter';
+  return (
+    prettifyEmailName(call.plivo_recruiter_email) ||
+    prettifyEmailName(call.created_by) ||
+    'Recruiter'
+  );
+};
+
+// Parse a raw "Speaker: text" transcript into structured turns with real names.
+// Returns [{ side: 'recruiter' | 'candidate', name, text }].
+const parseTranscript = (rawText, { candidateName, recruiterName } = {}) => {
+  const text = String(rawText || '').trim();
+  if (!text) return [];
+
+  const recruiterLabel = (recruiterName || 'Recruiter').trim() || 'Recruiter';
+  const candidateLabel = (candidateName || 'Candidate').trim() || 'Candidate';
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const labeledRe = /^([A-Za-z][A-Za-z0-9 ._-]{0,40}?)\s*:\s*(.*)$/;
+
+  const sideFromLabel = (label) => {
+    const norm = String(label || '').trim().toLowerCase();
+    if (RECRUITER_SPEAKER_HINTS.has(norm)) return 'recruiter';
+    if (CANDIDATE_SPEAKER_HINTS.has(norm)) return 'candidate';
+    if (candidateName && norm === candidateLabel.toLowerCase()) return 'candidate';
+    if (recruiterName && norm === recruiterLabel.toLowerCase()) return 'recruiter';
+    return null;
+  };
+
+  const turns = [];
+  let anyLabeled = false;
+  let firstUnknownSide = null;
+  const unknownSideMap = {};
+
+  for (const line of lines) {
+    const match = line.match(labeledRe);
+    if (match) {
+      const label = match[1];
+      const body = match[2].trim();
+      let side = sideFromLabel(label);
+      if (side) {
+        anyLabeled = true;
+      } else {
+        // Unlabeled/unknown speaker: assign first distinct -> recruiter, second -> candidate.
+        const key = label.toLowerCase();
+        if (!(key in unknownSideMap)) {
+          if (!firstUnknownSide) {
+            firstUnknownSide = 'recruiter';
+            unknownSideMap[key] = 'recruiter';
+          } else {
+            unknownSideMap[key] = 'candidate';
+          }
+        }
+        side = unknownSideMap[key];
+        anyLabeled = true;
+      }
+      if (!body) continue;
+      const name = side === 'recruiter' ? recruiterLabel : candidateLabel;
+      const last = turns[turns.length - 1];
+      if (last && last.side === side) {
+        last.text += ' ' + body;
+      } else {
+        turns.push({ side, name, text: body });
+      }
+    } else {
+      // No label at all: append to previous turn if present.
+      const last = turns[turns.length - 1];
+      if (last) {
+        last.text += ' ' + line;
+      } else {
+        turns.push({ side: 'recruiter', name: recruiterLabel, text: line });
+      }
+    }
+  }
+
+  if (!anyLabeled) {
+    // Fully unlabeled transcript: split into sentences and alternate speakers.
+    const sentences = text
+      .split(/(?<=[.!?])\s+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (sentences.length >= 2 && sentences.length <= 40) {
+      return sentences.map((sentence, idx) => {
+        const side = idx % 2 === 0 ? 'recruiter' : 'candidate';
+        return {
+          side,
+          name: side === 'recruiter' ? recruiterLabel : candidateLabel,
+          text: sentence,
+        };
+      });
+    }
+    return [];
+  }
+
+  return turns;
+};
+
+const TranscriptView = ({ transcript, candidateName, recruiterName, fallback }) => {
+  const turns = parseTranscript(transcript, { candidateName, recruiterName });
+  if (!turns.length) {
+    return (
+      <div style={{ whiteSpace: 'pre-wrap' }}>
+        {transcript || fallback}
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {turns.map((turn, idx) => {
+        const isRecruiter = turn.side === 'recruiter';
+        return (
+          <div
+            key={idx}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: isRecruiter ? 'flex-start' : 'flex-end',
+            }}
+          >
+            <span style={{
+              fontSize: 11, fontWeight: 800, letterSpacing: '0.02em',
+              color: isRecruiter ? '#6366f1' : '#0f766e',
+              marginBottom: 4, textTransform: 'none',
+            }}>
+              {turn.name}
+            </span>
+            <div style={{
+              maxWidth: '82%',
+              padding: '9px 13px',
+              borderRadius: isRecruiter ? '4px 14px 14px 14px' : '14px 4px 14px 14px',
+              background: isRecruiter ? 'rgba(99,102,241,0.08)' : 'rgba(15,118,110,0.08)',
+              border: `1px solid ${isRecruiter ? 'rgba(99,102,241,0.18)' : 'rgba(15,118,110,0.18)'}`,
+              color: '#334155',
+              fontSize: 13,
+              lineHeight: 1.55,
+              whiteSpace: 'pre-wrap',
+            }}>
+              {turn.text}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const TABS = [
   { id: 'today', label: 'Due Today', icon: Clock },
   { id: 'upcoming', label: 'Upcoming', icon: Calendar },
@@ -116,6 +287,7 @@ const needsPostCallArtifacts = (callData) => {
 };
 
 const SOFTPHONE_PREPARING_TIMEOUT_MS = 12000;
+const SOFTPHONE_FIRST_CLICK_RECOVERY_MS = 18000;
 const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
 
 const cleanVoipReasonText = (value) => (
@@ -144,9 +316,10 @@ const buildCallWrapUpMeta = (event, candidateName) => {
     if (lowerReason.includes('busy')) {
       return {
         ...baseMeta,
-        title: 'Line busy',
-        message: `${firstName}'s line was busy, so the browser call did not connect.`,
-        suggestedOutcome: 'No Answer',
+        title: 'Call did not connect',
+        message: reasonText
+          ? `Plivo reported the browser call as busy: ${reasonText}.`
+          : 'Plivo reported the browser call as busy, so it did not connect.',
       };
     }
 
@@ -187,9 +360,10 @@ const buildCallWrapUpMeta = (event, candidateName) => {
   if (lowerReason.includes('busy')) {
     return {
       ...baseMeta,
-      title: 'Line busy',
-      message: `${firstName}'s line was busy and the browser call ended.`,
-      suggestedOutcome: 'No Answer',
+      title: 'Call ended',
+      message: reasonText
+        ? `The browser call ended with a busy signal from Plivo: ${reasonText}.`
+        : 'The browser call ended with a busy signal from Plivo.',
     };
   }
 
@@ -856,7 +1030,7 @@ export default function Calls() {
     toast('Recording is not ready in Plivo yet');
   };
 
-  const filteredCalls = (calls || []).filter(c => 
+  const filteredCalls = (calls || []).filter(c =>
     (c.candidate_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (c.candidate_title || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
@@ -869,8 +1043,12 @@ export default function Calls() {
         : activeTab === 'completed'
           ? 'status=completed'
           : '';
-  const showCallsLoading = activeTab !== 'lists' && (!callsLastFetchedAt || (loading && callsLastQueryKey !== currentCallsQueryKey));
-  const showListsLoading = activeTab === 'lists' && !selectedList && (!callsLastFetchedAt || (loading && !callLists.length));
+  // Show skeleton only when: no data has ever been loaded for this tab's query key
+  // (callsLastQueryKey !== currentCallsQueryKey means we're waiting for a different tab's fetch)
+  const isWaitingForCurrentQuery = callsLastQueryKey !== currentCallsQueryKey;
+  const showCallsLoading = activeTab !== 'lists' && (loading || isWaitingForCurrentQuery) && !callsLastFetchedAt || 
+    (activeTab !== 'lists' && loading && isWaitingForCurrentQuery);
+  const showListsLoading = activeTab === 'lists' && !selectedList && loading && !callLists.length;
 
   return (
     <div style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
@@ -913,10 +1091,10 @@ export default function Calls() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', columnGap: '24px', rowGap: '10px' }}>
-        {TABS.map(tab => (
+      {TABS.map(tab => (
           <button
             key={tab.id}
-            onClick={() => { clearCallsState(); setActiveTab(tab.id); setSelectedList(null); }}
+            onClick={() => { setActiveTab(tab.id); setSelectedList(null); }}
             style={{
               padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #111827' : '2px solid transparent',
               color: activeTab === tab.id ? '#111827' : '#64748b', fontSize: '14px', fontWeight: 600,
@@ -1182,15 +1360,15 @@ export default function Calls() {
                       <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '12px' }}>
                         <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Call Recording</h4>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                          {(call.frejun_link || call.frejun_summary_url) && (
+                          {call.recording_url && (
                             <a
-                              href={call.frejun_link || call.frejun_summary_url}
+                              href={call.recording_url}
                               target="_blank"
                               rel="noreferrer"
                               style={{ fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                             >
                               <ExternalLink size={14} />
-                              Open Plivo
+                              Open Recording
                             </a>
                           )}
                           {!call.recording_url && (
@@ -1244,9 +1422,19 @@ export default function Calls() {
                         <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Full Transcript</h4>
                         <div style={{ 
                           fontSize: '13px', color: '#64748b', lineHeight: '1.6', height: '200px', overflowY: 'auto', 
-                          paddingRight: '12px', whiteSpace: 'pre-wrap' 
+                          paddingRight: '12px'
                         }}>
-                          {call.transcript || (call.recording_url ? 'Transcribing call...' : 'No transcript available.')}
+                          {call.transcript ? (
+                            <TranscriptView
+                              transcript={call.transcript}
+                              candidateName={call.candidate_name}
+                              recruiterName={recruiterDisplayName(call)}
+                            />
+                          ) : (
+                            <div style={{ whiteSpace: 'pre-wrap' }}>
+                              {call.recording_url ? 'Transcribing call...' : 'No transcript available.'}
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1292,15 +1480,35 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationErrorCode, setInitiationErrorCode] = useState('');
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
+  const [softphoneRecoveryAttempt, setSoftphoneRecoveryAttempt] = useState(0);
   const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore(useShallow((state) => ({
     updateCall: state.updateCall,
     initiateCall: state.initiateCall,
     fetchCalls: state.fetchCalls,
     syncCallRecording: state.syncCallRecording,
   })));
-  const { activeCall, answerCall, rejectCall, placeCall, voipStatus, voipError, voipErrorCode, voipActionLabel, voipActionUrl, voipMeta, voipConnectionEvent, voipCallEvent, agentEmail, retryVoip } = useVoIP();
+  const {
+    activeCall,
+    answerCall,
+    rejectCall,
+    placeCall,
+    ensureMicrophonePermission,
+    waitForPlivoDial,
+    voipStatus,
+    voipError,
+    voipErrorCode,
+    voipActionLabel,
+    voipActionUrl,
+    voipMeta,
+    voipConnectionEvent,
+    voipCallEvent,
+    agentEmail,
+    endpointUsername,
+    retryVoip,
+  } = useVoIP();
   const isInitiated = useRef(false);
   const lastHandledCallEventRef = useRef(0);
+  const autoRetriedSoftphoneRef = useRef(false);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
@@ -1334,7 +1542,17 @@ function CallingModal({ call, onClose, onRefresh }) {
     isInitiated.current = true;
 
     try {
-      const res = await initiateCall(call.id);
+      const micResult = await ensureMicrophonePermission();
+      if (!micResult?.success) {
+        const message = micResult?.error || 'Microphone permission is required to place a Plivo browser call';
+        setInitiationError(message);
+        setInitiationErrorCode('microphone_permission_denied');
+        setCallState('error');
+        toast.error(message);
+        return;
+      }
+
+      const res = await initiateCall(call.id, { plivoUsername: endpointUsername });
       if (!res.success) {
         const message = res.error || 'Failed to start browser VoIP call';
         setInitiationError(message);
@@ -1358,6 +1576,16 @@ function CallingModal({ call, onClose, onRefresh }) {
         }
       }
 
+      const dialState = await waitForPlivoDial(endpointUsername);
+      if (!dialState?.success) {
+        const message = dialState?.error || 'Plivo browser call did not reach the backend';
+        setInitiationError(message);
+        setInitiationErrorCode(dialState?.code || 'plivo_dial_webhook_timeout');
+        setCallState('error');
+        toast.error(message);
+        return;
+      }
+
       setCallState('waiting_for_invite');
     } catch (e) {
       const message = 'Connection error while starting browser VoIP call';
@@ -1366,7 +1594,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, initiateCall, placeCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
+  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, placeCall, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
 
   useEffect(() => {
     if (isInitiated.current) return;
@@ -1424,6 +1652,8 @@ function CallingModal({ call, onClose, onRefresh }) {
     const recovered = ['registered', 'answer_required', 'invite_received', 'connected'].includes(voipStatus);
     if (!recovered) return;
 
+    autoRetriedSoftphoneRef.current = false;
+    setSoftphoneRecoveryAttempt(0);
     setInitiationError('');
     setInitiationErrorCode('');
     setInitiationActionLabel('');
@@ -1466,16 +1696,23 @@ function CallingModal({ call, onClose, onRefresh }) {
         return;
       }
 
+      if (!autoRetriedSoftphoneRef.current && retryVoip) {
+        autoRetriedSoftphoneRef.current = true;
+        setSoftphoneRecoveryAttempt(1);
+        retryVoip();
+        return;
+      }
+
       const exhausted = Boolean(voipConnectionEvent?.maxRetriesReached);
       const message = voipConnectionEvent?.error
         || (exhausted ? 'Plivo softphone registration failed' : 'Plivo softphone registration timed out');
       setInitiationError(message);
       setInitiationErrorCode(exhausted ? 'softphone_registration_failed' : 'softphone_registration_timeout');
       setCallState('error');
-    }, SOFTPHONE_PREPARING_TIMEOUT_MS);
+    }, softphoneRecoveryAttempt > 0 ? SOFTPHONE_FIRST_CLICK_RECOVERY_MS : SOFTPHONE_PREPARING_TIMEOUT_MS);
 
     return () => window.clearTimeout(timeoutId);
-  }, [callState, voipConnectionEvent, voipStatus]);
+  }, [callState, retryVoip, softphoneRecoveryAttempt, voipConnectionEvent, voipStatus]);
 
   useEffect(() => {
     if ((callState === 'answer_required' || callState === 'invite_received' || callState === 'active') && !activeCall) {
@@ -1573,40 +1810,13 @@ function CallingModal({ call, onClose, onRefresh }) {
     setCallWrapUpMeta(null);
     setCallState('preparing_softphone');
     isInitiated.current = false;
+    autoRetriedSoftphoneRef.current = false;
+    setSoftphoneRecoveryAttempt(0);
     retryVoip();
   };
 
   const handleBlockingAction = async () => {
     if (!effectiveActionUrl) return;
-
-    if (effectiveActionUrl.includes('/api/auth/frejun-login')) {
-      const appToken = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
-      if (!appToken) {
-        toast.error('Your session expired. Please sign in again and reconnect Plivo VoIP.');
-        return;
-      }
-
-      try {
-        const separator = effectiveActionUrl.includes('?') ? '&' : '?';
-        const response = await fetch(`${effectiveActionUrl}${separator}mode=url`, {
-          headers: {
-            Authorization: `Bearer ${appToken}`,
-          },
-        });
-        const data = await response.json().catch(() => ({}));
-
-        if (!response.ok || !data?.auth_url) {
-          toast.error(data?.detail?.message || data?.detail || 'Unable to start Plivo connection');
-          return;
-        }
-
-        window.location.href = data.auth_url;
-        return;
-      } catch (_error) {
-        toast.error('Unable to reach the Plivo endpoint');
-        return;
-      }
-    }
 
     if (/^https?:\/\//.test(effectiveActionUrl)) {
       window.location.href = effectiveActionUrl;
@@ -2018,10 +2228,10 @@ function CallingModal({ call, onClose, onRefresh }) {
                       <PhoneCall size={16} color="#2563eb" /> Post-Call Analysis
                     </h4>
                     
-                    {reviewCallData?.recording_url || reviewCallData?.frejun_link ? (
+                    {reviewCallData?.recording_url ? (
                       <div style={{ marginBottom: '24px' }}>
                         <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>Recording</div>
-                        <audio src={reviewCallData.recording_url || reviewCallData.frejun_link} controls style={{ width: '100%', height: '40px' }} />
+                        <audio src={reviewCallData.recording_url} controls style={{ width: '100%', height: '40px' }} />
                       </div>
                     ) : (
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px', background: '#eff6ff', borderRadius: '8px', color: '#1e40af', fontSize: '13px', marginBottom: '24px' }}>
@@ -2041,8 +2251,12 @@ function CallingModal({ call, onClose, onRefresh }) {
                         Transcript {(!reviewTranscript && reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000) ? '(Fallback AI Triggered)' : ''}
                       </div>
                       {reviewTranscript ? (
-                        <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', maxHeight: '200px', overflowY: 'auto', fontSize: '13px', lineHeight: 1.6, color: '#475569', whiteSpace: 'pre-wrap' }}>
-                          {reviewTranscript}
+                        <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', maxHeight: '200px', overflowY: 'auto', fontSize: '13px', lineHeight: 1.6, color: '#475569' }}>
+                          <TranscriptView
+                            transcript={reviewTranscript}
+                            candidateName={reviewCallData?.candidate_name}
+                            recruiterName={recruiterDisplayName(reviewCallData)}
+                          />
                         </div>
                       ) : (
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>

@@ -5,7 +5,7 @@ import threading
 from typing import Optional
 from openai import OpenAI
 from backend.db.connection import get_db_connection_context
-from backend.services.frejun_calls import (
+from backend.services.call_artifacts import (
     SHORT_CALL_SUMMARY,
     extract_transcript_text,
     is_brief_transcript,

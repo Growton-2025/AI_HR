@@ -704,9 +704,15 @@ export const useAppStore = create(persist((set, get) => ({
                 if (getAnalyticsUserKey(get().user) !== userKey) {
                     return { success: false, stale: true, error: 'Ignored stale analytics request' }
                 }
+                // If total_sourced is 0 the DB may have been temporarily unavailable.
+                // Mark lastFetchedAt as 0 so a background re-fetch is triggered on
+                // the next render instead of persisting stale zeros to localStorage.
+                const isEmpty = !res.data?.summary
+                    ? (res.data?.total_sourced === 0 || res.data?.total_sourced == null)
+                    : (res.data.summary?.total_sourced === 0 || res.data.summary?.total_sourced == null)
                 set({
                     analytics: res.data,
-                    analyticsLastFetchedAt: Date.now(),
+                    analyticsLastFetchedAt: isEmpty ? 0 : Date.now(),
                     analyticsRequest: null,
                     analyticsUserKey: userKey,
                     analyticsRequestUserKey: '',
@@ -2784,11 +2790,15 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
-    initiateCall: async (callId) => {
+    initiateCall: async (callId, options = {}) => {
         try {
             const res = await axios.post(
                 `${API_BASE}/calls/initiate`,
-                { call_id: callId, dial_mode: 'voip' },
+                {
+                    call_id: callId,
+                    dial_mode: 'voip',
+                    plivo_username: options.plivoUsername || options.plivo_username || '',
+                },
                 { timeout: 45000 }
             )
             return { success: true, data: res.data }

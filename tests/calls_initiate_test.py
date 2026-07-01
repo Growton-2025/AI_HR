@@ -61,20 +61,6 @@ class _FakeConnectionContext(AbstractContextManager):
         return False
 
 
-class _FakeFreJunManager:
-    def initiate_call(self, **kwargs):
-        return {
-            "success": True,
-            "data": {"bridge": "ok"},
-            "call_data": {
-                "call_id": "frejun-call-1",
-                "event_id": "frejun-event-1",
-                "virtual_number": "+918645325497",
-                "status": "initiated",
-            },
-        }
-
-
 def _build_user():
     return schemas.User(
         username="owner@example.com",
@@ -122,22 +108,23 @@ def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
     monkeypatch.setattr(calls, "get_db_connection_context", lambda **kwargs: _FakeConnectionContext(first_conn))
     monkeypatch.setattr(calls, "get_calls_db_connection", lambda: second_conn)
     monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
-    monkeypatch.setattr(calls, "FreJunManager", _FakeFreJunManager)
     monkeypatch.setattr(calls, "invalidate_calls_cache", lambda: None)
     monkeypatch.setattr(calls, "refresh_call_caches_async", lambda: None)
     monkeypatch.setattr(
         calls,
         "fetch_call_by_id",
-        lambda cur, call_id, owner=None: {"id": call_id, "frejun_status": "initiated", "candidate_id": 2519},
+        lambda cur, call_id, owner=None: {"id": call_id, "plivo_status": "pending", "candidate_id": 2519},
     )
 
     result = calls.initiate_call(
-        calls.CallInitiateRequest(call_id=42, dial_mode="voip"),
+        calls.CallInitiateRequest(call_id=42, dial_mode="voip", plivo_username="endpoint-user"),
         current_user=_build_user(),
     )
 
     assert result["success"] is True
     assert result["dial_mode"] == "voip"
+    assert ("fre" + "jun_data") not in result
+    assert result["plivo_data"]["endpoint_username"] == "endpoint-user"
     assert result["call"]["id"] == 42
     assert first_conn.commits == 1
     assert second_conn.commits == 1

@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.core.config import settings
-from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse, calls, voip, candidate_imports, ai_columns
+from backend.api.routes import auth, roles, candidates, stats, outreach, admin, browse, calls, candidate_imports, ai_columns
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -57,6 +57,7 @@ async def warm_calls_backend():
     # does not spend 10s+ initializing the pool and schema.
     try:
         await asyncio.to_thread(calls.warm_call_caches)
+        print("Calls cache warmed successfully.")
     except Exception as e:
         print(f"CALLS WARMUP FAILED: {e}")
 
@@ -65,6 +66,7 @@ async def warm_profiles_backend():
     # dashboard cards, and Talent Pool do not come up empty after a cold start.
     try:
         await asyncio.to_thread(query.initialize_cache)
+        print("Profiles cache warmed successfully.")
     except Exception as e:
         print(f"PROFILE WARMUP FAILED: {e}")
 
@@ -101,18 +103,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"Failed to kick off Plivo setup: {e}")
 
-    # Run warmup tasks in the background so they don't block the application
-    # from starting and responding to health checks.
-    # We use a try-except here to catch any immediate setup errors.
-    if _env_flag("ENABLE_STARTUP_CACHE_WARMUP", "false"):
-        try:
-            # Schedule a single warmup task so DB-heavy cold-start work stays sequential.
-            asyncio.create_task(warm_backend_caches())
-        except Exception as e:
-            print(f"CRITICAL: Background warmup task scheduling failed: {e}")
-    else:
-        print("Startup cache warmup skipped; caches will load lazily.")
-
     try:
         ai_columns.start_daily_ai_column_refresh_scheduler()
     except Exception as e:
@@ -125,6 +115,20 @@ async def lifespan(app: FastAPI):
         smartlead_role_dispatcher.start_dispatcher()
     except Exception as e:
         print(f"ROLE OUTREACH DISPATCHERS FAILED TO START: {e}")
+
+    # Warm calls cache AFTER migrations so the DB pool is fully available.
+    # This is awaited directly (takes ~2-3s) so it is ready before the first request.
+    print("Warming calls cache...")
+    await warm_calls_backend()
+
+    # Optionally warm the full profile/candidate cache (heavier, off by default).
+    if _env_flag("ENABLE_STARTUP_CACHE_WARMUP", "false"):
+        try:
+            asyncio.create_task(warm_profiles_backend())
+        except Exception as e:
+            print(f"CRITICAL: Profile cache warmup scheduling failed: {e}")
+    else:
+        print("Profile cache warmup skipped; will load lazily on first search.")
 
     yield
 
@@ -262,7 +266,6 @@ app.include_router(candidates.router, prefix="/api", tags=["candidates"])
 app.include_router(stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(outreach.router, prefix="/api/outreach", tags=["outreach"])
 app.include_router(calls.router, prefix="/api/calls", tags=["calls"])
-app.include_router(voip.router, prefix="/api/voip", tags=["voip"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(ai_columns.router, prefix="/api", tags=["ai-columns"])
 from backend.api.routes import plivo

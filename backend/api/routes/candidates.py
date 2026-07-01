@@ -13,7 +13,7 @@ from backend.api import schemas, deps
 from backend.db.connection import (
     get_db_connection_context,
 )
-from backend.services.frejun_calls import transcript_preview
+from backend.services.call_artifacts import transcript_preview
 from backend.pipeline.query import (
     process_query_main,
     load_all_profiles_from_db,
@@ -566,10 +566,8 @@ async def get_candidate_activity(
                         c.summary,
                         c.transcript,
                         c.notes,
-                        c.frejun_virtual_number,
-                        cand.mobile_phone,
-                        c.frejun_link,
-                        c.frejun_summary_url
+                        c.plivo_virtual_number,
+                        cand.mobile_phone
                     FROM calls c
                     JOIN call_lists cl ON c.list_id = cl.id
                     JOIN candidates cand ON c.candidate_id = cand.id
@@ -602,7 +600,7 @@ async def get_candidate_activity(
                 "transcript_preview": transcript_preview(row[7]),
                 "from_number": row[9],
                 "to_number": row[10],
-                "source_url": row[11] or row[12] or row[5],
+                "source_url": row[5],
             }
         )
 
