@@ -870,6 +870,8 @@ export default function Calls() {
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
   const [expandedCallId, setExpandedCallId] = useState(null);
   const [syncingCallId, setSyncingCallId] = useState(null);
+  const [deletingCallIds, setDeletingCallIds] = useState(() => new Set());
+  const [deletingListIds, setDeletingListIds] = useState(() => new Set());
   
   // List Creation State
   const [isCreatingList, setIsCreatingList] = useState(false);
@@ -978,23 +980,44 @@ export default function Calls() {
   };
 
   const handleDeleteCall = async (callId) => {
+    if (deletingCallIds.has(callId)) return;
     if (!window.confirm('Remove this candidate from the call list?')) return;
-    const res = await deleteCall(callId);
-    if (res.success) toast.success('Removed from list');
-    else toast.error(res.error || 'Failed to remove');
+    setDeletingCallIds(prev => new Set(prev).add(callId));
+    try {
+      const res = await deleteCall(callId);
+      if (res.success) toast.success('Removed from list');
+      else toast.error(res.error || 'Failed to remove');
+    } finally {
+      setDeletingCallIds(prev => {
+        const next = new Set(prev);
+        next.delete(callId);
+        return next;
+      });
+    }
   };
 
   const handleDeleteList = async (listId, name) => {
+    if (deletingListIds.has(listId)) return;
     if (!window.confirm(`Delete the list "${name}"? This will remove all associated tasks.`)) return;
-    const res = await deleteCallList(listId);
-    if (res.success) {
-      if (selectedList?.id === listId) setSelectedList(null);
-      toast.success('List deleted');
+    setDeletingListIds(prev => new Set(prev).add(listId));
+    try {
+      const res = await deleteCallList(listId);
+      if (res.success) {
+        if (selectedList?.id === listId) setSelectedList(null);
+        toast.success('List deleted');
+      }
+      else toast.error(res.error || 'Failed to delete list');
+    } finally {
+      setDeletingListIds(prev => {
+        const next = new Set(prev);
+        next.delete(listId);
+        return next;
+      });
     }
-    else toast.error(res.error || 'Failed to delete list');
   };
 
   const handleCreateList = async () => {
+    if (isSubmittingList) return;
     if (!newListName.trim()) {
       setIsCreatingList(false);
       return;
@@ -1155,7 +1178,7 @@ export default function Calls() {
                       placeholder="e.g. Frontend Q1 Hires"
                       value={newListName}
                       onChange={e => setNewListName(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && handleCreateList()}
+                      onKeyDown={e => e.key === 'Enter' && !isSubmittingList && handleCreateList()}
                       disabled={isSubmittingList}
                       style={{
                         width: '100%', padding: '10px 14px', borderRadius: '10px',
@@ -1174,7 +1197,7 @@ export default function Calls() {
                       <button 
                         onClick={(e) => { e.stopPropagation(); setIsCreatingList(false); setNewListName(''); }}
                         disabled={isSubmittingList}
-                        style={{ ...CALL_SECONDARY_BUTTON, padding: '8px 12px', fontSize: '13px' }}
+                        style={{ ...CALL_SECONDARY_BUTTON, padding: '8px 12px', fontSize: '13px', cursor: isSubmittingList ? 'wait' : 'pointer' }}
                       >
                         Cancel
                       </button>
@@ -1183,42 +1206,68 @@ export default function Calls() {
                 )}
               </div>
 
-              {callLists.map(list => (
+              {callLists.map(list => {
+                const isDeletingList = deletingListIds.has(list.id);
+                const isPendingList = Boolean(list.is_pending);
+                const isListDisabled = isDeletingList || isPendingList;
+
+                return (
                 <div 
                   key={list.id} 
-                  onClick={() => { clearCallsState(); setSelectedList(list); }}
-                  style={{ 
-                    padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', cursor: 'pointer',
-                    transition: 'all 0.2s'
+                  onClick={() => {
+                    if (isListDisabled) return;
+                    clearCallsState();
+                    setSelectedList(list);
                   }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#111827'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.transform = 'none'; }}
+                  style={{ 
+                    padding: '24px', borderRadius: '20px', border: '1px solid #e2e8f0', cursor: isListDisabled ? 'wait' : 'pointer',
+                    transition: 'all 0.2s',
+                    opacity: isDeletingList ? 0.55 : 1
+                  }}
+                  onMouseEnter={e => {
+                    if (isListDisabled) return;
+                    e.currentTarget.style.borderColor = '#111827';
+                    e.currentTarget.style.transform = 'translateY(-2px)';
+                  }}
+                  onMouseLeave={e => {
+                    e.currentTarget.style.borderColor = '#e2e8f0';
+                    e.currentTarget.style.transform = 'none';
+                  }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
                     <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <List size={20} color="#475569" />
+                      {isDeletingList || isPendingList ? (
+                        <Loader2 size={20} color="#475569" className="animate-spin" />
+                      ) : (
+                        <List size={20} color="#475569" />
+                      )}
                     </div>
                     <button 
                       onClick={(e) => {
                         e.stopPropagation();
+                        if (isListDisabled) return;
                         handleDeleteList(list.id, list.name);
                       }}
-                      style={{ padding: '6px', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', borderRadius: '8px' }}
-                      onMouseEnter={e => e.currentTarget.style.color = '#ef4444'}
-                      onMouseLeave={e => e.currentTarget.style.color = '#94a3b8'}
+                      disabled={isListDisabled}
+                      style={{ padding: '6px', background: 'none', border: 'none', color: '#94a3b8', cursor: isListDisabled ? 'wait' : 'pointer', borderRadius: '8px', opacity: isListDisabled ? 0.6 : 1 }}
+                      onMouseEnter={e => { if (!isListDisabled) e.currentTarget.style.color = '#ef4444'; }}
+                      onMouseLeave={e => { if (!isListDisabled) e.currentTarget.style.color = '#94a3b8'; }}
                     >
-                      <Trash2 size={16} />
+                      {isDeletingList ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
                     </button>
                   </div>
                   <h3 style={{ fontSize: '16px', fontWeight: 700, color: '#0f172a', marginBottom: '4px' }}>{list.name}</h3>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                     <User size={12} color="#94a3b8" />
-                    <span style={{ fontSize: '13px', color: '#64748b' }}>{list.candidate_count} Pending</span>
+                    <span style={{ fontSize: '13px', color: '#64748b' }}>
+                      {isDeletingList ? 'Deleting...' : isPendingList ? 'Saving...' : `${list.candidate_count} Pending`}
+                    </span>
                   </div>
                 </div>
-              ))}
+                );
+              })}
               {(callLists || []).length === 0 && (
-                <div style={{ gridColumn: '1/-1', py: 60, textAlign: 'center', color: '#94a3b8' }}>No call lists found yet.</div>
+                <div style={{ gridColumn: '1/-1', padding: '60px', textAlign: 'center', color: '#94a3b8' }}>No call lists found yet.</div>
               )}
             </div>
           </div>
@@ -1273,12 +1322,16 @@ export default function Calls() {
               ))}
               {!showCallsLoading && (
                 <>
-              {(filteredCalls || []).map(call => (
+              {(filteredCalls || []).map(call => {
+                const isDeletingCall = deletingCallIds.has(call.id);
+
+                return (
                 <React.Fragment key={call.id}>
                 <div 
                   style={{ 
                     padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', 
-                    alignItems: 'center', gap: '16px'
+                    alignItems: 'center', gap: '16px',
+                    opacity: isDeletingCall ? 0.55 : 1
                   }}
                 >
                   <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#64748b' }}>
@@ -1327,21 +1380,22 @@ export default function Calls() {
                     )}
                     <button 
                       onClick={() => handleDeleteCall(call.id)}
-                      style={{ padding: '8px', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', borderRadius: '8px' }}
-                      onMouseEnter={e => e.currentTarget.style.color = '#ef4444'}
-                      onMouseLeave={e => e.currentTarget.style.color = '#94a3b8'}
+                      disabled={isDeletingCall}
+                      style={{ padding: '8px', background: 'none', border: 'none', color: '#94a3b8', cursor: isDeletingCall ? 'wait' : 'pointer', borderRadius: '8px', opacity: isDeletingCall ? 0.6 : 1 }}
+                      onMouseEnter={e => { if (!isDeletingCall) e.currentTarget.style.color = '#ef4444'; }}
+                      onMouseLeave={e => { if (!isDeletingCall) e.currentTarget.style.color = '#94a3b8'; }}
                       title="Remove from list"
                     >
-                      <Trash2 size={18} />
+                      {isDeletingCall ? <Loader2 size={18} className="animate-spin" /> : <Trash2 size={18} />}
                     </button>
                     <button 
                       onClick={() => handleDial(call)}
-                      disabled={call.status === 'completed'}
+                      disabled={call.status === 'completed' || isDeletingCall}
                       style={{ 
                         padding: '8px 16px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
-                        background: call.status === 'completed' ? '#f1f5f9' : '#111827',
-                        color: call.status === 'completed' ? '#94a3b8' : '#fff',
-                        border: call.status === 'completed' ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: call.status === 'completed' ? 'not-allowed' : 'pointer',
+                        background: call.status === 'completed' || isDeletingCall ? '#f1f5f9' : '#111827',
+                        color: call.status === 'completed' || isDeletingCall ? '#94a3b8' : '#fff',
+                        border: call.status === 'completed' || isDeletingCall ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: call.status === 'completed' || isDeletingCall ? 'not-allowed' : 'pointer',
                         display: 'flex', alignItems: 'center', gap: '8px'
                       }}
                     >
@@ -1441,7 +1495,8 @@ export default function Calls() {
                   </div>
                 )}
               </React.Fragment>
-            ))}
+                );
+              })}
               {(filteredCalls || []).length === 0 && !loading && (
                 <div style={{ padding: '60px', textAlign: 'center', color: '#94a3b8' }}>No candidates matching your query.</div>
               )}

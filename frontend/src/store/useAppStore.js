@@ -311,6 +311,31 @@ function removeCallAcrossCaches(callsCache = {}, callId) {
     return nextCache
 }
 
+function removeCallsByListAcrossCaches(callsCache = {}, listId) {
+    const targetListId = Number(listId)
+    const nextCache = {}
+
+    for (const [queryKey, entries] of Object.entries(callsCache || {})) {
+        if (!Array.isArray(entries)) {
+            nextCache[queryKey] = entries
+            continue
+        }
+        nextCache[queryKey] = entries.filter(call => Number(call?.list_id) !== targetListId)
+    }
+
+    return nextCache
+}
+
+function isDueTodayCall(call) {
+    if (!call || call.status === 'completed' || !call.due_date) return false
+    const dueDate = new Date(call.due_date)
+    if (Number.isNaN(dueDate.getTime())) return false
+    const today = new Date()
+    dueDate.setHours(0, 0, 0, 0)
+    today.setHours(0, 0, 0, 0)
+    return dueDate <= today
+}
+
 // API base URL
 // On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
 // causing cross-origin preflight failures.
@@ -2238,14 +2263,18 @@ export const useAppStore = create(persist((set, get) => ({
     callStats: defaultCallStats,
     callListsLastFetchedAt: 0,
     callListsRequest: null,
+    callListsRequestSeq: 0,
     callsCache: {},
     callsCacheFetchedAt: {},
     callsLastFetchedAt: 0,
     callsLastQueryKey: '',
     callsRequest: null,
     callsRequestQueryKey: '',
+    callsRequestSeq: 0,
+    callsMutationSeq: 0,
     callStatsLastFetchedAt: 0,
     callStatsRequest: null,
+    callStatsRequestSeq: 0,
     callListsBackoffUntil: 0,
     callStatsBackoffUntil: 0,
     callsBackoffUntilByQuery: {},
@@ -2271,35 +2300,47 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, error: 'Retrying call lists shortly' }
         }
 
-        if (state.callListsRequest) {
+        if (state.callListsRequest && (!force || state.callListsRequestSeq === state.callsMutationSeq)) {
             return state.callListsRequest
         }
 
+        const requestSeq = state.callsMutationSeq
         const request = axios.get(`${API_BASE}/calls/lists`, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
                 const latestState = get()
                 const mergedLists = mergePendingCallLists(res.data, latestState.callLists)
-                set({
-                    callLists: mergedLists,
-                    callListsLastFetchedAt: Date.now(),
-                    callListsRequest: null,
-                    callListsBackoffUntil: 0,
-                })
+                if (latestState.callListsRequestSeq === requestSeq && latestState.callsMutationSeq === requestSeq) {
+                    set({
+                        callLists: mergedLists,
+                        callListsLastFetchedAt: Date.now(),
+                        callListsRequest: null,
+                        callListsRequestSeq: 0,
+                        callListsBackoffUntil: 0,
+                    })
+                } else if (latestState.callListsRequestSeq === requestSeq) {
+                    set({
+                        callListsRequest: null,
+                        callListsRequestSeq: 0,
+                    })
+                }
                 return { success: true, data: mergedLists, cached: false }
             })
             .catch(e => {
                 console.error('Failed to fetch call lists:', e)
-                set({
-                    callListsRequest: null,
-                    callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
-                })
+                if (get().callListsRequestSeq === requestSeq) {
+                    set({
+                        callListsRequest: null,
+                        callListsRequestSeq: 0,
+                        callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    })
+                }
                 if (get().callLists.length) {
                     return { success: true, data: get().callLists, cached: true }
                 }
                 return { success: false, error: getRequestErrorMessage(e, 'Failed to fetch call lists') }
             })
 
-        set({ callListsRequest: request })
+        set({ callListsRequest: request, callListsRequestSeq: requestSeq })
         return request
     },
 
@@ -2324,8 +2365,10 @@ export const useAppStore = create(persist((set, get) => ({
             candidate_count: 0,
             is_pending: true,
         }
+        const mutationSeq = get().callsMutationSeq + 1
 
         set(currentState => ({
+            callsMutationSeq: mutationSeq,
             callLists: sortCallListsByCreatedAt([optimisticList, ...currentState.callLists]),
             callListsLastFetchedAt: Date.now(),
             callListsBackoffUntil: 0,
@@ -2348,6 +2391,7 @@ export const useAppStore = create(persist((set, get) => ({
                 )
 
                 return {
+                    callsMutationSeq: Math.max(currentState.callsMutationSeq || 0, mutationSeq),
                     callLists: sortCallListsByCreatedAt([createdList, ...remainingLists]),
                     callListsLastFetchedAt: Date.now(),
                     callListsBackoffUntil: 0,
@@ -2363,21 +2407,33 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: true, data: createdList }
         } catch (e) {
             console.error('Failed to create call list:', e)
-            set(currentState => ({
-                callLists: currentState.callLists.filter(list => list.id !== optimisticId),
-                callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
-                callStats: {
-                    ...currentState.callStats,
-                    active_lists: Math.max(0, (currentState.callStats?.active_lists || 1) - 1),
-                },
-                callStatsLastFetchedAt: Date.now(),
-                callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
-            }))
+            set(currentState => {
+                if (currentState.callsMutationSeq !== mutationSeq) {
+                    return {
+                        callLists: currentState.callLists.filter(list => list.id !== optimisticId),
+                        callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                        callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    }
+                }
+
+                return {
+                    callLists: currentState.callLists.filter(list => list.id !== optimisticId),
+                    callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    callStats: {
+                        ...currentState.callStats,
+                        active_lists: Math.max(0, (currentState.callStats?.active_lists || 1) - 1),
+                    },
+                    callStatsLastFetchedAt: Date.now(),
+                    callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                }
+            })
             return { success: false, error: getRequestErrorMessage(e, 'Failed to create list') }
         }
     },
 
     addCandidatesToCallList: async (candidateIds, listId) => {
+        let mutationSeq = 0
+        let previousState = null
         try {
             const uniqueCandidateIds = [...new Set((candidateIds || []).map(Number).filter(Boolean))]
             if (!uniqueCandidateIds.length) {
@@ -2386,14 +2442,20 @@ export const useAppStore = create(persist((set, get) => ({
 
             const targetListId = Number(listId)
             const optimisticAddedCount = uniqueCandidateIds.length
-            const previousState = {
+            mutationSeq = get().callsMutationSeq + 1
+            previousState = {
                 callLists: get().callLists,
                 callStats: get().callStats,
                 callListsLastFetchedAt: get().callListsLastFetchedAt,
                 callStatsLastFetchedAt: get().callStatsLastFetchedAt,
+                callsCache: get().callsCache,
+                callsCacheFetchedAt: get().callsCacheFetchedAt,
+                callsLastFetchedAt: get().callsLastFetchedAt,
+                callsLastQueryKey: get().callsLastQueryKey,
             }
 
             set(state => ({
+                callsMutationSeq: mutationSeq,
                 callLists: state.callLists.map(list =>
                     list.id === targetListId
                         ? { ...list, candidate_count: Math.max(0, (list.candidate_count || 0) + optimisticAddedCount) }
@@ -2407,49 +2469,64 @@ export const useAppStore = create(persist((set, get) => ({
                 callStatsLastFetchedAt: Date.now(),
             }))
 
-            void axios.post(
+            const res = await axios.post(
                 `${API_BASE}/calls/add-candidates`,
                 { candidate_ids: uniqueCandidateIds, list_id: targetListId },
                 { timeout: CALL_REQUEST_TIMEOUT_MS }
             )
-                .then(res => {
-                    const actualAddedCount = Number(res.data?.added_count || 0)
-                    const delta = actualAddedCount - optimisticAddedCount
-                    set(state => ({
-                        callLists: state.callLists.map(list =>
-                            list.id === targetListId
-                                ? { ...list, candidate_count: Math.max(0, (list.candidate_count || 0) + delta) }
-                                : list
-                        ),
-                        callStats: {
-                            ...state.callStats,
-                            due_today: Math.max(0, (state.callStats?.due_today || 0) + delta),
-                        },
-                        callListsLastFetchedAt: 0,
-                        callStatsLastFetchedAt: 0,
-                        callsCache: {},
-                        callsCacheFetchedAt: {},
-                        callsLastFetchedAt: 0,
-                        callsLastQueryKey: '',
-                    }))
-                    get().fetchCallStats({ force: true })
-                    get().fetchCallLists({ force: true })
-                    get().fetchCalls({ due_filter: 'today', status: 'pending' }, { force: true, updateState: false })
-                })
-                .catch(e => {
-                    console.error('Failed to add candidates to list:', e)
-                    set({
-                        callLists: previousState.callLists,
-                        callStats: previousState.callStats,
-                        callListsLastFetchedAt: previousState.callListsLastFetchedAt,
-                        callStatsLastFetchedAt: previousState.callStatsLastFetchedAt,
-                    })
-                    toast.error(getRequestErrorMessage(e, 'Failed to add candidates to list'))
-                })
+            const actualAddedCount = Number(res.data?.added_count || 0)
+            const delta = actualAddedCount - optimisticAddedCount
 
-            return { success: true, data: { success: true, added_count: optimisticAddedCount }, optimistic: true }
+            set(state => ({
+                callsMutationSeq: Math.max(state.callsMutationSeq || 0, mutationSeq),
+                callLists: state.callLists.map(list =>
+                    list.id === targetListId
+                        ? { ...list, candidate_count: Math.max(0, (list.candidate_count || 0) + delta) }
+                        : list
+                ),
+                callStats: {
+                    ...state.callStats,
+                    due_today: Math.max(0, (state.callStats?.due_today || 0) + delta),
+                },
+                callListsLastFetchedAt: 0,
+                callStatsLastFetchedAt: 0,
+                callsCache: {},
+                callsCacheFetchedAt: {},
+                callsLastFetchedAt: 0,
+                callsLastQueryKey: '',
+            }))
+
+            await Promise.allSettled([
+                get().fetchCallStats({ force: true }),
+                get().fetchCallLists({ force: true }),
+                get().fetchCalls({ due_filter: 'today', status: 'pending' }, { force: true, updateState: false }),
+                get().fetchCalls({ list_id: targetListId, status: 'pending' }, { force: true, updateState: false }),
+            ])
+
+            return { success: true, data: res.data }
         } catch (e) {
             console.error('Failed to add candidates to list:', e)
+            set(state => {
+                if (!previousState || state.callsMutationSeq !== mutationSeq) {
+                    return {
+                        callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                        callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    }
+                }
+
+                return {
+                    callLists: previousState.callLists,
+                    callStats: previousState.callStats,
+                    callListsLastFetchedAt: previousState.callListsLastFetchedAt,
+                    callStatsLastFetchedAt: previousState.callStatsLastFetchedAt,
+                    callsCache: previousState.callsCache,
+                    callsCacheFetchedAt: previousState.callsCacheFetchedAt,
+                    callsLastFetchedAt: previousState.callsLastFetchedAt,
+                    callsLastQueryKey: previousState.callsLastQueryKey,
+                    callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                }
+            })
             return { success: false, error: getRequestErrorMessage(e, 'Failed to add candidates to list') }
         }
     },
@@ -2505,9 +2582,10 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, error: 'Retrying calls shortly' }
         }
 
-        if (state.callsRequest && state.callsRequestQueryKey === queryKey) {
+        if (state.callsRequest && state.callsRequestQueryKey === queryKey && (!force || state.callsRequestSeq === state.callsMutationSeq)) {
+            const existingRequestSeq = state.callsRequestSeq
             return state.callsRequest.then(result => {
-                if (updateState && result?.success) {
+                if (updateState && result?.success && get().callsMutationSeq === existingRequestSeq) {
                     set({
                         calls: result.data || [],
                         callsLastFetchedAt: get().callsCacheFetchedAt[queryKey] || Date.now(),
@@ -2518,27 +2596,30 @@ export const useAppStore = create(persist((set, get) => ({
             })
         }
 
+        const requestSeq = state.callsMutationSeq
         const request = axios.get(`${API_BASE}/calls?${queryParams}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
-                if (get().callsRequestQueryKey === queryKey) {
+                const latestState = get()
+                if (latestState.callsRequestQueryKey === queryKey && latestState.callsRequestSeq === requestSeq) {
                     const fetchedAt = Date.now()
                     const nextState = {
                         callsCache: {
-                            ...get().callsCache,
+                            ...latestState.callsCache,
                             [queryKey]: res.data,
                         },
                         callsCacheFetchedAt: {
-                            ...get().callsCacheFetchedAt,
+                            ...latestState.callsCacheFetchedAt,
                             [queryKey]: fetchedAt,
                         },
                         callsRequest: null,
                         callsRequestQueryKey: '',
+                        callsRequestSeq: 0,
                         callsBackoffUntilByQuery: {
-                            ...get().callsBackoffUntilByQuery,
+                            ...latestState.callsBackoffUntilByQuery,
                             [queryKey]: 0,
                         },
                     }
-                    if (updateState) {
+                    if (updateState && latestState.callsMutationSeq === requestSeq) {
                         nextState.calls = res.data
                         nextState.callsLastFetchedAt = fetchedAt
                         nextState.callsLastQueryKey = queryKey
@@ -2549,10 +2630,11 @@ export const useAppStore = create(persist((set, get) => ({
             })
             .catch(e => {
                 console.error('Failed to fetch calls:', e)
-                if (get().callsRequestQueryKey === queryKey) {
+                if (get().callsRequestQueryKey === queryKey && get().callsRequestSeq === requestSeq) {
                     set({
                         callsRequest: null,
                         callsRequestQueryKey: '',
+                        callsRequestSeq: 0,
                         callsBackoffUntilByQuery: {
                             ...get().callsBackoffUntilByQuery,
                             [queryKey]: Date.now() + CALL_RETRY_BACKOFF_MS,
@@ -2576,6 +2658,7 @@ export const useAppStore = create(persist((set, get) => ({
         set({
             callsRequest: request,
             callsRequestQueryKey: queryKey,
+            callsRequestSeq: requestSeq,
         })
         return request
     },
@@ -2583,13 +2666,16 @@ export const useAppStore = create(persist((set, get) => ({
     updateCall: async (callId, data) => {
         try {
             await axios.patch(`${API_BASE}/calls/${callId}`, data)
+            const mutationSeq = get().callsMutationSeq + 1
             set(state => ({
+                callsMutationSeq: mutationSeq,
                 calls: state.calls.filter(c => c.id !== callId),
                 callsCache: {},
                 callsCacheFetchedAt: {},
                 callsLastFetchedAt: 0,
                 callsLastQueryKey: '',
                 callsRequestQueryKey: '',
+                callsRequestSeq: 0,
             }))
             get().fetchCallStats({ force: true })
             return { success: true }
@@ -2630,17 +2716,27 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
-    deleteCall: (callId) => {
+    deleteCall: async (callId) => {
         const previousState = {
             calls: get().calls,
             callLists: get().callLists,
             callStats: get().callStats,
+            callsCache: get().callsCache,
+            callsCacheFetchedAt: get().callsCacheFetchedAt,
+            callsLastFetchedAt: get().callsLastFetchedAt,
+            callsLastQueryKey: get().callsLastQueryKey,
+            callListsLastFetchedAt: get().callListsLastFetchedAt,
+            callStatsLastFetchedAt: get().callStatsLastFetchedAt,
         }
         const removedCall = (previousState.calls || []).find(c => c.id === callId)
         const listId = Number(removedCall?.list_id)
+        const dueTodayDelta = isDueTodayCall(removedCall) ? 1 : 0
+        const mutationSeq = get().callsMutationSeq + 1
 
         set(state => ({
+            callsMutationSeq: mutationSeq,
             calls: state.calls.filter(c => c.id !== callId),
+            callsCache: removeCallAcrossCaches(state.callsCache, callId),
             callLists: state.callLists.map(list =>
                 list.id === listId
                     ? { ...list, candidate_count: Math.max(0, (list.candidate_count || 0) - 1) }
@@ -2648,83 +2744,125 @@ export const useAppStore = create(persist((set, get) => ({
             ),
             callStats: {
                 ...state.callStats,
-                due_today: Math.max(0, (state.callStats?.due_today || 0) - 1),
+                due_today: Math.max(0, (state.callStats?.due_today || 0) - dueTodayDelta),
             },
             callListsLastFetchedAt: Date.now(),
             callStatsLastFetchedAt: Date.now(),
-            callsCache: {},
-            callsCacheFetchedAt: {},
-            callsLastFetchedAt: 0,
             callsRequestQueryKey: '',
+            callsRequestSeq: 0,
         }))
 
-        void axios.delete(`${API_BASE}/calls/${callId}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
-            .then(() => {
-                set({
-                    callListsLastFetchedAt: 0,
-                    callStatsLastFetchedAt: 0,
-                })
-                get().fetchCallStats({ force: true })
-                get().fetchCallLists({ force: true })
-            })
-            .catch(e => {
-                console.error('Failed to delete call:', e)
-                set({
+        try {
+            const res = await axios.delete(`${API_BASE}/calls/${callId}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
+            set(state => ({
+                callsMutationSeq: Math.max(state.callsMutationSeq || 0, mutationSeq),
+                callListsLastFetchedAt: 0,
+                callStatsLastFetchedAt: 0,
+            }))
+            await Promise.allSettled([
+                get().fetchCallStats({ force: true }),
+                get().fetchCallLists({ force: true }),
+            ])
+            return { success: true, data: res.data }
+        } catch (e) {
+            console.error('Failed to delete call:', e)
+            set(state => {
+                if (state.callsMutationSeq !== mutationSeq) {
+                    return {
+                        callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                        callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    }
+                }
+
+                return {
                     calls: previousState.calls,
                     callLists: previousState.callLists,
                     callStats: previousState.callStats,
-                })
-                toast.error(getRequestErrorMessage(e, 'Failed to remove candidate from list'))
+                    callsCache: previousState.callsCache,
+                    callsCacheFetchedAt: previousState.callsCacheFetchedAt,
+                    callsLastFetchedAt: previousState.callsLastFetchedAt,
+                    callsLastQueryKey: previousState.callsLastQueryKey,
+                    callListsLastFetchedAt: previousState.callListsLastFetchedAt,
+                    callStatsLastFetchedAt: previousState.callStatsLastFetchedAt,
+                    callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                }
             })
-
-        return Promise.resolve({ success: true, optimistic: true })
+            return { success: false, error: getRequestErrorMessage(e, 'Failed to remove candidate from list') }
+        }
     },
 
-    deleteCallList: (listId) => {
+    deleteCallList: async (listId) => {
         const previousState = {
             callLists: get().callLists,
             calls: get().calls,
             callStats: get().callStats,
+            callsCache: get().callsCache,
+            callsCacheFetchedAt: get().callsCacheFetchedAt,
+            callsLastFetchedAt: get().callsLastFetchedAt,
+            callsLastQueryKey: get().callsLastQueryKey,
+            callListsLastFetchedAt: get().callListsLastFetchedAt,
+            callStatsLastFetchedAt: get().callStatsLastFetchedAt,
         }
-        const removedCalls = (previousState.calls || []).filter(call => call.list_id === listId)
+        const targetListId = Number(listId)
+        const removedCalls = (previousState.calls || []).filter(call => Number(call.list_id) === targetListId)
+        const removedDueTodayCount = removedCalls.filter(isDueTodayCall).length
+        const mutationSeq = get().callsMutationSeq + 1
 
         set(state => ({
-            callLists: state.callLists.filter(l => l.id !== listId),
-            calls: state.calls.filter(call => call.list_id !== listId),
+            callsMutationSeq: mutationSeq,
+            callLists: state.callLists.filter(l => Number(l.id) !== targetListId),
+            calls: state.calls.filter(call => Number(call.list_id) !== targetListId),
             callStats: {
                 ...state.callStats,
                 active_lists: Math.max(0, (state.callStats?.active_lists || 0) - 1),
-                due_today: Math.max(0, (state.callStats?.due_today || 0) - removedCalls.length),
+                due_today: Math.max(0, (state.callStats?.due_today || 0) - removedDueTodayCount),
             },
-            callsCache: {},
-            callsCacheFetchedAt: {},
+            callsCache: removeCallsByListAcrossCaches(state.callsCache, targetListId),
             callListsLastFetchedAt: Date.now(),
             callStatsLastFetchedAt: Date.now(),
-            callsLastFetchedAt: 0,
-            callsLastQueryKey: '',
             callsRequestQueryKey: '',
+            callsRequestSeq: 0,
         }))
 
-        void axios.delete(`${API_BASE}/calls/lists/${listId}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
-            .then(() => {
-                set({
-                    callListsLastFetchedAt: 0,
-                    callStatsLastFetchedAt: 0,
-                })
-                get().fetchCallStats({ force: true })
-                get().fetchCallLists({ force: true })
-            })
-            .catch(e => {
-                console.error('Failed to delete call list:', e)
-                set({
+        try {
+            const res = await axios.delete(`${API_BASE}/calls/lists/${targetListId}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
+            set(state => ({
+                callsMutationSeq: Math.max(state.callsMutationSeq || 0, mutationSeq),
+                callListsLastFetchedAt: 0,
+                callStatsLastFetchedAt: 0,
+            }))
+            await Promise.allSettled([
+                get().fetchCallStats({ force: true }),
+                get().fetchCallLists({ force: true }),
+            ])
+            return { success: true, data: res.data }
+        } catch (e) {
+            console.error('Failed to delete call list:', e)
+            set(state => {
+                if (state.callsMutationSeq !== mutationSeq) {
+                    return {
+                        callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                        callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    }
+                }
+
+                return {
                     callLists: previousState.callLists,
                     calls: previousState.calls,
                     callStats: previousState.callStats,
-                })
-                toast.error(getRequestErrorMessage(e, 'Failed to delete list'))
+                    callsCache: previousState.callsCache,
+                    callsCacheFetchedAt: previousState.callsCacheFetchedAt,
+                    callsLastFetchedAt: previousState.callsLastFetchedAt,
+                    callsLastQueryKey: previousState.callsLastQueryKey,
+                    callListsLastFetchedAt: previousState.callListsLastFetchedAt,
+                    callStatsLastFetchedAt: previousState.callStatsLastFetchedAt,
+                    callListsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                }
             })
-
-        return Promise.resolve({ success: true, optimistic: true })
+            return { success: false, error: getRequestErrorMessage(e, 'Failed to delete list') }
+        }
     },
 
     fetchCallStats: async (options = {}) => {
@@ -2745,30 +2883,43 @@ export const useAppStore = create(persist((set, get) => ({
             return { success: false, error: 'Retrying call stats shortly' }
         }
 
-        if (state.callStatsRequest) {
+        if (state.callStatsRequest && (!force || state.callStatsRequestSeq === state.callsMutationSeq)) {
             return state.callStatsRequest
         }
 
+        const requestSeq = state.callsMutationSeq
         const request = axios.get(`${API_BASE}/calls/stats`, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
-                set({
-                    callStats: res.data,
-                    callStatsLastFetchedAt: Date.now(),
-                    callStatsRequest: null,
-                    callStatsBackoffUntil: 0,
-                })
+                const latestState = get()
+                if (latestState.callStatsRequestSeq === requestSeq && latestState.callsMutationSeq === requestSeq) {
+                    set({
+                        callStats: res.data,
+                        callStatsLastFetchedAt: Date.now(),
+                        callStatsRequest: null,
+                        callStatsRequestSeq: 0,
+                        callStatsBackoffUntil: 0,
+                    })
+                } else if (latestState.callStatsRequestSeq === requestSeq) {
+                    set({
+                        callStatsRequest: null,
+                        callStatsRequestSeq: 0,
+                    })
+                }
                 return { success: true, data: res.data, cached: false }
             })
             .catch(e => {
                 console.error('Failed to fetch call stats:', e)
-                set({
-                    callStatsRequest: null,
-                    callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
-                })
+                if (get().callStatsRequestSeq === requestSeq) {
+                    set({
+                        callStatsRequest: null,
+                        callStatsRequestSeq: 0,
+                        callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
+                    })
+                }
                 return { success: false, error: e.response?.data?.detail || 'Failed to fetch call stats' }
             })
 
-        set({ callStatsRequest: request })
+        set({ callStatsRequest: request, callStatsRequestSeq: requestSeq })
         return request
     },
 
@@ -2829,12 +2980,14 @@ export const useAppStore = create(persist((set, get) => ({
 
             if (isMissingCallTask) {
                 set(state => ({
+                    callsMutationSeq: (state.callsMutationSeq || 0) + 1,
                     calls: (state.calls || []).filter(call => Number(call?.id) !== Number(callId)),
                     callsCache: removeCallAcrossCaches(state.callsCache, callId),
                     callsCacheFetchedAt: {},
                     callsLastFetchedAt: 0,
                     callsRequest: null,
                     callsRequestQueryKey: '',
+                    callsRequestSeq: 0,
                 }))
             }
 
@@ -2883,9 +3036,13 @@ export const useAppStore = create(persist((set, get) => ({
             callsLastFetchedAt: 0,
             callStatsLastFetchedAt: 0,
             callListsRequest: null,
+            callListsRequestSeq: 0,
             callsRequest: null,
             callsRequestQueryKey: '',
+            callsRequestSeq: 0,
+            callsMutationSeq: 0,
             callStatsRequest: null,
+            callStatsRequestSeq: 0,
             tpScopeTotal: nextState.tpScopeTotal,
             tpScopeStatusCounts: nextState.tpScopeStatusCounts || {},
             tpScopeSummaryRequest: null,

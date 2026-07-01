@@ -9,8 +9,9 @@ from backend.api.routes import calls
 
 
 class _FakeCursor:
-    def __init__(self, fetchone_results=None, execute_side_effect=None):
+    def __init__(self, fetchone_results=None, fetchall_results=None, execute_side_effect=None):
         self._fetchone_results = list(fetchone_results or [])
+        self._fetchall_results = list(fetchall_results or [])
         self._execute_side_effect = execute_side_effect
         self.executed = []
 
@@ -29,6 +30,11 @@ class _FakeCursor:
         if self._fetchone_results:
             return self._fetchone_results.pop(0)
         return None
+
+    def fetchall(self):
+        if self._fetchall_results:
+            return self._fetchall_results.pop(0)
+        return []
 
     def close(self):
         return None
@@ -134,3 +140,96 @@ def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
     assert "FROM calls" in first_queries[0]
     assert "FROM call_lists" in first_queries[1]
     assert "FROM candidates" in first_queries[2]
+
+
+def test_add_candidates_duplicate_returns_400_without_wrapping(monkeypatch):
+    cursor = _FakeCursor(fetchone_results=[(1,), (1,)])
+    conn = _FakeConnection(cursor)
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        calls.add_candidates_to_list(
+            calls.AddCandidatesRequest(candidate_ids=[101], list_id=7),
+            current_user=_build_user(),
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 400
+    assert exc.detail == "Candidate is already in this call list"
+    assert conn.rollbacks == 1
+
+
+def test_add_candidates_success_invalidates_cache(monkeypatch):
+    cursor = _FakeCursor(fetchone_results=[(1,), (0,)], fetchall_results=[[(10,), (11,)]])
+    conn = _FakeConnection(cursor)
+    invalidated = []
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda conn: invalidated.append(conn))
+
+    result = calls.add_candidates_to_list(
+        calls.AddCandidatesRequest(candidate_ids=[101, 102], list_id=7),
+        current_user=_build_user(),
+    )
+
+    assert result == {"success": True, "added_count": 2}
+    assert conn.commits == 1
+    assert invalidated == [conn]
+
+
+def test_delete_missing_call_returns_404(monkeypatch):
+    cursor = _FakeCursor(fetchone_results=[None])
+    conn = _FakeConnection(cursor)
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        calls.delete_call(42, current_user=_build_user())
+
+    exc = exc_info.value
+    assert exc.status_code == 404
+    assert exc.detail == "Call task not found"
+    assert conn.rollbacks == 1
+    assert conn.commits == 0
+
+
+def test_delete_missing_call_list_returns_404(monkeypatch):
+    cursor = _FakeCursor(fetchone_results=[(3,), None])
+    conn = _FakeConnection(cursor)
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        calls.delete_call_list(7, current_user=_build_user())
+
+    exc = exc_info.value
+    assert exc.status_code == 404
+    assert exc.detail == "Call list not found"
+    assert conn.rollbacks == 1
+    assert conn.commits == 0
+
+
+def test_delete_call_list_returns_deleted_call_count_and_invalidates(monkeypatch):
+    cursor = _FakeCursor(fetchone_results=[(3,), (7,)])
+    conn = _FakeConnection(cursor)
+    invalidated = []
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda conn: invalidated.append(conn))
+
+    result = calls.delete_call_list(7, current_user=_build_user())
+
+    assert result == {"success": True, "deleted_call_count": 3}
+    assert conn.commits == 1
+    assert invalidated == [conn]

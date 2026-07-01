@@ -632,7 +632,7 @@ def add_candidates_to_list(
             (request.list_id, request.candidate_ids)
         )
         if cur.fetchone()[0] > 0:
-            raise HTTPException(status_code=400, detail="He or she is already there.")
+            raise HTTPException(status_code=400, detail="Candidate is already in this call list")
 
         cur.execute(
             """
@@ -651,6 +651,9 @@ def add_candidates_to_list(
         conn.commit()
         invalidate_calls_cache(conn)
         return {"success": True, "added_count": inserted_count}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -950,9 +953,15 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
             (call_id, owner),
         )
         deleted = cur.fetchone()
+        if not deleted:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Call task not found")
+
         conn.commit()
         invalidate_calls_cache(conn)
-        return {"success": deleted is not None, "list_id": deleted[0] if deleted else None}
+        return {"success": True, "list_id": deleted[0]}
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -975,6 +984,18 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
         cur = conn.cursor()
         cur.execute(
             """
+            SELECT COUNT(*)
+            FROM calls c
+            JOIN call_lists cl ON c.list_id = cl.id
+            WHERE c.list_id = %s
+              AND LOWER(COALESCE(cl.created_by, '')) = %s
+            """,
+            (list_id, owner),
+        )
+        deleted_call_count = cur.fetchone()[0] or 0
+
+        cur.execute(
+            """
             DELETE FROM call_lists
             WHERE id = %s
               AND LOWER(COALESCE(created_by, '')) = %s
@@ -983,9 +1004,15 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
             (list_id, owner),
         )
         deleted = cur.fetchone()
+        if not deleted:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Call list not found")
+
         conn.commit()
         invalidate_calls_cache(conn)
-        return {"success": deleted is not None}
+        return {"success": True, "deleted_call_count": deleted_call_count}
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
