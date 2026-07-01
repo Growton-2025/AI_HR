@@ -140,6 +140,40 @@ const buildVoipCallEvent = (type, detail = {}, fallbackNumber = '') => {
   };
 };
 
+const stopAudioElement = (audio) => {
+  if (!audio) return;
+  try {
+    audio.pause?.();
+    audio.currentTime = 0;
+    const stream = audio.srcObject;
+    if (stream && typeof stream.getTracks === 'function') {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    audio.srcObject = null;
+    audio.removeAttribute?.('src');
+    audio.load?.();
+  } catch (_) {
+    // Best-effort browser audio cleanup.
+  }
+};
+
+const stopPlivoManagedAudio = () => {
+  if (typeof document === 'undefined') return;
+  document.querySelectorAll('audio').forEach(audio => {
+    const idClass = `${audio.id || ''} ${audio.className || ''}`.toLowerCase();
+    const src = String(audio.src || '').toLowerCase();
+    const isPlivoOrRingtone =
+      idClass.includes('plivo') ||
+      idClass.includes('ringtone') ||
+      /\bring\b/.test(idClass) ||
+      src.includes('plivo') ||
+      src.includes('ringtone');
+    if (isPlivoOrRingtone) {
+      stopAudioElement(audio);
+    }
+  });
+};
+
 export function useVoIP() {
   return useContext(VoIPContext);
 }
@@ -170,6 +204,29 @@ export function VoIPProvider({ children }) {
   const recoveryTimerRef = useRef(null);
   const queuedForceInitRef = useRef(false);
 
+  const hangupSoftphoneCall = () => {
+    const softphone = softphoneRef.current;
+    if (!softphone) return;
+    [
+      () => softphone.hangup?.(),
+      () => softphone.reject?.(),
+      () => softphone.client?.hangup?.(),
+      () => softphone.client?.reject?.(),
+    ].forEach(attempt => {
+      try {
+        attempt();
+      } catch (_) {
+        // Different Plivo SDK builds expose different call-ending methods.
+      }
+    });
+  };
+
+  const stopCallAudio = () => {
+    stopAudioElement(remoteAudioRef.current);
+    stopAudioElement(localAudioRef.current);
+    stopPlivoManagedAudio();
+  };
+
   useEffect(() => {
     const remoteAudio = document.createElement('audio');
     remoteAudio.autoplay = true;
@@ -192,13 +249,15 @@ export function VoIPProvider({ children }) {
         window.clearTimeout(recoveryTimerRef.current);
         recoveryTimerRef.current = null;
       }
+      hangupSoftphoneCall();
+      stopCallAudio();
       try {
         softphoneRef.current?.logout?.();
       } catch (_) {
         // Ignore shutdown errors when the provider unmounts.
       }
-      document.body.removeChild(remoteAudio);
-      document.body.removeChild(localAudio);
+      remoteAudio.remove();
+      localAudio.remove();
     };
   }, []);
 
@@ -507,17 +566,8 @@ export function VoIPProvider({ children }) {
   };
 
   const rejectCall = async () => {
-    if (softphoneRef.current) {
-      try {
-        if (typeof softphoneRef.current.hangup === 'function') {
-          softphoneRef.current.hangup();
-        } else if (softphoneRef.current.client && typeof softphoneRef.current.client.hangup === 'function') {
-          softphoneRef.current.client.hangup();
-        }
-      } catch (e) {
-        console.error('Plivo hangup error:', e);
-      }
-    }
+    hangupSoftphoneCall();
+    stopCallAudio();
     setVoipCallEvent({
       at: Date.now(),
       type: 'terminated',

@@ -1897,6 +1897,12 @@ function CallingModal({ call, onClose, onRefresh }) {
                   : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
 
   const isLiveCallState = ['preparing_softphone', 'connecting', 'waiting_for_invite', 'answer_required', 'invite_received', 'active', 'error'].includes(callState);
+  const handleCloseModal = useCallback(async () => {
+    if (isLiveCallState || activeCall || isInitiated.current) {
+      await rejectCall();
+    }
+    onClose();
+  }, [activeCall, isLiveCallState, onClose, rejectCall]);
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
@@ -1923,7 +1929,7 @@ function CallingModal({ call, onClose, onRefresh }) {
               </button>
             ))}
           </div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8' }}>
+          <button onClick={handleCloseModal} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8' }}>
             <X size={20} />
           </button>
         </div>
@@ -2109,7 +2115,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                         <RefreshCw size={20} /> Retry VoIP
                       </button>
                       <button
-                        onClick={onClose}
+                        onClick={handleCloseModal}
                         style={{
                           ...CALL_SECONDARY_BUTTON,
                           flex: 1,

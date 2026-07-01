@@ -2458,11 +2458,12 @@ export const useAppStore = create(persist((set, get) => ({
         const cachedData = state.callsCache[queryKey]
         const cachedAt = state.callsCacheFetchedAt[queryKey] || 0
         const backoffUntil = state.callsBackoffUntilByQuery?.[queryKey] || 0
+        const hasCachedData = Array.isArray(cachedData)
         const isFresh = Array.isArray(cachedData) &&
             cachedAt &&
             (Date.now() - cachedAt < maxAgeMs)
 
-        if (!force && isFresh) {
+        if (!force && hasCachedData) {
             if (updateState) {
                 set({
                     calls: cachedData,
@@ -2470,11 +2471,13 @@ export const useAppStore = create(persist((set, get) => ({
                     callsLastQueryKey: queryKey,
                 })
             }
-            return { success: true, data: cachedData, cached: true }
+            if (isFresh) {
+                return { success: true, data: cachedData, cached: true }
+            }
         }
 
         if (backoffUntil && Date.now() < backoffUntil) {
-            if (Array.isArray(cachedData)) {
+            if (hasCachedData) {
                 if (updateState) {
                     set({
                         calls: cachedData,
