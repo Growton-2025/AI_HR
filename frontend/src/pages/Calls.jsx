@@ -913,15 +913,19 @@ export default function Calls() {
     if (!hasCache) setLoading(true);
     else setIsRevalidating(true);
 
-    void fetchCallStats().then(res => {
+    const statsPromise = fetchCallStats({ force: true }).then(res => {
       if (!res?.success) {
         console.error('Failed to refresh call stats:', res?.error);
       }
+      return res;
     });
 
     try {
       if (activeTab === 'lists' && !selectedList) {
-        const listsRes = await fetchCallLists();
+        const [listsRes] = await Promise.all([
+          fetchCallLists(),
+          statsPromise,
+        ]);
         if (!listsRes?.success) {
           setFetchNotice(hasCache ? 'Server is slow. Showing the last available call lists.' : 'Server is slow. Trying again shortly.');
           retryTimerRef.current = setTimeout(() => {
@@ -942,7 +946,10 @@ export default function Calls() {
           params.status = 'pending';
         }
 
-        const callsRes = await fetchCalls(params);
+        const [callsRes] = await Promise.all([
+          fetchCalls(params),
+          statsPromise,
+        ]);
         if (!callsRes?.success) {
           setFetchNotice(hasCache ? 'Server is slow. Showing the last available call tasks.' : 'Server is slow. Trying again shortly.');
           retryTimerRef.current = setTimeout(() => {

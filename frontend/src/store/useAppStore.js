@@ -2389,15 +2389,16 @@ export const useAppStore = create(persist((set, get) => ({
                     list.id !== optimisticId &&
                     normalizeListName(list?.name) !== normalizedName
                 )
+                const nextLists = sortCallListsByCreatedAt([createdList, ...remainingLists])
 
                 return {
                     callsMutationSeq: Math.max(currentState.callsMutationSeq || 0, mutationSeq),
-                    callLists: sortCallListsByCreatedAt([createdList, ...remainingLists]),
+                    callLists: nextLists,
                     callListsLastFetchedAt: Date.now(),
                     callListsBackoffUntil: 0,
                     callStats: {
                         ...currentState.callStats,
-                        active_lists: Math.max(currentState.callStats?.active_lists || 0, remainingLists.length + 1),
+                        active_lists: nextLists.length,
                     },
                     callStatsLastFetchedAt: Date.now(),
                     callStatsBackoffUntil: 0,

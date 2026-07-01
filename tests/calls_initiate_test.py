@@ -1,4 +1,5 @@
 from contextlib import AbstractContextManager
+from datetime import date, datetime
 
 import psycopg2
 import pytest
@@ -233,3 +234,62 @@ def test_delete_call_list_returns_deleted_call_count_and_invalidates(monkeypatch
     assert result == {"success": True, "deleted_call_count": 3}
     assert conn.commits == 1
     assert invalidated == [conn]
+
+
+def test_warm_call_caches_publishes_one_consistent_snapshot(monkeypatch):
+    cursor = _FakeCursor(
+        fetchall_results=[
+            [(7, "Customer Marketing - Locad", datetime(2026, 7, 1, 10, 0, 0), "owner@example.com")],
+            [(
+                42,
+                101,
+                7,
+                "pending",
+                None,
+                None,
+                0,
+                date(2026, 7, 1),
+                datetime(2026, 7, 1, 10, 1, 0),
+                "Call 1 - Day 1",
+                "Latha Ramakrishnan",
+                "Candidate",
+                "+919008999139",
+                None,
+                None,
+                None,
+                None,
+                "owner@example.com",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )],
+        ]
+    )
+    conn = _FakeConnection(cursor)
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    calls._stats_cache = {"owner@example.com": {"due_today": 99}}
+    calls._stats_cache_ts = {"owner@example.com": 1}
+    calls._call_lists_cache = [{"id": 99, "name": "Old", "created_by": "owner@example.com"}]
+    calls._calls_cache = []
+
+    calls.warm_call_caches(conn)
+
+    with calls._calls_lock:
+        assert calls._call_lists_cache == [
+            {
+                "id": 7,
+                "name": "Customer Marketing - Locad",
+                "created_at": datetime(2026, 7, 1, 10, 0, 0),
+                "created_by": "owner@example.com",
+            }
+        ]
+        assert [call["id"] for call in calls._calls_cache] == [42]
+        assert calls._calls_cache[0]["list_id"] == 7
+        assert calls._stats_cache == {}
+        assert calls._stats_cache_ts == {}

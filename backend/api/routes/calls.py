@@ -120,6 +120,34 @@ def get_call_list_owner(current_user: schemas.User) -> str:
     return owner
 
 
+def load_calls_cache_data(conn) -> List[dict]:
+    with conn.cursor() as cur:
+        cur.execute(f"{CALLS_SELECT_QUERY} ORDER BY c.due_date ASC, c.created_at DESC")
+        rows = cur.fetchall()
+        return [call_row_to_dict(row) for row in rows]
+
+
+def load_call_lists_cache_data(conn) -> List[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, created_at, LOWER(COALESCE(created_by, ''))
+            FROM call_lists
+            ORDER BY created_at DESC
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "created_at": row[2],
+                "created_by": row[3],
+            }
+            for row in rows
+        ]
+
+
 def build_call_initiation_error(
     code: str,
     message: str,
@@ -156,13 +184,10 @@ def bulk_load_calls_cache(shared_conn=None):
     def _do_load(conn):
         global _calls_cache
         try:
-            with conn.cursor() as cur:
-                cur.execute(f"{CALLS_SELECT_QUERY} ORDER BY c.due_date ASC, c.created_at DESC")
-                rows = cur.fetchall()
-                data = [call_row_to_dict(row) for row in rows]
-                with _calls_lock:
-                    _calls_cache = data
-                print(f"DEBUG: Bulk-warmed {len(data)} calls into memory.")
+            data = load_calls_cache_data(conn)
+            with _calls_lock:
+                _calls_cache = data
+            print(f"DEBUG: Bulk-warmed {len(data)} calls into memory.")
         except Exception as e:
             print(f"WARNING: Failed to warm calls cache: {e}")
 
@@ -181,27 +206,10 @@ def bulk_load_call_lists_cache(shared_conn=None):
     def _do_load(conn):
         global _call_lists_cache
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, name, created_at, LOWER(COALESCE(created_by, ''))
-                    FROM call_lists
-                    ORDER BY created_at DESC
-                    """
-                )
-                rows = cur.fetchall()
-                data = [
-                    {
-                        "id": row[0],
-                        "name": row[1],
-                        "created_at": row[2],
-                        "created_by": row[3],
-                    }
-                    for row in rows
-                ]
-                with _calls_lock:
-                    _call_lists_cache = data
-                print(f"DEBUG: Bulk-warmed {len(data)} call lists into memory.")
+            data = load_call_lists_cache_data(conn)
+            with _calls_lock:
+                _call_lists_cache = data
+            print(f"DEBUG: Bulk-warmed {len(data)} call lists into memory.")
         except Exception as e:
             print(f"WARNING: Failed to warm call lists cache: {e}")
 
@@ -214,15 +222,27 @@ def bulk_load_call_lists_cache(shared_conn=None):
 
 
 def warm_call_caches(shared_conn=None):
+    global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
+
+    def _warm_from_connection(conn):
+        global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
+        call_lists_data = load_call_lists_cache_data(conn)
+        calls_data = load_calls_cache_data(conn)
+        with _calls_lock:
+            _call_lists_cache = call_lists_data
+            _calls_cache = calls_data
+            _stats_cache = {}
+            _stats_cache_ts = {}
+        print(f"DEBUG: Bulk-warmed {len(call_lists_data)} call lists into memory.")
+        print(f"DEBUG: Bulk-warmed {len(calls_data)} calls into memory.")
+
     ensure_calls_schema_ready()
     if shared_conn:
-        bulk_load_call_lists_cache(shared_conn)
-        bulk_load_calls_cache(shared_conn)
+        _warm_from_connection(shared_conn)
     else:
         with get_db_connection_context(validate=True, register_pgvector=False) as conn:
             if conn:
-                bulk_load_call_lists_cache(conn)
-                bulk_load_calls_cache(conn)
+                _warm_from_connection(conn)
 
 
 def refresh_call_caches_async():
