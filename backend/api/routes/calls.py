@@ -111,6 +111,35 @@ def invalidate_calls_cache():
         _stats_cache_ts = {}
     refresh_call_caches_async()
 
+
+def evict_call_from_cache(call_id: int):
+    """Synchronously remove a single deleted call from _calls_cache so that
+    GET /calls, GET /calls/lists, and GET /calls/stats immediately reflect the
+    deletion — before the async background refresh finishes.
+    """
+    global _calls_cache
+    with _calls_lock:
+        if _calls_cache is not None:
+            _calls_cache = [c for c in _calls_cache if c.get("id") != call_id]
+        # Wipe stats so they are recomputed from the patched cache
+        global _stats_cache, _stats_cache_ts
+        _stats_cache = {}
+        _stats_cache_ts = {}
+
+
+def evict_call_list_from_cache(list_id: int):
+    """Synchronously remove a deleted call list and all its calls from the
+    in-memory caches so every GET endpoint immediately sees up-to-date data.
+    """
+    global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
+    with _calls_lock:
+        if _calls_cache is not None:
+            _calls_cache = [c for c in _calls_cache if c.get("list_id") != list_id]
+        if _call_lists_cache is not None:
+            _call_lists_cache = [l for l in _call_lists_cache if l.get("id") != list_id]
+        _stats_cache = {}
+        _stats_cache_ts = {}
+
 def get_call_list_owner(current_user: schemas.User) -> str:
     owner = (current_user.email or current_user.username or "").strip().lower()
     if not owner:
@@ -997,7 +1026,8 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
         cur = None
         return_db_connection(conn)
         conn = None
-        invalidate_calls_cache()
+        evict_call_from_cache(call_id)
+        refresh_call_caches_async()
         return {"success": True, "list_id": deleted[0]}
     except HTTPException:
         if conn: conn.rollback()
@@ -1054,7 +1084,8 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
         cur = None
         return_db_connection(conn)
         conn = None
-        invalidate_calls_cache()
+        evict_call_list_from_cache(list_id)
+        refresh_call_caches_async()
         return {"success": True, "deleted_call_count": deleted_call_count}
     except HTTPException:
         if conn: conn.rollback()
