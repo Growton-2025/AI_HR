@@ -70,6 +70,11 @@ def normalize_number(number):
         return f"+{digits}" if digits else ""
 
 
+def download_plivo_recording(record_url: str, timeout: int = 30):
+    auth = (PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN) if PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN else None
+    return requests.get(record_url, timeout=timeout, auth=auth)
+
+
 def record_browser_dial(username: str, call_uuid: str, to_number: str):
     global latest_call_uuid
     if not username or not call_uuid:
@@ -259,7 +264,7 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         max_retries = 6
         response = None
         for attempt in range(max_retries):
-            response = await asyncio.to_thread(requests.get, record_url, timeout=30)
+            response = await asyncio.to_thread(download_plivo_recording, record_url, 30)
             if response.status_code == 200:
                 break
             logger.warning(f"Download failed with {response.status_code}. Retrying in 5s...")

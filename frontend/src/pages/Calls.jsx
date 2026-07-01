@@ -1561,6 +1561,10 @@ function CallingModal({ call, onClose, onRefresh }) {
         setInitiationActionUrl(res.actionUrl || '');
         setCallState('error');
         toast.error(message);
+        if (res.errorCode === 'call_task_not_found') {
+          await onRefresh?.();
+          onClose();
+        }
         return;
       }
 
@@ -1594,7 +1598,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, placeCall, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
+  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, onClose, onRefresh, placeCall, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
 
   useEffect(() => {
     if (isInitiated.current) return;

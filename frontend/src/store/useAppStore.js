@@ -296,6 +296,21 @@ function patchCallAcrossCaches(callsCache = {}, updatedCall) {
     return { nextCache, found }
 }
 
+function removeCallAcrossCaches(callsCache = {}, callId) {
+    const targetId = Number(callId)
+    const nextCache = {}
+
+    for (const [queryKey, entries] of Object.entries(callsCache || {})) {
+        if (!Array.isArray(entries)) {
+            nextCache[queryKey] = entries
+            continue
+        }
+        nextCache[queryKey] = entries.filter(call => Number(call?.id) !== targetId)
+    }
+
+    return nextCache
+}
+
 // API base URL
 // On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
 // causing cross-origin preflight failures.
@@ -2808,13 +2823,31 @@ export const useAppStore = create(persist((set, get) => ({
         } catch (error) {
             console.error('Failed to initiate call:', error)
             const detail = getRequestErrorDetail(error, 'Initiation failed')
+            const status = error?.response?.status
+            const isMissingCallTask = status === 404 &&
+                String(detail.message || '').toLowerCase().includes('call task not found')
+
+            if (isMissingCallTask) {
+                set(state => ({
+                    calls: (state.calls || []).filter(call => Number(call?.id) !== Number(callId)),
+                    callsCache: removeCallAcrossCaches(state.callsCache, callId),
+                    callsCacheFetchedAt: {},
+                    callsLastFetchedAt: 0,
+                    callsRequest: null,
+                    callsRequestQueryKey: '',
+                }))
+            }
+
             return {
                 success: false,
-                error: detail.message,
-                errorCode: detail.code,
+                error: isMissingCallTask
+                    ? 'This call task no longer exists. Refreshing the Calls workspace.'
+                    : detail.message,
+                errorCode: isMissingCallTask ? 'call_task_not_found' : detail.code,
                 actionLabel: detail.actionLabel,
                 actionUrl: detail.actionUrl,
                 errorMeta: detail.meta,
+                httpStatus: status,
             }
         }
     },

@@ -108,7 +108,7 @@ def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
     monkeypatch.setattr(calls, "get_db_connection_context", lambda **kwargs: _FakeConnectionContext(first_conn))
     monkeypatch.setattr(calls, "get_calls_db_connection", lambda: second_conn)
     monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
-    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda: None)
+    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda *args, **kwargs: None)
     monkeypatch.setattr(calls, "refresh_call_caches_async", lambda: None)
     monkeypatch.setattr(
         calls,

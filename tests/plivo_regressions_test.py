@@ -102,6 +102,34 @@ def test_recording_callback_waits_for_final_recording_metadata():
     ) is True
 
 
+def test_download_plivo_recording_uses_account_auth(monkeypatch):
+    captured = {}
+
+    def fake_get(url, timeout=None, auth=None):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["auth"] = auth
+
+        class _Response:
+            status_code = 200
+            content = b"audio"
+
+        return _Response()
+
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_ID", "auth-id")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_TOKEN", "auth-token")
+    monkeypatch.setattr(plivo_service.requests, "get", fake_get)
+
+    response = plivo_service.download_plivo_recording("https://media.example.com/recording.mp3", timeout=17)
+
+    assert response.status_code == 200
+    assert captured == {
+        "url": "https://media.example.com/recording.mp3",
+        "timeout": 17,
+        "auth": ("auth-id", "auth-token"),
+    }
+
+
 def test_setup_plivo_serializes_concurrent_endpoint_creation(monkeypatch):
     _reset_plivo_setup_state()
 
