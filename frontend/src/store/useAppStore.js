@@ -336,6 +336,31 @@ function isDueTodayCall(call) {
     return dueDate <= today
 }
 
+// Canonical query key for the calls cache: drops empty values, stringifies,
+// and sorts params so `{status, list_id}` and `{list_id, status}` (or a number
+// vs string list_id) always map to the SAME cache entry. Without this, two
+// callers requesting the same view could read/write different cache keys and
+// briefly show each other's stale data.
+export function canonicalCallsQuery(params = {}) {
+    const entries = Object.entries(params || {})
+        .filter(([, value]) => value !== undefined && value !== null && value !== '')
+        .map(([key, value]) => [key, String(value)])
+        .sort(([left], [right]) => left.localeCompare(right))
+    return new URLSearchParams(entries).toString()
+}
+
+function clearCallRequestState() {
+    return {
+        callListsRequest: null,
+        callListsRequestSeq: -1,
+        callsRequest: null,
+        callsRequestQueryKey: '',
+        callsRequestSeq: -1,
+        callStatsRequest: null,
+        callStatsRequestSeq: -1,
+    }
+}
+
 // API base URL
 // On localhost/dev, always prefer same-origin `/api` to avoid stale external VITE_API_URL values
 // causing cross-origin preflight failures.
@@ -2367,6 +2392,7 @@ export const useAppStore = create(persist((set, get) => ({
         const mutationSeq = get().callsMutationSeq + 1
 
         set(currentState => ({
+            ...clearCallRequestState(),
             callsMutationSeq: mutationSeq,
             callLists: sortCallListsByCreatedAt([optimisticList, ...currentState.callLists]),
             callListsLastFetchedAt: Date.now(),
@@ -2455,6 +2481,7 @@ export const useAppStore = create(persist((set, get) => ({
             }
 
             set(state => ({
+                ...clearCallRequestState(),
                 callsMutationSeq: mutationSeq,
                 callLists: state.callLists.map(list =>
                     list.id === targetListId
@@ -2496,7 +2523,9 @@ export const useAppStore = create(persist((set, get) => ({
                 callsLastQueryKey: '',
             }))
 
-            await Promise.allSettled([
+            // Fire-and-forget: counts were already reconciled from added_count
+            // above, so the modal shouldn't wait ~2-3s for these revalidations.
+            void Promise.allSettled([
                 get().fetchCallStats({ force: true }),
                 get().fetchCallLists({ force: true }),
                 get().fetchCalls({ due_filter: 'today', status: 'pending' }, { force: true, updateState: false }),
@@ -2543,8 +2572,27 @@ export const useAppStore = create(persist((set, get) => ({
             params = {};
         }
 
-        const queryParams = new URLSearchParams(params).toString()
+        const queryParams = canonicalCallsQuery(params)
         const queryKey = queryParams || '__all__'
+
+        // Background mode: plain fetch that ONLY refreshes the cache entry.
+        // It never touches callsRequest/callsRequestQueryKey/callsRequestSeq,
+        // so a poller (e.g. the post-call review modal) can run concurrently
+        // without clobbering the page's in-flight fetch and its commit guard.
+        if (typeof optionsVal === 'object' && optionsVal.background === true) {
+            try {
+                const res = await axios.get(`${API_BASE}/calls?${queryParams}`, { timeout: CALL_REQUEST_TIMEOUT_MS })
+                set(state => ({
+                    callsCache: { ...state.callsCache, [queryKey]: res.data },
+                    callsCacheFetchedAt: { ...state.callsCacheFetchedAt, [queryKey]: Date.now() },
+                }))
+                return { success: true, data: res.data, cached: false }
+            } catch (e) {
+                console.error('Background calls fetch failed:', e)
+                return { success: false, error: getRequestErrorMessage(e, 'Failed to fetch calls') }
+            }
+        }
+
         const maxAgeMs = 15 * 1000
         const state = get()
         const cachedData = state.callsCache[queryKey]
@@ -2586,8 +2634,14 @@ export const useAppStore = create(persist((set, get) => ({
             const existingRequestSeq = state.callsRequestSeq
             return state.callsRequest.then(result =>
             {
-                // When deduplicating, always update state if data arrives
-                if (updateState && result?.success) {
+                const latestState = get()
+                const requestStillCurrent = latestState.callsRequestQueryKey === queryKey &&
+                    latestState.callsRequestSeq === existingRequestSeq
+                const requestSettledWithoutMutation = latestState.callsRequestQueryKey === '' &&
+                    latestState.callsRequestSeq === 0 &&
+                    latestState.callsMutationSeq === existingRequestSeq
+                // When deduplicating, only update state if this request was not invalidated by a mutation.
+                if (updateState && result?.success && (requestStillCurrent || requestSettledWithoutMutation)) {
                     set({
                         calls: result.data || [],
                         callsLastFetchedAt: get().callsCacheFetchedAt[queryKey] || Date.now(),
@@ -2670,11 +2724,16 @@ export const useAppStore = create(persist((set, get) => ({
     },
 
     updateCall: async (callId, data) => {
+        const mutationSeq = get().callsMutationSeq + 1
+        set(state => ({
+            ...clearCallRequestState(),
+            callsMutationSeq: mutationSeq,
+        }))
+
         try {
-            await axios.patch(`${API_BASE}/calls/${callId}`, data)
-            const mutationSeq = get().callsMutationSeq + 1
+            const res = await axios.patch(`${API_BASE}/calls/${callId}`, data)
             set(state => ({
-                callsMutationSeq: mutationSeq,
+                callsMutationSeq: Math.max(state.callsMutationSeq || 0, mutationSeq),
                 calls: state.calls.filter(c => c.id !== callId),
                 callsCache: {},
                 callsCacheFetchedAt: {},
@@ -2684,7 +2743,7 @@ export const useAppStore = create(persist((set, get) => ({
                 callsRequestSeq: 0,
             }))
             get().fetchCallStats({ force: true })
-            return { success: true }
+            return { success: true, data: res.data }
         } catch (e) {
             console.error('Failed to update call:', e)
             return { success: false, error: getRequestErrorMessage(e, 'Failed to update call') }
@@ -2692,6 +2751,14 @@ export const useAppStore = create(persist((set, get) => ({
     },
 
     syncCallRecording: async (callId) => {
+        // NOTE: deliberately does NOT clearCallRequestState() — the review
+        // modal polls this every few seconds and wiping the request
+        // bookkeeping made the page's own in-flight refetch discard its
+        // results (stale list until manual refresh). The success handler
+        // patches the affected call across caches directly instead.
+        const mutationSeq = get().callsMutationSeq + 1
+        set({ callsMutationSeq: mutationSeq })
+
         try {
             const res = await axios.post(`${API_BASE}/calls/${callId}/sync-recording`, {}, { timeout: CALL_REQUEST_TIMEOUT_MS })
             const updatedCall = res.data
@@ -2708,6 +2775,7 @@ export const useAppStore = create(persist((set, get) => ({
                 }
 
                 return {
+                    callsMutationSeq: Math.max(state.callsMutationSeq || 0, mutationSeq),
                     calls: currentCalls.found ? currentCalls.next : state.calls,
                     callsCache: cachePatch.nextCache,
                     candidateActivityCache: nextActivityCache,
@@ -2740,6 +2808,7 @@ export const useAppStore = create(persist((set, get) => ({
         const mutationSeq = get().callsMutationSeq + 1
 
         set(state => ({
+            ...clearCallRequestState(),
             callsMutationSeq: mutationSeq,
             calls: state.calls.filter(c => c.id !== callId),
             callsCache: removeCallAcrossCaches(state.callsCache, callId),
@@ -2754,8 +2823,6 @@ export const useAppStore = create(persist((set, get) => ({
             },
             callListsLastFetchedAt: Date.now(),
             callStatsLastFetchedAt: Date.now(),
-            callsRequestQueryKey: '',
-            callsRequestSeq: 0,
         }))
 
         try {
@@ -2765,7 +2832,9 @@ export const useAppStore = create(persist((set, get) => ({
                 callListsLastFetchedAt: 0,
                 callStatsLastFetchedAt: 0,
             }))
-            await Promise.allSettled([
+            // Fire-and-forget: the optimistic update already removed the row(s);
+            // don't hold the delete spinner on revalidation round trips.
+            void Promise.allSettled([
                 get().fetchCallStats({ force: true }),
                 get().fetchCallLists({ force: true }),
             ])
@@ -2816,6 +2885,7 @@ export const useAppStore = create(persist((set, get) => ({
         const mutationSeq = get().callsMutationSeq + 1
 
         set(state => ({
+            ...clearCallRequestState(),
             callsMutationSeq: mutationSeq,
             callLists: state.callLists.filter(l => Number(l.id) !== targetListId),
             calls: state.calls.filter(call => Number(call.list_id) !== targetListId),
@@ -2827,8 +2897,6 @@ export const useAppStore = create(persist((set, get) => ({
             callsCache: removeCallsByListAcrossCaches(state.callsCache, targetListId),
             callListsLastFetchedAt: Date.now(),
             callStatsLastFetchedAt: Date.now(),
-            callsRequestQueryKey: '',
-            callsRequestSeq: 0,
         }))
 
         try {
@@ -2838,7 +2906,9 @@ export const useAppStore = create(persist((set, get) => ({
                 callListsLastFetchedAt: 0,
                 callStatsLastFetchedAt: 0,
             }))
-            await Promise.allSettled([
+            // Fire-and-forget: the optimistic update already removed the row(s);
+            // don't hold the delete spinner on revalidation round trips.
+            void Promise.allSettled([
                 get().fetchCallStats({ force: true }),
                 get().fetchCallLists({ force: true }),
             ])
@@ -2982,15 +3052,14 @@ export const useAppStore = create(persist((set, get) => ({
                 String(detail.message || '').toLowerCase().includes('call task not found')
 
             if (isMissingCallTask) {
+                const mutationSeq = get().callsMutationSeq + 1
                 set(state => ({
-                    callsMutationSeq: (state.callsMutationSeq || 0) + 1,
+                    ...clearCallRequestState(),
+                    callsMutationSeq: mutationSeq,
                     calls: (state.calls || []).filter(call => Number(call?.id) !== Number(callId)),
                     callsCache: removeCallAcrossCaches(state.callsCache, callId),
                     callsCacheFetchedAt: {},
                     callsLastFetchedAt: 0,
-                    callsRequest: null,
-                    callsRequestQueryKey: '',
-                    callsRequestSeq: 0,
                 }))
             }
 
@@ -3008,8 +3077,13 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
-    // Add explicitly to help UI clear state on tab switch
-    clearCallsState: () => set({ calls: [], callsLastQueryKey: '' })
+    // Add explicitly to help UI clear state on tab/list switch
+    clearCallsState: () => set({
+        ...clearCallRequestState(),
+        calls: [],
+        callsLastFetchedAt: 0,
+        callsLastQueryKey: '',
+    })
 }), {
     name: 'app-storage-v2',
     partialize: (state) => ({
@@ -3023,6 +3097,18 @@ export const useAppStore = create(persist((set, get) => ({
         tpScopeStatusCounts: state.tpScopeStatusCounts,
         tpTotal: state.tpTotal,
         tpStatusCounts: state.tpStatusCounts,
+        // Talent Pool view state — filters/search/sort/page/scope survive a
+        // refresh so the recruiter lands back on the exact same view.
+        tpFilters: state.tpFilters,
+        tpActiveStatusTab: state.tpActiveStatusTab,
+        tpSortBy: state.tpSortBy,
+        tpSortDir: state.tpSortDir,
+        tpPage: state.tpPage,
+        tpPageSize: state.tpPageSize,
+        tpGlobalSearch: state.tpGlobalSearch,
+        talentPoolViewScope: state.talentPoolViewScope,
+        talentPoolRecruiterFilterId: state.talentPoolRecruiterFilterId,
+        talentPoolRoleFilterId: state.talentPoolRoleFilterId,
     }),
     merge: (persistedState, currentState) => {
         const nextState = {

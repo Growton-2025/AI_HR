@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
 import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus } from 'lucide-react'
@@ -132,6 +133,51 @@ function Roles() {
     const [isFilteringRole, setIsFilteringRole] = useState(false)
     const roleFilterRequestSeqRef = useRef(0)
     const roleFilterDebounceRef = useRef(null)
+
+    // ── URL ↔ open-role sync ─────────────────────────────────────────────
+    // The open role lives in the URL (?role=<name>) so a refresh, browser
+    // back/forward, or a shared link restores the exact same view.
+    const [searchParams, setSearchParams] = useSearchParams()
+    const roleParamName = searchParams.get('role') || ''
+    const roleUrlInitRef = useRef(false)
+
+    useEffect(() => {
+        const currentViewing = useAppStore.getState().viewingRole
+        if (!roleUrlInitRef.current) {
+            roleUrlInitRef.current = true
+            if (!roleParamName && currentViewing?.name) {
+                // Mounted with a role already open (in-app navigation back to
+                // /roles) — reflect it in the URL instead of closing it.
+                setSearchParams(
+                    currentViewing.id
+                        ? { role: currentViewing.name, role_id: String(currentViewing.id) }
+                        : { role: currentViewing.name },
+                    { replace: true },
+                )
+                return
+            }
+        }
+        if (roleParamName) {
+            if (currentViewing?.name !== roleParamName) {
+                const known = (useAppStore.getState().roles || []).find(r => r.name === roleParamName)
+                // openRole handles unknown names: it fetches by name and
+                // clears the view on 404 (deleted roles).
+                openRole(known || { name: roleParamName })
+            }
+        } else if (currentViewing) {
+            clearViewingRole()
+        }
+    }, [roleParamName, openRole, clearViewingRole, setSearchParams])
+
+    const openRoleView = useCallback((role) => {
+        openRole(role)
+        setSearchParams(role?.id ? { role: role.name, role_id: String(role.id) } : { role: role?.name || '' })
+    }, [openRole, setSearchParams])
+
+    const closeRoleView = useCallback(() => {
+        clearViewingRole()
+        setSearchParams({})
+    }, [clearViewingRole, setSearchParams])
     const [addCandidateOpen, setAddCandidateOpen] = useState(false)
     const [candidateSearch, setCandidateSearch] = useState('')
     const [candidateSearchResults, setCandidateSearchResults] = useState([])
@@ -1076,7 +1122,7 @@ function Roles() {
             <div className="roles-page" style={{ width: '100%', position: 'relative', minHeight: '100vh', animation: 'fadeIn 0.2s ease-out' }}>
                 {activationRole && <RoleCreateModal role={activationRole} onClose={() => setActivationRole(null)} onSubmit={handleActivateExisting} />}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
-                    <button className="btn btn-secondary" onClick={clearViewingRole}>
+                    <button className="btn btn-secondary" onClick={closeRoleView}>
                         <ArrowLeft size={16} /> Back to Roles
                     </button>
                     <h2 style={{ margin: 0, fontSize: '24px', fontWeight: 700, color: '#1e293b' }}>{viewingRole.name}</h2>
@@ -1562,9 +1608,11 @@ function Roles() {
                                                         })}>
                                                             <span>
                                                                 <MessageSquare size={13} /> Open conversation
-                                                                <b className={responseState.messageCount == null ? 'is-loading' : ''}>
-                                                                    {responseState.messageCount == null ? '…' : responseState.messageCount}
-                                                                </b>
+                                                                {responseState.messageCount == null ? (
+                                                                    <b className="is-loading">…</b>
+                                                                ) : responseState.messageCount > 0 ? (
+                                                                    <b>{responseState.messageCount}</b>
+                                                                ) : null}
                                                             </span>
                                                             <small title={responseState.responseText}>{responseState.responseText || 'No response yet'}</small>
                                                             {responseState.responseChannel && <em>{responseState.responseChannel}</em>}
@@ -1713,7 +1761,7 @@ function Roles() {
                 ) : (
                     roles.map(role => (
                         <div key={role.name} className="role-card">
-                            <div className="role-card-main" onClick={() => openRole(role)}>
+                            <div className="role-card-main" onClick={() => openRoleView(role)}>
                                 <div className="role-card-icon">
                                     <Folder size={20} />
                                 </div>

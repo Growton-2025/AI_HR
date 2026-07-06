@@ -1,10 +1,12 @@
 import logging
+
 import threading
 import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import psycopg2
+from datetime import time as dt_time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from backend.api import deps, schemas
@@ -18,6 +20,50 @@ from backend.services.call_artifacts import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Call cadence ─────────────────────────────────────────────────────────────
+# 5 attempts: Day 1 (second half), Day 2 (first half), Day 4 (second half),
+# Day 7 (first half), Day 10 (second half). After the 5th failed attempt the
+# system auto-marks the call "Unreachable" and stops scheduling.
+FIRST_ATTEMPT_TITLE = "Call 1 - Day 1 - Second Half"
+
+# (title_prefix, delay_days_to_next, next_title)
+CALL_SEQUENCE_STEPS = [
+    ("Call 1", 1, "Call 2 - Day 2 - First Half"),
+    ("Call 2", 2, "Call 3 - Day 4 - Second Half"),
+    ("Call 3", 3, "Call 4 - Day 7 - First Half"),
+    ("Call 4", 3, "Call 5 - Day 10 - Second Half"),
+]
+FINAL_ATTEMPT_PREFIX = "Call 5"
+UNREACHABLE_OUTCOME = "Unreachable"
+
+# Recruiter outcomes that mean "the call did not connect" — cadence continues.
+# Legacy outcomes are kept so historical rows keep progressing.
+FAILED_CALL_OUTCOMES = {
+    "Not Connected",
+    "Not Connected - Not Reachable",
+    "Left Voicemail",
+    "No Answer",
+}
+# Connected outcomes that end the cadence (candidate leaves the calling list).
+TERMINAL_CALL_OUTCOMES = {
+    "Connected - Interested",
+    "Connected - Not Interested",
+}
+FOLLOWUP_CALL_OUTCOMES = {"Connected - Follow-up", "Connected - Follow up later"}
+FOLLOWUP_TASK_TITLE = "Follow-up Call"
+WRONG_NUMBER_OUTCOME = "Wrong Number"
+
+
+def next_sequence_step(task_title: Optional[str]):
+    """Returns (delay_days, next_title) for the attempt after task_title,
+    or None when there is no scheduled next attempt (final attempt, follow-up
+    tasks, or unrecognized titles)."""
+    current_title = task_title or "Call 1"
+    for step_prefix, step_delay, next_title in CALL_SEQUENCE_STEPS:
+        if current_title.startswith(step_prefix):
+            return step_delay, next_title
+    return None
 
 _calls_schema_ready = False
 _calls_schema_lock = threading.Lock()
@@ -65,7 +111,11 @@ CALLS_SELECT_QUERY = """
         c.plivo_endpoint_username,
         c.plivo_recruiter_email,
         c.recording_source,
-        c.recording_synced_at
+        c.recording_synced_at,
+        c.due_time,
+        COALESCE(cand.mobile_phone_wrong, FALSE),
+        cand.notes,
+        COALESCE(NULLIF(TRIM(cand.status), ''), 'To be started')
     FROM calls c
     JOIN call_lists cl ON c.list_id = cl.id
     JOIN candidates cand ON c.candidate_id = cand.id
@@ -101,6 +151,10 @@ def call_row_to_dict(row) -> dict:
         "plivo_recruiter_email": row[23],
         "recording_source": row[24],
         "recording_synced_at": row[25],
+        "due_time": row[26],
+        "candidate_phone_wrong": bool(row[27]),
+        "candidate_notes": row[28],
+        "candidate_status": row[29],
     }
 
 
@@ -109,8 +163,11 @@ def invalidate_calls_cache():
     Always uses a fresh pooled connection - never the write connection
     (which may still have open cursors or be mid-transaction).
     """
-    global _stats_cache, _stats_cache_ts
+    global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts, _cache_generation
     with _calls_lock:
+        _cache_generation += 1
+        _calls_cache = None
+        _call_lists_cache = None
         _stats_cache = {}
         _stats_cache_ts = {}
     refresh_call_caches_async()
@@ -406,6 +463,10 @@ class CallUpdate(BaseModel):
     recording_url: Optional[str] = None
     transcript: Optional[str] = None
     summary: Optional[str] = None
+    # Required when completing with a follow-up outcome: the exact slot the
+    # candidate should reappear in the calling list.
+    followup_due_date: Optional[date] = None
+    followup_due_time: Optional[dt_time] = None
 
 
 class CallResponse(BaseModel):
@@ -435,6 +496,10 @@ class CallResponse(BaseModel):
     plivo_recruiter_email: Optional[str] = None
     recording_source: Optional[str] = None
     recording_synced_at: Optional[datetime] = None
+    due_time: Optional[dt_time] = None
+    candidate_phone_wrong: Optional[bool] = False
+    candidate_notes: Optional[str] = None
+    candidate_status: Optional[str] = None
 
 
 def ensure_calls_schema_ready(force: bool = False):
@@ -455,6 +520,28 @@ def ensure_calls_schema_ready(force: bool = False):
         try:
             legacy_provider_prefix = "fre" + "jun"
             cur = conn.cursor()
+
+            # Fast path: the remote DB costs ~0.6s per statement, and the full
+            # DDL below is ~50 statements (~30s). One sentinel round-trip checks
+            # whether the NEWEST migration columns already exist — if so the
+            # whole barrage is skipped. Keep the sentinel columns in sync with
+            # the latest ALTERs whenever new DDL is added below.
+            if not force:
+                cur.execute("""
+                    SELECT
+                        EXISTS (SELECT 1 FROM information_schema.columns
+                                WHERE table_name = 'calls' AND column_name = 'due_time')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'candidates' AND column_name = 'mobile_phone_wrong')
+                        AND NOT EXISTS (SELECT 1 FROM pg_constraint
+                                        WHERE conname = 'unique_candidate_list')
+                """)
+                sentinel_row = cur.fetchone()
+                if sentinel_row and sentinel_row[0]:
+                    conn.rollback()
+                    _calls_schema_ready = True
+                    return
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS call_lists (
                     id SERIAL PRIMARY KEY,
@@ -508,6 +595,10 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_endpoint_username VARCHAR(255);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_source VARCHAR(100);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_synced_at TIMESTAMP;")
+            # Follow-up calls carry an exact slot (date + time); cadence calls only a date.
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS due_time TIME;")
+            # Wrong-number tag lives on the candidate so every call list sees it.
+            cur.execute("ALTER TABLE candidates ADD COLUMN IF NOT EXISTS mobile_phone_wrong BOOLEAN DEFAULT FALSE;")
             cur.execute(f"""
                 DO $$
                 BEGIN
@@ -551,6 +642,10 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("""
                 DROP INDEX IF EXISTS idx_calls_candidate_list_unique;
             """)
+            # Legacy one-call-per-candidate-per-list constraint — incompatible
+            # with the multi-attempt cadence (Call 1..5 rows per candidate).
+            cur.execute("ALTER TABLE calls DROP CONSTRAINT IF EXISTS unique_candidate_list;")
+            cur.execute("DROP INDEX IF EXISTS unique_candidate_list;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_list_id ON calls(list_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_candidate_id ON calls(candidate_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_status_due_date ON calls(status, due_date);")
@@ -645,24 +740,28 @@ def create_call_list(request: CallListCreate, current_user: schemas.User = Depen
     cur = None
     try:
         cur = conn.cursor()
+        # Case-insensitive duplicate check + insert in ONE round trip — each
+        # statement costs ~0.6s against the remote DB.
         cur.execute(
             """
-            SELECT id
-            FROM call_lists
-            WHERE LOWER(TRIM(name)) = LOWER(%s)
-              AND LOWER(COALESCE(created_by, '')) = %s
-            LIMIT 1
+            WITH existing AS (
+                SELECT id FROM call_lists
+                WHERE LOWER(TRIM(name)) = LOWER(%s)
+                  AND LOWER(COALESCE(created_by, '')) = %s
+                LIMIT 1
+            ), inserted AS (
+                INSERT INTO call_lists (name, created_by)
+                SELECT %s, %s
+                WHERE NOT EXISTS (SELECT 1 FROM existing)
+                RETURNING id, name, created_at
+            )
+            SELECT id, name, created_at FROM inserted
             """,
-            (list_name, owner),
-        )
-        if cur.fetchone():
-            raise HTTPException(status_code=400, detail="A list with this name already exists")
-
-        cur.execute(
-            "INSERT INTO call_lists (name, created_by) VALUES (%s, %s) RETURNING id, name, created_at",
-            (list_name, owner),
+            (list_name, owner, list_name, owner),
         )
         row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="A list with this name already exists")
         conn.commit()
         result = {"id": row[0], "name": row[1], "created_at": row[2], "candidate_count": 0}
         if cur:
@@ -705,30 +804,61 @@ def add_candidates_to_list(
             return {"success": True, "added_count": 0}
 
         cur = conn.cursor()
-        ensure_list_exists_for_owner(cur, request.list_id, owner)
-
-        # Check for duplicates
-        cur.execute(
-            "SELECT COUNT(1) FROM calls WHERE list_id = %s AND candidate_id = ANY(%s::int[])",
-            (request.list_id, request.candidate_ids)
-        )
-        if cur.fetchone()[0] > 0:
-            raise HTTPException(status_code=400, detail="Candidate is already in this call list")
-
+        # Ownership check + duplicate count + insert in ONE round trip — each
+        # statement costs ~0.6s against the remote DB. CTEs read a consistent
+        # snapshot, so `duplicates` counts rows as they were BEFORE the insert.
         cur.execute(
             """
-            INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
-            SELECT DISTINCT c_id, %s, 'pending', CURRENT_DATE, 'Call 1 - Day 1'
-            FROM UNNEST(%s::int[]) AS c_id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM calls existing
-                WHERE existing.candidate_id = c_id AND existing.list_id = %s
+            WITH target_list AS (
+                SELECT id FROM call_lists
+                WHERE id = %s
+                  AND LOWER(COALESCE(created_by, '')) = %s
+            ),
+            duplicates AS (
+                SELECT COUNT(DISTINCT candidate_id) AS dup_count
+                FROM calls
+                WHERE list_id = %s
+                  AND candidate_id = ANY(%s::int[])
+            ),
+            inserted AS (
+                INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
+                SELECT DISTINCT c_id, %s, 'pending', CURRENT_DATE, %s
+                FROM UNNEST(%s::int[]) AS c_id
+                WHERE EXISTS (SELECT 1 FROM target_list)
+                  AND (SELECT dup_count FROM duplicates) = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM calls existing
+                      WHERE existing.candidate_id = c_id AND existing.list_id = %s
+                  )
+                RETURNING id
             )
-            RETURNING id
+            SELECT
+                (SELECT COUNT(*) FROM target_list) AS list_found,
+                (SELECT dup_count FROM duplicates) AS duplicate_count,
+                (SELECT COUNT(*) FROM inserted) AS inserted_count
             """,
-            (request.list_id, request.candidate_ids, request.list_id),
+            (
+                request.list_id, owner,
+                request.list_id, request.candidate_ids,
+                request.list_id, FIRST_ATTEMPT_TITLE, request.candidate_ids, request.list_id,
+            ),
         )
-        inserted_count = len(cur.fetchall())
+        list_found, duplicate_count, inserted_count = cur.fetchone()
+
+        if not list_found:
+            raise HTTPException(status_code=404, detail="Call list not found")
+
+        duplicate_count = duplicate_count or 0
+        if duplicate_count > 0:
+            requested_count = len(set(request.candidate_ids))
+            if requested_count == 1:
+                detail = "Candidate is already in this call list"
+            elif duplicate_count >= requested_count:
+                detail = "All selected candidates are already in this call list"
+            else:
+                detail = f"{duplicate_count} of {requested_count} selected candidates are already in this call list"
+            raise HTTPException(status_code=400, detail=detail)
+
         conn.commit()
         cur.close()
         cur = None
@@ -780,9 +910,9 @@ def get_calls(
             if status == "completed":
                 data.sort(key=lambda x: x.get("completed_at") or datetime.min, reverse=True)
             else:
-                # Key tip: Python's sort is stable, we sort by created_at then due_date
+                # Key tip: Python's sort is stable, we sort by created_at then due_date+due_time
                 data.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
-                data.sort(key=lambda x: x.get("due_date") or date.min)
+                data.sort(key=lambda x: (x.get("due_date") or date.min, x.get("due_time") or dt_time.min))
             
             return data
 
@@ -814,7 +944,7 @@ def get_calls(
         if status == "completed":
             query += " ORDER BY c.completed_at DESC NULLS LAST"
         else:
-            query += " ORDER BY c.due_date ASC NULLS FIRST, c.created_at DESC NULLS LAST"
+            query += " ORDER BY c.due_date ASC NULLS FIRST, c.due_time ASC NULLS FIRST, c.created_at DESC NULLS LAST"
 
         cur.execute(query, params)
         rows = cur.fetchall()
@@ -830,6 +960,19 @@ def get_calls(
 @router.patch("/{call_id}")
 def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = Depends(deps.get_current_user)):
     ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+
+    # A follow-up outcome must carry the exact slot the candidate reappears in.
+    if (
+        request.status == "completed"
+        and (request.outcome or "").strip() in FOLLOWUP_CALL_OUTCOMES
+        and (request.followup_due_date is None or request.followup_due_time is None)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Follow-up date and time are required for a follow-up outcome",
+        )
+
     conn = get_calls_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -874,38 +1017,87 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        params.append(call_id)
-        cur.execute(f"UPDATE calls SET {', '.join(fields)}, updated_at = NOW() WHERE id = %s RETURNING candidate_id, list_id, status, outcome, task_title", params)
+        params.extend([call_id, owner])
+        cur.execute(
+            f"""
+            UPDATE calls
+            SET {', '.join(fields)}, updated_at = NOW()
+            WHERE id = %s
+              AND list_id IN (
+                  SELECT id FROM call_lists
+                  WHERE LOWER(COALESCE(created_by, '')) = %s
+              )
+            RETURNING candidate_id, list_id, status, outcome, task_title
+            """,
+            params,
+        )
         row = cur.fetchone()
-        
-        if row:
-            candidate_id, list_id, current_status, current_outcome, task_title = row
-            
-            if current_status == "completed" and current_outcome in ["Left Voicemail", "No Answer"]:
-                sequence = [
-                    ("Call 1", 1, "Call 2 - Day 2"),
-                    ("Call 2", 2, "Call 3 - Day 4"),
-                    ("Call 3", 3, "Call 4 - Day 7")
-                ]
-                
+        if not row:
+            raise HTTPException(status_code=404, detail="Call task not found")
+
+        candidate_id, list_id, current_status, current_outcome, task_title = row
+
+        scheduled_next_title = None
+        auto_unreachable = False
+        wrong_number_tagged = False
+
+        if current_status == "completed" and current_outcome:
+            if current_outcome in FAILED_CALL_OUTCOMES:
                 current_title = task_title or "Call 1"
-                next_title = None
-                delay_days = 0
-                
-                for step_prefix, step_delay, next_step in sequence:
-                    if current_title.startswith(step_prefix):
-                        next_title = next_step
-                        delay_days = step_delay
-                        break
-                
-                if next_title:
+                if current_title.startswith(FINAL_ATTEMPT_PREFIX):
+                    # 5th failed attempt — system tags the call Unreachable and
+                    # the cadence stops (candidate moves to the cooldown pool).
                     cur.execute(
-                        """
-                        INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
-                        VALUES (%s, %s, 'pending', CURRENT_DATE + %s * INTERVAL '1 day', %s)
-                        """,
-                        (candidate_id, list_id, delay_days, next_title)
+                        "UPDATE calls SET outcome = %s WHERE id = %s",
+                        (UNREACHABLE_OUTCOME, call_id),
                     )
+                    auto_unreachable = True
+                else:
+                    step = next_sequence_step(task_title)
+                    if step:
+                        # A wrong-number tag pauses the cadence until a new
+                        # number is sourced (flag cleared on phone update).
+                        cur.execute(
+                            "SELECT COALESCE(mobile_phone_wrong, FALSE) FROM candidates WHERE id = %s",
+                            (candidate_id,),
+                        )
+                        phone_row = cur.fetchone()
+                        if not (phone_row and phone_row[0]):
+                            delay_days, next_title = step
+                            cur.execute(
+                                """
+                                INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
+                                VALUES (%s, %s, 'pending', CURRENT_DATE + %s * INTERVAL '1 day', %s)
+                                """,
+                                (candidate_id, list_id, delay_days, next_title)
+                            )
+                            scheduled_next_title = next_title
+            elif current_outcome in FOLLOWUP_CALL_OUTCOMES and request.followup_due_date:
+                # Candidate reappears in the calling list at the chosen slot.
+                cur.execute(
+                    """
+                    INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
+                    VALUES (%s, %s, 'pending', %s, %s, %s)
+                    """,
+                    (
+                        candidate_id,
+                        list_id,
+                        request.followup_due_date,
+                        request.followup_due_time,
+                        FOLLOWUP_TASK_TITLE,
+                    ),
+                )
+                scheduled_next_title = FOLLOWUP_TASK_TITLE
+            elif current_outcome == WRONG_NUMBER_OUTCOME:
+                # Tag the number on the candidate so every list sees it; the
+                # cadence pauses until an alternate number is saved.
+                cur.execute(
+                    "UPDATE candidates SET mobile_phone_wrong = TRUE, updated_at = NOW() WHERE id = %s",
+                    (candidate_id,),
+                )
+                wrong_number_tagged = True
+            # Connected - Interested / Not Interested end the cadence: the call
+            # completes and nothing new is scheduled.
 
         conn.commit()
         cur.close()
@@ -913,7 +1105,15 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         return_db_connection(conn)
         conn = None
         invalidate_calls_cache()
-        return {"success": True}
+        return {
+            "success": True,
+            "scheduled_next_title": scheduled_next_title,
+            "auto_unreachable": auto_unreachable,
+            "wrong_number_tagged": wrong_number_tagged,
+        }
+    except HTTPException:
+        if conn: conn.rollback()
+        raise
     except Exception as e:
         if conn: conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -944,8 +1144,15 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
             for call in _calls_cache:
                 if call.get("created_by") != owner:
                     continue
-                if call.get("status") == "completed":
+                status = call.get("status")
+                if status == "completed":
                     completed += 1
+                    continue
+                # Only pending calls are bucketed into due_today / upcoming.
+                # This MUST match the SQL path below (status = 'pending')
+                # otherwise the counts flicker whenever the stats request
+                # switches between the in-memory cache and the DB fallback.
+                if status != "pending":
                     continue
                 due_date = call.get("due_date")
                 if not due_date:
@@ -1045,7 +1252,6 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
         )
         deleted = cur.fetchone()
         if not deleted:
-            conn.rollback()
             raise HTTPException(status_code=404, detail="Call task not found")
 
         conn.commit()
@@ -1103,7 +1309,6 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
         )
         deleted = cur.fetchone()
         if not deleted:
-            conn.rollback()
             raise HTTPException(status_code=404, detail="Call list not found")
 
         conn.commit()

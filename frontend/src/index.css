@@ -2294,6 +2294,8 @@ input:checked + .slider:before {
 .candidate-message-body {
   font-size: 13px;
   line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .candidate-message small {
@@ -2809,6 +2811,149 @@ input:checked + .slider:before {
   .shortlist-destination-select,
   .shortlist-action-bar .btn {
     grid-column: 1 / -1;
+  }
+}
+
+/* ── Calls page & call modals: responsive behaviour ─────────────────────────
+   The Calls page is built with inline styles, so overrides below need
+   !important to win. Class hooks live in Calls.jsx / AddToListModal.jsx. */
+
+/* Modals must never exceed the viewport; content scrolls internally. */
+.call-modal-overlay {
+  padding: 16px;
+}
+
+.call-modal-shell {
+  display: flex;
+  flex-direction: column;
+  max-height: 100svh;
+  min-height: 0;
+}
+
+.call-modal-header {
+  flex-shrink: 0;
+}
+
+.call-modal-content {
+  overflow-y: auto;
+  min-height: 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+.add-to-list-overlay {
+  padding: 16px;
+}
+
+.add-to-list-card {
+  max-height: 100svh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 900px) {
+  .calls-hero {
+    padding: 20px !important;
+  }
+
+  /* Cards can shrink below 280px instead of forcing horizontal overflow. */
+  .calls-lists-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)) !important;
+  }
+
+  /* Insight panels (AI summary / transcript) stack in one column. */
+  .calls-insights-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Expanded details lose the avatar-alignment indent on narrow screens. */
+  .calls-expanded-details {
+    margin-left: 0 !important;
+  }
+
+  .call-followup-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .call-modal-header {
+    flex-wrap: wrap !important;
+    gap: 12px;
+  }
+
+  .call-modal-body {
+    padding: 24px !important;
+  }
+}
+
+@media (max-width: 560px) {
+  .calls-hero {
+    padding: 16px !important;
+    border-radius: 18px !important;
+  }
+
+  .calls-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 12px !important;
+    margin-bottom: 24px !important;
+  }
+
+  .calls-stat-card {
+    padding: 16px !important;
+  }
+
+  .calls-lists-section {
+    padding: 16px !important;
+  }
+
+  .calls-workspace-toolbar {
+    padding: 14px 16px !important;
+  }
+
+  .calls-rows {
+    padding: 0 16px !important;
+  }
+
+  /* Stack each call row: avatar + text on top, action buttons wrap below. */
+  .calls-row {
+    flex-wrap: wrap !important;
+  }
+
+  .calls-row-main {
+    flex: 1 1 calc(100% - 56px) !important;
+    min-width: 200px;
+  }
+
+  .calls-row-actions {
+    width: 100% !important;
+    justify-content: flex-start !important;
+  }
+
+  .call-modal-overlay,
+  .add-to-list-overlay {
+    padding: 8px;
+  }
+
+  .call-modal-header {
+    padding: 16px !important;
+  }
+
+  /* Tabs drop to their own full-width scrollable row inside the header. */
+  .call-modal-tabs {
+    order: 3;
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .call-modal-body {
+    padding: 20px 16px 24px !important;
+  }
+
+  .call-modal-actions {
+    flex-direction: column !important;
+  }
+
+  .add-to-list-card {
+    padding: 20px !important;
+    border-radius: 18px !important;
   }
 }
 

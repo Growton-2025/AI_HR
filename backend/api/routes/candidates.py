@@ -535,6 +535,52 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
         PROFILES_BY_ID[candidate_id] = profile
     invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
 
+    # 3. A new phone number un-tags "wrong number" and resumes any paused call
+    # cadence: the attempt where the wrong number was found is retried today.
+    # Separate transaction so a failure here never breaks the contact update.
+    phone_value = next(
+        (str(data.get(f) or '').strip() for f in ('mobile_phone', 'phone') if str(data.get(f) or '').strip()),
+        None,
+    )
+    if phone_value:
+        try:
+            cleared_wrong_number = False
+            with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+                if conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE candidates SET mobile_phone_wrong = FALSE WHERE id = %s AND COALESCE(mobile_phone_wrong, FALSE)",
+                            (candidate_id,),
+                        )
+                        cleared_wrong_number = bool(cur.rowcount)
+                        if cleared_wrong_number:
+                            cur.execute(
+                                """
+                                INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
+                                SELECT c.candidate_id, c.list_id, 'pending', CURRENT_DATE, c.task_title
+                                FROM calls c
+                                WHERE c.candidate_id = %s
+                                  AND c.outcome = 'Wrong Number'
+                                  AND c.created_at = (
+                                      SELECT MAX(c2.created_at) FROM calls c2
+                                      WHERE c2.candidate_id = c.candidate_id AND c2.list_id = c.list_id
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM calls p
+                                      WHERE p.candidate_id = c.candidate_id
+                                        AND p.list_id = c.list_id
+                                        AND p.status = 'pending'
+                                  )
+                                """,
+                                (candidate_id,),
+                            )
+                    conn.commit()
+            if cleared_wrong_number:
+                from backend.api.routes.calls import invalidate_calls_cache
+                invalidate_calls_cache()
+        except Exception as e:
+            print(f"WARNING: wrong-number reset failed for candidate {candidate_id}: {e}")
+
     return {"success": True, "data": data}
 
 

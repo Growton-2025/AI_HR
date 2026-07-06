@@ -34,9 +34,16 @@ export default function AddToListModal({ selectedCount, onClose, onSuccess, cand
       if (!listId) return;
       const res = await addCandidatesToCallList(candidateIds, listId);
       if (res.success) {
-        toast.success(
-          `Added ${selectedCount} candidate${selectedCount === 1 ? '' : 's'} to call list`
-        );
+        // Report the count the backend actually inserted — a concurrent add can
+        // make it differ from the local selection size.
+        const addedCount = Number(res.data?.added_count ?? selectedCount);
+        if (addedCount > 0) {
+          toast.success(
+            `Added ${addedCount} candidate${addedCount === 1 ? '' : 's'} to call list`
+          );
+        } else {
+          toast.info('Selected candidates are already in this call list');
+        }
         onSuccess();
       } else {
         toast.error(res.error || 'Failed to add candidates to list');
@@ -49,8 +56,8 @@ export default function AddToListModal({ selectedCount, onClose, onSuccess, cand
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
-      <div style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '440px', padding: '32px', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
+    <div className="add-to-list-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+      <div className="add-to-list-card" style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '440px', padding: '32px', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
         <h3 style={{ fontSize: '20px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>Add to Call List</h3>
         <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '24px' }}>Choose a list to add {selectedCount} candidates to.</p>
 

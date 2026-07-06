@@ -1,6 +1,7 @@
 import { VoIPProvider, useVoIP } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { 
   Phone, Calendar, CheckCircle2, List, PhoneCall, 
   Search, RefreshCw, MoreHorizontal, User, 
@@ -8,7 +9,7 @@ import {
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming, Loader2
 } from 'lucide-react';
-import { BACKEND_BASE, useAppStore } from '../store/useAppStore';
+import { BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 
@@ -215,14 +216,30 @@ const TABS = [
   { id: 'lists', label: 'Call Lists', icon: Layers },
 ];
 
+// Call status options — each drives a different next step (see cadence below).
 const OUTCOMES = [
-  'Left Voicemail',
+  'Not Connected',
+  'Not Connected - Not Reachable',
   'Connected - Interested',
   'Connected - Not Interested',
-  'Connected - Follow up later',
-  'No Answer',
+  'Connected - Follow-up',
   'Wrong Number'
 ];
+
+// Outcomes that mean "did not connect": the backend schedules the next attempt
+// in the Day 1 → 2 → 4 → 7 → 10 cadence (5 attempts, then auto-Unreachable).
+const FAILED_OUTCOMES = new Set(['Not Connected', 'Not Connected - Not Reachable']);
+const FOLLOWUP_OUTCOME = 'Connected - Follow-up';
+const WRONG_NUMBER_OUTCOME = 'Wrong Number';
+const FINAL_ATTEMPT_PREFIX = 'Call 5';
+
+const isFinalAttempt = (call) => (call?.task_title || '').startsWith(FINAL_ATTEMPT_PREFIX);
+
+// "15:30:00" → "15:30" for display.
+const formatDueTime = (value) => {
+  const text = String(value || '');
+  return /^\d{2}:\d{2}/.test(text) ? text.slice(0, 5) : text;
+};
 
 const CALL_PANEL_STYLE = {
   background: 'rgba(255,255,255,0.86)',
@@ -328,7 +345,7 @@ const buildCallWrapUpMeta = (event, candidateName) => {
         ...baseMeta,
         title: 'No answer',
         message: `${firstName} did not answer the browser call.`,
-        suggestedOutcome: 'No Answer',
+        suggestedOutcome: 'Not Connected',
       };
     }
 
@@ -372,7 +389,7 @@ const buildCallWrapUpMeta = (event, candidateName) => {
       ...baseMeta,
       title: 'No answer',
       message: `${firstName} did not answer the call.`,
-      suggestedOutcome: 'No Answer',
+      suggestedOutcome: 'Not Connected',
     };
   }
 
@@ -831,6 +848,7 @@ export default function Calls() {
     fetchCalls,
     callLists,
     fetchCallLists,
+    callListsLastFetchedAt,
     callsLastQueryKey,
     callStats,
     fetchCallStats,
@@ -848,6 +866,7 @@ export default function Calls() {
     fetchCalls: state.fetchCalls,
     callLists: state.callLists,
     fetchCallLists: state.fetchCallLists,
+    callListsLastFetchedAt: state.callListsLastFetchedAt,
     callsLastQueryKey: state.callsLastQueryKey,
     callStats: state.callStats,
     fetchCallStats: state.fetchCallStats,
@@ -862,7 +881,14 @@ export default function Calls() {
     sidebarWidth: state.sidebarWidth,
   })));
 
-  const [activeTab, setActiveTab] = useState('today');
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Deep-link restore: remember the list_id from the URL until callLists arrive.
+  const pendingListIdRef = useRef(Number(searchParams.get('list_id')) || null);
+
+  const [activeTab, setActiveTab] = useState(() => {
+    const tab = searchParams.get('tab');
+    return TABS.some(t => t.id === tab) ? tab : 'today';
+  });
   const [loading, setLoading] = useState(false);
   const [isRevalidating, setIsRevalidating] = useState(false);
   const [selectedList, setSelectedList] = useState(null);
@@ -900,6 +926,33 @@ export default function Calls() {
     if (typeof window === 'undefined' || window.scrollX === 0) return;
     window.scrollTo({ left: 0, top: window.scrollY });
   }, [sidebarWidth, activeTab, selectedList]);
+
+  // Restore the URL's list_id once the call lists have loaded.
+  useEffect(() => {
+    const pendingListId = pendingListIdRef.current;
+    if (!pendingListId) return;
+    if (!(callLists || []).length && !callListsLastFetchedAt) return; // wait for the first fetch
+    const match = (callLists || []).find(list => Number(list.id) === pendingListId);
+    pendingListIdRef.current = null;
+    if (match) {
+      clearCallsState();
+      setActiveTab('lists');
+      setSelectedList(match);
+    }
+  }, [callLists, callListsLastFetchedAt, clearCallsState]);
+
+  // Keep tab + selected list in the URL so a refresh restores this exact view.
+  useEffect(() => {
+    if (pendingListIdRef.current) return; // still restoring from the URL
+    const next = {};
+    if (selectedList?.id) {
+      next.tab = 'lists';
+      next.list_id = String(selectedList.id);
+    } else if (activeTab !== 'today') {
+      next.tab = activeTab;
+    }
+    setSearchParams(next, { replace: true });
+  }, [activeTab, selectedList, setSearchParams]);
 
   const fetchData = useCallback(async () => {
     if (retryTimerRef.current) {
@@ -975,6 +1028,15 @@ export default function Calls() {
     fetchData();
   }, [fetchData]);
 
+  useEffect(() => {
+    if (!selectedList || !callListsLastFetchedAt) return;
+    const selectedListStillExists = (callLists || []).some(list => Number(list.id) === Number(selectedList.id));
+    if (!selectedListStillExists) {
+      clearCallsState();
+      setSelectedList(null);
+    }
+  }, [selectedList, callLists, callListsLastFetchedAt, clearCallsState]);
+
   const stats = [
     { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#334155', bg: '#f8fafc' },
     { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#8b6b44', bg: '#fcf8f2' },
@@ -1010,7 +1072,10 @@ export default function Calls() {
     try {
       const res = await deleteCallList(listId);
       if (res.success) {
-        if (selectedList?.id === listId) setSelectedList(null);
+        if (Number(selectedList?.id) === Number(listId)) {
+          clearCallsState();
+          setSelectedList(null);
+        }
         toast.success('List deleted');
       }
       else toast.error(res.error || 'Failed to delete list');
@@ -1060,31 +1125,35 @@ export default function Calls() {
     toast('Recording is not ready in Plivo yet');
   };
 
-  const filteredCalls = (calls || []).filter(c =>
+  // Build the key through the SAME canonicalizer the store uses so the view
+  // never mismatches its cache entry (param order / number-vs-string list_id).
+  const currentCallsQueryKey = selectedList
+    ? canonicalCallsQuery({ list_id: selectedList.id, status: 'pending' })
+    : activeTab === 'today'
+      ? canonicalCallsQuery({ due_filter: 'today', status: 'pending' })
+      : activeTab === 'upcoming'
+        ? canonicalCallsQuery({ due_filter: 'upcoming', status: 'pending' })
+        : activeTab === 'completed'
+          ? canonicalCallsQuery({ status: 'completed' })
+          : '';
+  const callsForCurrentQuery = callsLastQueryKey === currentCallsQueryKey ? (calls || []) : [];
+  const filteredCalls = callsForCurrentQuery.filter(c =>
     (c.candidate_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (c.candidate_title || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
-  const currentCallsQueryKey = selectedList
-    ? `list_id=${selectedList.id}&status=pending`
-    : activeTab === 'today'
-      ? 'due_filter=today&status=pending'
-      : activeTab === 'upcoming'
-        ? 'due_filter=upcoming&status=pending'
-        : activeTab === 'completed'
-          ? 'status=completed'
-          : '';
   // Show skeleton only when actively loading and no data exists yet for this view
   const isWaitingForCurrentQuery = callsLastQueryKey !== currentCallsQueryKey;
+  const hasCurrentCallsData = callsLastQueryKey === currentCallsQueryKey && Boolean(callsLastFetchedAt);
   const showCallsLoading = (
     activeTab !== 'lists' &&
     (loading || isWaitingForCurrentQuery) &&
-    !callsLastFetchedAt
+    !hasCurrentCallsData
   );
   const showListsLoading = (activeTab === 'lists' && !selectedList && loading && !callLists.length);
 
   return (
-    <div style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
-      <header style={{ ...CALL_PANEL_STYLE, marginBottom: '28px', padding: '24px 28px', borderRadius: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px 24px' }}>
+    <div className="calls-page" style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
+      <header className="calls-hero" style={{ ...CALL_PANEL_STYLE, marginBottom: '28px', padding: '24px 28px', borderRadius: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px 24px' }}>
         <div>
           <div style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px' }}>
             Call operations
@@ -1105,9 +1174,9 @@ export default function Calls() {
       </header>
 
       {/* Stats Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '20px', marginBottom: '40px' }}>
+      <div className="calls-stats-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '20px', marginBottom: '40px' }}>
         {stats.map((stat, i) => (
-          <div key={i} style={{ ...CALL_PANEL_STYLE, padding: '24px', borderRadius: '20px', minWidth: 0 }}>
+          <div className="calls-stat-card" key={i} style={{ ...CALL_PANEL_STYLE, padding: '24px', borderRadius: '20px', minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
               <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: stat.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                 <stat.icon size={20} color={stat.color} />
@@ -1122,11 +1191,11 @@ export default function Calls() {
       </div>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', columnGap: '24px', rowGap: '10px' }}>
+      <div className="calls-tabs" style={{ display: 'flex', flexWrap: 'wrap', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', columnGap: '24px', rowGap: '10px' }}>
       {TABS.map(tab => (
           <button
             key={tab.id}
-            onClick={() => { setActiveTab(tab.id); setSelectedList(null); }}
+            onClick={() => { clearCallsState(); setActiveTab(tab.id); setSelectedList(null); }}
             style={{
               padding: '12px 4px', background: 'none', border: 'none', borderBottom: activeTab === tab.id ? '2px solid #111827' : '2px solid transparent',
               color: activeTab === tab.id ? '#111827' : '#64748b', fontSize: '14px', fontWeight: 600,
@@ -1141,10 +1210,10 @@ export default function Calls() {
       </div>
 
       {/* Content Area */}
-      <div style={{ ...CALL_PANEL_STYLE, borderRadius: '24px', overflow: 'hidden' }}>
+      <div className="calls-content-panel" style={{ ...CALL_PANEL_STYLE, borderRadius: '24px', overflow: 'hidden' }}>
         {activeTab === 'lists' && !selectedList ? (
-          <div style={{ padding: '24px' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
+          <div className="calls-lists-section" style={{ padding: '24px' }}>
+            <div className="calls-lists-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
               {showListsLoading && Array.from({ length: 4 }).map((_, idx) => (
                 <div
                   key={`list-skeleton-${idx}`}
@@ -1157,7 +1226,8 @@ export default function Calls() {
               ))}
               
               {/* Create List Card */}
-              <div 
+              <div
+                className="calls-list-card calls-list-create-card"
                 style={{ 
                   padding: '24px', borderRadius: '20px', 
                   border: isCreatingList ? '1px solid #111827' : '1px dashed #cbd5e1',
@@ -1221,7 +1291,8 @@ export default function Calls() {
                 const isListDisabled = isDeletingList || isPendingList;
 
                 return (
-                <div 
+                <div
+                  className="calls-list-card"
                   key={list.id} 
                   onClick={() => {
                     if (isListDisabled) return;
@@ -1281,8 +1352,8 @@ export default function Calls() {
             </div>
           </div>
         ) : (
-          <div style={{ minHeight: '400px' }}>
-            <div style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+          <div className="calls-workspace" style={{ minHeight: '400px' }}>
+            <div className="calls-workspace-toolbar" style={{ padding: '20px 24px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
               {selectedList && (
                 <button 
                   onClick={() => { clearCallsState(); setSelectedList(null); }}
@@ -1315,7 +1386,7 @@ export default function Calls() {
               </div>
             </div>
 
-            <div style={{ padding: '0 24px' }}>
+            <div className="calls-rows" style={{ padding: '0 24px' }}>
               {showCallsLoading && Array.from({ length: 5 }).map((_, idx) => (
                 <div
                   key={`call-skeleton-${idx}`}
@@ -1336,17 +1407,18 @@ export default function Calls() {
 
                 return (
                 <React.Fragment key={call.id}>
-                <div 
+                <div
+                  className="calls-row"
                   style={{ 
                     padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', 
                     alignItems: 'center', gap: '16px',
                     opacity: isDeletingCall ? 0.55 : 1
                   }}
                 >
-                  <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#64748b' }}>
+                  <div className="calls-row-avatar" style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#64748b' }}>
                     {call.candidate_name?.split(' ').map(n => n[0]).join('') || '?' }
                   </div>
-                  <div style={{ flex: 1 }}>
+                  <div className="calls-row-main" style={{ flex: 1 }}>
                     <h3 style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a', marginBottom: '2px' }}>{call.candidate_name || 'Anonymous'}</h3>
                     <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '4px' }}>
                       {call.task_title || call.candidate_title || 'No Title'}
@@ -1355,11 +1427,21 @@ export default function Calls() {
                       <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <Phone size={12} /> {call.candidate_phone || 'N/A'}
                       </div>
+                      {call.candidate_phone_wrong && (
+                        <span style={{ padding: '2px 8px', borderRadius: '999px', background: '#fef2f2', color: '#b91c1c', fontWeight: 700, fontSize: '11px', border: '1px solid #fecaca' }}>
+                          Wrong number — calling paused
+                        </span>
+                      )}
+                      {call.candidate_status && call.candidate_status !== 'To be started' && (
+                        <span style={{ padding: '2px 8px', borderRadius: '999px', background: '#eef2ff', color: '#4338ca', fontWeight: 700, fontSize: '11px', border: '1px solid #c7d2fe' }}>
+                          {call.candidate_status}
+                        </span>
+                      )}
                       <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <Calendar size={12} /> 
-                        {call.status === 'completed' 
+                        <Calendar size={12} />
+                        {call.status === 'completed'
                           ? `Completed: ${call.completed_at ? new Date(call.completed_at).toLocaleDateString() : 'Unknown'}`
-                          : `Due: ${formatLocalDate(call.due_date)}`
+                          : `Due: ${formatLocalDate(call.due_date)}${call.due_time ? ` at ${formatDueTime(call.due_time)}` : ''}`
                         }
                       </div>
                       {call.status === 'completed' && (
@@ -1367,14 +1449,14 @@ export default function Calls() {
                           <div style={{ color: '#2563eb', fontWeight: 600 }}>
                             {call.duration ? `${Math.floor(call.duration / 60)}m ${call.duration % 60}s` : '0s'}
                           </div>
-                          <div style={{ color: '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
+                          <div style={{ color: call.outcome === 'Unreachable' ? '#b45309' : '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
                             {call.outcome || 'No Outcome'}
                           </div>
                         </>
                       )}
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  <div className="calls-row-actions" style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {call.status === 'completed' && (
                       <button
                         onClick={() => setExpandedCallId(expandedCallId === call.id ? null : call.id)}
@@ -1397,25 +1479,31 @@ export default function Calls() {
                     >
                       {isDeletingCall ? <Loader2 size={18} className="animate-spin" /> : <Trash2 size={18} />}
                     </button>
-                    <button 
+                    {(() => {
+                      const dialDisabled = call.status === 'completed' || isDeletingCall || Boolean(call.candidate_phone_wrong);
+                      return (
+                    <button
                       onClick={() => handleDial(call)}
-                      disabled={call.status === 'completed' || isDeletingCall}
-                      style={{ 
+                      disabled={dialDisabled}
+                      title={call.candidate_phone_wrong ? 'Number tagged as wrong — update the candidate’s phone to resume calling' : undefined}
+                      style={{
                         padding: '8px 16px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
-                        background: call.status === 'completed' || isDeletingCall ? '#f1f5f9' : '#111827',
-                        color: call.status === 'completed' || isDeletingCall ? '#94a3b8' : '#fff',
-                        border: call.status === 'completed' || isDeletingCall ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: call.status === 'completed' || isDeletingCall ? 'not-allowed' : 'pointer',
+                        background: dialDisabled ? '#f1f5f9' : '#111827',
+                        color: dialDisabled ? '#94a3b8' : '#fff',
+                        border: dialDisabled ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: dialDisabled ? 'not-allowed' : 'pointer',
                         display: 'flex', alignItems: 'center', gap: '8px'
                       }}
                     >
-                      <PhoneCall size={16} /> 
+                      <PhoneCall size={16} />
                     </button>
+                      );
+                    })()}
                   </div>
                 </div>
 
                 {/* Expanded Details Section */}
                 {expandedCallId === call.id && (
-                  <div style={{ 
+                  <div className="calls-expanded-details" style={{
                     padding: '24px', background: '#f8fafc', borderRadius: '16px', margin: '0 0 20px 56px',
                     border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
                   }}>
@@ -1474,7 +1562,7 @@ export default function Calls() {
                       )}
                     </div>
 
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+                    <div className="calls-insights-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
                       <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
                         <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>AI Summary</h4>
                         <div style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
@@ -1535,9 +1623,9 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [callWrapUpMeta, setCallWrapUpMeta] = useState(null);
   const [outcome, setOutcome] = useState('');
   const [notes, setNotes] = useState('');
-  const [createFollowup, setCreateFollowup] = useState(false);
-  const [followupTitle, setFollowupTitle] = useState(call?.task_title || '');
+  // Follow-up slot — required when the outcome is "Connected - Follow-up".
   const [followupDueDate, setFollowupDueDate] = useState('');
+  const [followupDueTime, setFollowupDueTime] = useState('');
   const [saving, setSaving] = useState(false);
   const [isAnswering, setIsAnswering] = useState(false);
   const [initiationError, setInitiationError] = useState('');
@@ -1545,11 +1633,12 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
   const [softphoneRecoveryAttempt, setSoftphoneRecoveryAttempt] = useState(0);
-  const { updateCall, initiateCall, fetchCalls, syncCallRecording } = useAppStore(useShallow((state) => ({
+  const { updateCall, initiateCall, fetchCalls, syncCallRecording, updateCandidateNotes } = useAppStore(useShallow((state) => ({
     updateCall: state.updateCall,
     initiateCall: state.initiateCall,
     fetchCalls: state.fetchCalls,
     syncCallRecording: state.syncCallRecording,
+    updateCandidateNotes: state.updateCandidateNotes,
   })));
   const {
     activeCall,
@@ -1573,6 +1662,11 @@ function CallingModal({ call, onClose, onRefresh }) {
   const isInitiated = useRef(false);
   const lastHandledCallEventRef = useRef(0);
   const autoRetriedSoftphoneRef = useRef(false);
+  // Real call-duration tracking: stamp the wall-clock time when the call
+  // actually connects and when it ends, so we can report true talk time
+  // instead of a placeholder value.
+  const connectedAtRef = useRef(null);
+  const endedAtRef = useRef(null);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
@@ -1788,6 +1882,17 @@ function CallingModal({ call, onClose, onRefresh }) {
     }
   }, [activeCall, callState]);
 
+  // Stamp connect/end times to measure the real call duration.
+  useEffect(() => {
+    if (callState === 'active' && connectedAtRef.current === null) {
+      connectedAtRef.current = Date.now();
+      endedAtRef.current = null;
+    }
+    if ((callState === 'ended' || callState === 'review') && connectedAtRef.current !== null && endedAtRef.current === null) {
+      endedAtRef.current = Date.now();
+    }
+  }, [callState]);
+
   useEffect(() => {
     if (!voipCallEvent?.at || lastHandledCallEventRef.current === voipCallEvent.at || callState === 'review') {
       return;
@@ -1836,7 +1941,10 @@ function CallingModal({ call, onClose, onRefresh }) {
              await syncCallRecording(call.id);
            }
 
-           const res = await fetchCalls({ list_id: call.list_id }, { force: true, updateState: false });
+           // background: refresh only this modal's data — never disturb the
+           // Calls page's own fetch/request state (doing so left the page
+           // stale until a manual refresh).
+           const res = await fetchCalls({ list_id: call.list_id }, { background: true });
            if (res.success && res.data) {
              const updated = res.data.find(c => c.id === call.id);
              if (updated) setReviewCallData(updated);
@@ -1879,6 +1987,8 @@ function CallingModal({ call, onClose, onRefresh }) {
     setCallState('preparing_softphone');
     isInitiated.current = false;
     autoRetriedSoftphoneRef.current = false;
+    connectedAtRef.current = null;
+    endedAtRef.current = null;
     setSoftphoneRecoveryAttempt(0);
     retryVoip();
   };
@@ -1896,28 +2006,65 @@ function CallingModal({ call, onClose, onRefresh }) {
 
   const handleSaveLog = async () => {
     if (!outcome) {
-      toast.error('Please select an outcome');
+      toast.error('Please select a call status');
       return;
     }
-    if (createFollowup && !followupDueDate) {
-      toast.error('Please select a due date for the follow-up task');
+    const isFollowUpOutcome = outcome === FOLLOWUP_OUTCOME;
+    if (isFollowUpOutcome && (!followupDueDate || !followupDueTime)) {
+      toast.error('Please pick the follow-up date and time');
       return;
     }
     setSaving(true);
     try {
+      // Real talk time = end timestamp − connect timestamp (in whole seconds).
+      // Falls back to 0 when the call never actually connected.
+      const measuredDuration = (connectedAtRef.current && endedAtRef.current)
+        ? Math.max(0, Math.round((endedAtRef.current - connectedAtRef.current) / 1000))
+        : 0;
       const payload = {
-        status: createFollowup ? 'pending' : 'completed',
+        status: 'completed',
         outcome,
         notes,
-        duration: Math.floor(Math.random() * 300) + 30
+        duration: measuredDuration
       };
-      if (createFollowup) {
-        payload.due_date = followupDueDate;
-        payload.task_title = followupTitle.trim();
+      if (isFollowUpOutcome) {
+        payload.followup_due_date = followupDueDate;
+        payload.followup_due_time = followupDueTime;
       }
 
-      await updateCall(call.id, payload);
-      toast.success(createFollowup ? 'Follow-up task scheduled' : 'Call log saved');
+      const res = await updateCall(call.id, payload);
+      if (!res?.success) {
+        toast.error(res?.error || 'Failed to save log');
+        return;
+      }
+
+      // Append the new text below the candidate's existing notes so it also
+      // shows up in Manage Roles / Talent Pool. Uses the same store action
+      // (and permissions) as the notes editor in the roles table.
+      const newNoteText = (notes || '').trim();
+      if (newNoteText && call.candidate_id) {
+        const existingNotes = (call.candidate_notes || '').trim();
+        const combinedNotes = existingNotes ? `${existingNotes}\n\n${newNoteText}` : newNoteText;
+        if (combinedNotes !== existingNotes) {
+          // Non-fatal: the call log is already saved; updateCandidateNotes
+          // surfaces its own toast on failure.
+          await updateCandidateNotes(call.candidate_id, combinedNotes);
+        }
+      }
+
+      const result = res.data || {};
+      if (result.auto_unreachable) {
+        toast.warning('5th failed attempt — candidate marked Unreachable and moved to cooldown');
+      } else if (result.wrong_number_tagged) {
+        toast.warning('Number tagged as wrong. Calling is paused — source an alternate number to resume.');
+      } else if (result.scheduled_next_title === 'Follow-up Call') {
+        toast.success(`Follow-up scheduled for ${formatLocalDate(followupDueDate)} at ${formatDueTime(followupDueTime)}`);
+      } else if (result.scheduled_next_title) {
+        toast.success(`Call logged — next attempt scheduled (${result.scheduled_next_title})`);
+      } else {
+        toast.success('Call log saved');
+      }
+
       onRefresh();
       setCallState('review');
     } catch (e) {
@@ -1973,14 +2120,14 @@ function CallingModal({ call, onClose, onRefresh }) {
   }, [activeCall, isLiveCallState, onClose, rejectCall]);
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
-      <div style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '720px', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
-        <div style={{ padding: '24px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+    <div className="call-modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+      <div className="call-modal-shell" style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '720px', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
+        <div className="call-modal-header" style={{ padding: '24px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '4px' }}>{call.candidate_name}</h2>
             <p style={{ fontSize: '13px', color: '#64748b' }}>Candidate Conversations</p>
           </div>
-          <div style={{ display: 'flex', background: '#f1f5f9', padding: '4px', borderRadius: '12px', gap: '4px' }}>
+          <div className="call-modal-tabs" style={{ display: 'flex', background: '#f1f5f9', padding: '4px', borderRadius: '12px', gap: '4px' }}>
             {tabs.map(tab => (
               <button 
                 key={tab.id}
@@ -2002,10 +2149,10 @@ function CallingModal({ call, onClose, onRefresh }) {
           </button>
         </div>
 
-        <div style={{ minHeight: '400px', background: '#fff' }}>
+        <div className="call-modal-content" style={{ minHeight: '400px', background: '#fff' }}>
           {activeTab === 'calls' ? (
-            <div style={{ padding: '32px 40px 40px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-              <div style={{
+            <div className="call-modal-body" style={{ padding: '32px 40px 40px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+              <div className="call-status-banner" style={{
                 alignSelf: 'stretch',
                 marginBottom: '28px',
                 padding: '14px 16px',
@@ -2111,7 +2258,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                   </div>
 
                   {callState === 'answer_required' ? (
-                    <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+                    <div className="call-modal-actions" style={{ display: 'flex', gap: '12px', width: '100%' }}>
                       <button
                         onClick={handleAnswer}
                         disabled={isAnswering}
@@ -2155,7 +2302,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                       </button>
                     </div>
                   ) : callState === 'error' ? (
-                    <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+                    <div className="call-modal-actions" style={{ display: 'flex', gap: '12px', width: '100%' }}>
                       {effectiveActionLabel && effectiveActionUrl && (
                         <button
                           onClick={handleBlockingAction}
@@ -2229,69 +2376,116 @@ function CallingModal({ call, onClose, onRefresh }) {
                       </div>
                     </div>
                   )}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px', flexWrap: 'wrap' }}>
                     <PhoneCall size={18} color="#2563eb" />
                     <span style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>Log Call Details</span>
+                    {call.candidate_status && (
+                      <span style={{
+                        marginLeft: 'auto', padding: '4px 10px', borderRadius: '999px',
+                        background: '#eef2ff', color: '#4338ca', border: '1px solid #c7d2fe',
+                        fontSize: '11px', fontWeight: 800, letterSpacing: '0.02em', whiteSpace: 'nowrap',
+                      }}>
+                        Candidate status: {call.candidate_status}
+                      </span>
+                    )}
                   </div>
 
                   <div style={{ marginBottom: '24px' }}>
-                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Outcome / Stage</label>
-                    <select 
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Call Status</label>
+                    <select
                       value={outcome}
                       onChange={e => setOutcome(e.target.value)}
                       style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', outline: 'none', background: '#fff' }}
                     >
-                      <option value="">Select an outcome...</option>
+                      <option value="">Select a status...</option>
                       {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
                     </select>
                   </div>
 
-                  {['Left Voicemail', 'No Answer'].includes(outcome) && !createFollowup && (
+                  {FAILED_OUTCOMES.has(outcome) && !isFinalAttempt(call) && (
                     <div style={{ padding: '12px', background: '#eff6ff', color: '#1e40af', borderRadius: '12px', fontSize: '13px', marginBottom: '24px', border: '1px solid #bfdbfe', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
                       <Calendar size={16} style={{ marginTop: '2px', flexShrink: 0 }} />
                       <div>
-                        <strong style={{ display: 'block', marginBottom: '4px' }}>Automated Call Sequence</strong>
-                        Because the call went unanswered, the next step in the Call 1 → Day 2 → Day 4 → Day 7 sequence will be scheduled automatically when you save.
+                        <strong style={{ display: 'block', marginBottom: '4px' }}>Automated Call Cadence</strong>
+                        The next attempt in the Day 1 → 2 → 4 → 7 → 10 cadence will be scheduled automatically when you save.
+                      </div>
+                    </div>
+                  )}
+
+                  {FAILED_OUTCOMES.has(outcome) && isFinalAttempt(call) && (
+                    <div style={{ padding: '12px', background: '#fef3c7', color: '#92400e', borderRadius: '12px', fontSize: '13px', marginBottom: '24px', border: '1px solid #fde68a', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <Clock size={16} style={{ marginTop: '2px', flexShrink: 0 }} />
+                      <div>
+                        <strong style={{ display: 'block', marginBottom: '4px' }}>Final Attempt</strong>
+                        This is the 5th attempt. On save, the candidate will be marked <strong>Unreachable</strong> and moved to the cooldown pool — no further calls will be scheduled.
+                      </div>
+                    </div>
+                  )}
+
+                  {outcome === WRONG_NUMBER_OUTCOME && (
+                    <div style={{ padding: '12px', background: '#fef2f2', color: '#991b1b', borderRadius: '12px', fontSize: '13px', marginBottom: '24px', border: '1px solid #fecaca', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <Phone size={16} style={{ marginTop: '2px', flexShrink: 0 }} />
+                      <div>
+                        <strong style={{ display: 'block', marginBottom: '4px' }}>Wrong Number</strong>
+                        This number will be tagged as wrong and the calling cadence paused. Source an alternate number (edit the candidate&apos;s contact info) to resume calling.
+                      </div>
+                    </div>
+                  )}
+
+                  {outcome === FOLLOWUP_OUTCOME && (
+                    <div className="call-followup-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '24px', padding: '16px', background: '#f0fdf4', borderRadius: '12px', border: '1px solid #bbf7d0' }}>
+                      <div style={{ gridColumn: '1 / -1', fontSize: '13px', color: '#166534', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                        <Calendar size={16} style={{ marginTop: '2px', flexShrink: 0 }} />
+                        <span>Pick the slot the candidate asked for — they will reappear in the calling list at that date and time.</span>
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Follow-up Date *</label>
+                        <input type="date" value={followupDueDate} onChange={e => setFollowupDueDate(e.target.value)} min={new Date().toISOString().split('T')[0]} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff', boxSizing: 'border-box' }} />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Follow-up Time *</label>
+                        <input type="time" value={followupDueTime} onChange={e => setFollowupDueTime(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff', boxSizing: 'border-box' }} />
                       </div>
                     </div>
                   )}
 
                   <div style={{ marginBottom: '24px' }}>
                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Notes & Next Steps</label>
-                    <textarea 
-                      placeholder="Summarize the call and note any next steps..."
+                    {(call.candidate_notes || '').trim() && (
+                      <div style={{
+                        padding: '12px 16px', borderRadius: '12px 12px 0 0',
+                        border: '1px solid rgba(203,213,225,0.9)', borderBottom: 'none',
+                        background: '#f8fafc', fontSize: '13px', color: '#475569',
+                        whiteSpace: 'pre-wrap', maxHeight: '140px', overflowY: 'auto', lineHeight: 1.55,
+                      }}>
+                        <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '6px' }}>
+                          Existing candidate notes
+                        </div>
+                        {call.candidate_notes.trim()}
+                      </div>
+                    )}
+                    <textarea
+                      placeholder={(call.candidate_notes || '').trim()
+                        ? 'Add new notes below the existing ones...'
+                        : 'Summarize the call and note any next steps...'}
                       value={notes}
                       onChange={e => setNotes(e.target.value)}
-                      style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '100px', resize: 'none', background: '#fff' }}
+                      style={{
+                        width: '100%', padding: '12px 16px',
+                        borderRadius: (call.candidate_notes || '').trim() ? '0 0 12px 12px' : '12px',
+                        border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '100px',
+                        resize: 'none', background: '#fff', boxSizing: 'border-box',
+                      }}
                     />
+                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#94a3b8' }}>
+                      New text is appended to the candidate&apos;s notes (visible in Manage Roles) and saved on this call log.
+                    </div>
                   </div>
 
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', marginBottom: '32px' }}>
-                    <input 
-                      type="checkbox" 
-                      checked={createFollowup}
-                      onChange={e => setCreateFollowup(e.target.checked)}
-                    />
-                    <span style={{ fontSize: '14px' }}>Create a follow-up task</span>
-                  </label>
-
-                  {createFollowup && (
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 180px', gap: '12px', marginBottom: '32px' }}>
-                      <div>
-                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Task Title</label>
-                        <input type="text" value={followupTitle} onChange={e => setFollowupTitle(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff' }} />
-                      </div>
-                      <div>
-                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Due Date</label>
-                        <input type="date" value={followupDueDate} onChange={e => setFollowupDueDate(e.target.value)} min={new Date().toISOString().split('T')[0]} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff' }} />
-                      </div>
-                    </div>
-                  )}
-
-                  <div style={{ display: 'flex', gap: '12px' }}>
+                  <div className="call-modal-actions" style={{ display: 'flex', gap: '12px' }}>
                     <button style={{ ...CALL_SECONDARY_BUTTON, flex: 1, padding: '14px' }} onClick={handleEndCall}>Cancel</button>
                     <button onClick={handleSaveLog} disabled={saving} style={{ ...CALL_PRIMARY_BUTTON, flex: 1, padding: '14px', cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1 }}>
-                      {saving ? 'Saving...' : 'Save Call Log'}
+                      {saving ? 'Saving...' : 'Save'}
                     </button>
                   </div>
                 </div>
