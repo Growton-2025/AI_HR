@@ -22,6 +22,25 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))
 
+# Skip the SELECT 1 validation round-trip when the connection was used this
+# recently. Azure idle timeouts are minutes long, so 120s is safely inside it.
+_VALIDATE_SKIP_WINDOW_SECONDS = int(os.getenv("DB_VALIDATE_SKIP_WINDOW_S", "120"))
+
+
+class _PooledConnection(psycopg2.extensions.connection):
+    """Python subclass of the C connection type so pooled connections accept
+    bookkeeping attributes (_last_ok_at, _pgvector_registered) — the base
+    class has no __dict__."""
+    pass
+
+
+def _mark_conn(conn, attr, value):
+    """Set a bookkeeping attribute, tolerating raw C connections."""
+    try:
+        setattr(conn, attr, value)
+    except AttributeError:
+        pass
+
 # Connection pool (initialized on first use)
 _connection_pool = None
 _pool_lock = threading.Lock()
@@ -136,6 +155,7 @@ def _initialize_pool():
             _connection_pool = pool.ThreadedConnectionPool(
                 minconn=DB_POOL_MIN,
                 maxconn=DB_POOL_MAX,
+                connection_factory=_PooledConnection,
                 **get_db_connection_params()
             )
             logger.info("Database connection pool initialized successfully")
@@ -183,22 +203,31 @@ def get_db_connection(max_retries=3, retry_delay=1, validate=False, register_pgv
 
             if validate:
                 # Azure PostgreSQL may kill idle SSL sockets after long inactivity.
-                # Only pay for a round-trip validation when the caller explicitly asks for it.
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        cur.fetchone()
-                except (psycopg2.OperationalError, psycopg2.InterfaceError, Exception) as test_error:
-                    logger.warning(
-                        f"Stale/dead connection detected (Azure idle timeout?), discarding and retrying: {test_error}"
-                    )
-                    _discard_broken_connection(conn, "stale/dead validated connection")
-                    raise test_error  # retry loop will get a fresh connection
+                # The validation ping costs a full round trip (~0.6s to a remote
+                # region), so skip it when this connection was successfully used
+                # in the last couple of minutes — a socket cannot go idle-stale
+                # that fast.
+                last_ok_at = getattr(conn, "_last_ok_at", 0)
+                if time.time() - last_ok_at > _VALIDATE_SKIP_WINDOW_SECONDS:
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1")
+                            cur.fetchone()
+                        _mark_conn(conn, '_last_ok_at', time.time())
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError, Exception) as test_error:
+                        logger.warning(
+                            f"Stale/dead connection detected (Azure idle timeout?), discarding and retrying: {test_error}"
+                        )
+                        _discard_broken_connection(conn, "stale/dead validated connection")
+                        raise test_error  # retry loop will get a fresh connection
 
-            
-            if register_pgvector:
+
+            if register_pgvector and not getattr(conn, "_pgvector_registered", False):
+                # register_vector() queries pg_type — a full round trip. Pooled
+                # connections only need it once for their lifetime.
                 try:
                     register_vector(conn)
+                    _mark_conn(conn, '_pgvector_registered', True)
                 except Exception as reg_error:
                     logger.warning(f"Failed to register vector extension: {reg_error}")
             
@@ -263,11 +292,37 @@ def return_db_connection(conn, close=False):
     
     if _connection_pool and conn:
         try:
+            needs_rollback = False
             if not conn.closed and not getattr(conn, "autocommit", False):
+                try:
+                    # Local libpq check — no network round trip. A plain SELECT
+                    # leaves the connection INTRANS, committed writes leave it
+                    # IDLE, so most returns after writes skip rollback entirely.
+                    needs_rollback = (
+                        conn.get_transaction_status()
+                        != psycopg2.extensions.TRANSACTION_STATUS_IDLE
+                    )
+                except Exception:
+                    needs_rollback = True
+
+            if needs_rollback and not close:
+                # The rollback itself costs a full round trip (~0.6s to a remote
+                # region). Do it off the request path: the connection re-enters
+                # the pool as soon as it is clean, and the caller returns now.
+                _mark_conn(conn, '_last_ok_at', time.time())
+                threading.Thread(
+                    target=_rollback_and_putconn,
+                    args=(conn,),
+                    daemon=True,
+                ).start()
+                return
+
+            if needs_rollback:
                 try:
                     conn.rollback()
                 except Exception as rollback_error:
                     logger.debug(f"Rollback before returning pooled connection failed: {rollback_error}")
+            _mark_conn(conn, '_last_ok_at', time.time())
             _connection_pool.putconn(conn, close=close)
         except Exception as e:
             # "unkeyed connection" means the pool is no longer tracking this specific object
@@ -282,6 +337,41 @@ def return_db_connection(conn, close=False):
                     pass
             else:
                 logger.error(f"Error returning connection to pool: {e}. Pool state: {_get_connection_pool_state()}")
+
+def _rollback_and_putconn(conn):
+    """Roll back a dirty connection off the request path, then repool it."""
+    global _connection_pool
+    try:
+        conn.rollback()
+    except Exception as rollback_error:
+        logger.debug(f"Async rollback failed, closing connection: {rollback_error}")
+        try:
+            if _connection_pool:
+                _connection_pool.putconn(conn, close=True)
+            elif not conn.closed:
+                conn.close()
+        except Exception:
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
+        return
+    try:
+        if _connection_pool:
+            _connection_pool.putconn(conn)
+        elif not conn.closed:
+            conn.close()
+    except Exception as e:
+        if "unkeyed" in str(e).lower():
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
+        else:
+            logger.error(f"Error returning connection to pool after async rollback: {e}")
+
 
 def close_all_connections():
     """Close all connections in the pool. Call this on application shutdown."""

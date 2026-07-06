@@ -183,6 +183,9 @@ _DIAGNOSTIC_PATHS = {
     "/api/candidates/analytics",
     "/api/candidates/browse",
     "/api/candidates/browse/summary",
+    "/api/calls",
+    "/api/calls/lists",
+    "/api/calls/stats",
 }
 
 

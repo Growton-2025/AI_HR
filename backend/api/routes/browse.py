@@ -69,13 +69,16 @@ async def get_sample_candidate(
 # Caches filtered + paginated results so repeated requests return instantly
 _browse_cache: dict = {}  # key: param_hash → {result, ts}
 _summary_cache: dict = {}  # key: param_hash → {result, ts}
+_meta_cache: dict = {}     # key: param_hash → {result, ts}
 _BROWSE_CACHE_TTL = 20   # seconds
+_META_CACHE_TTL = 60     # seconds — filter dropdown values change rarely
 
 def _invalidate_browse_cache():
     """Called when outreach data changes so stale data isn't served."""
-    global _browse_cache, _summary_cache
+    global _browse_cache, _summary_cache, _meta_cache
     _browse_cache.clear()
     _summary_cache.clear()
+    _meta_cache.clear()
 # ──────────────────────────────────────────────────────────────
 
 
@@ -733,33 +736,54 @@ async def fetch_browse_page_sql(
     direction = "DESC" if sort_dir == "desc" else "ASC"
     offset = (page - 1) * page_size
 
-    conn = get_db_connection(validate=False, register_pgvector=False)
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
-                    COUNT(*)::int AS count
-                FROM candidates c
-                WHERE {count_where_sql}
-                GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
-                """,
-                count_params,
-            )
-            status_counts = {str(row[0]): int(row[1] or 0) for row in cur.fetchall()}
+    # Each round trip to the remote DB costs ~0.6s, so: (1) status counts and
+    # the filtered total are combined into ONE statement, and (2) that statement
+    # runs CONCURRENTLY with the page-rows query on a second pooled connection.
+    # Wall-clock cost ≈ one round trip instead of three sequential ones.
+    def _run_counts_query():
+        conn = get_db_connection(validate=False, register_pgvector=False)
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH status_counts AS (
+                        SELECT
+                            COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                            COUNT(*)::int AS count
+                        FROM candidates c
+                        WHERE {count_where_sql}
+                        GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
+                    ),
+                    total_count AS (
+                        SELECT COUNT(*)::int AS total FROM candidates c WHERE {row_where_sql}
+                    )
+                    SELECT sc.status, sc.count, tc.total
+                    FROM total_count tc
+                    LEFT JOIN status_counts sc ON TRUE
+                    """,
+                    [*count_params, *row_params],
+                )
+                combined_rows = cur.fetchall()
+            counts = {
+                str(row[0]): int(row[1] or 0)
+                for row in combined_rows
+                if row[0] is not None
+            }
+            total_value = int(combined_rows[0][2] or 0) if combined_rows else 0
+            return counts, total_value
+        finally:
+            return_db_connection(conn)
 
-            cur.execute(
-                f"SELECT COUNT(*)::int FROM candidates c WHERE {row_where_sql}",
-                row_params,
-            )
-            total_row = cur.fetchone()
-            total = int(total_row[0] or 0) if total_row else 0
-
-            cur.execute(
-                f"""
+    def _run_rows_query():
+        conn = get_db_connection(validate=False, register_pgvector=False)
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
                 SELECT
                     c.id,
                     c.name,
@@ -809,9 +833,17 @@ async def fetch_browse_page_sql(
                 ORDER BY {order_expr} {direction}, c.id ASC
                 LIMIT %s OFFSET %s
                 """,
-                [*row_params, page_size, offset],
-            )
-            rows = cur.fetchall()
+                    [*row_params, page_size, offset],
+                )
+                return cur.fetchall()
+        finally:
+            return_db_connection(conn)
+
+    try:
+        (status_counts, total), rows = await asyncio.gather(
+            asyncio.to_thread(_run_counts_query),
+            asyncio.to_thread(_run_rows_query),
+        )
 
         candidates = []
         for row in rows:
@@ -860,8 +892,11 @@ async def fetch_browse_page_sql(
             "status_counts": status_counts,
             "is_semantic_search": False,
         }
-    finally:
-        return_db_connection(conn)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"browse SQL page fetch failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load candidates")
 
 
 async def build_browse_candidate_rows(
@@ -1160,6 +1195,34 @@ async def browse_candidates(
     )
     candidate_id_list = _parse_candidate_ids(candidate_ids)
 
+    # One cache key for both the SQL fast path and the in-memory fallback, so
+    # repeated identical requests (re-renders, tab switches) skip the DB.
+    browse_cache_key = hashlib.md5(json.dumps({
+        "uid": current_user.id,
+        "role": current_user.role,
+        "view_scope": effective_scope,
+        "recruiter_filter_id": effective_recruiter,
+        "page": page, "page_size": page_size, "q": q, "title": title,
+        "company": company, "city": city, "location_type": location_type,
+        "product_service": product_service, "status": status, "created_by": created_by,
+        "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
+        "candidate_ids": candidate_id_list,
+        "role_id": role_id,
+        "sort_by": sort_by, "sort_dir": sort_dir,
+    }, sort_keys=True).encode()).hexdigest()
+    cached_browse = _browse_cache.get(browse_cache_key)
+    if cached_browse and (time.monotonic() - cached_browse["ts"]) < _BROWSE_CACHE_TTL:
+        cached_result = cached_browse["result"]
+        _log_browse_timing(
+            "rows",
+            started,
+            total=cached_result.get("total"),
+            page_size=page_size,
+            scope=effective_scope,
+            recruiter_id=effective_recruiter,
+        )
+        return cached_result
+
     if _can_use_fast_sql_browse(
         q=q,
         title=title,
@@ -1196,6 +1259,7 @@ async def browse_candidates(
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
+        _browse_cache[browse_cache_key] = {"result": result, "ts": time.monotonic()}
         _log_browse_timing(
             "rows",
             started,
@@ -1364,6 +1428,25 @@ async def browse_metadata(
         role_id=role_id,
     )
 
+    # Filter dropdown values change rarely — serve repeats from a short cache.
+    meta_cache_key = hashlib.md5(json.dumps({
+        "uid": current_user.id,
+        "role": current_user.role,
+        "scope": effective_scope,
+        "recruiter": effective_recruiter,
+        "role_id": role_id,
+    }, sort_keys=True).encode()).hexdigest()
+    cached_meta = _meta_cache.get(meta_cache_key)
+    if cached_meta and (time.monotonic() - cached_meta["ts"]) < _META_CACHE_TTL:
+        _log_browse_timing(
+            "meta",
+            started,
+            total=sum(len(v) for v in cached_meta["result"].values() if isinstance(v, list)),
+            scope=effective_scope,
+            recruiter_id=effective_recruiter,
+        )
+        return cached_meta["result"]
+
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -1383,11 +1466,12 @@ async def browse_metadata(
         return sorted(cleaned, key=lambda item: item.lower())[:limit]
 
     try:
+        # All seven dropdown sources in ONE statement: each remote round trip
+        # costs ~0.6s, so 7 sequential queries were ~4.5s of pure latency.
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT DISTINCT value
-                FROM (
+                (SELECT 'company' AS kind, value FROM (
                     SELECT NULLIF(TRIM(c.raw_fields->>'import_company'), '') AS value
                     FROM candidates c
                     WHERE {where_sql}
@@ -1397,18 +1481,9 @@ async def browse_metadata(
                     JOIN roles r ON r.candidate_id = c.id
                     JOIN companies co ON co.id = r.company_id
                     WHERE {where_sql}
-                ) meta_values
-                WHERE value IS NOT NULL
-                LIMIT 100
-                """,
-                [*params, *params],
-            )
-            companies = _clean([row[0] for row in cur.fetchall()])
-
-            cur.execute(
-                f"""
-                SELECT DISTINCT value
-                FROM (
+                 ) v WHERE value IS NOT NULL LIMIT 100)
+                UNION ALL
+                (SELECT 'title', value FROM (
                     SELECT NULLIF(TRIM(c.headline), '') AS value
                     FROM candidates c
                     WHERE {where_sql}
@@ -1417,29 +1492,15 @@ async def browse_metadata(
                     FROM candidates c
                     JOIN roles r ON r.candidate_id = c.id
                     WHERE {where_sql}
-                ) meta_values
-                WHERE value IS NOT NULL
-                LIMIT 100
-                """,
-                [*params, *params],
-            )
-            titles = _clean([row[0] for row in cur.fetchall()])
-
-            cur.execute(
-                f"""
-                SELECT DISTINCT NULLIF(TRIM(COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1))), '') AS city
-                FROM candidates c
-                WHERE {where_sql}
-                LIMIT 100
-                """,
-                params,
-            )
-            cities = _clean([row[0] for row in cur.fetchall()])
-
-            cur.execute(
-                f"""
-                SELECT DISTINCT value
-                FROM (
+                 ) v WHERE value IS NOT NULL LIMIT 100)
+                UNION ALL
+                (SELECT 'city', value FROM (
+                    SELECT DISTINCT NULLIF(TRIM(COALESCE(NULLIF(c.city, ''), split_part(COALESCE(c.location, ''), ',', 1))), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                 ) v WHERE value IS NOT NULL LIMIT 100)
+                UNION ALL
+                (SELECT 'product', value FROM (
                     SELECT NULLIF(TRIM(c.raw_fields->>'extracted_industry'), '') AS value
                     FROM candidates c
                     WHERE {where_sql}
@@ -1453,43 +1514,39 @@ async def browse_metadata(
                     JOIN roles r ON r.candidate_id = c.id
                     JOIN companies co ON co.id = r.company_id
                     WHERE {where_sql}
-                ) meta_values
-                WHERE value IS NOT NULL
-                LIMIT 100
+                 ) v WHERE value IS NOT NULL LIMIT 100)
+                UNION ALL
+                (SELECT 'location_type', value FROM (
+                    SELECT DISTINCT NULLIF(TRIM(COALESCE(c.raw_fields->>'work_preference', c.raw_fields->>'location_type')), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                 ) v WHERE value IS NOT NULL)
+                UNION ALL
+                (SELECT 'status', value FROM (
+                    SELECT DISTINCT COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                 ) v WHERE value IS NOT NULL)
+                UNION ALL
+                (SELECT 'recruiter', value FROM (
+                    SELECT DISTINCT NULLIF(TRIM(c.created_by), '') AS value
+                    FROM candidates c
+                    WHERE {where_sql}
+                 ) v WHERE value IS NOT NULL)
                 """,
-                [*params, *params, *params],
+                [*params] * 11,
             )
-            products = _clean([row[0] for row in cur.fetchall()])
+            grouped: Dict[str, List[str]] = {}
+            for kind, value in cur.fetchall():
+                grouped.setdefault(kind, []).append(value)
 
-            cur.execute(
-                f"""
-                SELECT DISTINCT NULLIF(TRIM(COALESCE(c.raw_fields->>'work_preference', c.raw_fields->>'location_type')), '') AS location_type
-                FROM candidates c
-                WHERE {where_sql}
-                """,
-                params,
-            )
-            locations = _clean([row[0] for row in cur.fetchall()], limit=200)
-
-            cur.execute(
-                f"""
-                SELECT DISTINCT COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status
-                FROM candidates c
-                WHERE {where_sql}
-                """,
-                params,
-            )
-            statuses = _clean([row[0] for row in cur.fetchall()], limit=200)
-
-            cur.execute(
-                f"""
-                SELECT DISTINCT NULLIF(TRIM(c.created_by), '') AS recruiter
-                FROM candidates c
-                WHERE {where_sql}
-                """,
-                params,
-            )
-            recruiters = _clean([row[0] for row in cur.fetchall()], limit=200)
+        companies = _clean(grouped.get("company", []))
+        titles = _clean(grouped.get("title", []))
+        cities = _clean(grouped.get("city", []))
+        products = _clean(grouped.get("product", []))
+        locations = _clean(grouped.get("location_type", []), limit=200)
+        statuses = _clean(grouped.get("status", []), limit=200)
+        recruiters = _clean(grouped.get("recruiter", []), limit=200)
 
         statuses = _clean([*statuses, *RECRUITMENT_STAGES], limit=300)
         result = {
@@ -1501,6 +1558,7 @@ async def browse_metadata(
             "statuses": statuses,
             "recruiters": recruiters,
         }
+        _meta_cache[meta_cache_key] = {"result": result, "ts": time.monotonic()}
         _log_browse_timing(
             "meta",
             started,
@@ -1553,6 +1611,12 @@ async def update_notes(
 
     _invalidate_browse_cache()
     invalidate_role_detail_cache_for_candidate(candidate_id)
+    # Calls rows carry candidate_notes — refresh that cache too.
+    try:
+        from backend.api.routes.calls import invalidate_calls_cache
+        invalidate_calls_cache()
+    except Exception:
+        pass
     logger.info(
         "candidate notes updated candidate_id=%s duration_ms=%.1f",
         candidate_id,
