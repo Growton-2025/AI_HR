@@ -39,7 +39,10 @@ _LI_CACHE_STALE_THRESHOLD = 45
 _email_chat_cache: Dict[int, Dict] = {}
 _email_chat_lock = threading.Lock()
 _EMAIL_CACHE_TTL = 3600        # 1 hour for emails (last longer than LI)
-_EMAIL_CACHE_STALE_THRESHOLD = 300 # 5 minutes threshold for bg refresh
+# Polls are served instantly from memory; a background Smartlead sync fires
+# when the cache is older than this. 60s keeps new replies near-real-time
+# without the former poll-storm (a sync every 5s per open modal).
+_EMAIL_CACHE_STALE_THRESHOLD = 60
 
 _smartlead_accounts_cache: Dict[str, object] = {"accounts": [], "ts": 0.0}
 _SMARTLEAD_ACCOUNTS_TTL = 300
@@ -119,12 +122,18 @@ def _sync_li_messages(
                 print(f"DEBUG: Preserving {len(old_messages)} existing messages for cand {candidate_id} after empty/failed sync.")
                 final_messages = old_messages
 
-        _li_chat_cache[candidate_id] = {
+        previous_li_entry = _li_chat_cache.get(candidate_id) or {}
+        new_li_entry = {
             "messages": final_messages or [],
             "ts": time.monotonic(),
             "refreshing": False,
             "db_updated_at": datetime.now(tz_module.utc),
         }
+        # Preserve the initial LI message so hot-path responses keep showing it.
+        if "initial" in previous_li_entry:
+            new_li_entry["initial"] = previous_li_entry.get("initial")
+            new_li_entry["initial_at"] = previous_li_entry.get("initial_at")
+        _li_chat_cache[candidate_id] = new_li_entry
 
         # ── PERSISTENT DB CACHE ──────────────────────────────────────────────
         # Save the fetched history to DB so it lives across restarts
@@ -182,15 +191,21 @@ def _sync_email_messages(candidate_id: int, email: str, campaign_id: str) -> Lis
     with _email_chat_lock:
         final_messages = messages
         # If fetch failed/empty, preserve old cache if possible
-        if not final_messages and candidate_id in _email_chat_cache:
-            final_messages = _email_chat_cache[candidate_id].get("messages", [])
+        previous_entry = _email_chat_cache.get(candidate_id) or {}
+        if not final_messages:
+            final_messages = previous_entry.get("messages", [])
 
-        _email_chat_cache[candidate_id] = {
+        new_entry = {
             "messages": final_messages or [],
             "ts": time.monotonic(),
             "refreshing": False,
             "db_updated_at": datetime.now(tz_module.utc),
         }
+        # Preserve the sanitized initial message so the hot path keeps working.
+        if "initial" in previous_entry:
+            new_entry["initial"] = previous_entry.get("initial")
+            new_entry["initial_at"] = previous_entry.get("initial_at")
+        _email_chat_cache[candidate_id] = new_entry
 
         # Persist to DB
         if final_messages:
@@ -1619,10 +1634,13 @@ async def get_outreach_status(
 async def get_email_chat_history(
     role_id: int,
     candidate_id: int,
+    force: bool = False,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured Email chat history for a candidate"""
-    return await get_chat_history(role_id, candidate_id, current_user)
+    # NOTE: force/current_user must be passed by keyword — passing current_user
+    # positionally lands it in `force`, which permanently disables the cache.
+    return await get_chat_history(role_id, candidate_id, force=force, current_user=current_user)
 
 
 @router.post("/prewarm/linkedin")
@@ -1811,8 +1829,9 @@ async def get_linkedin_chat_history(
             # No more strict junk guard - if a message exists, show it.
             if not clean:
                 return msgs
+            clean_key = _msg_dedup_key(clean)
             already = any(
-                (m.get("email_body") or "").strip() == clean
+                _msg_dedup_key(m.get("email_body")) == clean_key
                 for m in (msgs or [])
             )
             if already:
@@ -1870,6 +1889,14 @@ async def get_linkedin_chat_history(
             t.start()
             print(f"DEBUG: Background HeyReach refresh started for cand {candidate_id} (cached={cached is not None}, stale={is_stale})")
 
+        # Store the initial LI message on the existing cache entry so the hot
+        # path can prepend it without a DB read on future polls.
+        with _li_chat_lock:
+            li_entry = _li_chat_cache.get(candidate_id)
+            if li_entry is not None:
+                li_entry["initial"] = initial_li_text
+                li_entry["initial_at"] = initial_li_at
+
         current_messages = cached["messages"] if cached else []
         final_msgs = _prepend_initial(current_messages)
 
@@ -1901,6 +1928,52 @@ async def get_linkedin_chat_history(
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch LinkedIn chat history: {e}"
         )
+
+
+# Narrow HTML detector: avoids misclassifying plain text with a stray "<".
+_HTML_HINT = re.compile(
+    r"<\s*(br|p|div|span|a|strong|b|i|em|u|ul|ol|li|table|tr|td|blockquote|h[1-6])\b"
+    r"|</\s*[a-z]+\s*>|&(nbsp|amp|lt|gt|quot|#39|apos);",
+    re.IGNORECASE,
+)
+
+
+def _normalize_body_text(body: str) -> str:
+    """Convert an HTML email body to clean plain text with real newlines.
+
+    Only touches bodies that actually look like HTML; plain-text messages pass
+    through untouched so existing (already-clean) messages are never disturbed.
+    Mirrors the frontend normalization so display is identical everywhere.
+    """
+    if not body or not isinstance(body, str):
+        return body
+    if not _HTML_HINT.search(body):
+        return body
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", body, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/\s*(p|div|li|tr|h[1-6]|blockquote)\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _msg_dedup_key(text: str) -> str:
+    """Formatting-agnostic key for comparing two message bodies.
+
+    Normalizes HTML (<br> etc.), collapses whitespace and lowercases so the
+    stored initial_message (clean text) and its Smartlead-synced copy (which may
+    carry <br> markup) compare equal — preventing the same send from rendering
+    twice in the conversation view.
+    """
+    return re.sub(r"\s+", " ", _normalize_body_text(text or "") or "").strip().lower()
 
 
 def _clean_email_body(body: str) -> str:
@@ -1939,7 +2012,9 @@ def _clean_email_body(body: str) -> str:
     if not cleaned:
         cleaned = re.sub(r"<[^>]+>", " ", body).strip()
 
-    return cleaned
+    # Convert any remaining inline <br>/block tags to real newlines so no HTML
+    # markup is stored or shown (this is what fixes the literal "<br><br>").
+    return _normalize_body_text(cleaned)
 
 
 @router.get("/chat/{role_id}/{candidate_id}")
@@ -1950,6 +2025,35 @@ async def get_chat_history(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Fetch structured chat history (Default to Email)"""
+    # ── HOT PATH: serve a fresh in-memory cache without any DB round trip ──
+    # Mirrors the LinkedIn endpoint. Each DB round trip costs ~0.6s to the
+    # remote region and the conversation modal polls this endpoint every few
+    # seconds. Only valid once the sanitized initial message has been cached
+    # ("initial" key present) — set by the DB path below.
+    if not force:
+        with _email_chat_lock:
+            hot_entry = _email_chat_cache.get(candidate_id)
+            if hot_entry and "initial" in hot_entry:
+                hot_age = time.monotonic() - hot_entry.get("ts", 0)
+                hot_refreshing = hot_entry.get("refreshing", False)
+                if hot_age <= _EMAIL_CACHE_STALE_THRESHOLD or hot_refreshing:
+                    hot_msgs = list(hot_entry.get("messages", []))
+                    hot_initial = hot_entry.get("initial")
+                    hot_initial_at = hot_entry.get("initial_at")
+                    if hot_initial:
+                        entry = {
+                            "type": "SENT",
+                            "email_body": hot_initial,
+                            "time": hot_initial_at.isoformat() if hot_initial_at else None,
+                            "sender_name": "You",
+                        }
+                        init_key = _msg_dedup_key(hot_initial)
+                        if not hot_msgs:
+                            hot_msgs = [entry]
+                        elif not any(_msg_dedup_key(m.get("email_body")) == init_key for m in hot_msgs):
+                            hot_msgs = [entry] + hot_msgs
+                    return {"messages": hot_msgs, "syncing": hot_refreshing}
+
     try:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
             if not conn:
@@ -2012,12 +2116,13 @@ async def get_chat_history(
                 "sender_name": "You",
             }
             if not msgs: return [entry]
-            if any((m.get("email_body") or "").strip() == clean_init for m in msgs):
+            init_key = _msg_dedup_key(clean_init)
+            if any(_msg_dedup_key(m.get("email_body")) == init_key for m in msgs):
                 return msgs
             return [entry] + msgs
 
         if (not is_stale or already_refreshing) and not force:
-            return {'messages': _prepend_initial(cached['messages'] if cached else []), 'syncing': already_refreshing}
+            return {'messages': _prepend_initial_email(cached['messages'] if cached else []), 'syncing': already_refreshing}
 
         if not already_refreshing and (is_stale or not cached):
             # Try instant restore from DB cache column
@@ -2052,6 +2157,18 @@ async def get_chat_history(
                 )
                 t.start()
                 print(f"DEBUG: Background Smartlead refresh started for cand {candidate_id}")
+
+        # Remember the SANITIZED initial message on the cache entry so the hot
+        # path above can serve future polls without touching the DB. Create an
+        # entry even for empty conversations — polling them repeatedly was one
+        # of the main sources of per-poll DB latency.
+        with _email_chat_lock:
+            entry = _email_chat_cache.get(candidate_id)
+            if entry is None:
+                entry = {"messages": [], "ts": time.monotonic(), "refreshing": False}
+                _email_chat_cache[candidate_id] = entry
+            entry["initial"] = initial_msg_text.strip() if initial_msg_text else None
+            entry["initial_at"] = initial_msg_at
 
         # Return whatever we have in cache (or empty) + syncing flag
         current_messages = cached["messages"] if cached else []

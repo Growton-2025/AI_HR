@@ -6,8 +6,41 @@ import StatusDropdown from './StatusDropdown'
 
 const EMPTY_THREAD = { messages: [], loaded: false, error: '' }
 
+// Detects whether a stored body is HTML (email clients send HTML with <br>,
+// <p>, entities) versus plain text. Deliberately narrow so plain-text bodies
+// that merely contain a stray "<" (e.g. "salary < 10L") aren't misclassified.
+function looksLikeHtml(str) {
+  return /<\s*(br|p|div|span|a|strong|b|i|em|u|ul|ol|li|table|tr|td|blockquote|h[1-6])\b|<\/\s*[a-z]+\s*>|&(nbsp|amp|lt|gt|quot|#39|apos);/i.test(str)
+}
+
+function decodeEntities(str) {
+  return str
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+}
+
+// Convert an HTML email body to plain text with real newlines so the same
+// pre-wrap rendering path works for both HTML and plain-text messages. This
+// avoids literal "<br><br>" leaking into the UI and is XSS-safe (no HTML is
+// injected into the DOM).
+function htmlToText(str) {
+  return str
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*\/\s*(p|div|li|tr|h[1-6]|blockquote)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
 function messageBody(message) {
-  return message?.email_body || message?.text || message?.message || message?.content || message?.html_body || message?.body || ''
+  const raw = message?.email_body || message?.text || message?.message || message?.content || message?.html_body || message?.body || ''
+  if (!raw || typeof raw !== 'string') return raw || ''
+  if (!looksLikeHtml(raw)) return raw
+  return decodeEntities(htmlToText(raw)).trim()
 }
 
 function messageTime(message) {

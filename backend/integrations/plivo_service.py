@@ -248,7 +248,7 @@ def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: st
         logger.error(f"Failed to initiate Plivo call: {e}")
         return {"success": False, "error": str(e)}
 
-async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0):
+async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0, duration_seconds: int = None):
     try:
         existing_insights = call_insights.get(call_uuid)
         if existing_insights and not existing_insights.get("error"):
@@ -326,7 +326,7 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
 
         # Sync back to local SQL database
         try:
-            from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+            from backend.api.routes.calls import get_calls_db_connection, return_db_connection, invalidate_calls_cache
             conn = get_calls_db_connection()
             if conn:
                 cur = conn.cursor()
@@ -339,33 +339,45 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                 else:
                     t_str = str(t_items) if t_items else raw_text
                 
+                # Authoritative provider duration wins when present; COALESCE
+                # keeps any existing value (e.g. the client-side timer) when the
+                # webhook didn't carry a usable duration.
                 cur.execute("""
                     UPDATE calls
-                    SET 
+                    SET
                         recording_url = %s,
                         transcript = %s,
                         summary = %s,
+                        duration = COALESCE(%s, duration),
                         status = 'completed',
                         updated_at = NOW()
                     WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
-                """, (record_url, t_str, result_json.get("summary"), call_uuid, call_uuid))
+                """, (record_url, t_str, result_json.get("summary"), duration_seconds, call_uuid, call_uuid))
                 conn.commit()
 
                 if cur.rowcount == 0:
                     logger.info("No matching UUID found in DB, falling back to updating latest call task record")
                     cur.execute("""
                         UPDATE calls
-                        SET 
+                        SET
                             recording_url = %s,
                             transcript = %s,
                             summary = %s,
+                            duration = COALESCE(%s, duration),
                             status = 'completed',
                             updated_at = NOW()
                         WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
-                    """, (record_url, t_str, result_json.get("summary")))
+                    """, (record_url, t_str, result_json.get("summary"), duration_seconds))
                     conn.commit()
                 cur.close()
                 return_db_connection(conn)
+                # Refresh the in-memory caches so the newly stored duration,
+                # transcript and summary surface immediately in the calls list
+                # and stats instead of lagging behind by a cache cycle.
+                try:
+                    invalidate_calls_cache()
+                except Exception as cache_err:
+                    logger.warning(f"Cache invalidation after Plivo sync failed: {cache_err}")
                 logger.info(f"Database synced for Plivo insights: {call_uuid}")
         except Exception as db_err:
             logger.error(f"DB update failed for Plivo insights: {db_err}")

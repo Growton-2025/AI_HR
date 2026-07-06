@@ -31,6 +31,24 @@ def _recording_callback_is_final(form_data) -> bool:
     return duration is not None or duration_ms is not None or end_ms is not None
 
 
+def _extract_duration_seconds(form_data):
+    """Return the authoritative recording duration in whole seconds.
+
+    Plivo sends ``RecordingDuration`` in seconds; when absent we fall back to
+    ``RecordingDurationMs`` (milliseconds). Returns ``None`` when neither is a
+    usable positive value.
+    """
+    duration = _parse_int(form_data.get("RecordingDuration"))
+    if duration is not None and duration > 0:
+        return duration
+
+    duration_ms = _parse_int(form_data.get("RecordingDurationMs"))
+    if duration_ms is not None and duration_ms > 0:
+        return max(1, round(duration_ms / 1000))
+
+    return None
+
+
 @router.post("/dial")
 async def plivo_dial(request: Request):
     form_data = await request.form()
@@ -74,8 +92,16 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
     if call_uuid and recording_url:
         plivo_service.recordings[call_uuid] = recording_url
         logger.info(f"Stored recording for {call_uuid}")
+        duration_seconds = _extract_duration_seconds(form_data)
+        logger.info(f"Provider recording duration for {call_uuid}: {duration_seconds}s")
         if _recording_callback_is_final(form_data):
-            background_tasks.add_task(plivo_service.process_call_insights, call_uuid, recording_url)
+            background_tasks.add_task(
+                plivo_service.process_call_insights,
+                call_uuid,
+                recording_url,
+                0,
+                duration_seconds,
+            )
         else:
             logger.info(
                 "Recording callback for %s is not final yet; delaying processing until Plivo media is likely ready.",
@@ -86,6 +112,7 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
                 call_uuid,
                 recording_url,
                 30,
+                duration_seconds,
             )
         
     return Response(status_code=200)
