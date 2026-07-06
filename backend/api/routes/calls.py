@@ -1,5 +1,5 @@
 import logging
-
+import os
 import threading
 import time
 from datetime import date, datetime
@@ -78,6 +78,16 @@ _cache_refreshing = False
 # warm_call_caches() captures this before its DB round-trip and
 # discards results if the counter changed (eviction happened mid-flight).
 _cache_generation: int = 0
+# When the caches were last warmed from the DB. Gunicorn workers do NOT share
+# memory: a mutation handled by worker A only invalidates A's cache, so worker
+# B would serve stale counts forever. Serving memory only while fresh makes a
+# stale worker fall back to the DB (always correct) and re-warm itself.
+_cache_warmed_at: float = 0.0
+_CACHE_FRESH_SECONDS = int(os.getenv("CALLS_CACHE_FRESH_SECONDS", "15"))
+
+
+def calls_cache_is_fresh() -> bool:
+    return (time.time() - _cache_warmed_at) < _CACHE_FRESH_SECONDS
 
 # In-memory Stats cache
 _stats_cache: dict[str, dict] = {}
@@ -317,7 +327,7 @@ def warm_call_caches(shared_conn=None):
     global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
 
     def _warm_from_connection(conn):
-        global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts, _cache_generation
+        global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts, _cache_generation, _cache_warmed_at
         # Snapshot generation BEFORE reading from DB.
         # If an eviction (delete) happens while we're querying,
         # _cache_generation will be > gen_before, so we discard stale results.
@@ -337,6 +347,7 @@ def warm_call_caches(shared_conn=None):
             _calls_cache = calls_data
             _stats_cache = {}
             _stats_cache_ts = {}
+            _cache_warmed_at = time.time()
         print(f"DEBUG: Bulk-warmed {len(call_lists_data)} call lists and {len(calls_data)} calls into memory.")
         return False  # signal: all good
 
@@ -377,6 +388,10 @@ def refresh_call_caches_async():
 def get_cached_call_lists(owner: str) -> Optional[List[dict]]:
     with _calls_lock:
         if _call_lists_cache is None or _calls_cache is None:
+            return None
+        # Stale worker (mutation happened on a sibling process): force the
+        # DB fallback so counts are always correct after a page refresh.
+        if not calls_cache_is_fresh():
             return None
 
         pending_counts: dict[int, int] = {}
@@ -890,9 +905,11 @@ def get_calls(
     owner = get_call_list_owner(current_user)
 
     # ── HIGH PERFORMANCE IN-MEMORY FILTERING ──
-    # If cache is available, filter in Python to avoid 5s SQL latency (Azure/SSL overhead)
+    # If cache is available AND fresh, filter in Python to avoid SQL latency.
+    # Freshness matters across gunicorn workers: a sibling process may have
+    # mutated data this worker's cache never saw.
     with _calls_lock:
-        if _calls_cache is not None:
+        if _calls_cache is not None and calls_cache_is_fresh():
             data = [c for c in _calls_cache if c.get("created_by") == owner]
             if status:
                 data = [c for c in data if c.get("status") == status]
@@ -1129,13 +1146,19 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
     ensure_calls_schema_ready()
     owner = get_call_list_owner(current_user)
 
-    # ── INSTANT STATS CACHE (30s TTL) ──
+    # ── INSTANT STATS CACHE ──
+    # Both stats layers are derived from this worker's calls cache, so they
+    # are only trustworthy while that cache is fresh (see calls_cache_is_fresh).
     now = time.time()
-    if owner in _stats_cache and (now - _stats_cache_ts.get(owner, 0) < _STATS_TTL):
+    if (
+        owner in _stats_cache
+        and (now - _stats_cache_ts.get(owner, 0) < _STATS_TTL)
+        and calls_cache_is_fresh()
+    ):
         return _stats_cache[owner]
 
     with _calls_lock:
-        if _calls_cache is not None and _call_lists_cache is not None:
+        if _calls_cache is not None and _call_lists_cache is not None and calls_cache_is_fresh():
             today = date.today()
             due_today = 0
             upcoming = 0

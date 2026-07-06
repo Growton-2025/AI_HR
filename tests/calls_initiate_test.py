@@ -718,6 +718,7 @@ def test_stats_reflect_call_eviction_immediately(monkeypatch):
     today = date.today()
 
     with calls._calls_lock:
+        calls._cache_warmed_at = calls.time.time()
         calls._stats_cache = {}
         calls._stats_cache_ts = {}
         calls._call_lists_cache = [{"id": 7, "created_by": owner}]
@@ -748,6 +749,7 @@ def test_stats_reflect_list_eviction_immediately(monkeypatch):
     today = date.today()
 
     with calls._calls_lock:
+        calls._cache_warmed_at = calls.time.time()
         calls._stats_cache = {}
         calls._stats_cache_ts = {}
         calls._call_lists_cache = [
@@ -779,6 +781,7 @@ def test_call_stats_route_matches_db_and_memory_cache_paths(monkeypatch):
     today = date.today()
 
     with calls._calls_lock:
+        calls._cache_warmed_at = calls.time.time()
         calls._stats_cache = {}
         calls._stats_cache_ts = {}
         calls._call_lists_cache = [{"id": 7, "created_by": owner}]
