@@ -10,7 +10,8 @@ import {
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming, Loader2
 } from 'lucide-react';
-import { BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
+import axios from 'axios';
+import { API_BASE, BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 
@@ -1626,12 +1627,14 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [callState, setCallState] = useState('preparing_softphone');
   const [callWrapUpMeta, setCallWrapUpMeta] = useState(null);
   const [outcome, setOutcome] = useState('');
-  const [notes, setNotes] = useState('');
   // Follow-up slot — required when the outcome is "Connected - Follow-up".
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [followupDueTime, setFollowupDueTime] = useState('');
   const [saving, setSaving] = useState(false);
   const [candidateStatus, setCandidateStatus] = useState(call.candidate_status || '');
+  const [liveNotes, setLiveNotes] = useState(call.candidate_notes || '');
+  const [notesLoading, setNotesLoading] = useState(Boolean(call.candidate_id));
+  const originalNotesRef = useRef(call.candidate_notes || '');
   const [isAnswering, setIsAnswering] = useState(false);
   const [initiationError, setInitiationError] = useState('');
   const [initiationErrorCode, setInitiationErrorCode] = useState('');
@@ -1676,6 +1679,30 @@ function CallingModal({ call, onClose, onRefresh }) {
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
   const showReviewSummary = reviewSummary && !hasPlaceholderSummary(reviewSummary);
+
+  // Fetch the freshest candidate notes when the modal opens so the recruiter
+  // always sees the latest version (call.candidate_notes can be stale).
+  useEffect(() => {
+    if (!call.candidate_id) return;
+    let cancelled = false;
+    setNotesLoading(true);
+    axios.get(`${API_BASE}/candidates/${call.candidate_id}`)
+      .then(res => {
+        if (!cancelled) {
+          const fetched = res.data?.notes || '';
+          setLiveNotes(fetched);
+          originalNotesRef.current = fetched;
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLiveNotes(call.candidate_notes || '');
+      })
+      .finally(() => {
+        if (!cancelled) setNotesLoading(false);
+      });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [call.candidate_id]);
 
   const effectiveError = initiationError || voipError || 'Browser VoIP could not be established.';
   const effectiveErrorCode = initiationErrorCode || voipErrorCode || '';
@@ -2027,14 +2054,14 @@ function CallingModal({ call, onClose, onRefresh }) {
         ? Math.max(0, Math.round((endedAtRef.current - connectedAtRef.current) / 1000))
         : 0;
       const payload = {
-        status: 'completed',
+        status: isFollowUpOutcome ? 'pending' : 'completed',
         outcome,
-        notes,
+        notes: liveNotes,
         duration: measuredDuration
       };
       if (isFollowUpOutcome) {
-        payload.followup_due_date = followupDueDate;
-        payload.followup_due_time = followupDueTime;
+        payload.due_date = followupDueDate;
+        payload.due_time = followupDueTime;
       }
 
       const res = await updateCall(call.id, payload);
@@ -2043,18 +2070,11 @@ function CallingModal({ call, onClose, onRefresh }) {
         return;
       }
 
-      // Append the new text below the candidate's existing notes so it also
-      // shows up in Manage Roles / Talent Pool. Uses the same store action
-      // (and permissions) as the notes editor in the roles table.
-      const newNoteText = (notes || '').trim();
-      if (newNoteText && call.candidate_id) {
-        const existingNotes = (call.candidate_notes || '').trim();
-        const combinedNotes = existingNotes ? `${existingNotes}\n\n${newNoteText}` : newNoteText;
-        if (combinedNotes !== existingNotes) {
-          // Non-fatal: the call log is already saved; updateCandidateNotes
-          // surfaces its own toast on failure.
-          await updateCandidateNotes(call.candidate_id, combinedNotes);
-        }
+      // Save the edited notes back to the candidate profile so they're visible
+      // in Manage Roles and Talent Pool.
+      const currentNotes = liveNotes.trim();
+      if (call.candidate_id && currentNotes !== originalNotesRef.current.trim()) {
+        await updateCandidateNotes(call.candidate_id, currentNotes);
       }
 
       const result = res.data || {};
@@ -2087,34 +2107,27 @@ function CallingModal({ call, onClose, onRefresh }) {
   ];
   
   const callStatusMeta = callState === 'preparing_softphone'
-    ? {
-        label: 'Preparing',
-        tone: '#2563eb',
-        bg: '#eff6ff',
-        message: voipConnectionEvent?.maxRetriesReached
-          ? 'Recovering browser softphone registration...'
-          : 'Registering the browser softphone...',
-      }
+    ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: '' }
     : callState === 'connecting'
-      ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: 'Starting the browser VoIP call...' }
+      ? { label: 'Ringing', tone: '#2563eb', bg: '#eff6ff', message: '' }
       : callState === 'waiting_for_invite'
-        ? { label: 'Waiting', tone: '#d97706', bg: '#fef3c7', message: 'Waiting to deliver the browser invite...' }
+        ? { label: 'Ringing', tone: '#2563eb', bg: '#eff6ff', message: '' }
         : callState === 'answer_required'
-          ? { label: 'Answer Required', tone: '#d97706', bg: '#fef3c7', message: 'The browser invite is ready. Answer to join the call.' }
+          ? { label: 'Incoming Call', tone: '#d97706', bg: '#fef3c7', message: '' }
           : callState === 'invite_received'
-            ? { label: 'Joining', tone: '#2563eb', bg: '#eff6ff', message: 'Connecting browser audio...' }
+            ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: '' }
             : callState === 'active'
-              ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: 'Two-way browser VoIP call is active.' }
+              ? { label: 'Connected', tone: '#10b981', bg: '#ecfdf5', message: '' }
               : callState === 'ended'
                 ? {
-                    label: callWrapUpMeta?.label || 'Wrap-up',
-                    tone: callWrapUpMeta?.tone || '#8b6b44',
-                    bg: callWrapUpMeta?.bg || '#f8f5ef',
-                    message: callWrapUpMeta?.message || 'Capture the outcome and next step below.',
+                    label: callWrapUpMeta?.title || 'Call Ended',
+                    tone: callWrapUpMeta?.tone || '#475569',
+                    bg: callWrapUpMeta?.bg || '#f8fafc',
+                    message: '',
                   }
                 : callState === 'error'
-                  ? { label: 'VoIP Error', tone: '#dc2626', bg: '#fef2f2', message: effectiveError }
-                  : { label: 'Review', tone: '#8b5cf6', bg: '#f5f3ff', message: 'AI processing recording...' };
+                  ? { label: 'Not Reachable', tone: '#dc2626', bg: '#fef2f2', message: '' }
+                  : { label: 'Processing', tone: '#8b5cf6', bg: '#f5f3ff', message: '' };
 
   const isLiveCallState = ['preparing_softphone', 'connecting', 'waiting_for_invite', 'answer_required', 'invite_received', 'active', 'error'].includes(callState);
   const handleCloseModal = useCallback(async () => {
@@ -2160,7 +2173,7 @@ function CallingModal({ call, onClose, onRefresh }) {
               <div className="call-status-banner" style={{
                 alignSelf: 'stretch',
                 marginBottom: '28px',
-                padding: '14px 16px',
+                padding: '10px 16px',
                 borderRadius: '16px',
                 background: callStatusMeta.bg,
                 color: callStatusMeta.tone,
@@ -2168,19 +2181,24 @@ function CallingModal({ call, onClose, onRefresh }) {
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 gap: '12px',
-                transition: 'all 0.25s ease'
+                transition: 'all 0.3s ease'
               }}>
-                <div>
-                  <div style={{ fontSize: '12px', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase' }}>{callStatusMeta.label}</div>
-                  <div style={{ fontSize: '13px', marginTop: '4px' }}>{callStatusMeta.message}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{
+                    width: 8, height: 8, borderRadius: '50%', background: callStatusMeta.tone, flexShrink: 0,
+                    animation: ['Ringing', 'Connecting'].includes(callStatusMeta.label) ? 'ping 1.5s cubic-bezier(0,0,0.2,1) infinite' : 'none',
+                    display: 'inline-block',
+                  }} />
+                  <span style={{ fontSize: '13px', fontWeight: 700 }}>{callStatusMeta.label}</span>
                 </div>
                 <div style={{
-                  padding: '6px 10px',
+                  padding: '4px 10px',
                   borderRadius: '999px',
                   background: '#fff',
                   border: `1px solid ${callStatusMeta.tone}22`,
                   fontSize: '11px',
-                  fontWeight: 800
+                  fontWeight: 700,
+                  color: '#475569',
                 }}>
                   {call.list_name || 'Call Task'}
                 </div>
@@ -2189,77 +2207,39 @@ function CallingModal({ call, onClose, onRefresh }) {
               {/* Call Mode / Agent Cards Removed */}
 
               {hasBlockingVoipError && (
-                <div style={{ 
-                  alignSelf: 'stretch', marginBottom: '20px', padding: '20px', 
-                  borderRadius: '16px', background: '#fff7ed', border: '1px solid #fed7aa', 
+                <div style={{
+                  alignSelf: 'stretch', marginBottom: '20px', padding: '20px',
+                  borderRadius: '16px', background: '#fef2f2', border: '1px solid #fecaca',
                   display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', textAlign: 'center'
                 }}>
-                  <div style={{ color: '#9a3412', fontSize: '14px', fontWeight: 700 }}>
-                    Browser VoIP Unavailable
+                  <div style={{ color: '#b91c1c', fontSize: '14px', fontWeight: 700 }}>
+                    Could not connect the call
                   </div>
-                  <div style={{ color: '#c2410c', fontSize: '13px' }}>
-                    {effectiveError}
+                  <div style={{ color: '#dc2626', fontSize: '13px' }}>
+                    Please check your microphone and internet connection, then try again.
                   </div>
-                  {effectiveErrorCode === 'browser_calling_disabled' && voipMeta?.agent_id && (
-                    <div style={{ color: '#9a3412', fontSize: '12px', fontWeight: 600 }}>
-                      Seat: {displayedAgentEmail} • Agent ID: {voipMeta.agent_id}
-                    </div>
-                  )}
                   {effectiveActionLabel && effectiveActionUrl && (
-                    <button
-                      onClick={handleBlockingAction}
-                      style={{
-                        ...CALL_PRIMARY_BUTTON, display: 'block', width: '100%', padding: '12px', fontSize: '14px'
-                      }}
-                    >
+                    <button onClick={handleBlockingAction} style={{ ...CALL_PRIMARY_BUTTON, display: 'block', width: '100%', padding: '12px', fontSize: '14px' }}>
                       {effectiveActionLabel}
                     </button>
-                  )}
-                  {effectiveErrorCode && (
-                    <div style={{ color: '#9a3412', fontSize: '12px', fontWeight: 700 }}>
-                      Error code: {effectiveErrorCode}
-                    </div>
                   )}
                 </div>
               )}
 
               {isLiveCallState ? (
                 <>
-                  <div style={{ 
-                    width: '120px', height: '120px', borderRadius: '50%', background: '#eff6ff', 
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '32px',
-                    position: 'relative',
-                    transition: 'transform 0.25s ease, box-shadow 0.25s ease',
-                    transform: callState === 'active' ? 'scale(1.03)' : 'scale(1)',
-                    boxShadow: callState === 'active' ? '0 18px 30px -24px rgba(37,99,235,0.5)' : '0 0 0 0 rgba(37,99,235,0.18)'
-                  }}>
-                    {callState === 'answer_required' ? <PhoneIncoming size={48} color="#d97706" /> : <Phone size={48} color="#2563eb" />}
-                    {(callState === 'preparing_softphone' || callState === 'connecting' || callState === 'waiting_for_invite' || callState === 'invite_received') && (
-                      <div style={{ 
-                        position: 'absolute', inset: -10, borderRadius: '50%', 
-                        border: '2px solid #2563eb', animation: 'ping 2s cubic-bezier(0, 0, 0.2, 1) infinite' 
-                      }} />
-                    )}
-                  </div>
-                  <h3 style={{ fontSize: '24px', fontWeight: 800, color: '#0f172a', marginBottom: '8px' }}>
-                    {callState === 'preparing_softphone' ? 'Preparing Browser Softphone...' :
-                     callState === 'connecting' ? `Calling ${call.candidate_name?.split(' ')[0] || 'Candidate'}...` :
-                     callState === 'waiting_for_invite' ? 'Waiting For Browser Invite...' :
-                     callState === 'answer_required' ? 'Answer Browser Call' :
-                     callState === 'invite_received' ? 'Joining Browser Call...' :
-                     callState === 'active' ? `Active call with ${call.candidate_name || 'Candidate'}` :
-                     'Browser VoIP unavailable'}
+                  <h3 style={{ fontSize: '20px', fontWeight: 700, color: '#0f172a', marginBottom: '4px', textAlign: 'center' }}>
+                    {call.candidate_name || 'Candidate'}
                   </h3>
-                  <p style={{ fontSize: '18px', color: '#64748b', fontWeight: 500, marginBottom: '16px' }}>{call.candidate_phone}</p>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: callStatusMeta.tone, fontSize: '14px', fontWeight: 700, marginBottom: '40px' }}>
-                    {callState === 'answer_required' ? <PhoneIncoming size={14} /> : <RefreshCw size={14} style={{ animation: (callState === 'active' || callState === 'error') ? 'none' : 'spin 2s linear infinite' }} />}
-                    {callState === 'preparing_softphone' ? 'Registering softphone' :
-                     callState === 'connecting' ? 'Initiating call' :
-                     callState === 'waiting_for_invite' ? 'Waiting for browser invite' :
-                     callState === 'answer_required' ? 'Invite received' :
-                     callState === 'invite_received' ? 'Connecting browser audio' :
-                     callState === 'active' ? 'Connected' :
-                     'Needs attention'}
+                  <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '20px' }}>
+                    {call.candidate_phone}
+                  </p>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: callStatusMeta.tone, marginBottom: '36px' }}>
+                    {callState === 'active' ? 'Connected'
+                      : callState === 'error' ? 'Not Reachable'
+                      : callState === 'answer_required' ? 'Incoming Call'
+                      : callState === 'preparing_softphone' || callState === 'invite_received' ? 'Connecting...'
+                      : 'Ringing...'}
                   </div>
 
                   {callState === 'answer_required' ? (
@@ -2332,7 +2312,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                           fontSize: '15px',
                         }}
                       >
-                        <RefreshCw size={20} /> Retry VoIP
+                        <RefreshCw size={20} /> Try Again
                       </button>
                       <button
                         onClick={handleCloseModal}
@@ -2363,22 +2343,18 @@ function CallingModal({ call, onClose, onRefresh }) {
               ) : callState === 'ended' ? (
                 <div style={{ width: '100%' }}>
                   {callWrapUpMeta && (
-                    <div
-                      style={{
-                        marginBottom: '20px',
-                        padding: '16px 18px',
-                        borderRadius: '14px',
-                        background: callWrapUpMeta.bg,
-                        border: `1px solid ${callWrapUpMeta.border}`,
-                        color: callWrapUpMeta.tone,
-                      }}
-                    >
-                      <div style={{ fontSize: '12px', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-                        {callWrapUpMeta.title}
-                      </div>
-                      <div style={{ fontSize: '13px', marginTop: '6px', lineHeight: 1.5 }}>
-                        {callWrapUpMeta.message}
-                      </div>
+                    <div style={{
+                      marginBottom: '20px',
+                      padding: '12px 16px',
+                      borderRadius: '12px',
+                      background: callWrapUpMeta.bg || '#f8fafc',
+                      border: `1px solid ${callWrapUpMeta.border || '#e2e8f0'}`,
+                      display: 'flex', alignItems: 'center', gap: '10px',
+                    }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', background: callWrapUpMeta.tone || '#475569', flexShrink: 0 }} />
+                      <span style={{ fontSize: '13px', fontWeight: 700, color: callWrapUpMeta.tone || '#475569' }}>
+                        {callWrapUpMeta.title || 'Call Ended'}
+                      </span>
                     </div>
                   )}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px', padding: '12px 16px', background: '#f8fafc', borderRadius: '12px', flexWrap: 'wrap' }}>
@@ -2469,37 +2445,25 @@ function CallingModal({ call, onClose, onRefresh }) {
                     </div>
                   )}
 
+                  {/* Notes — pre-populated with existing candidate notes, fully editable */}
                   <div style={{ marginBottom: '24px' }}>
-                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Notes & Next Steps</label>
-                    {(call.candidate_notes || '').trim() && (
-                      <div style={{
-                        padding: '12px 16px', borderRadius: '12px 12px 0 0',
-                        border: '1px solid rgba(203,213,225,0.9)', borderBottom: 'none',
-                        background: '#f8fafc', fontSize: '13px', color: '#475569',
-                        whiteSpace: 'pre-wrap', maxHeight: '140px', overflowY: 'auto', lineHeight: 1.55,
-                      }}>
-                        <div style={{ fontSize: '11px', fontWeight: 800, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '6px' }}>
-                          Existing candidate notes
-                        </div>
-                        {call.candidate_notes.trim()}
-                      </div>
-                    )}
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      Notes
+                    </label>
                     <textarea
-                      placeholder={(call.candidate_notes || '').trim()
-                        ? 'Add new notes below the existing ones...'
-                        : 'Summarize the call and note any next steps...'}
-                      value={notes}
-                      onChange={e => setNotes(e.target.value)}
+                      placeholder={notesLoading ? 'Loading notes…' : 'Add notes about this candidate...'}
+                      value={liveNotes}
+                      onChange={e => setLiveNotes(e.target.value)}
+                      disabled={notesLoading}
                       style={{
                         width: '100%', padding: '12px 16px',
-                        borderRadius: (call.candidate_notes || '').trim() ? '0 0 12px 12px' : '12px',
-                        border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '100px',
-                        resize: 'none', background: '#fff', boxSizing: 'border-box',
+                        borderRadius: '12px',
+                        border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '120px',
+                        resize: 'none', background: notesLoading ? '#f8fafc' : '#fff',
+                        boxSizing: 'border-box', outline: 'none', lineHeight: 1.6,
+                        color: notesLoading ? '#94a3b8' : '#334155',
                       }}
                     />
-                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#94a3b8' }}>
-                      New text is appended to the candidate&apos;s notes (visible in Manage Roles) and saved on this call log.
-                    </div>
                   </div>
 
                   <div className="call-modal-actions" style={{ display: 'flex', gap: '12px' }}>

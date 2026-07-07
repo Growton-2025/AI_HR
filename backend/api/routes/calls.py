@@ -474,12 +474,12 @@ class CallUpdate(BaseModel):
     notes: Optional[str] = None
     duration: Optional[int] = None
     due_date: Optional[date] = None
+    due_time: Optional[dt_time] = None
     task_title: Optional[str] = None
     recording_url: Optional[str] = None
     transcript: Optional[str] = None
     summary: Optional[str] = None
-    # Required when completing with a follow-up outcome: the exact slot the
-    # candidate should reappear in the calling list.
+    # Legacy fields kept for backwards compatibility — no longer used.
     followup_due_date: Optional[date] = None
     followup_due_time: Optional[dt_time] = None
 
@@ -834,6 +834,7 @@ def add_candidates_to_list(
                 FROM calls
                 WHERE list_id = %s
                   AND candidate_id = ANY(%s::int[])
+                  AND status = 'pending'
             ),
             inserted AS (
                 INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
@@ -844,6 +845,7 @@ def add_candidates_to_list(
                   AND NOT EXISTS (
                       SELECT 1 FROM calls existing
                       WHERE existing.candidate_id = c_id AND existing.list_id = %s
+                        AND existing.status = 'pending'
                   )
                 RETURNING id
             )
@@ -981,9 +983,8 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
 
     # A follow-up outcome must carry the exact slot the candidate reappears in.
     if (
-        request.status == "completed"
-        and (request.outcome or "").strip() in FOLLOWUP_CALL_OUTCOMES
-        and (request.followup_due_date is None or request.followup_due_time is None)
+        (request.outcome or "").strip() in FOLLOWUP_CALL_OUTCOMES
+        and (request.due_date is None or request.due_time is None)
     ):
         raise HTTPException(
             status_code=400,
@@ -1018,6 +1019,9 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         if request.due_date is not None:
             fields.append("due_date = %s")
             params.append(request.due_date)
+        if request.due_time is not None:
+            fields.append("due_time = %s")
+            params.append(request.due_time)
         if request.task_title is not None:
             fields.append("task_title = %s")
             params.append(request.task_title.strip() or None)
@@ -1089,21 +1093,9 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                                 (candidate_id, list_id, delay_days, next_title)
                             )
                             scheduled_next_title = next_title
-            elif current_outcome in FOLLOWUP_CALL_OUTCOMES and request.followup_due_date:
-                # Candidate reappears in the calling list at the chosen slot.
-                cur.execute(
-                    """
-                    INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
-                    VALUES (%s, %s, 'pending', %s, %s, %s)
-                    """,
-                    (
-                        candidate_id,
-                        list_id,
-                        request.followup_due_date,
-                        request.followup_due_time,
-                        FOLLOWUP_TASK_TITLE,
-                    ),
-                )
+            elif current_outcome in FOLLOWUP_CALL_OUTCOMES:
+                # The call row was already rescheduled in-place (status kept as
+                # 'pending', due_date/due_time updated above) — no new row needed.
                 scheduled_next_title = FOLLOWUP_TASK_TITLE
             elif current_outcome == WRONG_NUMBER_OUTCOME:
                 # Tag the number on the candidate so every list sees it; the
