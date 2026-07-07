@@ -295,11 +295,13 @@ function Roles() {
 
     const [editingCell, setEditingCell] = useState({ candidateId: null, field: null })
     const [editValue, setEditValue] = useState('')
+    const editOriginalRef = useRef('')
 
     const handleContactEdit = async (candidateId, field, value) => {
         const trimmed = String(value || '').trim()
         setEditingCell({ candidateId: null, field: null })
         setEditValue('')
+        if (trimmed === editOriginalRef.current) return
         try {
             await axios.patch(`${API_BASE}/candidates/${candidateId}`, { [field]: trimmed })
             const patch = field === 'email'
@@ -313,6 +315,7 @@ function Roles() {
     }
 
     const startEdit = (candidateId, field, currentValue) => {
+        editOriginalRef.current = currentValue || ''
         setEditingCell({ candidateId, field })
         setEditValue(currentValue || '')
     }
