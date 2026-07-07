@@ -1854,6 +1854,43 @@ input:checked + .slider:before {
   max-width: 155px;
 }
 
+.role-contact-edit-input {
+  width: 100%;
+  min-width: 120px;
+  padding: 4px 7px;
+  border: 1.5px solid #6366f1;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #0f172a;
+  background: #fff;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+.role-contact-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px dashed #cbd5e1;
+  background: transparent;
+  color: #94a3b8;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.role-contact-add:hover {
+  border-color: #6366f1;
+  color: #6366f1;
+  background: #eef2ff;
+}
+
 .role-response-cell {
   width: 100%;
   border: 0;

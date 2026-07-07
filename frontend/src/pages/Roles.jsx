@@ -293,6 +293,35 @@ function Roles() {
         roleStatusOptions.filter(status => Number(statusCounts[status] || 0) > 0 || RECRUITMENT_STAGES.includes(status))
     ), [roleStatusOptions, statusCounts])
 
+    const [editingCell, setEditingCell] = useState({ candidateId: null, field: null })
+    const [editValue, setEditValue] = useState('')
+
+    const handleContactEdit = async (candidateId, field, value) => {
+        const trimmed = String(value || '').trim()
+        setEditingCell({ candidateId: null, field: null })
+        setEditValue('')
+        try {
+            await axios.patch(`${API_BASE}/candidates/${candidateId}`, { [field]: trimmed })
+            const patch = field === 'email'
+                ? { email: trimmed }
+                : { mobile_phone: trimmed, phone: trimmed }
+            updateCandidateInRole(candidateId, patch)
+            toast.success('Contact updated')
+        } catch (error) {
+            toast.error(error.response?.data?.detail || 'Failed to update contact')
+        }
+    }
+
+    const startEdit = (candidateId, field, currentValue) => {
+        setEditingCell({ candidateId, field })
+        setEditValue(currentValue || '')
+    }
+
+    const cancelEdit = () => {
+        setEditingCell({ candidateId: null, field: null })
+        setEditValue('')
+    }
+
     const [emailSetup, setEmailSetup] = useState(null)
     const [emailSetupLoading, setEmailSetupLoading] = useState(false)
     const [emailSetupModalOpen, setEmailSetupModalOpen] = useState(false)
@@ -1563,29 +1592,60 @@ function Roles() {
                                                     <td>{Number(candidate.total_experience_years || 0) > 0 ? `${Number(candidate.total_experience_years).toFixed(1)}y` : '—'}</td>
                                                     <td>{Number(candidate.avg_tenure_years || candidate.avg_years_in_company || 0) > 0 ? `${Number(candidate.avg_tenure_years || candidate.avg_years_in_company).toFixed(1)}y` : '—'}</td>
                                                     <td>
-                                                        {candidate.email ? (
+                                                        {editingCell.candidateId === candidate.id && editingCell.field === 'email' ? (
+                                                            <input
+                                                                autoFocus
+                                                                className="role-contact-edit-input"
+                                                                type="email"
+                                                                value={editValue}
+                                                                onChange={e => setEditValue(e.target.value)}
+                                                                onBlur={() => handleContactEdit(candidate.id, 'email', editValue)}
+                                                                onKeyDown={e => {
+                                                                    if (e.key === 'Enter') handleContactEdit(candidate.id, 'email', editValue)
+                                                                    if (e.key === 'Escape') cancelEdit()
+                                                                }}
+                                                            />
+                                                        ) : candidate.email ? (
                                                             <div className="role-contact-value">
-                                                                <span title={candidate.email}>{candidate.email}</span>
+                                                                <span title={candidate.email} style={{ cursor: 'text' }} onClick={() => startEdit(candidate.id, 'email', candidate.email)}>{candidate.email}</span>
                                                                 <button type="button" className="icon-btn" onClick={() => handleCopy(candidate.email)} title="Copy email"><Copy size={12} /></button>
                                                             </div>
-                                                        ) : <span className="empty-val">Not available</span>}
+                                                        ) : (
+                                                            <button type="button" className="role-contact-add" onClick={() => startEdit(candidate.id, 'email', '')}>+ Add email</button>
+                                                        )}
                                                     </td>
                                                     <td>
-                                                        {phone ? (
+                                                        {editingCell.candidateId === candidate.id && editingCell.field === 'mobile_phone' ? (
+                                                            <input
+                                                                autoFocus
+                                                                className="role-contact-edit-input"
+                                                                type="tel"
+                                                                value={editValue}
+                                                                onChange={e => setEditValue(e.target.value)}
+                                                                onBlur={() => handleContactEdit(candidate.id, 'mobile_phone', editValue)}
+                                                                onKeyDown={e => {
+                                                                    if (e.key === 'Enter') handleContactEdit(candidate.id, 'mobile_phone', editValue)
+                                                                    if (e.key === 'Escape') cancelEdit()
+                                                                }}
+                                                            />
+                                                        ) : phone ? (
                                                             <div className="role-contact-value">
-                                                                <span title={phone}>{phone}</span>
+                                                                <span title={phone} style={{ cursor: 'text' }} onClick={() => startEdit(candidate.id, 'mobile_phone', phone)}>{phone}</span>
                                                                 <button type="button" className="icon-btn" onClick={() => handleCopy(phone)} title="Copy phone"><Copy size={12} /></button>
                                                             </div>
                                                         ) : (
-                                                            <button
-                                                                type="button"
-                                                                className="role-refresh-contact"
-                                                                onClick={() => handleRefreshProfile(candidate)}
-                                                                disabled={Boolean(refreshingProfileIds[candidate.id])}
-                                                            >
-                                                                <RefreshCcw size={12} className={refreshingProfileIds[candidate.id] ? 'animate-spin' : ''} />
-                                                                {refreshingProfileIds[candidate.id] ? 'Fetching…' : 'Fetch contact'}
-                                                            </button>
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                                <button
+                                                                    type="button"
+                                                                    className="role-refresh-contact"
+                                                                    onClick={() => handleRefreshProfile(candidate)}
+                                                                    disabled={Boolean(refreshingProfileIds[candidate.id])}
+                                                                >
+                                                                    <RefreshCcw size={12} className={refreshingProfileIds[candidate.id] ? 'animate-spin' : ''} />
+                                                                    {refreshingProfileIds[candidate.id] ? 'Fetching…' : 'Fetch contact'}
+                                                                </button>
+                                                                <button type="button" className="role-contact-add" onClick={() => startEdit(candidate.id, 'mobile_phone', '')}>+ Add</button>
+                                                            </div>
                                                         )}
                                                     </td>
                                                     <td>
