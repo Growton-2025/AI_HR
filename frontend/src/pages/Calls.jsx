@@ -1,6 +1,7 @@
 import { VoIPProvider, useVoIP } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import StatusDropdown from '../components/StatusDropdown';
 import { useSearchParams } from 'react-router-dom';
 import { 
   Phone, Calendar, CheckCircle2, List, PhoneCall, 
@@ -881,6 +882,8 @@ export default function Calls() {
     sidebarWidth: state.sidebarWidth,
   })));
 
+  const [statusOverrides, setStatusOverrides] = useState({});
+
   const [searchParams, setSearchParams] = useSearchParams();
   // Deep-link restore: remember the list_id from the URL until callLists arrive.
   const pendingListIdRef = useRef(Number(searchParams.get('list_id')) || null);
@@ -1432,11 +1435,12 @@ export default function Calls() {
                           Wrong number — calling paused
                         </span>
                       )}
-                      {call.candidate_status && call.candidate_status !== 'To be started' && (
-                        <span style={{ padding: '2px 8px', borderRadius: '999px', background: '#eef2ff', color: '#4338ca', fontWeight: 700, fontSize: '11px', border: '1px solid #c7d2fe' }}>
-                          {call.candidate_status}
-                        </span>
-                      )}
+                      <StatusDropdown
+                        status={statusOverrides[call.candidate_id] ?? call.candidate_status}
+                        candidateId={call.candidate_id}
+                        optimistic
+                        onUpdate={(id, newStatus) => setStatusOverrides(prev => ({ ...prev, [id]: newStatus }))}
+                      />
                       <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <Calendar size={12} />
                         {call.status === 'completed'
@@ -1627,6 +1631,7 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [followupDueDate, setFollowupDueDate] = useState('');
   const [followupDueTime, setFollowupDueTime] = useState('');
   const [saving, setSaving] = useState(false);
+  const [candidateStatus, setCandidateStatus] = useState(call.candidate_status || '');
   const [isAnswering, setIsAnswering] = useState(false);
   const [initiationError, setInitiationError] = useState('');
   const [initiationErrorCode, setInitiationErrorCode] = useState('');
@@ -2400,6 +2405,21 @@ function CallingModal({ call, onClose, onRefresh }) {
                       <option value="">Select a status...</option>
                       {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
                     </select>
+                  </div>
+
+                  <div style={{ marginBottom: '24px' }}>
+                    <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Candidate Status</label>
+                    <div>
+                      <StatusDropdown
+                        status={candidateStatus}
+                        candidateId={call.candidate_id}
+                        optimistic
+                        onUpdate={(id, newStatus) => setCandidateStatus(newStatus)}
+                      />
+                    </div>
+                    <div style={{ marginTop: '6px', fontSize: '11px', color: '#94a3b8' }}>
+                      Updates across Manage Roles and Talent Pool.
+                    </div>
                   </div>
 
                   {FAILED_OUTCOMES.has(outcome) && !isFinalAttempt(call) && (
