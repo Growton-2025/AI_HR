@@ -342,18 +342,13 @@ def _summary_scope_sql(
     params: List[Any] = []
     user_role = (current_user.role or "").strip().lower()
 
-    if user_role != "admin":
-        where.append("c.owner_user_id = %s")
-        params.append(current_user.id)
-    elif effective_scope == VIEW_SCOPE_RECRUITER_POOLS:
-        where.append("c.owner_user_id IS NOT NULL")
-        if effective_recruiter is not None:
-            where.append("c.owner_user_id = %s")
-            params.append(effective_recruiter)
-    elif effective_scope == VIEW_SCOPE_ALL_RECRUITER_POOLS:
-        where.append("c.owner_user_id IS NOT NULL")
-
     if role_id:
+        # Role membership alone defines the pool. The Manage Roles table lists
+        # every candidate linked to the role regardless of which recruiter owns
+        # the profile, so filters must not additionally narrow by candidate
+        # owner — otherwise filtered results/counts drop candidates that are
+        # plainly visible in the unfiltered table. Access control stays on the
+        # role itself (rr.user_id).
         role_filters = ["rrc.candidate_id = c.id", "rrc.role_id = %s"]
         params.append(role_id)
         if user_role != "admin":
@@ -373,6 +368,18 @@ def _summary_scope_sql(
             )
             """.format(role_where=" AND ".join(role_filters))
         )
+        return " AND ".join(where), params
+
+    if user_role != "admin":
+        where.append("c.owner_user_id = %s")
+        params.append(current_user.id)
+    elif effective_scope == VIEW_SCOPE_RECRUITER_POOLS:
+        where.append("c.owner_user_id IS NOT NULL")
+        if effective_recruiter is not None:
+            where.append("c.owner_user_id = %s")
+            params.append(effective_recruiter)
+    elif effective_scope == VIEW_SCOPE_ALL_RECRUITER_POOLS:
+        where.append("c.owner_user_id IS NOT NULL")
 
     return " AND ".join(where), params
 
