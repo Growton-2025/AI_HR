@@ -17,6 +17,24 @@ import AddToListModal from '../components/AddToListModal'
 const RESPONDED_TAB = '__responded__'
 const RESPONSE_TAB_LABEL = 'Responded'
 
+const NEW_BADGE_DAYS = 7
+
+function isRecentlyAdded(isoString) {
+    if (!isoString) return false
+    const added = new Date(isoString)
+    if (Number.isNaN(added.getTime())) return false
+    return (Date.now() - added.getTime()) < NEW_BADGE_DAYS * 86400000
+}
+
+function addedTooltip(isoString) {
+    if (!isoString) return ''
+    const added = new Date(isoString)
+    if (Number.isNaN(added.getTime())) return ''
+    const day = added.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+    const time = added.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    return `Added on ${day} at ${time}`
+}
+
 function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
     const countsReady = options.countsReady !== false
     const candidateCountsReady = countsReady || candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true
@@ -465,7 +483,13 @@ function Roles() {
             try {
                 const response = await axios.get(`${API_BASE}/candidates/browse?${params.toString()}&cb=${Date.now()}`, { timeout: 60000 })
                 if (requestSeq !== roleFilterRequestSeqRef.current) return
-                setRoleFilteredCandidates(response.data?.candidates || [])
+                // Browse rows don't carry role-link fields (added_to_role_at) —
+                // merge them in from the role's own candidate list.
+                const roleById = new Map((viewingRole.candidates || []).map(c => [Number(c.id), c]))
+                setRoleFilteredCandidates((response.data?.candidates || []).map(row => {
+                    const roleRow = roleById.get(Number(row.id))
+                    return roleRow?.added_to_role_at ? { ...row, added_to_role_at: roleRow.added_to_role_at } : row
+                }))
                 setRoleStatusCounts(response.data?.status_counts || {})
             } catch (error) {
                 if (requestSeq === roleFilterRequestSeqRef.current) {
@@ -1579,7 +1603,25 @@ function Roles() {
                                                             style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
                                                         />
                                                     </td>
-                                                    <td className="role-sticky-first-name">{candidate.first_name || candidate.name?.split(' ')[0] || '—'}</td>
+                                                    <td className="role-sticky-first-name">
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                                            {candidate.first_name || candidate.name?.split(' ')[0] || '—'}
+                                                            {isRecentlyAdded(candidate.added_to_role_at) && (
+                                                                <span
+                                                                    className="hy-tooltip"
+                                                                    data-tooltip={addedTooltip(candidate.added_to_role_at)}
+                                                                    style={{
+                                                                        padding: '1px 6px', borderRadius: 5,
+                                                                        background: '#ecfdf5', border: '1px solid #a7f3d0',
+                                                                        fontSize: 10, fontWeight: 700, color: '#047857',
+                                                                        letterSpacing: '0.03em', cursor: 'default',
+                                                                    }}
+                                                                >
+                                                                    New
+                                                                </span>
+                                                            )}
+                                                        </span>
+                                                    </td>
                                                     <td className="role-sticky-last-name">{candidate.last_name || candidate.name?.split(' ').slice(1).join(' ') || '—'}</td>
                                                     <td className="role-truncate-cell" title={candidate.title || candidate.headline}>{candidate.title || candidate.headline || '—'}</td>
                                                     <td>

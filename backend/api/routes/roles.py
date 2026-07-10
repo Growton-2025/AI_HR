@@ -641,7 +641,8 @@ async def get_role(
                        COALESCE(role_outreach.li_conversation_id, ''),
                        COALESCE(role_outreach.email_message_count, 0),
                        COALESCE(role_outreach.li_message_count, 0),
-                       COALESCE(role_outreach.message_count, 0)
+                       COALESCE(role_outreach.message_count, 0),
+                       rc.created_at
                 FROM selected_role sr
                 LEFT JOIN users u ON u.id = sr.user_id
                 LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
@@ -781,6 +782,7 @@ async def get_role(
                     "outreach_counts_loaded": True,
                     "notes": row[25] or "",
                     "status": row[19] or candidate.get("status") or "To be started",
+                    "added_to_role_at": row[38].isoformat() if row[38] else None,
                 })
                 candidate["priority"] = row[10]
                 candidate["feedback"] = row[11]

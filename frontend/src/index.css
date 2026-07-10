@@ -1769,6 +1769,12 @@ input:checked + .slider:before {
   background: #f8fafc;
 }
 
+/* Keep the hovered first-name cell above its sticky siblings so the
+   "New" badge tooltip isn't painted over by the last-name column. */
+.role-candidates-table tbody .role-sticky-first-name:hover {
+  z-index: 9;
+}
+
 .role-truncate-cell {
   max-width: 190px;
   overflow: hidden;
@@ -3001,4 +3007,49 @@ input:checked + .slider:before {
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Instant custom tooltip — used by the "New" candidate badge */
+.hy-tooltip {
+  position: relative;
+}
+.hy-tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%) translateY(3px);
+  background: #0f172a;
+  color: #f8fafc;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: normal;
+  padding: 6px 10px;
+  border-radius: 7px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.2);
+}
+.hy-tooltip::before {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: #0f172a;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 1000;
+}
+.hy-tooltip:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.hy-tooltip:hover::before {
+  opacity: 1;
 }
