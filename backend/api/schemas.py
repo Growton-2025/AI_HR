@@ -38,8 +38,7 @@ class RoleCreate(BaseModel):
     job_description: Optional[str] = None
     heyreach_campaign_id: int
     smartlead_sender_account_id: Optional[int] = 0
-    email_subject: Optional[str] = ""
-    email_body: Optional[str] = ""
+    smartlead_campaign_id: Optional[int] = 0
     auto_create_call_list: bool = False
 
 class RoleUpdate(BaseModel):
@@ -48,8 +47,7 @@ class RoleUpdate(BaseModel):
 class RoleActivationSetup(BaseModel):
     heyreach_campaign_id: int
     smartlead_sender_account_id: Optional[int] = 0
-    email_subject: Optional[str] = ""
-    email_body: Optional[str] = ""
+    smartlead_campaign_id: Optional[int] = 0
 
 class AssignmentDetail(BaseModel):
     candidate_id: int

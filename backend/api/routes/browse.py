@@ -21,6 +21,7 @@ import logging
 import time
 import hashlib
 import json
+from datetime import date
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -337,6 +338,8 @@ def _summary_scope_sql(
     effective_scope: str,
     effective_recruiter: Optional[int],
     role_id: Optional[int],
+    added_from: Optional[str] = None,
+    added_to: Optional[str] = None,
 ) -> tuple[str, List[Any]]:
     where = ["COALESCE(c.is_archived, FALSE) = FALSE"]
     params: List[Any] = []
@@ -357,6 +360,13 @@ def _summary_scope_sql(
         elif effective_scope == VIEW_SCOPE_RECRUITER_POOLS and effective_recruiter is not None:
             role_filters.append("rr.user_id = %s")
             params.append(effective_recruiter)
+        if added_from:
+            role_filters.append("rrc.created_at >= %s::date")
+            params.append(added_from)
+        if added_to:
+            # Inclusive end date: anything before the next day counts.
+            role_filters.append("rrc.created_at < %s::date + INTERVAL '1 day'")
+            params.append(added_to)
 
         where.append(
             """
@@ -540,12 +550,16 @@ def _browse_where_sql(
     min_avg_tenure: Optional[float] = None,
     candidate_ids: Optional[List[int]] = None,
     include_status: bool = True,
+    added_from: Optional[str] = None,
+    added_to: Optional[str] = None,
 ) -> tuple[str, List[Any]]:
     where_sql, params = _summary_scope_sql(
         current_user,
         effective_scope=effective_scope,
         effective_recruiter=effective_recruiter,
         role_id=role_id,
+        added_from=added_from,
+        added_to=added_to,
     )
     where = [where_sql]
 
@@ -686,6 +700,8 @@ async def fetch_browse_page_sql(
     max_exp: Optional[float] = None,
     min_avg_tenure: Optional[float] = None,
     candidate_ids: Optional[List[int]] = None,
+    added_from: Optional[str] = None,
+    added_to: Optional[str] = None,
     sort_by: Optional[str],
     sort_dir: Optional[str],
 ) -> Dict[str, Any]:
@@ -711,6 +727,8 @@ async def fetch_browse_page_sql(
         min_avg_tenure=min_avg_tenure,
         candidate_ids=candidate_ids,
         include_status=False,
+        added_from=added_from,
+        added_to=added_to,
     )
     row_where_sql, row_params = _browse_where_sql(
         current_user,
@@ -730,6 +748,8 @@ async def fetch_browse_page_sql(
         min_avg_tenure=min_avg_tenure,
         candidate_ids=candidate_ids,
         include_status=True,
+        added_from=added_from,
+        added_to=added_to,
     )
     sort_map = {
         "name": "LOWER(COALESCE(c.name, ''))",
@@ -1189,12 +1209,21 @@ async def browse_candidates(
     min_avg_tenure: Optional[float] = None, # stability
     candidate_ids: Optional[str] = None,
     role_id: Optional[int] = None,
+    # Role-link date range (when the candidate was added to the role, YYYY-MM-DD)
+    added_from: Optional[str] = None,
+    added_to: Optional[str] = None,
     # Sort
     sort_by: Optional[str] = "name",
     sort_dir: Optional[str] = "asc",
 ):
     """Browse candidates with role-based pool scope."""
     started = time.monotonic()
+    for label, value in (("added_from", added_from), ("added_to", added_to)):
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
     effective_scope, effective_recruiter = resolve_browse_scope(
         current_user,
         view_scope,
@@ -1215,6 +1244,7 @@ async def browse_candidates(
         "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
         "candidate_ids": candidate_id_list,
         "role_id": role_id,
+        "added_from": added_from, "added_to": added_to,
         "sort_by": sort_by, "sort_dir": sort_dir,
     }, sort_keys=True).encode()).hexdigest()
     cached_browse = _browse_cache.get(browse_cache_key)
@@ -1263,6 +1293,8 @@ async def browse_candidates(
             max_exp=max_exp,
             min_avg_tenure=min_avg_tenure,
             candidate_ids=candidate_id_list,
+            added_from=added_from,
+            added_to=added_to,
             sort_by=sort_by,
             sort_dir=sort_dir,
         )
@@ -1291,6 +1323,7 @@ async def browse_candidates(
         "min_exp": min_exp, "max_exp": max_exp, "min_avg_tenure": min_avg_tenure,
         "candidate_ids": candidate_id_list,
         "role_id": role_id,
+        "added_from": added_from, "added_to": added_to,
         "sort_by": sort_by, "sort_dir": sort_dir,
     }, sort_keys=True)
     cache_key = hashlib.md5(cache_key_src.encode()).hexdigest()

@@ -4,22 +4,13 @@ import { Loader2, Plus, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { API_BASE } from '../store/useAppStore'
 
-const DEFAULT_SUBJECT = 'A {{role_name}} opportunity for you'
-const DEFAULT_BODY = `Hi {{first_name}},
-
-I came across your profile and thought your experience could be a strong fit for our {{role_name}} opportunity.
-
-Would you be open to a brief conversation?
-
-Best regards`
-
 export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [accounts, setAccounts] = useState([])
   const [form, setForm] = useState({
     name: role?.name || '', heyreach_campaign_id: '', smartlead_sender_account_id: '',
-    email_subject: DEFAULT_SUBJECT, email_body: DEFAULT_BODY,
+    smartlead_campaign_id: '',
     auto_create_call_list: false,
   })
 
@@ -38,8 +29,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
           name: role?.name || current.name,
           heyreach_campaign_id: saved.heyreach_campaign_id || '',
           smartlead_sender_account_id: saved.smartlead_sender_account_id || '',
-          email_subject: saved.email_subject || current.email_subject,
-          email_body: saved.email_body || current.email_body,
+          smartlead_campaign_id: saved.smartlead_campaign_id || '',
         }))
       })
       .catch(error => {
@@ -58,8 +48,7 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
         name: form.name.trim(),
         heyreach_campaign_id: Number(form.heyreach_campaign_id),
         smartlead_sender_account_id: Number(form.smartlead_sender_account_id) || 0,
-        email_subject: form.email_subject.trim(),
-        email_body: form.email_body.trim(),
+        smartlead_campaign_id: Number(form.smartlead_campaign_id) || 0,
         auto_create_call_list: form.auto_create_call_list,
       })
       if (!result?.success) throw new Error(result?.error || (role ? 'Activation failed' : 'Failed to create role'))
@@ -71,15 +60,16 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
     }
   }
 
-  const isSmartleadSelected = Boolean(form.smartlead_sender_account_id && String(form.smartlead_sender_account_id) !== "0")
+  const hasSmartleadSender = Boolean(form.smartlead_sender_account_id && String(form.smartlead_sender_account_id) !== "0")
+  const hasSmartleadCampaign = Boolean(form.smartlead_campaign_id && Number(form.smartlead_campaign_id) > 0)
+  const isSmartleadSelected = hasSmartleadSender
   const isHeyreachSelected = Boolean(form.heyreach_campaign_id && Number(form.heyreach_campaign_id) > 0)
   const invalid = !form.name.trim() || (!isSmartleadSelected && !isHeyreachSelected && !form.auto_create_call_list)
-    || (isSmartleadSelected && (!form.email_subject.trim() || !form.email_body.trim()))
 
   return <div className="modal-overlay" onClick={onClose}>
     <div className="modal-content" style={{ maxWidth: 720, maxHeight: '90vh', padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={event => event.stopPropagation()}>
       <div style={{ padding: '20px 22px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', flexShrink: 0 }}>
-        <div><h3 className="modal-title" style={{ margin: 0 }}>{role ? `Activate ${role.name}` : 'Create and activate role'}</h3><p style={{ margin: '5px 0 0', color: '#64748b', fontSize: 12 }}>Smartlead creates an empty campaign named after this role. HeyReach links the existing campaign ID.</p></div>
+        <div><h3 className="modal-title" style={{ margin: 0 }}>{role ? `Activate ${role.name}` : 'Create and activate role'}</h3><p style={{ margin: '5px 0 0', color: '#64748b', fontSize: 12 }}>Smartlead links your campaign ID or creates a campaign automatically. HeyReach links the existing campaign ID. Shortlisted candidates are pushed automatically.</p></div>
         <button className="icon-btn" onClick={onClose}><X size={18} /></button>
       </div>
       <div style={{ padding: 22, display: 'grid', gap: 15, overflowY: 'auto', minHeight: 0 }}>
@@ -89,8 +79,10 @@ export default function RoleCreateModal({ role = null, onClose, onSubmit }) {
           <option value="">{loading ? 'Loading connected senders…' : 'Optional: Select a connected sender…'}</option>
           {accounts.map(account => <option key={account.id} value={account.id} disabled={!account.connected}>{account.email}{account.name ? ` · ${account.name}` : ''}{account.connected ? '' : ' · disconnected'}</option>)}
         </select></label>
-        <label>Email subject<input className="input-field" maxLength={500} value={form.email_subject} onChange={e => setForm(f => ({ ...f, email_subject: e.target.value }))} style={{ width: '100%', marginTop: 6 }} /></label>
-        <label>Email body<textarea className="input-field" rows={8} maxLength={20000} value={form.email_body} onChange={e => setForm(f => ({ ...f, email_body: e.target.value }))} style={{ width: '100%', marginTop: 6, resize: 'vertical' }} /></label>
+        <label>Smartlead campaign ID<input className="input-field" type="text" inputMode="numeric" pattern="[0-9]*" value={form.smartlead_campaign_id} onChange={e => setForm(f => ({ ...f, smartlead_campaign_id: e.target.value.replace(/\D/g, '') }))} placeholder="Optional: Paste campaign ID" style={{ width: '100%', marginTop: 6 }} />
+          {hasSmartleadSender && !hasSmartleadCampaign && <span style={{ display: 'block', marginTop: 5, color: '#64748b', fontSize: 11 }}>No campaign ID — a Smartlead campaign named after this role is created automatically.</span>}
+          {hasSmartleadCampaign && !hasSmartleadSender && <span style={{ display: 'block', marginTop: 5, color: '#b45309', fontSize: 11 }}>Select a sender to enable Smartlead — without one, email outreach is skipped.</span>}
+        </label>
         {!role && (
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, cursor: 'pointer' }}>
             <input 

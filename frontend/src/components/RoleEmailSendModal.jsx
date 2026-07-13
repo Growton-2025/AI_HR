@@ -4,17 +4,8 @@ import { Loader2, Save, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { API_BASE } from '../store/useAppStore'
 
-const DEFAULT_SUBJECT = 'A {{role_name}} opportunity for you'
-const DEFAULT_BODY = `Hi {{first_name}},
-
-I came across your profile and thought your experience could be a strong fit for our {{role_name}} opportunity.
-
-Would you be open to a brief conversation?
-
-Best regards`
-
 export default function RoleEmailSendModal({ roleId, roleName, onClose, onSaved }) {
-  const [setup, setSetup] = useState({ sender_account_id: '', subject: DEFAULT_SUBJECT, initial_body: DEFAULT_BODY })
+  const [setup, setSetup] = useState({ sender_account_id: '', campaign_id: '' })
   const [accounts, setAccounts] = useState([])
   const [busy, setBusy] = useState(true)
 
@@ -28,8 +19,7 @@ export default function RoleEmailSendModal({ roleId, roleName, onClose, onSaved 
       const value = setupRes.data || {}
       setSetup({
         sender_account_id: String(value.sender_account_id || ''),
-        subject: value.subject || DEFAULT_SUBJECT,
-        initial_body: value.initial_body || DEFAULT_BODY,
+        campaign_id: String(value.campaign_id || ''),
       })
       setAccounts(accountRes.data?.accounts || [])
     }).catch(error => {
@@ -44,8 +34,7 @@ export default function RoleEmailSendModal({ roleId, roleName, onClose, onSaved 
     try {
       const res = await axios.put(`${API_BASE}/outreach/roles/${roleId}/email-setup`, {
         sender_account_id: Number(setup.sender_account_id),
-        subject: setup.subject.trim(),
-        initial_body: setup.initial_body.trim(),
+        campaign_id: Number(setup.campaign_id),
       })
       toast.success(`Email setup saved for ${roleName}`)
       onSaved?.(res.data)
@@ -58,14 +47,14 @@ export default function RoleEmailSendModal({ roleId, roleName, onClose, onSaved 
   }
 
   const selectedAccount = accounts.find(account => String(account.id) === String(setup.sender_account_id))
-  const invalid = !setup.sender_account_id || !setup.subject.trim() || !setup.initial_body.trim()
+  const invalid = !setup.sender_account_id
 
   return <div className="modal-overlay" onClick={() => !busy && onClose()}>
     <div className="modal-content" style={{ maxWidth: 680, padding: 0, overflow: 'hidden' }} onClick={event => event.stopPropagation()}>
       <div style={{ padding: '20px 22px', borderBottom: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div>
           <h3 className="modal-title" style={{ margin: 0 }}>Email outreach setup</h3>
-          <p style={{ color: '#64748b', fontSize: 12, marginTop: 5 }}>Saved for {roleName}. Tokens: {'{{first_name}}'}, {'{{last_name}}'}, {'{{role_name}}'}.</p>
+          <p style={{ color: '#64748b', fontSize: 12, marginTop: 5 }}>Saved for {roleName}. Links an existing Smartlead campaign — shortlisted candidates are pushed to it automatically.</p>
         </div>
         <button className="icon-btn" onClick={onClose} disabled={busy} aria-label="Close"><X size={18} /></button>
       </div>
@@ -82,12 +71,9 @@ export default function RoleEmailSendModal({ roleId, roleName, onClose, onSaved 
             {selectedAccount?.warmup_status && <span style={{ display: 'block', marginTop: 5, color: '#64748b', fontSize: 11 }}>Warmup: {selectedAccount.warmup_status}</span>}
           </label>
 
-          <label style={{ fontSize: 12, fontWeight: 700, color: '#334155' }}>Subject
-            <input className="input-field" value={setup.subject} maxLength={500} onChange={event => setSetup(current => ({ ...current, subject: event.target.value }))} style={{ width: '100%', marginTop: 7 }} />
-          </label>
-
-          <label style={{ fontSize: 12, fontWeight: 700, color: '#334155' }}>Initial email
-            <textarea className="input-field" rows={9} maxLength={20000} value={setup.initial_body} onChange={event => setSetup(current => ({ ...current, initial_body: event.target.value }))} style={{ width: '100%', marginTop: 7, resize: 'vertical', lineHeight: 1.55 }} />
+          <label style={{ fontSize: 12, fontWeight: 700, color: '#334155' }}>Smartlead campaign ID
+            <input className="input-field" type="text" inputMode="numeric" pattern="[0-9]*" value={setup.campaign_id} onChange={event => setSetup(current => ({ ...current, campaign_id: event.target.value.replace(/\D/g, '') }))} placeholder="Optional — leave blank to auto-create" style={{ width: '100%', marginTop: 7 }} />
+            <span style={{ display: 'block', marginTop: 5, color: '#64748b', fontSize: 11 }}>Paste an ID to link an existing campaign, or leave blank to create one named after this role. The sequence and content are configured inside Smartlead.</span>
           </label>
         </div>}
       </div>

@@ -505,7 +505,37 @@ def _resolve_scope(
 ) -> tuple[str, Optional[int]]:
     if (current_user.role or "").strip().lower() == "admin":
         return view_scope or VIEW_SCOPE_MASTER, recruiter_filter_id
+    # Role-scoped smart columns are shared per role, not per recruiter pool.
+    if view_scope and view_scope.startswith("role_"):
+        return view_scope, recruiter_filter_id
     return VIEW_SCOPE_RECRUITER_POOLS, current_user.id
+
+
+def _role_scope_id(view_scope: Optional[str], role_id: Optional[int]) -> Optional[int]:
+    """role_{id} scope or explicit role_id → role id, else None."""
+    if role_id:
+        return int(role_id)
+    if view_scope and view_scope.startswith("role_"):
+        try:
+            return int(view_scope.split("_", 1)[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _profiles_for_role(role_id: int) -> List[Dict[str, Any]]:
+    """Profiles restricted to a role's assigned candidates (cache-first)."""
+    with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+        if not conn:
+            return []
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT candidate_id FROM recruitment_role_candidates WHERE role_id = %s",
+                (role_id,),
+            )
+            ids = [row[0] for row in cur.fetchall()]
+    profiles = [query.PROFILES_BY_ID[i] for i in ids if i in query.PROFILES_BY_ID]
+    return [p for p in profiles if not p.get("is_archived")]
 
 
 def _limit_profiles_for_field_catalog(profiles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -945,7 +975,29 @@ def _call_openai_for_json(system_prompt: str, user_prompt: str, *, use_web: bool
                     timeout=request_timeout,
                 )
             parsed = _json_block_to_dict(response.output_text or "")
-            parsed.setdefault("sources", _collect_response_sources(response))
+            # The model's own sources array often omits URLs (the schema marks
+            # them optional). Keep only entries with a URL, then backfill from
+            # the web_search annotations and, failing that, markdown links in
+            # the answer text — a web-derived answer must carry source URLs.
+            model_sources = [
+                source for source in (parsed.get("sources") if isinstance(parsed.get("sources"), list) else [])
+                if isinstance(source, dict) and str(source.get("url") or "").strip()
+            ]
+            seen_urls = {str(source.get("url")).strip() for source in model_sources}
+            for source in _collect_response_sources(response):
+                url = source.get("url") or ""
+                if url and url not in seen_urls and len(model_sources) < 8:
+                    model_sources.append(source)
+                    seen_urls.add(url)
+            if not model_sources:
+                for match in re.finditer(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", response.output_text or ""):
+                    url = match.group(2).strip()
+                    if url not in seen_urls:
+                        model_sources.append({"url": url, "title": match.group(1).strip(), "note": ""})
+                        seen_urls.add(url)
+                    if len(model_sources) >= 8:
+                        break
+            parsed["sources"] = model_sources
             parsed["searched_at"] = searched_at
             parsed["freshness_date"] = searched_at[:10]
             parsed["web_search_tool"] = tool_config.get("type") or ""
@@ -2128,13 +2180,19 @@ def get_ai_column_field_catalog(
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     resolved_scope, resolved_recruiter = _resolve_scope(current_user, view_scope, recruiter_filter_id)
-    profiles = get_profiles_for_scope(
-        query.PROFILES_BY_ID,
-        user_role=(current_user.role or "").strip().lower(),
-        user_id=current_user.id,
-        view_scope=resolved_scope,
-        recruiter_filter_id=resolved_recruiter,
-    )
+    scope_role_id = _role_scope_id(resolved_scope, role_id)
+    if scope_role_id and _fetch_role_context(scope_role_id, current_user):
+        # Role scope: sample the role's own candidates so field suggestions
+        # reflect their data (including CSV-imported columns), not the whole pool.
+        profiles = _profiles_for_role(scope_role_id)
+    else:
+        profiles = get_profiles_for_scope(
+            query.PROFILES_BY_ID,
+            user_role=(current_user.role or "").strip().lower(),
+            user_id=current_user.id,
+            view_scope=resolved_scope,
+            recruiter_filter_id=resolved_recruiter,
+        )
     defs = _fetch_visible_definitions(
         current_user,
         view_scope=resolved_scope,
@@ -2159,13 +2217,17 @@ def generate_ai_column_config(
 ):
     try:
         resolved_scope, resolved_recruiter = _resolve_scope(current_user, body.view_scope, body.recruiter_filter_id)
-        profiles = get_profiles_for_scope(
-            query.PROFILES_BY_ID,
-            user_role=(current_user.role or "").strip().lower(),
-            user_id=current_user.id,
-            view_scope=resolved_scope,
-            recruiter_filter_id=resolved_recruiter,
-        )
+        scope_role_id = _role_scope_id(resolved_scope, None)
+        if scope_role_id and _fetch_role_context(scope_role_id, current_user):
+            profiles = _profiles_for_role(scope_role_id)
+        else:
+            profiles = get_profiles_for_scope(
+                query.PROFILES_BY_ID,
+                user_role=(current_user.role or "").strip().lower(),
+                user_id=current_user.id,
+                view_scope=resolved_scope,
+                recruiter_filter_id=resolved_recruiter,
+            )
         defs = _fetch_visible_definitions(
             current_user,
             view_scope=resolved_scope,

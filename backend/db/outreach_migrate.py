@@ -55,6 +55,8 @@ def ensure_outreach_migrations(conn) -> None:
             for column_sql in (
                 "ADD COLUMN IF NOT EXISTS initial_message TEXT",
                 "ADD COLUMN IF NOT EXISTS initial_message_at TIMESTAMP",
+                "ADD COLUMN IF NOT EXISTS response_read_at TIMESTAMP",
+                "ADD COLUMN IF NOT EXISTS li_response_read_at TIMESTAMP",
             ):
                 cur.execute(f"ALTER TABLE candidate_outreach {column_sql}")
 

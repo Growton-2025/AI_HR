@@ -1681,6 +1681,29 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
+    markOutreachResponseRead: async (roleId, candidateId) => {
+        // Optimistically flip the bubble back to light green immediately
+        set(state => {
+            const roleStatuses = state.outreachStatusCache[roleId]
+            const entry = roleStatuses?.[candidateId]
+            if (!entry || !entry.has_unread_response) return state
+            return {
+                outreachStatusCache: {
+                    ...state.outreachStatusCache,
+                    [roleId]: {
+                        ...roleStatuses,
+                        [candidateId]: { ...entry, has_unread_response: false },
+                    },
+                },
+            }
+        })
+        try {
+            await axios.post(`${API_BASE}/outreach/mark-response-read/${roleId}/${candidateId}`)
+        } catch (error) {
+            console.error('Failed to mark response as read:', error)
+        }
+    },
+
     syncOutreachResponses: async (roleId) => {
         try {
             const res = await axios.post(`${API_BASE}/outreach/sync-responses/${roleId}`)

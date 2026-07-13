@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus, Play, Edit2, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import { useShallow } from 'zustand/react/shallow'
@@ -13,6 +13,11 @@ import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterC
 import CandidateConversationModal from '../components/CandidateConversationModal'
 import EditableCandidateNotes from '../components/EditableCandidateNotes'
 import AddToListModal from '../components/AddToListModal'
+import AiColumnConfigModal from '../components/AiColumnConfigModal'
+import AiColumnCellDrawer from '../components/AiColumnCellDrawer'
+import HayasaBrand from '../components/HayasaBrand'
+import { longOperationAxios } from '../api/longTimeoutAxios'
+import { renderFriendlyAiValue, resolveAiCellValue, summarizeAiRun, createOptimisticAiColumn, mergeAiColumnDefinitions } from './TalentPool'
 
 const RESPONDED_TAB = '__responded__'
 const RESPONSE_TAB_LABEL = 'Responded'
@@ -63,6 +68,7 @@ function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) 
         responseChannel,
         messageCount,
         hasResponse: Boolean(String(responseText || '').trim()) || Number(messageCount || 0) > 0 || Boolean(outreach.li_conversation_id),
+        hasUnread: Boolean(outreach.has_unread_response),
     }
 }
 
@@ -141,7 +147,8 @@ function Roles() {
         city: [], cityInput: '',
         product_service: [], productInput: '',
         status: [], statusInput: '',
-        min_exp: 0, max_exp: 40
+        min_exp: 0, max_exp: 40,
+        added_from: '', added_to: ''
     })
     const [roleFilteredCandidates, setRoleFilteredCandidates] = useState([])
     const [roleStatusCounts, setRoleStatusCounts] = useState({})
@@ -200,6 +207,8 @@ function Roles() {
     const [candidateSearch, setCandidateSearch] = useState('')
     const [candidateSearchResults, setCandidateSearchResults] = useState([])
     const [candidateSearchLoading, setCandidateSearchLoading] = useState(false)
+    // 'talent_pool' searches the whole master pool; 'owner_pool' narrows to the role owner's uploads (admin only)
+    const [addCandidateScope, setAddCandidateScope] = useState('talent_pool')
     const [selectedCandidateAdds, setSelectedCandidateAdds] = useState(new Set())
     const [isAddingCandidates, setIsAddingCandidates] = useState(false)
     const candidateSearchDebounceRef = useRef(null)
@@ -233,6 +242,8 @@ function Roles() {
         || Boolean(activeStatusTab)
         || Number(filters.min_exp || 0) > 0
         || Number(filters.max_exp ?? 40) < 40
+        || Boolean(filters.added_from)
+        || Boolean(filters.added_to)
     ), [activeStatusTab, filters, roleSearch, splitFilterValues])
 
     const hasServerRoleFilters = useMemo(() => (
@@ -245,6 +256,8 @@ function Roles() {
         || Boolean(activeStatusTab && activeStatusTab !== RESPONDED_TAB)
         || Number(filters.min_exp || 0) > 0
         || Number(filters.max_exp ?? 40) < 40
+        || Boolean(filters.added_from)
+        || Boolean(filters.added_to)
     ), [activeStatusTab, filters, roleSearch, splitFilterValues])
 
     const setFilter = useCallback((key, val) => {
@@ -265,7 +278,8 @@ function Roles() {
             city: [], cityInput: '',
             product_service: [], productInput: '',
             status: [], statusInput: '',
-            min_exp: 0, max_exp: 40
+            min_exp: 0, max_exp: 40,
+            added_from: '', added_to: ''
         })
         setActiveStatusTab('')
         setRoleSearch('')
@@ -310,6 +324,194 @@ function Roles() {
     const visibleStatusTabs = useMemo(() => (
         roleStatusOptions.filter(status => Number(statusCounts[status] || 0) > 0 || RECRUITMENT_STAGES.includes(status))
     ), [roleStatusOptions, statusCounts])
+
+    // ── Smart Columns (role-scoped AI columns, mirrors the Talent Pool feature) ──
+    const [roleAiColumns, setRoleAiColumns] = useState([])
+    const [aiColumnModal, setAiColumnModal] = useState(null)
+    const [aiCellDrawer, setAiCellDrawer] = useState({ open: false, loading: false, detail: null, title: '' })
+    const roleAiInFlightKeyRef = useRef('')
+    const roleAiRequestSeqRef = useRef(0)
+
+    const roleViewScope = viewingRole?.id ? `role_${viewingRole.id}` : ''
+    const roleAiCandidateIdsKey = useMemo(
+        () => filteredCandidates.map(candidate => candidate.id).filter(Boolean).join(','),
+        [filteredCandidates]
+    )
+
+    const fetchRoleAiColumns = useCallback(async () => {
+        if (!roleViewScope || !roleAiCandidateIdsKey) return
+        const params = new URLSearchParams()
+        params.set('candidate_ids', roleAiCandidateIdsKey)
+        params.set('view_scope', roleViewScope)
+        params.set('role_id', roleViewScope.replace('role_', ''))
+        const requestKey = params.toString()
+        if (roleAiInFlightKeyRef.current === requestKey) return
+        const requestId = ++roleAiRequestSeqRef.current
+        roleAiInFlightKeyRef.current = requestKey
+        try {
+            const res = await longOperationAxios.get(`${API_BASE}/ai-columns?${requestKey}`, { timeout: 120000 })
+            if (requestId !== roleAiRequestSeqRef.current) return
+            setRoleAiColumns(prev => mergeAiColumnDefinitions(prev || [], res.data?.columns || []))
+        } catch (error) {
+            console.error('Failed to fetch role smart columns', error)
+        } finally {
+            if (roleAiInFlightKeyRef.current === requestKey) roleAiInFlightKeyRef.current = ''
+        }
+    }, [roleViewScope, roleAiCandidateIdsKey])
+
+    useEffect(() => { setRoleAiColumns([]) }, [roleViewScope])
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => { void fetchRoleAiColumns() }, 400)
+        return () => window.clearTimeout(timer)
+    }, [fetchRoleAiColumns])
+
+    useEffect(() => {
+        const hasActiveRuns = (roleAiColumns || []).some(column => {
+            const status = column.latest_run?.status
+            if (status === 'queued' || status === 'running') return true
+            return Object.values(column.cells_by_candidate || {}).some(cell => cell.status === 'queued' || cell.status === 'running')
+        })
+        if (!hasActiveRuns) return undefined
+        const timer = window.setInterval(() => { void fetchRoleAiColumns() }, 2000)
+        return () => window.clearInterval(timer)
+    }, [roleAiColumns, fetchRoleAiColumns])
+
+    const dynamicRoleAiCols = useMemo(() => (
+        (roleAiColumns || []).flatMap(definition => {
+            const outputs = Array.isArray(definition.output_schema) && definition.output_schema.length
+                ? definition.output_schema
+                : [{ key: 'result', label: 'Result', primary: true }]
+            return outputs.map(output => ({
+                key: `__ai__${definition.id}__${output.key}`,
+                label: outputs.length === 1 ? definition.name : `${definition.name} · ${output.label}`,
+                definitionId: definition.id,
+                definition,
+                outputKey: output.key,
+                isPrimaryOutput: Boolean(output.primary),
+            }))
+        })
+    ), [roleAiColumns])
+
+    const upsertOptimisticRoleAiColumn = useCallback((runInfo = {}) => {
+        const candidateIdArray = Array.isArray(runInfo.candidateIds)
+            ? runInfo.candidateIds.map(Number).filter(Number.isFinite)
+            : []
+        const rawDefinition = runInfo.definition || {}
+        const definition = {
+            ...rawDefinition,
+            id: rawDefinition.id ?? runInfo.columnDefinitionId,
+            name: rawDefinition.name || runInfo.columnName || 'Smart Column',
+        }
+        if (!definition.id || !candidateIdArray.length) return
+        const optimisticColumn = createOptimisticAiColumn(definition, candidateIdArray, runInfo.runId || null)
+        setRoleAiColumns(prev => {
+            const existingIndex = (prev || []).findIndex(col => String(col.id) === String(definition.id))
+            if (existingIndex === -1) return [...(prev || []), optimisticColumn]
+            return (prev || []).map((col, index) => (
+                index === existingIndex ? mergeAiColumnDefinitions([col], [optimisticColumn])[0] : col
+            ))
+        })
+    }, [])
+
+    const revertOptimisticRoleAiColumn = useCallback((runInfo = {}) => {
+        if (!runInfo?.columnDefinitionId) return
+        if (runInfo.isEditMode) {
+            void fetchRoleAiColumns()
+            return
+        }
+        setRoleAiColumns(prev => (prev || []).filter(col => (
+            String(col.id) !== String(runInfo.columnDefinitionId) || !col.__optimistic
+        )))
+    }, [fetchRoleAiColumns])
+
+    const attachRoleAiColumnRun = useCallback((runInfo = {}) => {
+        if (!runInfo?.columnDefinitionId || !runInfo?.runId) return
+        setRoleAiColumns(prev => (prev || []).map(col => {
+            if (String(col.id) !== String(runInfo.columnDefinitionId)) return col
+            return {
+                ...col,
+                latest_run: {
+                    ...(col.latest_run || {}),
+                    id: runInfo.runId,
+                    run_id: runInfo.runId,
+                    status: 'queued',
+                },
+            }
+        }))
+    }, [])
+
+    const deleteRoleAiColumn = async (definition) => {
+        if (!window.confirm(`Delete smart column "${definition?.name}"?`)) return
+        const id = Number(definition?.id)
+        if (!Number.isFinite(id)) {
+            toast.error('Invalid smart column id — try refreshing the page')
+            return
+        }
+        const previousColumns = roleAiColumns
+        setRoleAiColumns(prev => (prev || []).filter(col => Number(col.id) !== id))
+        try {
+            await longOperationAxios.delete(`${API_BASE}/ai-columns/${id}`, { timeout: 120000 })
+            toast.success('Smart column removed')
+            void fetchRoleAiColumns()
+        } catch (error) {
+            setRoleAiColumns(previousColumns || [])
+            toast.error(error.response?.data?.detail || 'Failed to delete smart column')
+        }
+    }
+
+    const rerunRoleAiColumn = async (definition) => {
+        const selectedIdArray = Array.from(selectedIds || [])
+        if (selectedIdArray.length === 0) {
+            toast.error('Select at least one row first, then run the smart column')
+            return
+        }
+        const previousColumns = roleAiColumns
+        setRoleAiColumns(prev => (prev || []).map(col => {
+            if (col.id !== definition.id) return col
+            const updatedCells = { ...(col.cells_by_candidate || {}) }
+            selectedIdArray.forEach(id => {
+                updatedCells[id] = { ...(updatedCells[id] || {}), status: 'queued', primary_output: '', outputs: {} }
+            })
+            return {
+                ...col,
+                cells_by_candidate: updatedCells,
+                latest_run: { ...(col.latest_run || {}), status: 'queued', total: selectedIdArray.length, completed: 0, failed: 0, skipped: 0 },
+            }
+        }))
+        try {
+            await longOperationAxios.post(`${API_BASE}/ai-columns/run`, {
+                column_definition_id: definition.id,
+                selection_mode: 'selected_ids',
+                selected_ids: selectedIdArray,
+                view_scope: roleViewScope,
+                role_id: viewingRole?.id || null,
+            })
+            toast.success(`Running "${definition.name}" on ${selectedIdArray.length} row(s)…`)
+            void fetchRoleAiColumns()
+        } catch (error) {
+            toast.error(error.response?.data?.detail || 'Failed to run smart column')
+            setRoleAiColumns(previousColumns)
+        }
+    }
+
+    const openRoleAiCellDrawer = async (definition, candidate, outputKey) => {
+        const candidateName = (candidate?.name || `${candidate?.first_name || ''} ${candidate?.last_name || ''}`).trim()
+        setAiCellDrawer({ open: true, loading: true, detail: null, title: `${definition?.name || 'Smart Column'} • ${candidateName}` })
+        try {
+            const res = await longOperationAxios.get(`${API_BASE}/ai-columns/${definition.id}/cells/${candidate.id}`, { timeout: 60000 })
+            const detail = res.data || null
+            if (detail && outputKey && detail.outputs && detail.outputs[outputKey] && outputKey !== 'primary') {
+                detail.primary_output = detail.outputs[outputKey]
+            }
+            setAiCellDrawer(current => ({ ...current, loading: false, detail }))
+        } catch (error) {
+            if (error.response?.status !== 404) {
+                toast.error(error.response?.data?.detail || 'Failed to load AI cell details')
+            }
+            setAiCellDrawer(current => ({ ...current, loading: false, detail: null }))
+        }
+    }
 
     const [editingCell, setEditingCell] = useState({ candidateId: null, field: null })
     const [editValue, setEditValue] = useState('')
@@ -392,7 +594,8 @@ function Roles() {
             city: [], cityInput: '',
             product_service: [], productInput: '',
             status: [], statusInput: '',
-            min_exp: 0, max_exp: 40
+            min_exp: 0, max_exp: 40,
+            added_from: '', added_to: ''
         })
         setActiveStatusTab('')
         setRoleSearch('')
@@ -465,6 +668,8 @@ function Roles() {
         if (status) params.set('status', status)
         if (Number(filters.min_exp || 0) > 0) params.set('min_exp', filters.min_exp)
         if (Number(filters.max_exp ?? 40) < 40) params.set('max_exp', filters.max_exp)
+        if (filters.added_from) params.set('added_from', filters.added_from)
+        if (filters.added_to) params.set('added_to', filters.added_to)
 
         if (!hasServerRoleFilters) {
             const baseCandidates = viewingRole.candidates || []
@@ -791,9 +996,13 @@ function Roles() {
             params.set('sort_dir', 'asc')
             const query = candidateSearch.trim()
             if (query) params.set('q', query)
-            if (String(user?.role || '').toLowerCase() === 'admin' && viewingRole?.owner_user_id) {
-                params.set('view_scope', 'recruiter_pools')
-                params.set('recruiter_filter_id', viewingRole.owner_user_id)
+            if (String(user?.role || '').toLowerCase() === 'admin') {
+                if (addCandidateScope === 'owner_pool' && viewingRole?.owner_user_id) {
+                    params.set('view_scope', 'recruiter_pools')
+                    params.set('recruiter_filter_id', viewingRole.owner_user_id)
+                } else {
+                    params.set('view_scope', 'master')
+                }
             }
             setCandidateSearchLoading(true)
             try {
@@ -808,7 +1017,7 @@ function Roles() {
             }
         }, 180)
         return () => window.clearTimeout(candidateSearchDebounceRef.current)
-    }, [addCandidateOpen, candidateSearch, user?.role, viewingRole?.candidates, viewingRole?.id, viewingRole?.owner_user_id])
+    }, [addCandidateOpen, addCandidateScope, candidateSearch, user?.role, viewingRole?.candidates, viewingRole?.id, viewingRole?.owner_user_id])
 
     const toggleCandidateAdd = useCallback((candidateId) => {
         setSelectedCandidateAdds(previous => {
@@ -879,8 +1088,7 @@ function Roles() {
             const res = await axios.put(`${API_BASE}/roles/id/${role.id}/activation`, {
                 heyreach_campaign_id: setup.heyreach_campaign_id,
                 smartlead_sender_account_id: setup.smartlead_sender_account_id,
-                email_subject: setup.email_subject,
-                email_body: setup.email_body,
+                smartlead_campaign_id: setup.smartlead_campaign_id,
             })
             await fetchRoles({ force: true })
             if (viewingRole?.id === role.id) await fetchRoleDetails(role.name, { force: true })
@@ -1228,6 +1436,26 @@ function Roles() {
                                 />
                                 {candidateSearchLoading && <Loader2 size={15} className="animate-spin" />}
                             </div>
+                            {String(user?.role || '').toLowerCase() === 'admin' && (
+                                <div style={{ display: 'flex', gap: 6, padding: '8px 16px 0' }}>
+                                    {[['talent_pool', 'Talent Pool'], ['owner_pool', "Role owner's pool"]].map(([value, label]) => (
+                                        <button
+                                            key={value}
+                                            type="button"
+                                            onClick={() => setAddCandidateScope(value)}
+                                            style={{
+                                                padding: '4px 12px', borderRadius: 999, fontSize: 11, fontWeight: 700,
+                                                cursor: 'pointer', fontFamily: 'inherit',
+                                                border: addCandidateScope === value ? '1px solid #0f172a' : '1px solid #e2e8f0',
+                                                background: addCandidateScope === value ? '#0f172a' : '#fff',
+                                                color: addCandidateScope === value ? '#fff' : '#64748b',
+                                            }}
+                                        >
+                                            {label}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
                             <div className="role-add-results">
                                 {candidateSearchResults.map(candidate => {
                                     const checked = selectedCandidateAdds.has(candidate.id)
@@ -1359,7 +1587,7 @@ function Roles() {
                             </div>
                             {emailSetupLoading ? <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#64748b', fontSize: 12 }}><Loader2 size={13} className="animate-spin" /> Loading…</div> : emailSetup?.campaign_configured ? <div style={{ minWidth: 0 }}>
                                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#334155' }}><Mail size={13} /><strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.sender_email}</strong></div>
-                                <div title={emailSetup.subject} style={{ marginTop: 4, fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{emailSetup.subject}</div>
+                                <div style={{ marginTop: 4, fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Shortlisted candidates push to campaign {emailSetup.campaign_id} automatically</div>
                             </div> : <div style={{ fontSize: 12, color: emailSetup?.campaign_error ? '#b91c1c' : '#64748b' }}>{emailSetup?.campaign_error || 'Not fully activated.'}</div>}
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                                 <button className="btn btn-secondary btn-sm" onClick={() => setEmailSetupModalOpen(true)} disabled={emailSetupLoading} style={{ height: 30, padding: '0 10px', fontSize: 11 }}><Settings2 size={12} /> Edit setup</button>
@@ -1424,6 +1652,55 @@ function Roles() {
                                   }}
                                 />
 
+                                <div style={{ marginTop: 14 }}>
+                                    <div style={{ fontSize: 11, fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
+                                        Added Date
+                                    </div>
+                                    <div style={{ display: 'flex', gap: 8 }}>
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ fontSize: 10, fontWeight: 600, color: '#94a3b8', marginBottom: 3 }}>From</div>
+                                            <input
+                                                type="date"
+                                                value={filters?.added_from || ''}
+                                                max={filters?.added_to || undefined}
+                                                onChange={e => setFilter('added_from', e.target.value)}
+                                                style={{
+                                                    width: '100%', padding: '7px 8px', borderRadius: 10,
+                                                    border: '1.5px solid #e2e8f0', fontSize: 12, color: '#334155',
+                                                    fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box',
+                                                    background: '#fff',
+                                                }}
+                                            />
+                                        </div>
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ fontSize: 10, fontWeight: 600, color: '#94a3b8', marginBottom: 3 }}>To</div>
+                                            <input
+                                                type="date"
+                                                value={filters?.added_to || ''}
+                                                min={filters?.added_from || undefined}
+                                                onChange={e => setFilter('added_to', e.target.value)}
+                                                style={{
+                                                    width: '100%', padding: '7px 8px', borderRadius: 10,
+                                                    border: '1.5px solid #e2e8f0', fontSize: 12, color: '#334155',
+                                                    fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box',
+                                                    background: '#fff',
+                                                }}
+                                            />
+                                        </div>
+                                    </div>
+                                    {(filters?.added_from || filters?.added_to) && (
+                                        <button
+                                            onClick={() => { setFilter('added_from', ''); setFilter('added_to', ''); }}
+                                            style={{
+                                                marginTop: 6, background: 'none', border: 'none', cursor: 'pointer',
+                                                fontSize: 11, fontWeight: 600, color: '#6366f1', padding: 0,
+                                            }}
+                                        >
+                                            Clear dates
+                                        </button>
+                                    )}
+                                </div>
+
                                 <div style={{ marginTop: 'auto', paddingTop: '20px' }}>
                                   <button
                                     onClick={clearFilters}
@@ -1462,6 +1739,19 @@ function Roles() {
                                         <Filter size={13} /> Filters
                                     </button>
                                 )}
+                                <button
+                                    className="btn btn-secondary btn-sm"
+                                    onClick={() => setAiColumnModal({ mode: 'create' })}
+                                    title={selectedIds.size > 0 ? `Run on ${selectedIds.size} selected candidates` : 'Select rows, then run a smart column'}
+                                >
+                                    <HayasaBrand size="compact" tone="light" showGrowton={false} />
+                                    Smart Column
+                                    {selectedIds.size > 0 && (
+                                        <span style={{ background: '#eef2f7', color: '#334155', borderRadius: 999, padding: '1px 7px', fontSize: 11 }}>
+                                            {selectedIds.size}
+                                        </span>
+                                    )}
+                                </button>
                                 <button className="btn btn-secondary btn-sm" onClick={() => setAddCandidateOpen(true)}>
                                     <UserPlus size={13} /> Add Candidate
                                 </button>
@@ -1586,6 +1876,59 @@ function Roles() {
                                             <th style={{ minWidth: 210 }}>Response</th>
                                             <th style={{ minWidth: 190 }}>Notes</th>
                                             <th style={{ minWidth: 64, width: 64 }}>Remove</th>
+                                            {dynamicRoleAiCols.map(col => (
+                                                <th key={col.key} style={{ minWidth: 220 }}>
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                                                            <span style={{ color: '#0f172a', fontWeight: 800, textTransform: 'none', fontSize: 12 }}>
+                                                                {col.label}
+                                                            </span>
+                                                            {col.isPrimaryOutput && (
+                                                                <span style={{ display: 'flex', gap: 4 }}>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => rerunRoleAiColumn(col.definition)}
+                                                                        style={{ width: 24, height: 24, borderRadius: 8, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#16a34a', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+                                                                        title={selectedIds.size > 0 ? `Run on ${selectedIds.size} selected row(s)` : 'Select rows first, then click to run'}
+                                                                    >
+                                                                        <Play size={11} fill="currentColor" />
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => setAiColumnModal({ mode: 'edit', definition: col.definition })}
+                                                                        style={{ width: 24, height: 24, borderRadius: 8, border: '1px solid #e2e8f0', background: '#fff', color: '#64748b', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+                                                                        title="Edit smart column"
+                                                                    >
+                                                                        <Edit2 size={11} />
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => deleteRoleAiColumn(col.definition)}
+                                                                        style={{ width: 24, height: 24, borderRadius: 8, border: '1px solid #fee2e2', background: '#fff', color: '#ef4444', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+                                                                        title="Delete smart column"
+                                                                    >
+                                                                        <Trash2 size={11} />
+                                                                    </button>
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                            <div style={{ flex: 1, height: 6, borderRadius: 999, background: '#e2e8f0', overflow: 'hidden' }}>
+                                                                <div
+                                                                    style={{
+                                                                        width: `${col.definition?.latest_run?.total ? Math.min(100, (((Number(col.definition.latest_run.completed || 0) + Number(col.definition.latest_run.failed || 0) + Number(col.definition.latest_run.skipped || 0)) / Number(col.definition.latest_run.total || 1)) * 100)) : 0}%`,
+                                                                        height: '100%',
+                                                                        background: col.definition?.latest_run?.status === 'completed_with_errors' ? '#f59e0b' : '#22c55e',
+                                                                    }}
+                                                                />
+                                                            </div>
+                                                            <span style={{ fontSize: 10, color: '#64748b', textTransform: 'none' }}>
+                                                                {summarizeAiRun(col.definition?.latest_run)}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                </th>
+                                            ))}
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -1605,7 +1948,12 @@ function Roles() {
                                                     </td>
                                                     <td className="role-sticky-first-name">
                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                                            {candidate.first_name || candidate.name?.split(' ')[0] || '—'}
+                                                            <span
+                                                                className={candidate.added_to_role_at ? 'hy-tooltip hy-tooltip-delayed hy-tooltip-left' : undefined}
+                                                                data-tooltip={candidate.added_to_role_at ? addedTooltip(candidate.added_to_role_at) : undefined}
+                                                            >
+                                                                {candidate.first_name || candidate.name?.split(' ')[0] || '—'}
+                                                            </span>
                                                             {isRecentlyAdded(candidate.added_to_role_at) && (
                                                                 <span
                                                                     className="hy-tooltip"
@@ -1705,18 +2053,23 @@ function Roles() {
                                                         />
                                                     </td>
                                                     <td>
-                                                        <button type="button" className="role-response-cell" onClick={() => setChattingWith({
-                                                            ...candidate,
-                                                            response: roleOutreach.response_text || candidate.response || '',
-                                                            li_response_text: roleOutreach.li_response_text || candidate.li_response_text || '',
-                                                            li_status: roleOutreach.li_status || candidate.li_status || '',
-                                                        })}>
+                                                        <button type="button" className="role-response-cell" onClick={() => {
+                                                            if (responseState.hasUnread) {
+                                                                useAppStore.getState().markOutreachResponseRead(viewingRole.id, candidate.id)
+                                                            }
+                                                            setChattingWith({
+                                                                ...candidate,
+                                                                response: roleOutreach.response_text || candidate.response || '',
+                                                                li_response_text: roleOutreach.li_response_text || candidate.li_response_text || '',
+                                                                li_status: roleOutreach.li_status || candidate.li_status || '',
+                                                            })
+                                                        }}>
                                                             <span>
                                                                 <MessageSquare size={13} /> Open conversation
                                                                 {responseState.messageCount == null ? (
                                                                     <b className="is-loading">…</b>
                                                                 ) : responseState.messageCount > 0 ? (
-                                                                    <b>{responseState.messageCount}</b>
+                                                                    <b className={responseState.hasUnread ? 'is-unread' : ''}>{responseState.messageCount}</b>
                                                                 ) : null}
                                                             </span>
                                                             <small title={responseState.responseText}>{responseState.responseText || 'No response yet'}</small>
@@ -1734,12 +2087,78 @@ function Roles() {
                                                             <Trash2 size={16} />
                                                         </button>
                                                     </td>
+                                                    {dynamicRoleAiCols.map(col => {
+                                                        const cellsMap = col.definition?.cells_by_candidate || {}
+                                                        const cell = cellsMap[candidate.id] ?? cellsMap[String(candidate.id)] ?? cellsMap[Number(candidate.id)]
+                                                        const aiVal = resolveAiCellValue(cell, col.outputKey, col.isPrimaryOutput)
+                                                        const st = cell?.status
+                                                        const isEmpty = !aiVal && st !== 'running' && st !== 'queued'
+                                                        return (
+                                                            <td
+                                                                key={col.key}
+                                                                style={{ maxWidth: 240, verticalAlign: 'top', cursor: 'pointer' }}
+                                                                onClick={() => openRoleAiCellDrawer(col.definition, candidate, col.outputKey)}
+                                                            >
+                                                                {st === 'running' || st === 'queued' ? (
+                                                                    <div style={{
+                                                                        fontSize: 11, color: '#2563eb', lineHeight: 1.55,
+                                                                        background: 'linear-gradient(135deg, #eff6ff, #eef2ff)',
+                                                                        border: '1px solid #bfdbfe', borderRadius: 10,
+                                                                        padding: '8px 10px', fontWeight: 700,
+                                                                    }}>
+                                                                        {st === 'queued' ? 'Queued…' : 'Running…'}
+                                                                    </div>
+                                                                ) : st === 'failed' ? (
+                                                                    <span style={{ color: '#b91c1c', fontSize: 11, lineHeight: 1.45, display: 'block' }}>
+                                                                        {cell?.error_message || 'Run failed'}
+                                                                    </span>
+                                                                ) : st === 'skipped' ? (
+                                                                    <span style={{ color: '#a16207', fontSize: 11, lineHeight: 1.45, display: 'block' }}>
+                                                                        {cell?.error_message || 'Skipped'}
+                                                                    </span>
+                                                                ) : isEmpty ? (
+                                                                    <span style={{ color: '#94a3b8', fontSize: 11, fontStyle: 'italic', lineHeight: 1.45 }}>
+                                                                        {cell ? 'No value for this field (open for details)' : '—'}
+                                                                    </span>
+                                                                ) : (
+                                                                    <div style={{
+                                                                        fontSize: 12, color: '#1e1b4b', lineHeight: 1.55,
+                                                                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                                                        background: 'linear-gradient(135deg, #faf5ff, #eff6ff)',
+                                                                        border: '1px solid #e0e7ff',
+                                                                        borderRadius: 8, padding: '8px 10px',
+                                                                        display: 'flex', flexDirection: 'column', gap: 6,
+                                                                    }}>
+                                                                        <div style={{ display: '-webkit-box', WebkitLineClamp: 4, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                                                                            {renderFriendlyAiValue(aiVal)}
+                                                                        </div>
+                                                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                                                                            <span style={{ fontSize: 10, color: '#6366f1', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.06em', whiteSpace: 'nowrap' }}>
+                                                                                Click for full answer
+                                                                            </span>
+                                                                            {Array.isArray(cell?.details?.sources) && cell.details.sources.filter(s => s.url).length > 0 && (
+                                                                                <a
+                                                                                    href={cell.details.sources.find(s => s.url).url}
+                                                                                    target="_blank"
+                                                                                    rel="noreferrer"
+                                                                                    onClick={e => e.stopPropagation()}
+                                                                                    style={{ fontSize: 10, color: '#2563eb', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 3, background: '#dbeafe', padding: '2px 6px', borderRadius: 6, fontWeight: 700, whiteSpace: 'nowrap' }}
+                                                                                >
+                                                                                    <ExternalLink size={10} /> Source
+                                                                                </a>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                            </td>
+                                                        )
+                                                    })}
                                                 </tr>
                                             )
                                         })}
                                         {filteredCandidates.length === 0 && (
                                             <tr>
-                                                <td colSpan="16" style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+                                                <td colSpan={16 + dynamicRoleAiCols.length} style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
                                                     No candidates match the selected filters.
                                                 </td>
                                             </tr>
@@ -1760,6 +2179,33 @@ function Roles() {
                         onStatusChanged={(candidateId, status) => updateCandidateInRole(candidateId, { status })}
                     />
                 )}
+
+                {aiColumnModal && (
+                    <AiColumnConfigModal
+                        selectedIds={selectedIds}
+                        initialDefinition={aiColumnModal?.mode === 'edit' ? aiColumnModal.definition : null}
+                        viewScope={roleViewScope}
+                        recruiterFilterId={null}
+                        roleId={viewingRole?.id || null}
+                        onClose={() => setAiColumnModal(null)}
+                        onColumnDefinitionCreated={upsertOptimisticRoleAiColumn}
+                        onColumnRunFailed={revertOptimisticRoleAiColumn}
+                        onColumnsCreated={(runInfo) => {
+                            attachRoleAiColumnRun(runInfo)
+                            setAiColumnModal(null)
+                            void fetchRoleAiColumns()
+                        }}
+                    />
+                )}
+
+                <AiColumnCellDrawer
+                    open={aiCellDrawer.open}
+                    loading={aiCellDrawer.loading}
+                    detail={aiCellDrawer.detail}
+                    title={aiCellDrawer.title}
+                    onClose={() => setAiCellDrawer({ open: false, loading: false, detail: null, title: '' })}
+                />
+
 
                 {showAddToListModal && (
                     <AddToListModal

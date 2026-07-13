@@ -25,7 +25,7 @@ def campaign_payload(row) -> Dict[str, Any]:
         "campaign_name": row[1] or "",
         "campaign_status": row[2] or "pending",
         "campaign_error": row[3] or "",
-        "campaign_configured": bool(row[4] and row[5] and row[6]),
+        "campaign_configured": bool(row[0] and row[4]),
         "sender_account_id": row[7] or "",
         "sender_email": row[4] or "",
         "subject": row[5] or "",

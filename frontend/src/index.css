@@ -1932,6 +1932,11 @@ input:checked + .slider:before {
   font-weight: 800;
 }
 
+.role-response-cell b.is-unread {
+  background: #047857;
+  color: #ffffff;
+}
+
 .role-response-cell b.is-loading {
   background: #f1f5f9;
   color: #94a3b8;
@@ -3052,4 +3057,26 @@ input:checked + .slider:before {
 }
 .hy-tooltip:hover::before {
   opacity: 1;
+}
+
+/* Variant: tooltip appears after a short hover pause (for dense table cells) */
+.hy-tooltip-delayed::after,
+.hy-tooltip-delayed::before {
+  transition-delay: 0s;
+}
+.hy-tooltip-delayed:hover::after,
+.hy-tooltip-delayed:hover::before {
+  transition-delay: 0.45s;
+}
+
+/* Variant: left-anchored tooltip for cells near the container's left edge */
+.hy-tooltip-left::after {
+  left: 0;
+  transform: translateX(0) translateY(3px);
+}
+.hy-tooltip-left:hover::after {
+  transform: translateX(0) translateY(0);
+}
+.hy-tooltip-left::before {
+  left: 18px;
 }

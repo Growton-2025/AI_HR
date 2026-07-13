@@ -372,8 +372,6 @@ async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Dep
     """Create a new role for the current user"""
     if not role.name.strip():
         raise HTTPException(status_code=400, detail="Role name is required")
-    if role.smartlead_sender_account_id > 0 and (not role.email_subject.strip() or not role.email_body.strip()):
-        raise HTTPException(status_code=400, detail="Email subject and body are required when Smartlead is selected")
     if role.heyreach_campaign_id <= 0 and role.smartlead_sender_account_id <= 0 and not role.auto_create_call_list:
         raise HTTPException(status_code=400, detail="At least one of HeyReach campaign, Smartlead sender, or Auto-create call list is required")
     conn = get_db_connection()
@@ -431,8 +429,7 @@ async def create_role(role: schemas.RoleCreate, current_user: schemas.User = Dep
             result[1],
             role.heyreach_campaign_id,
             role.smartlead_sender_account_id,
-            role.email_subject.strip(),
-            role.email_body.strip(),
+            role.smartlead_campaign_id,
         )
     except Exception as exc:
         logger.exception("Role %s activation failed", result[0])
@@ -521,8 +518,6 @@ async def configure_existing_role_activation(
 ):
     if setup.heyreach_campaign_id <= 0 and setup.smartlead_sender_account_id <= 0:
         raise HTTPException(status_code=400, detail="At least one of HeyReach campaign ID or Smartlead sender is required")
-    if setup.smartlead_sender_account_id > 0 and (not setup.email_subject.strip() or not setup.email_body.strip()):
-        raise HTTPException(status_code=400, detail="Email subject and body are required when Smartlead is selected")
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -537,7 +532,7 @@ async def configure_existing_role_activation(
         activate_role,
         role[0], role[1], setup.heyreach_campaign_id,
         setup.smartlead_sender_account_id,
-        setup.email_subject.strip(), setup.email_body.strip(),
+        setup.smartlead_campaign_id,
     )
     invalidate_role_detail_cache(role_id)
     return activation

@@ -228,20 +228,19 @@ async def bulk_assign_master_to_recruiter(
 
             selected_role = None
             if body.role_id is not None:
+                # Admin-only endpoint: the role may belong to any user (the
+                # admin themselves or any recruiter), not just the target.
                 cur.execute(
                     """
                     SELECT id, name
                     FROM recruitment_roles
-                    WHERE id = %s AND user_id = %s
+                    WHERE id = %s
                     """,
-                    (body.role_id, body.recruiter_user_id),
+                    (body.role_id,),
                 )
                 selected_role = cur.fetchone()
                 if not selected_role:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Selected role does not belong to this recruiter",
-                    )
+                    raise HTTPException(status_code=404, detail="Role not found")
 
             for idx, mid in enumerate(ordered_unique, start=1):
                 sp = f"bulk_assign_{idx}"

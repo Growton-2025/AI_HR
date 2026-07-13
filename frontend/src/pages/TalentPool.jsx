@@ -74,7 +74,7 @@ function isMeaningfulAiValue(value) {
   return text !== '' && !EMPTY_AI_RESPONSE_TEXTS.has(lower) && !lower.startsWith('needs review:');
 }
 
-function resolveAiCellValue(cell, outputKey, isPrimaryOutput) {
+export function resolveAiCellValue(cell, outputKey, isPrimaryOutput) {
   const outputs = cell?.outputs || {};
   const directOutput = outputs?.[outputKey];
   if (isMeaningfulAiValue(directOutput)) return directOutput;
@@ -563,7 +563,7 @@ function buildTalentPoolParamsString({
   return params.toString();
 }
 
-function summarizeAiRun(run) {
+export function summarizeAiRun(run) {
   if (!run) return '';
   const total = Number(run.total || 0);
   const finished = Number(run.completed || 0) + Number(run.failed || 0) + Number(run.skipped || 0);
@@ -583,7 +583,7 @@ function buildQueuedAiCells(candidateIds = []) {
   }, {});
 }
 
-function createOptimisticAiColumn(definition = {}, candidateIds = [], runId = null) {
+export function createOptimisticAiColumn(definition = {}, candidateIds = [], runId = null) {
   return {
     ...definition,
     id: definition.id,
@@ -607,7 +607,7 @@ function createOptimisticAiColumn(definition = {}, candidateIds = [], runId = nu
   };
 }
 
-function mergeAiColumnDefinitions(previous = [], incoming = []) {
+export function mergeAiColumnDefinitions(previous = [], incoming = []) {
   const previousById = new Map((previous || []).map(col => [String(col.id), col]));
   const incomingIds = new Set();
   const merged = (incoming || []).map(nextCol => {
@@ -1769,7 +1769,7 @@ export default function TalentPool() {
   }, [role, fetchRecruiters]);
 
   useEffect(() => {
-    if (!showAssignModal || !assignTargetRecruiterId) {
+    if (!showAssignModal) {
       setAssignRecruiterRoles([]);
       setAssignTargetRoleId('');
       return undefined;
@@ -1777,20 +1777,22 @@ export default function TalentPool() {
 
     let cancelled = false;
     setAssignRolesLoading(true);
-    axios.get(`${API_BASE}/roles?owner_user_id=${encodeURIComponent(assignTargetRecruiterId)}`, { timeout: 60000 })
+    // No owner filter: the backend returns every role for admins (their own plus
+    // all recruiters') and only the caller's own roles for recruiters.
+    axios.get(`${API_BASE}/roles`, { timeout: 60000 })
       .then(res => {
         if (!cancelled) setAssignRecruiterRoles(res.data?.roles || []);
       })
       .catch(error => {
         if (!cancelled) {
           setAssignRecruiterRoles([]);
-          toast.error(error.response?.data?.detail || 'Could not load recruiter roles');
+          toast.error(error.response?.data?.detail || 'Could not load roles');
         }
       })
       .finally(() => { if (!cancelled) setAssignRolesLoading(false); });
 
     return () => { cancelled = true; };
-  }, [showAssignModal, assignTargetRecruiterId]);
+  }, [showAssignModal]);
 
   useEffect(() => {
     if (
@@ -3907,6 +3909,20 @@ export default function TalentPool() {
               <Phone size={14} /> Add to Call List
             </button>
           )}
+          {selectedIds.size > 0 && (
+            <button
+              onClick={() => setShowAssignModal(true)}
+              style={{
+                padding: '8px 16px', background: '#fff', color: '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
+                borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+              onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+            >
+              <Briefcase size={14} /> Add to Role
+            </button>
+          )}
           <button
             onClick={() => { setSelectedIds(new Set()); setAllFilteredSelected(false); }}
             style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
@@ -3954,7 +3970,7 @@ export default function TalentPool() {
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.65)', zIndex: 10002, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
           <div style={{ background: '#fff', borderRadius: 20, maxWidth: 460, width: '100%', padding: 24, boxShadow: '0 24px 60px rgba(15,23,42,0.28)' }}>
             <h3 style={{ margin: '0 0 12px', fontSize: 18, fontWeight: 800 }}>Assign to recruiter</h3>
-            <p style={{ color: '#64748b', fontSize: 13, marginBottom: 18 }}>{selectedIds.size} master profile(s) will be copied to the recruiter&apos;s pool and can also be placed directly into one of their roles.</p>
+            <p style={{ color: '#64748b', fontSize: 13, marginBottom: 18 }}>{selectedIds.size} master profile(s) will be copied to the recruiter&apos;s pool and can also be placed directly into a role.</p>
             <label style={{ display: 'block', color: '#334155', fontSize: 12, fontWeight: 750, marginBottom: 14 }}>Recruiter
             <select
               value={assignTargetRecruiterId}
@@ -3968,20 +3984,27 @@ export default function TalentPool() {
             </select>
             </label>
 
-            <label style={{ display: 'block', color: '#334155', fontSize: 12, fontWeight: 750, marginBottom: 20 }}>Recruiter role
+            <label style={{ display: 'block', color: '#334155', fontSize: 12, fontWeight: 750, marginBottom: 20 }}>Role
               <select
                 value={assignTargetRoleId}
-                onChange={(e) => setAssignTargetRoleId(e.target.value)}
-                disabled={!assignTargetRecruiterId || assignRolesLoading}
+                onChange={(e) => {
+                  const nextRoleId = e.target.value;
+                  setAssignTargetRoleId(nextRoleId);
+                  const selectedRole = assignRecruiterRoles.find(r => String(r.id) === String(nextRoleId));
+                  if (selectedRole && recruiters.some(r => String(r.id) === String(selectedRole.owner_user_id))) {
+                    setAssignTargetRecruiterId(String(selectedRole.owner_user_id));
+                  }
+                }}
+                disabled={assignRolesLoading}
                 style={{ width: '100%', padding: '10px 12px', borderRadius: 10, border: '1px solid #e2e8f0', marginTop: 6, fontSize: 13, background: '#fff' }}
               >
                 <option value="">{assignRolesLoading ? 'Loading roles…' : 'Recruiter pool only (no role)'}</option>
                 {assignRecruiterRoles.map(recruiterRole => (
-                  <option key={recruiterRole.id} value={recruiterRole.id}>{recruiterRole.name} · {recruiterRole.candidate_count || 0} candidates</option>
+                  <option key={recruiterRole.id} value={recruiterRole.id}>{recruiterRole.name}{recruiterRole.owner_name ? ` · ${recruiterRole.owner_name}` : ''} · {recruiterRole.candidate_count || 0} candidates</option>
                 ))}
               </select>
-              {assignTargetRecruiterId && !assignRolesLoading && assignRecruiterRoles.length === 0 && (
-                <span style={{ display: 'block', color: '#94a3b8', fontSize: 11, marginTop: 6 }}>This recruiter has no roles yet; the profiles will remain in their pool.</span>
+              {!assignRolesLoading && assignRecruiterRoles.length === 0 && (
+                <span style={{ display: 'block', color: '#94a3b8', fontSize: 11, marginTop: 6 }}>No roles yet; the profiles will remain in the recruiter&apos;s pool.</span>
               )}
             </label>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>

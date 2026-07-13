@@ -97,8 +97,20 @@ def dispatch_due_email(limit: int = 20) -> int:
             ai_data = ai_columns_by_candidate.get(candidate_id, {})
             lead_data.update(ai_data)
             
-            if bot.add_leads([lead_data]) is None:
+            result = bot.add_leads([lead_data])
+            if result is None:
                 raise RuntimeError("Smartlead rejected the candidate")
+            if isinstance(result, dict):
+                # Smartlead returns HTTP 200 even when the lead is silently
+                # dropped (block list, invalid email, lead limit, ...).
+                added = (result.get("total_leads") or 0) + (result.get("already_added_to_campaign") or 0)
+                if added <= 0:
+                    reasons = {
+                        key: result.get(key)
+                        for key in ("block_count", "invalid_email_count", "bounce_count", "duplicate_count", "is_lead_limit_exhausted", "lead_import_stopped_count")
+                        if result.get(key)
+                    }
+                    raise RuntimeError(f"Smartlead did not add the lead: {reasons or result}")
             if not started_at and bot.start_campaign() is None:
                 raise RuntimeError("Candidate enrolled, but Smartlead campaign could not start")
             initial_message = _render(body, campaign_name, resolved_first, resolved_last)
