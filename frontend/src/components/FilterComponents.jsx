@@ -9,14 +9,31 @@ export function TagFilterInput({ label, values, inputValue, onInputChange, onTag
       .map(value => String(value || '').trim())
       .filter(Boolean)
   )];
+  const commitTag = (raw) => {
+    const val = String(raw || '').trim();
+    if (val && !tagList.includes(val)) {
+      onTagsChange([...tagList, val]);
+    }
+    onInputChange('');
+  };
+
+  const handleChange = (e) => {
+    const next = e.target.value;
+    // Picking a datalist suggestion fires an input event without an inputType
+    // (typing reports 'insertText' etc.) — commit the pick as a tag right away
+    // so the user doesn't have to press Enter. Typed text still needs Enter.
+    const inputType = e.nativeEvent?.inputType;
+    if (!inputType && suggestionOptions.some(option => option.toLowerCase() === next.trim().toLowerCase())) {
+      commitTag(next);
+      return;
+    }
+    onInputChange(next);
+  };
+
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && inputValue.trim()) {
       e.preventDefault();
-      const val = inputValue.trim();
-      if (!tagList.includes(val)) {
-        onTagsChange([...tagList, val]);
-      }
-      onInputChange('');
+      commitTag(inputValue);
     } else if (e.key === 'Backspace' && !inputValue && tagList.length > 0) {
       onTagsChange(tagList.slice(0, -1));
     }
@@ -42,7 +59,7 @@ export function TagFilterInput({ label, values, inputValue, onInputChange, onTag
             type="text"
             value={inputValue}
             list={suggestionOptions.length ? suggestionsId : undefined}
-            onChange={e => onInputChange(e.target.value)}
+            onChange={handleChange}
             onKeyDown={handleKeyDown}
             placeholder={tagList.length === 0 ? placeholder : "Add more..."}
             style={{

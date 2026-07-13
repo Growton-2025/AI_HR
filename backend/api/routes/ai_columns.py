@@ -1146,6 +1146,11 @@ def _run_ai_task(
         career_outputs = {}
     career_context_text = career_facts_to_text(career_facts)
     query_plan = build_query_plan(rendered_prompt or prompt_template, context, normalized_outputs, routing)
+    if mode == "web_research" and not query_plan.get("web_needed"):
+        # The user explicitly enabled web for this column; the heuristic plan
+        # must never talk the model out of doing live research.
+        query_plan["web_needed"] = True
+        query_plan["web_policy"] = "user_enabled_web"
     tool_results = run_candidate_query_tools(rendered_prompt or prompt_template, context, career_facts, query_plan)
     context_pack = build_candidate_context_pack(context, career_facts)
     model_call_credits: List[Dict[str, Any]] = []
@@ -1276,6 +1281,10 @@ def _run_ai_task(
         "AE experience, or city count from the raw role dates yourself — "
         "your manual arithmetic on month-only LinkedIn dates will always be off by at least one month per role. "
         "If the deterministic facts section is absent, return Unknown for any tenure or experience output. "
+        "These tenure rules apply ONLY to numeric tenure/duration/experience/count outputs. "
+        "Company attributes — industry, product/service, business model, customer segment, company size — are NOT "
+        "tenure outputs: answer them from the row context, web evidence, or reliable well-known-company knowledge "
+        "(for example, Adobe operates in the software industry), citing sources when web evidence is used. "
         "Never invent missing data; return Unknown or Needs verification when evidence is insufficient. "
         "GEOGRAPHY RULE — LOCATION DEDUPLICATION: "
         "You have complete world geography knowledge covering every country, state, city, and town. "
@@ -1289,8 +1298,13 @@ def _run_ai_task(
     )
     content_first_system_prompt = (
         f"{system_prompt} "
-        "When web access is disabled, answer strictly from the candidate row context already present in the task. "
-        "If the row context is insufficient, leave outputs blank instead of guessing and explain what information is missing."
+        "Web access is disabled for this task. Answer from the candidate row context already present in the task, "
+        "combined with your own stable general knowledge where it is reliable — for example, the industry, product "
+        "category, or business model of a well-known company named in the row (Adobe is software, HDFC is banking). "
+        "Never invent candidate-specific or time-sensitive facts this way (current employer, job changes, recent "
+        "posts, news, funding, headcount) — those must come from the row context itself. "
+        "If neither the row context nor reliable general knowledge can answer, leave outputs blank instead of "
+        "guessing and explain what information is missing."
     )
     output_hint = ", ".join([f"{item['key']} ({item['label']})" for item in normalized_outputs])
     user_prompt = (

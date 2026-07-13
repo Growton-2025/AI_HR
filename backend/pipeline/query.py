@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import os
 import json
 import logging
@@ -262,7 +263,7 @@ STATIC_GEOGRAPHY_MAP = {
     "philippines": "apac", "australia": "apac", "new zealand": "apac", "japan": "apac", "south korea": "apac",
     "india": "apac", "hong kong": "apac", "taiwan": "apac", "brunei": "apac", "cambodia": "apac", "laos": "apac",
     "myanmar": "apac", "pakistan": "apac", "bangladesh": "apac", "sri lanka": "apac", "nepal": "apac",
-    "asean": "apac",
+    "china": "apac", "asean": "apac",
     "united kingdom": "emea", "uk": "emea", "germany": "emea", "france": "emea", "spain": "emea", "italy": "emea",
     "netherlands": "emea", "sweden": "emea", "norway": "emea", "denmark": "emea", "finland": "emea",
     "united arab emirates": "emea", "uae": "emea", "saudi arabia": "emea", "south africa": "emea", "israel": "emea",
@@ -2332,6 +2333,8 @@ def _geography_match_terms(value: str, criterion: Any = None) -> List[str]:
 
 def _role_company_geo_text(role: Dict[str, Any]) -> str:
     company_details = role.get("company_details") or {}
+    # Spec: only real company presence (offices/operations) counts as geography
+    # evidence — customers in a region, subsidiaries, or revenue share do NOT.
     allowed_company_geo = {
         key: company_details.get(key)
         for key in (
@@ -2342,7 +2345,6 @@ def _role_company_geo_text(role: Dict[str, Any]) -> str:
             "operations",
             "operating_locations",
             "company_locations",
-            "customer_presence",
         )
         if company_details.get(key)
     }
@@ -2766,6 +2768,24 @@ def _cached_company_facts_for_criteria(criteria: Dict[str, Any]) -> Dict[str, An
     return out
 
 
+def _company_entry_name(entry: Any) -> str:
+    """Company lists from the LLM may hold plain names, dicts, or (from older
+    cache writes) stringified dicts — always reduce to the company name."""
+    if isinstance(entry, dict):
+        return str(entry.get("name") or entry.get("company") or entry.get("target") or "").strip()
+    text = str(entry or "").strip()
+    if text.startswith("{"):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                if isinstance(parsed, dict):
+                    return str(parsed.get("name") or parsed.get("company") or parsed.get("target") or "").strip()
+            except Exception:
+                continue
+        return ""
+    return text
+
+
 def _cache_company_facts_from_structured(criteria: Dict[str, Any], structured: Dict[str, Any]) -> None:
     if not isinstance(structured, dict):
         return
@@ -2790,7 +2810,7 @@ def _cache_company_facts_from_structured(criteria: Dict[str, Any], structured: D
         companies = item.get("companies") or item.get("competitors") or []
         if isinstance(companies, str):
             companies = re.split(r"[,;|]", companies)
-        companies = [str(company).strip() for company in companies if str(company or "").strip()][:50]
+        companies = [name for name in (_company_entry_name(company) for company in companies) if name][:50]
         cached = cache.get(key) if isinstance(cache.get(key), dict) else {}
         profile = profiles_by_key.get(key, {})
         cache[key] = {
@@ -2815,7 +2835,7 @@ def _cache_company_facts_from_structured(criteria: Dict[str, Any], structured: D
         if isinstance(companies, str):
             companies = re.split(r"[,;|]", companies)
         cached = cache.get(key) if isinstance(cache.get(key), dict) else {"target": target}
-        cached["similar_companies"] = [str(company).strip() for company in companies if str(company or "").strip()][:50]
+        cached["similar_companies"] = [name for name in (_company_entry_name(company) for company in companies) if name][:50]
         cached["sources"] = item.get("sources") or cached.get("sources") or []
         cached["last_verified_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         cache[key] = cached
@@ -5943,14 +5963,32 @@ def _sanitize_planner_criterion(value: Any) -> Any:
     }
 
 
+def _clause_window(query_l: str, start: int, end: int, *, back: int = 90, forward: int = 120) -> str:
+    """Text around [start, end) clipped to the current clause.
+
+    Year mentions must bind to the requirement in their own clause: in
+    "5+ years in alliance management and APAC market experience" the years
+    belong to alliance management, not to the APAC clause after "and".
+    """
+    left = max(0, start - back)
+    right = min(len(query_l), end + forward)
+    window_back = query_l[left:start]
+    boundary = max(window_back.rfind(bnd) for bnd in (" and ", ",", ";"))
+    if boundary != -1:
+        window_back = window_back[boundary + 1:]
+    window_fwd = query_l[end:right]
+    cut = min((idx for idx in (window_fwd.find(bnd) for bnd in (" and ", ",", ";")) if idx != -1), default=-1)
+    if cut != -1:
+        window_fwd = window_fwd[:cut]
+    return f"{window_back}{query_l[start:end]}{window_fwd}"
+
+
 def _query_years_near_terms(query: str, terms: List[str], context_terms: List[str]) -> Optional[float]:
     query_l = _normalize_search_text(query)
     if not query_l:
         return None
     for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", query_l):
-        start = max(0, match.start() - 90)
-        end = min(len(query_l), match.end() + 120)
-        window = query_l[start:end]
+        window = _clause_window(query_l, match.start(), match.end())
         if terms and not any(_term_matches_text(term, window) for term in terms):
             continue
         if context_terms and not any(_term_matches_text(term, window) for term in context_terms):
@@ -5972,7 +6010,7 @@ def _query_years_followed_by_terms(
         matched_years = _coerce_positive_float(match.group(1))
         if years and matched_years and abs(matched_years - years) > 0.01:
             continue
-        window = query_l[match.end(): min(len(query_l), match.end() + 140)]
+        window = _clause_window(query_l, match.end(), match.end(), back=0, forward=140)
         if terms and not any(_term_matches_text(term, window) for term in terms):
             continue
         if context_terms and not any(_term_matches_text(term, window) for term in context_terms):
@@ -6555,6 +6593,12 @@ async def process_query_main(
                     web_facts = web_enriched.get("_web_company_facts") if isinstance(web_enriched.get("_web_company_facts"), dict) else {}
                     web_competitor_names: List[str] = []
                     for item in web_facts.get("competitors") or []:
+                        if isinstance(item, str):
+                            # Older cache entries hold stringified per-company dicts.
+                            name = _company_entry_name(item)
+                            if name:
+                                web_competitor_names.append(name)
+                            continue
                         if not isinstance(item, dict):
                             continue
                         web_target = str(item.get("target") or "").strip()
@@ -6563,7 +6607,13 @@ async def process_query_main(
                         raw_names = item.get("companies") or item.get("competitors") or []
                         if isinstance(raw_names, str):
                             raw_names = re.split(r"[,;|]", raw_names)
-                        web_competitor_names.extend(str(name).strip() for name in raw_names if str(name or "").strip())
+                        if not raw_names and item.get("name"):
+                            # Per-company entry ({'name': 'MoEngage', ...}) rather
+                            # than a grouped {target, companies} entry.
+                            raw_names = [item.get("name")]
+                        web_competitor_names.extend(
+                            name for name in (_company_entry_name(raw) for raw in raw_names) if name
+                        )
                     final_competitors = _validate_company_names_against_db(web_competitor_names, exclude=target)
 
                 if web_enabled and not final_competitors:

@@ -54,5 +54,56 @@
       }
     ],
     "last_verified_at": "2026-06-16T09:06:24Z"
+  },
+  "clevertap": {
+    "company": "CleverTap",
+    "product_service": "Customer engagement and retention platform",
+    "customer_segment": "B2C brands",
+    "customer_presence": "Global",
+    "funding_stage": "Series D",
+    "revenue": "Not publicly disclosed",
+    "culture_type": "Innovative and customer-focused",
+    "headquarters": "San Francisco, California, USA",
+    "sources": [
+      {
+        "url": "https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives",
+        "title": "Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights",
+        "note": "This source lists several competitors to CleverTap in the multichannel marketing hubs category."
+      }
+    ],
+    "target": "clevertap",
+    "competitors": [
+      "{'name': 'MoEngage', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Mobile-first consumer brands globally', 'customer_presence': 'Strong presence in APAC, MENA, and Latin America', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'MoEngage is recognized as a top alternative to CleverTap in the multichannel marketing hubs category.'}]}",
+      "{'name': 'Braze', 'product_service': 'Customer engagement platform', 'customer_segment': 'Enterprise B2C teams with engineering resources', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Braze is listed as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
+      "{'name': 'Iterable', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Mid-market to enterprise teams', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Iterable is recognized as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
+      "{'name': 'Netcore', 'product_service': 'Customer engagement platform', 'customer_segment': 'Global', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Netcore is listed as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
+      "{'name': 'Insider One', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Enterprise brands', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Insider One is recognized as a competitor to CleverTap in the multichannel marketing hubs category.'}]}"
+    ],
+    "similar_companies": [],
+    "last_verified_at": "2026-07-13T10:54:34Z"
+  },
+  "onesignal": {
+    "target": "OneSignal",
+    "similar_companies": [],
+    "sources": [
+      {
+        "url": "https://www.g2.com/products/clevertap/competitors/alternatives",
+        "title": "Top 10 CleverTap Alternatives & Competitors in 2026 | G2",
+        "note": "OneSignal is listed as a top alternative to CleverTap on G2."
+      }
+    ],
+    "last_verified_at": "2026-07-13T10:54:34Z"
+  },
+  "webengage": {
+    "target": "WebEngage",
+    "similar_companies": [],
+    "sources": [
+      {
+        "url": "https://www.g2.com/products/clevertap/competitors/alternatives",
+        "title": "Top 10 CleverTap Alternatives & Competitors in 2026 | G2",
+        "note": "WebEngage is recognized as a competitor to CleverTap on G2."
+      }
+    ],
+    "last_verified_at": "2026-07-13T10:54:34Z"
   }
 }

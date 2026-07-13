@@ -158,6 +158,9 @@ function Roles() {
     const [isFilteringRole, setIsFilteringRole] = useState(false)
     const roleFilterRequestSeqRef = useRef(0)
     const roleFilterDebounceRef = useRef(null)
+    // Holds the role id whose saved filters have been loaded, so the persist
+    // effect never overwrites storage with defaults before hydration runs.
+    const roleFiltersHydratedRef = useRef(null)
 
     // ── URL ↔ open-role sync ─────────────────────────────────────────────
     // The open role lives in the URL (?role=<name>) so a refresh, browser
@@ -215,11 +218,22 @@ function Roles() {
     const [outreachCountLoadedRoles, setOutreachCountLoadedRoles] = useState(() => new Set())
 
     const splitFilterValues = useCallback((values = [], _inputValue = '') => {
+        // Tags are kept whole: suggestion values like "Bhubaneswar, Odisha, India"
+        // contain commas and must not be split into separate filter terms.
         const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values]
         return [...list]
-            .flatMap(value => String(value || '').split(','))
-            .map(value => value.trim())
+            .map(value => String(value || '').trim())
             .filter(Boolean)
+    }, [])
+
+    // Serialize filter values for the browse API. "||" is used when any value
+    // contains a comma (the backend splits on "||" when present); a trailing
+    // "||" marks a single comma-containing value as already-joined.
+    const joinFilterParam = useCallback((values = []) => {
+        if (!values.length) return ''
+        if (!values.some(value => value.includes(','))) return values.join(',')
+        const joined = values.join('||')
+        return values.length === 1 ? `${joined}||` : joined
     }, [])
 
     const roleScopeParams = useCallback(() => {
@@ -283,6 +297,9 @@ function Roles() {
         })
         setActiveStatusTab('')
         setRoleSearch('')
+        try {
+            if (viewingRole?.id) window.localStorage.removeItem(`role_filters_v1_${viewingRole.id}`)
+        } catch { /* storage unavailable */ }
         const baseCandidates = viewingRole?.candidates || []
         setRoleFilteredCandidates(baseCandidates)
         setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
@@ -290,7 +307,7 @@ function Roles() {
             counts[status] = (counts[status] || 0) + 1
             return counts
         }, {}))
-    }, [viewingRole?.candidates])
+    }, [viewingRole?.candidates, viewingRole?.id])
 
     const statusCounts = roleStatusCounts
     const roleStatusOptions = useMemo(
@@ -588,6 +605,12 @@ function Roles() {
             counts[status] = (counts[status] || 0) + 1
             return counts
         }, {}))
+        // Restore this role's saved filters (survives page refresh); fall back
+        // to a clean slate when nothing was saved.
+        let saved = null
+        try {
+            saved = JSON.parse(window.localStorage.getItem(`role_filters_v1_${viewingRole.id}`) || 'null')
+        } catch { saved = null }
         setFilters({
             title: [], titleInput: '',
             company: [], companyInput: '',
@@ -595,13 +618,26 @@ function Roles() {
             product_service: [], productInput: '',
             status: [], statusInput: '',
             min_exp: 0, max_exp: 40,
-            added_from: '', added_to: ''
+            added_from: '', added_to: '',
+            ...(saved && typeof saved.filters === 'object' ? saved.filters : {}),
         })
-        setActiveStatusTab('')
-        setRoleSearch('')
+        setActiveStatusTab(typeof saved?.activeStatusTab === 'string' ? saved.activeStatusTab : '')
+        setRoleSearch(typeof saved?.roleSearch === 'string' ? saved.roleSearch : '')
+        roleFiltersHydratedRef.current = viewingRole.id
         setSelectedIds(new Set())
         setAllFilteredSelected(false)
     }, [viewingRole?.id])
+
+    // Persist filters per role so a page refresh keeps the exact same view.
+    useEffect(() => {
+        if (!viewingRole?.id || roleFiltersHydratedRef.current !== viewingRole.id) return
+        try {
+            window.localStorage.setItem(
+                `role_filters_v1_${viewingRole.id}`,
+                JSON.stringify({ filters, roleSearch, activeStatusTab }),
+            )
+        } catch { /* storage unavailable */ }
+    }, [viewingRole?.id, filters, roleSearch, activeStatusTab])
 
     useEffect(() => {
         if (!viewingRole?.id || !Array.isArray(viewingRole.candidates)) return
@@ -654,12 +690,12 @@ function Roles() {
         params.set('sort_dir', 'asc')
 
         const query = roleSearch.trim()
-        const title = splitFilterValues(filters.title, filters.titleInput).join(',')
-        const company = splitFilterValues(filters.company, filters.companyInput).join(',')
-        const city = splitFilterValues(filters.city, filters.cityInput).join(',')
-        const product = splitFilterValues(filters.product_service, filters.productInput).join(',')
+        const title = joinFilterParam(splitFilterValues(filters.title, filters.titleInput))
+        const company = joinFilterParam(splitFilterValues(filters.company, filters.companyInput))
+        const city = joinFilterParam(splitFilterValues(filters.city, filters.cityInput))
+        const product = joinFilterParam(splitFilterValues(filters.product_service, filters.productInput))
         const statusValues = splitFilterValues(filters.status, filters.statusInput)
-        const status = statusValues.join(',')
+        const status = joinFilterParam(statusValues)
         if (query) params.set('q', query)
         if (title) params.set('title', title)
         if (company) params.set('company', company)
@@ -712,6 +748,7 @@ function Roles() {
         roleSearch,
         roleScopeParams,
         splitFilterValues,
+        joinFilterParam,
         viewingRole?.id,
         hasServerRoleFilters,
         viewingRole?.candidates,

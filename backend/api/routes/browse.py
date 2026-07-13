@@ -267,7 +267,11 @@ def _matches_filter(filter_str: Optional[str], target_val: Any) -> bool:
 def _split_filter_values(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
-    return [v.strip().lower() for v in str(raw).split(",") if v.strip()]
+    text = str(raw)
+    # "||" separates values that may themselves contain commas (e.g. the city
+    # "Bhubaneswar, Odisha, India"); plain comma-separated input still works.
+    sep = "||" if "||" in text else ","
+    return [v.strip().lower() for v in text.split(sep) if v.strip()]
 
 
 def _parse_candidate_ids(raw: Optional[str]) -> List[int]:

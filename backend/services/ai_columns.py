@@ -470,6 +470,9 @@ def build_candidate_context(
         value = _get_nested_value(profile, item["path"])
         if item["key"] == "candidate.product_service" and not value:
             value = profile.get("extracted_industry") or profile.get("candidate_services")
+        if item["key"] == "role.current_company" and not value:
+            raw = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+            value = raw.get("import_company") or raw.get("company") or raw.get("current_company")
         ctx[item["key"]] = stringify_context_value(value)
     # Keep a legacy alias so older prompts using {candidate.name} still work.
     if "candidate.full_name" in ctx:
@@ -773,16 +776,37 @@ def _parse_role_context_entries(context: Dict[str, str]) -> List[Dict[str, str]]
             if not current or current.lower() == "unknown":
                 role[key] = raw_value
     entries = [grouped[idx] for idx in sorted(grouped)]
-    if not entries and (context.get("role.current_company") or context.get("role.current_title")):
-        entries.append(
-            {
-                "company": context.get("role.current_company", ""),
-                "title": context.get("role.current_title", ""),
-                "start_date": context.get("role.start_date", ""),
-                "end_date": context.get("role.end_date", ""),
-                "industry": context.get("role.current_industry", ""),
-            }
+    if not entries:
+        # CSV imports often carry only flat fields (e.g. import_company) with no
+        # structured role history; without this fallback career facts report an
+        # empty current company even though the row knows it.
+        fallback_company = (
+            context.get("role.current_company")
+            or context.get("raw.import_company")
+            or context.get("row.raw_fields.import_company")
+            or context.get("raw.company")
+            or context.get("row.raw_fields.company")
+            or context.get("raw.current_company")
+            or context.get("row.raw_fields.current_company")
+            or ""
         )
+        fallback_title = (
+            context.get("role.current_title")
+            or context.get("raw.import_title")
+            or context.get("row.raw_fields.import_title")
+            or context.get("candidate.headline")
+            or ""
+        )
+        if fallback_company or fallback_title:
+            entries.append(
+                {
+                    "company": fallback_company,
+                    "title": fallback_title,
+                    "start_date": context.get("role.start_date", ""),
+                    "end_date": context.get("role.end_date", ""),
+                    "industry": context.get("role.current_industry", ""),
+                }
+            )
     return entries
 
 
@@ -1433,6 +1457,15 @@ def map_career_facts_to_outputs(
         return {}
     if _needs_model_geography_reasoning(prompt_template, intents):
         return {}
+    # Company-attribute questions (which industry / product / business model is
+    # the company in) can't be answered from career facts — let the LLM handle
+    # them instead of hijacking the output with a current-role summary.
+    asks_company_attribute = any(
+        term in prompt_l
+        for term in ("industry", "sector", "product", "service", "business model", "b2b", "b2c", "company size", "website", "funding", "revenue")
+    ) and any(term in prompt_l for term in ("company", "employer", "organisation", "organization"))
+    if asks_company_attribute and not any(term in prompt_l for term in ("experience", "tenure", "years", "months")):
+        return {}
     asks_thresholded_fit = bool(re.search(r"\b\d+\+?\s*(?:years?|yrs?|months?|mos?)\b", prompt_l))
     is_evaluation = bool(re.search(r"\b(if|yes|no|mark|qualified|eligible)\b", prompt_l))
     can_answer_eval = (
@@ -2076,7 +2109,7 @@ def build_query_plan(
             ),
         )
     if (
-        "company_verification" in tool_intents
+        ("company_verification" in tool_intents or "company_verification" in tool_calls)
         and (company_missing_info or current_status == "Needs web verification")
     ):
         web_needed = True

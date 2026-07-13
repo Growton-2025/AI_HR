@@ -505,11 +505,22 @@ function resolveContactValue(...values) {
 }
 
 function splitTalentPoolFilterValues(values = [], _inputValue = '') {
+  // Tags stay whole: suggestion values like "Bhubaneswar, Odisha, India" contain
+  // commas and must not be split into separate filter terms.
   const list = Array.isArray(values) ? values : values == null || values === '' ? [] : [values];
   return [...list]
-    .flatMap((value) => String(value || '').split(','))
-    .map((value) => value.trim())
+    .map((value) => String(value || '').trim())
     .filter(Boolean);
+}
+
+// Serialize filter values for the browse API. "||" is used when any value contains
+// a comma (the backend splits on "||" when present); a trailing "||" marks a single
+// comma-containing value as already-joined.
+function joinTalentPoolFilterParam(values = []) {
+  if (!values.length) return '';
+  if (!values.some((value) => value.includes(','))) return values.join(',');
+  const joined = values.join('||');
+  return values.length === 1 ? `${joined}||` : joined;
 }
 
 function buildTalentPoolParamsString({
@@ -534,22 +545,22 @@ function buildTalentPoolParamsString({
 
   if (!normalizedCandidateIds.length && globalSearch) params.set('q', globalSearch);
 
-  const titleSearch = splitTalentPoolFilterValues(filters?.title, filters?.titleInput).join(',');
+  const titleSearch = joinTalentPoolFilterParam(splitTalentPoolFilterValues(filters?.title, filters?.titleInput));
   if (!normalizedCandidateIds.length && titleSearch) params.set('title', titleSearch);
 
-  const companySearch = splitTalentPoolFilterValues(filters?.company, filters?.companyInput).join(',');
+  const companySearch = joinTalentPoolFilterParam(splitTalentPoolFilterValues(filters?.company, filters?.companyInput));
   if (!normalizedCandidateIds.length && companySearch) params.set('company', companySearch);
 
-  const citySearch = splitTalentPoolFilterValues(filters?.city, filters?.cityInput).join(',');
+  const citySearch = joinTalentPoolFilterParam(splitTalentPoolFilterValues(filters?.city, filters?.cityInput));
   if (!normalizedCandidateIds.length && citySearch) params.set('city', citySearch);
 
-  const productSearch = splitTalentPoolFilterValues(filters?.product_service, filters?.productInput).join(',');
+  const productSearch = joinTalentPoolFilterParam(splitTalentPoolFilterValues(filters?.product_service, filters?.productInput));
   if (!normalizedCandidateIds.length && productSearch) params.set('product_service', productSearch);
 
   const statusValues = Array.isArray(filters?.status)
     ? filters.status.filter(Boolean)
     : (filters?.status ? [filters.status] : []);
-  if (!normalizedCandidateIds.length && statusValues.length) params.set('status', statusValues.join(','));
+  if (!normalizedCandidateIds.length && statusValues.length) params.set('status', joinTalentPoolFilterParam(statusValues));
 
   const minExp = Number(filters?.min_exp);
   const maxExp = Number(filters?.max_exp);
