@@ -1,5 +1,5 @@
 #!/bin/bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="/Users/kandoewinpvtltd/AI_HR/node-dist/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 echo "Starting AI HR Platform Services..."
 

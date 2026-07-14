@@ -420,6 +420,29 @@ PRESETS: List[Dict[str, Any]] = [
         ),
         "output_schema": _schema(("icebreaker", "Icebreaker"), ("evidence_basis", "Evidence Basis")),
     },
+    {
+        "id": "resume_screen",
+        "label": "Resume Screen",
+        "category": "Person",
+        "description": "Screen the candidate's uploaded resume against the role's job description.",
+        "required_inputs": ["candidate.resume_text"],
+        "mode": "content",
+        "prompt_template": (
+            "Screen this candidate's resume against the role.\n\n"
+            "Resume (candidate-supplied):\n{candidate.resume_text}\n\n"
+            "Resume skills: {resume.skills}\n"
+            "Role: {role.name}\n"
+            "Job description:\n{role.job_description}\n\n"
+            "Assess only what the resume explicitly evidences. If no resume is on file "
+            "(resume text empty), return unknown for every output and say no resume was uploaded. "
+            "Do not use web research; do not invent experience the resume does not state."
+        ),
+        "output_schema": _schema(
+            ("resume_fit", "Resume Fit (Strong/Partial/Weak/Unknown)"),
+            ("matching_evidence", "Matching Evidence"),
+            ("gaps", "Gaps vs Role"),
+        ),
+    },
 ]
 
 

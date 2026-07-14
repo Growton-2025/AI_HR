@@ -94,6 +94,26 @@ COLUMN_CONTEXT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
     {"key": "context.pitch_context", "label": "context.pitch_context", "group": "Column Context"},
 )
 
+# Resume tokens: short scalars from the parsed resume plus one bounded text
+# excerpt. The full text only ever reaches the model via the context pack's
+# resume section or the opt-in {candidate.resume_full_text} token.
+RESUME_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
+    {"key": "candidate.resume_text", "label": "candidate.resume_text (excerpt)", "group": "Resume Fields", "path": ("resume_text",)},
+    {"key": "candidate.resume_summary", "label": "candidate.resume_summary", "group": "Resume Fields", "path": ("resume_summary",)},
+    {"key": "resume.present", "label": "resume.present", "group": "Resume Fields", "path": ("resume", "present")},
+    {"key": "resume.filename", "label": "resume.filename", "group": "Resume Fields", "path": ("resume", "filename")},
+    {"key": "resume.uploaded_at", "label": "resume.uploaded_at", "group": "Resume Fields", "path": ("resume", "uploaded_at")},
+    {"key": "resume.summary", "label": "resume.summary", "group": "Resume Fields", "path": ("resume_summary",)},
+    {"key": "resume.skills", "label": "resume.skills", "group": "Resume Fields", "path": ("resume_parsed", "skills")},
+    {"key": "resume.certifications", "label": "resume.certifications", "group": "Resume Fields", "path": ("resume_parsed", "certifications")},
+    {"key": "resume.current_title", "label": "resume.current_title", "group": "Resume Fields", "path": ("resume_parsed", "roles", 0, "title")},
+    {"key": "resume.current_company", "label": "resume.current_company", "group": "Resume Fields", "path": ("resume_parsed", "roles", 0, "company")},
+    {"key": "resume.total_experience_years", "label": "resume.total_experience_years", "group": "Resume Fields", "path": ("resume_parsed", "total_experience_years")},
+    {"key": "resume.education", "label": "resume.education", "group": "Resume Fields", "path": ("resume_parsed", "education")},
+)
+
+AI_COLUMN_RESUME_CHAR_BUDGET = int(os.getenv("AI_COLUMN_RESUME_CHAR_BUDGET", "6000"))
+
 TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
 URL_PATTERN = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
 
@@ -481,6 +501,40 @@ def build_candidate_context(
     linkedin_value = ctx.get("candidate.linkedin", "")
     for alias in ("Linkedin Profile", "LinkedIn Profile", "linkedin profile"):
         ctx[alias] = linkedin_value
+    # Resume tokens: bounded excerpt + short scalars from the parse. The
+    # untruncated text is exposed only via the opt-in candidate.resume_full_text.
+    resume_text_full = str(profile.get("resume_text") or "")
+    for item in RESUME_FIELD_DEFINITIONS:
+        if item["key"] == "candidate.resume_text":
+            if AI_COLUMN_RESUME_CHAR_BUDGET > 0:
+                # Prefer real text (lazily hydrated in the run path); the
+                # deterministic summary is the fallback for cold cache entries.
+                value = resume_text_full[:AI_COLUMN_RESUME_CHAR_BUDGET] or profile.get("resume_summary")
+            else:
+                value = ""
+            ctx[item["key"]] = stringify_context_value(value)
+            continue
+        ctx[item["key"]] = stringify_context_value(_get_nested_value(profile, item["path"]))
+    ctx["candidate.resume_full_text"] = resume_text_full if AI_COLUMN_RESUME_CHAR_BUDGET > 0 else ""
+    # Structured payload for build_candidate_context_pack (which only receives
+    # this flat dict). Excluded from the full-row-context dump by key name.
+    if AI_COLUMN_RESUME_CHAR_BUDGET > 0 and (profile.get("resume") or {}).get("present"):
+        resume_parsed = profile.get("resume_parsed") if isinstance(profile.get("resume_parsed"), dict) else {}
+        ctx["resume._pack_json"] = json.dumps(
+            {
+                "present": True,
+                "filename": (profile.get("resume") or {}).get("filename") or "",
+                "uploaded_at": (profile.get("resume") or {}).get("uploaded_at") or "",
+                "summary": profile.get("resume_summary") or resume_parsed.get("summary") or "",
+                "skills": (resume_parsed.get("skills") or [])[:40],
+                "certifications": (resume_parsed.get("certifications") or [])[:15],
+                "roles": (resume_parsed.get("roles") or [])[:10],
+                "education": (resume_parsed.get("education") or [])[:5],
+                "text_excerpt": resume_text_full[:AI_COLUMN_RESUME_CHAR_BUDGET],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
     for imported in flatten_raw_fields(profile.get("raw_fields")):
         raw_value = _get_nested_value(profile.get("raw_fields") or {}, imported["path"][1:])
         ctx[imported["key"]] = stringify_context_value(raw_value)
@@ -503,12 +557,22 @@ def build_candidate_context(
     return ctx
 
 
+# Top-level profile keys that must never enter the row.* dump: resume content
+# is delivered once via the context pack (bounded), and letting the walker
+# expand resume_parsed.roles[N].* would evict real fields at the max_fields cap.
+_PROFILE_CONTEXT_SKIP_KEYS = frozenset(
+    {"resume", "resume_text", "resume_full_text", "resume_summary", "resume_parsed"}
+)
+
+
 def flatten_profile_context(profile: Dict[str, Any], *, max_fields: int = 650) -> Dict[str, str]:
     """Expose the full row as row.* keys so AI columns can behave like Clay chatbot prompts."""
     out: Dict[str, str] = {}
 
     def walk(value: Any, parts: List[str]) -> None:
         if len(out) >= max_fields:
+            return
+        if len(parts) == 1 and parts[0] in _PROFILE_CONTEXT_SKIP_KEYS:
             return
         value = _normalize_context_container(value)
         if _context_value_is_empty(value):
@@ -1446,6 +1510,31 @@ def _intent_specific_reason(prompt: str, intents: Sequence[str]) -> str:
     return f"Answered from selected profile tool intent(s): {names}."
 
 
+# Skill/technology/content questions ("worked with TTS models", "hands-on with
+# Kubernetes", "what did they build") can never be answered by tenure math.
+# They must reach the LLM, which sees the full profile, resume, and web.
+_SKILL_TECH_PROMPT_PATTERN = re.compile(
+    r"\b(?:worked\s+(?:with|on)|working\s+(?:with|on)|hands[-\s]?on|"
+    r"experience\s+(?:with|using|building|developing)|familiar(?:ity)?\s+with|"
+    r"proficien\w*|knowledge\s+of|expertise|skills?|technolog\w+|tools?|"
+    r"frameworks?|librar(?:y|ies)|tech\s+stack|platforms?|models?|"
+    r"certifications?|certified|build(?:s|ing)?|built|develop(?:s|ed|ing)?|"
+    r"implement(?:s|ed|ing)?|deploy(?:s|ed|ing)?)\b"
+)
+
+# When every output key is generic (result/summary/...), the schema carries no
+# signal — only answer deterministically if the prompt itself is explicitly a
+# career-metrics question.
+_CAREER_METRIC_PROMPT_TERMS = (
+    "tenure", "experience", "years", "yrs", "months", "job hop", "job-hop",
+    "switch", "stint", "current company", "current title", "current role",
+    "companies", "company count", "company history", "role history",
+    "cities", "city count", "locations", "geograph",
+)
+
+_GENERIC_OUTPUT_KEYS = {"result", "summary", "reasoning"}
+
+
 def map_career_facts_to_outputs(
     prompt_template: str,
     output_schema: Sequence[Dict[str, Any]],
@@ -1456,6 +1545,10 @@ def map_career_facts_to_outputs(
     if not intents or not facts:
         return {}
     if _needs_model_geography_reasoning(prompt_template, intents):
+        return {}
+    # Questions about specific skills/technologies/work content are outside
+    # what career facts know — never hijack them with a tenure summary.
+    if _SKILL_TECH_PROMPT_PATTERN.search(prompt_l):
         return {}
     # Company-attribute questions (which industry / product / business model is
     # the company in) can't be answered from career facts — let the LLM handle
@@ -1482,10 +1575,11 @@ def map_career_facts_to_outputs(
     # Check if all keys in output_schema can be deterministically satisfied.
     # If any key falls to the 'else' block (i.e. is not a known deterministic field),
     # we return {} to let the LLM handle it instead of hijacking it with a flat summary.
+    has_specific_key = False
     for item in normalize_output_schema(output_schema):
         key = item["key"]
         label = f"{key} {item.get('label', '')}".lower()
-        
+
         is_supported = (
             ("average" in label and "tenure" in label)
             or ("current" in label and ("tenure" in label or "month" in label or "current_job" in key))
@@ -1513,6 +1607,14 @@ def map_career_facts_to_outputs(
         )
         if not is_supported:
             return {}  # Abort deterministic mapping; LLM is required!
+        if not (key in _GENERIC_OUTPUT_KEYS or key.endswith("_reasoning") or "reasoning" in label):
+            has_specific_key = True
+
+    # A schema made only of generic keys (the default single "result" column)
+    # says nothing about the question. Take the deterministic shortcut only
+    # when the prompt itself explicitly asks for career metrics.
+    if not has_specific_key and not any(term in prompt_l for term in _CAREER_METRIC_PROMPT_TERMS):
+        return {}
 
     outputs: Dict[str, str] = {}
     yes_no = ""
@@ -1666,7 +1768,27 @@ def build_candidate_context_pack(context: Dict[str, str], facts: Optional[Dict[s
             ),
             "sources": enrichment.get("sources", {}) if isinstance(enrichment, dict) else _flat_context_section(context, "row.raw_fields.enrichment.sources"),
         },
+        "resume": _resume_pack_section(context),
     }
+
+
+def _resume_pack_section(context: Dict[str, str]) -> Dict[str, Any]:
+    """The only place full resume content reaches the model.
+
+    Resume roles stay under this key and are never merged into the pack's
+    top-level roles[] — that list feeds compute_career_facts, and mixing in
+    resume history would double-count tenure against the authoritative
+    pre-computed career facts.
+    """
+    payload = _context_json_value(context, "resume._pack_json", {}) or {}
+    if not payload:
+        return {"present": False}
+    payload["note"] = (
+        "Candidate-supplied resume. Treat as first-party evidence. "
+        "If it conflicts with LinkedIn/enrichment employment dates or tenure, "
+        "prefer the enrichment data and the pre-computed career facts."
+    )
+    return payload
 
 
 def _prompt_has_any(prompt: str, terms: Sequence[str]) -> bool:
@@ -2461,6 +2583,13 @@ def build_field_catalog(
             "group": field["group"],
             "token": f"{{{field['key']}}}",
         }
+    for field in RESUME_FIELD_DEFINITIONS:
+        grouped[field["group"]][field["key"]] = {
+            "key": field["key"],
+            "label": field["label"],
+            "group": field["group"],
+            "token": f"{{{field['key']}}}",
+        }
     for profile in profiles:
         for imported in flatten_raw_fields(profile.get("raw_fields")):
             grouped["Imported Fields"][imported["key"]] = {
@@ -2494,6 +2623,7 @@ def build_field_catalog(
             }
     ordered_groups = [
         "Default Fields",
+        "Resume Fields",
         "Role Fields",
         "Role Context",
         "Column Context",

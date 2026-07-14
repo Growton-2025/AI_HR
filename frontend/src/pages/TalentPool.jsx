@@ -20,6 +20,9 @@ import { TagFilterInput, SelectFilter, RangeSlider, uniqueSortedOptions } from '
 import CsvMappingModal from '../components/CsvMappingModal';
 import HayasaBrand from '../components/HayasaBrand';
 import AddToListModal from '../components/AddToListModal';
+import ResumeCell from '../components/ResumeCell';
+import ResumeModal from '../components/ResumeModal';
+import useResumes from '../hooks/useResumes';
 
 export function parseStructuredValue(val) {
   if (val == null) return null;
@@ -1681,6 +1684,8 @@ export default function TalentPool() {
   const heyreachCampaignId = useAppStore(state => state.heyreachCampaignId);
   const didInitRef = useRef(false);
   const uploadFileRef = useRef(null);
+  const resumeFileRef = useRef(null);
+  const pendingResumeCandidateIdRef = useRef(null);
   const talentPoolRequestSeqRef = useRef(0);
   const tableScrollRef = useRef(null);
   const aiColumnsRequestSeqRef = useRef(0);
@@ -2211,6 +2216,38 @@ export default function TalentPool() {
 
   fetchCandidatesRef.current = fetchCandidates;
 
+  const {
+    resolveResume,
+    uploadingIds: resumeUploadingIds,
+    uploadResume,
+    viewer: resumeViewer,
+    openResume,
+    closeResume,
+    reparseResume,
+  } = useResumes({
+    onParsed: () => {
+      // Parsed fields (email, city, experience) may have been filled — refetch the page.
+      invalidateTalentPoolCaches();
+      const run = fetchCandidatesRef.current;
+      if (run) void run(page, { force: true });
+    },
+  });
+
+  const openResumePicker = (candidateId) => {
+    pendingResumeCandidateIdRef.current = candidateId;
+    resumeFileRef.current?.click();
+  };
+
+  const handleResumeFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    const candidateId = pendingResumeCandidateIdRef.current;
+    pendingResumeCandidateIdRef.current = null;
+    if (!file || !candidateId) return;
+    const result = await uploadResume(candidateId, file);
+    if (!result.ok) toast.error(result.error);
+  };
+
   useEffect(() => {
     if (role !== 'admin') return;
     if (!talentPoolScopeReady) {
@@ -2454,6 +2491,7 @@ export default function TalentPool() {
     { key: 'last_name', label: 'Last Name', w: 100 },
     { key: 'title', label: 'Title', w: 160, sortKey: 'title' },
     { key: 'linkedin', label: 'LinkedIn', w: 70 },
+    { key: 'resume', label: 'Resume', w: 90 },
     { key: 'company', label: 'Current Company', w: 160, sortKey: 'company' },
     { key: 'product_service', label: 'Product/Service', w: 140 },
     { key: 'city', label: 'City', w: 120, sortKey: 'city' },
@@ -3521,6 +3559,15 @@ export default function TalentPool() {
                         </a>
                         : <span style={{ color: '#94a3b8', fontSize: 11, fontWeight: 500, fontStyle: 'italic' }}>Not linked</span>}
                     </td>
+                    <td style={{ padding: '13px 14px', borderRight: '1px solid #eef2f7' }}>
+                      <ResumeCell
+                        resume={resolveResume(c)}
+                        uploading={resumeUploadingIds.has(c.id)}
+                        disabled={poolReadOnly}
+                        onView={() => openResume(c)}
+                        onUpload={() => openResumePicker(c.id)}
+                      />
+                    </td>
                     <td style={{ padding: '13px 14px', fontSize: 13, color: '#0f172a', borderRight: '1px solid #eef2f7' }}>{c.company || ''}</td>
                     <td style={{ padding: '13px 14px', fontSize: 12, color: '#64748b', borderRight: '1px solid #eef2f7' }}>{c.product_service || ''}</td>
                     <td style={{ padding: '13px 14px', fontSize: 13, color: '#374151', borderRight: '1px solid #eef2f7' }}>{c.city || ''}</td>
@@ -4088,6 +4135,21 @@ export default function TalentPool() {
           setAiCellDrawerDetail(null);
           setAiCellDrawerTitle('');
         }}
+      />
+
+      <input
+        ref={resumeFileRef}
+        type="file"
+        accept=".pdf,.docx,.txt,.md"
+        style={{ display: 'none' }}
+        onChange={handleResumeFileChange}
+      />
+      <ResumeModal
+        open={resumeViewer.open}
+        candidate={resumeViewer.candidate}
+        resume={resumeViewer.resume}
+        onClose={closeResume}
+        onReparse={() => resumeViewer.candidate && reparseResume(resumeViewer.candidate.id)}
       />
     </div>
   );

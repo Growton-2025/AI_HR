@@ -914,6 +914,16 @@ async def fetch_browse_page_sql(
                 "raw_fields": {},
             })
 
+        # Hydrate resume metadata in one batch query (no bytes, no text).
+        if candidates:
+            from backend.services.resume_service import fetch_resume_metas
+
+            resume_metas = await asyncio.to_thread(
+                fetch_resume_metas, [c["id"] for c in candidates]
+            )
+            for c in candidates:
+                c["resume"] = resume_metas.get(c["id"])
+
         return {
             "candidates": candidates,
             "total": total,

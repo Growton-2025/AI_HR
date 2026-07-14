@@ -11,7 +11,7 @@ echo "Starting backend on port $PORT with $WEB_CONCURRENCY worker(s)..."
 
 if [ "$RUN_STARTUP_MIGRATIONS" = "true" ] || [ "$RUN_STARTUP_MIGRATIONS" = "1" ]; then
     echo "Running startup migrations once before Gunicorn workers start..."
-    $PYTHON_EXEC -c "from backend.db.connection import get_db_connection, return_db_connection; from backend.db.ai_column_migrate import ensure_ai_column_migrations; from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations; conn = get_db_connection(validate=False, register_pgvector=False); assert conn is not None, 'Database connection failed'; ensure_candidate_pool_migrations(conn); ensure_ai_column_migrations(conn); return_db_connection(conn)"
+    $PYTHON_EXEC -c "from backend.db.connection import get_db_connection, return_db_connection; from backend.db.ai_column_migrate import ensure_ai_column_migrations; from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations; from backend.db.resume_migrate import ensure_resume_migrations; conn = get_db_connection(validate=False, register_pgvector=False); assert conn is not None, 'Database connection failed'; ensure_candidate_pool_migrations(conn); ensure_ai_column_migrations(conn); ensure_resume_migrations(conn); return_db_connection(conn)"
 else
     echo "Startup migrations disabled. Run them as an explicit deployment step when schema changes are needed."
 fi

@@ -427,6 +427,20 @@ def _profile_dicts_from_candidates_and_roles(
                 "normalized_linkedin": cand[30],
                 "source_master_candidate_id": cand[31],
                 "is_archived": bool(cand[32]),
+                # Resume columns are appended at the end of _CANDIDATE_SELECT_BODY;
+                # extracted_text is intentionally NOT cached here (hydrated lazily
+                # by the AI-column runner) to keep the profile cache small.
+                "resume": {
+                    "id": cand[33],
+                    "filename": cand[34] or "",
+                    "uploaded_at": cand[37].isoformat() if cand[37] else None,
+                    "present": cand[33] is not None,
+                },
+                "resume_summary": cand[35] or "",
+                "resume_parsed": (
+                    json.loads(cand[36]) if isinstance(cand[36], str) and cand[36]
+                    else (cand[36] if isinstance(cand[36], dict) else {})
+                ),
                 "roles": roles_by_candidate.get(candidate_id, []),
             }
         )
@@ -444,9 +458,17 @@ _CANDIDATE_SELECT_BODY = """
                 co.heyreach_campaign_id, co.li_status, co.campaign_id, co.status as email_outreach_status,
                 co.li_sent_count, co.message_sent_count,
                 c.owner_user_id, c.pool_source, c.normalized_linkedin, c.source_master_candidate_id,
-                c.is_archived
+                c.is_archived,
+                res.id, res.filename, res.summary, res.parsed_json, res.created_at
             FROM candidates c
             LEFT JOIN candidate_outreach co ON c.id = co.candidate_id AND co.recruitment_role_id IS NULL
+            LEFT JOIN LATERAL (
+                SELECT cr.id, cr.filename, cr.summary, cr.parsed_json, cr.created_at
+                FROM candidate_resumes cr
+                WHERE cr.candidate_id = c.id AND cr.is_current
+                ORDER BY cr.created_at DESC
+                LIMIT 1
+            ) res ON TRUE
 """
 
 _ROLES_SELECT_BODY = """

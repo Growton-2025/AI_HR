@@ -339,6 +339,14 @@ def _ai_credits_summary_from_details(details: Any) -> Dict[str, Any]:
     }
 
 
+# Resume text lives in the context pack's resume section; repeating it here
+# would only truncate it to max_value_len and double its token cost. The
+# _pack_json carrier key is an internal transport, never model-facing.
+_FULL_ROW_CONTEXT_SKIP_KEYS = frozenset(
+    {"candidate.resume_text", "candidate.resume_full_text", "resume._pack_json"}
+)
+
+
 def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 650, max_value_len: int = 1200) -> str:
     def priority(item: tuple[str, str]) -> tuple[int, str]:
         key, _ = item
@@ -346,18 +354,22 @@ def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 650, 
             return (0, key)
         if key.startswith("role."):
             return (1, key)
-        if key.startswith("extra."):
+        if key.startswith("resume."):
             return (2, key)
-        if key.startswith("raw."):
+        if key.startswith("extra."):
             return (3, key)
-        if key.startswith("ai."):
+        if key.startswith("raw."):
             return (4, key)
-        if key.startswith("row."):
+        if key.startswith("ai."):
             return (5, key)
-        return (6, key)
+        if key.startswith("row."):
+            return (6, key)
+        return (7, key)
 
     payload: Dict[str, str] = {}
     for key, raw_value in sorted((context or {}).items(), key=priority):
+        if key in _FULL_ROW_CONTEXT_SKIP_KEYS:
+            continue
         value = str(raw_value or "").strip()
         if not value:
             continue
@@ -768,10 +780,29 @@ def _fetch_visible_definitions(
     return definitions
 
 
+def _hydrate_resume_text(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Attach extracted resume text at run time.
+
+    The warm profile cache deliberately omits extracted_text (~60KB/candidate);
+    fetch it only when a Smart Column is actually about to run on this row.
+    """
+    if not profile:
+        return profile
+    if (profile.get("resume") or {}).get("present") and "resume_text" not in profile:
+        try:
+            from backend.services.resume_service import fetch_resume_text
+
+            profile["resume_text"] = fetch_resume_text(int(profile.get("id")))
+        except Exception:
+            logger.exception("Failed to hydrate resume text for candidate %s", profile.get("id"))
+            profile["resume_text"] = ""
+    return profile
+
+
 def _fetch_profile(candidate_id: int) -> Optional[Dict[str, Any]]:
     profile = query.PROFILES_BY_ID.get(candidate_id)
     if profile and profile.get("roles"):
-        return profile
+        return _hydrate_resume_text(profile)
 
     # Newly ingested/uploaded rows may not be present in the worker-local cache yet.
     # Refreshing the single profile uses backend.pipeline.query's full candidate +
@@ -780,16 +811,16 @@ def _fetch_profile(candidate_id: int) -> Optional[Dict[str, Any]]:
         query.refresh_profiles_in_cache([candidate_id])
         refreshed = query.PROFILES_BY_ID.get(candidate_id)
         if refreshed:
-            return refreshed
+            return _hydrate_resume_text(refreshed)
     except Exception:
         logger.exception("Failed to refresh AI-column profile cache for candidate %s", candidate_id)
 
     if profile:
-        return profile
+        return _hydrate_resume_text(profile)
 
     from backend.api.routes.enrichment import _fetch_profile_from_db
 
-    return _fetch_profile_from_db(candidate_id)
+    return _hydrate_resume_text(_fetch_profile_from_db(candidate_id))
 
 
 def _ai_context_values_from_definitions(definitions: List[Dict[str, Any]], candidate_id: int) -> Dict[str, str]:
@@ -1294,7 +1325,11 @@ def _run_ai_task(
         "Count and report them as ONE unique location (use the more specific city name). "
         "Apply this deduplication for any city-country or city-state pair you recognize from "
         "your world geography knowledge before reporting location counts or lists. "
-        "Similarly, treat 'Bengaluru' and 'Bangalore' as the same city (alternate spelling)."
+        "Similarly, treat 'Bengaluru' and 'Bangalore' as the same city (alternate spelling). "
+        "RESUME RULE: when the candidate context pack contains a 'resume' section, treat it as "
+        "first-party candidate-supplied evidence (skills, achievements, projects, wording). "
+        "If the resume conflicts with LinkedIn/enrichment data on employment dates or tenure, "
+        "prefer the enrichment data and the pre-computed career facts."
     )
     content_first_system_prompt = (
         f"{system_prompt} "

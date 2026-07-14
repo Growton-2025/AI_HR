@@ -783,6 +783,14 @@ async def get_role(
                 candidate["feedback"] = row[11]
                 candidates.append(candidate)
 
+            # Hydrate resume metadata in one batch query (no bytes, no text).
+            if candidates:
+                from backend.services.resume_service import fetch_resume_metas
+
+                resume_metas = fetch_resume_metas([c["id"] for c in candidates])
+                for candidate in candidates:
+                    candidate["resume"] = resume_metas.get(candidate["id"])
+
             role = rows[0]
             response = {
                 "id": role[0],

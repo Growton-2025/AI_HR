@@ -18,6 +18,9 @@ import AiColumnCellDrawer from '../components/AiColumnCellDrawer'
 import HayasaBrand from '../components/HayasaBrand'
 import { longOperationAxios } from '../api/longTimeoutAxios'
 import { renderFriendlyAiValue, resolveAiCellValue, summarizeAiRun, createOptimisticAiColumn, mergeAiColumnDefinitions } from './TalentPool'
+import ResumeCell from '../components/ResumeCell'
+import ResumeModal from '../components/ResumeModal'
+import useResumes from '../hooks/useResumes'
 
 const RESPONDED_TAB = '__responded__'
 const RESPONSE_TAB_LABEL = 'Responded'
@@ -130,6 +133,41 @@ function Roles() {
     const [uploadProgress, setUploadProgress] = useState(null)
     const [uploadEnrichmentMode, setUploadEnrichmentMode] = useState('none')
     const uploadFileRef = useRef(null)
+    const resumeFileRef = useRef(null)
+    const pendingResumeCandidateIdRef = useRef(null)
+    const viewingRoleNameRef = useRef(null)
+    viewingRoleNameRef.current = viewingRole?.name || null
+
+    const {
+        resolveResume,
+        uploadingIds: resumeUploadingIds,
+        uploadResume,
+        viewer: resumeViewer,
+        openResume,
+        closeResume,
+        reparseResume,
+    } = useResumes({
+        onParsed: () => {
+            // Parsed fields (email, city, experience) may have been filled — refresh the role table.
+            const roleName = viewingRoleNameRef.current
+            if (roleName) void fetchRoleDetails(roleName, { force: true })
+        },
+    })
+
+    const openResumePicker = (candidateId) => {
+        pendingResumeCandidateIdRef.current = candidateId
+        resumeFileRef.current?.click()
+    }
+
+    const handleResumeFileChange = async (e) => {
+        const file = e.target.files?.[0]
+        e.target.value = ''
+        const candidateId = pendingResumeCandidateIdRef.current
+        pendingResumeCandidateIdRef.current = null
+        if (!file || !candidateId) return
+        const result = await uploadResume(candidateId, file)
+        if (!result.ok) toast.error(result.error)
+    }
 
     // Selection State
     const [selectedIds, setSelectedIds] = useState(new Set())
@@ -1902,6 +1940,7 @@ function Roles() {
                                             <th className="role-sticky-last-name">Last Name</th>
                                             <th style={{ minWidth: 170 }}>Title</th>
                                             <th style={{ minWidth: 90 }}>LinkedIn</th>
+                                            <th style={{ minWidth: 95 }}>Resume</th>
                                             <th style={{ minWidth: 170 }}>Current Company</th>
                                             <th style={{ minWidth: 150 }}>Product/Service</th>
                                             <th style={{ minWidth: 120 }}>City</th>
@@ -2015,6 +2054,14 @@ function Roles() {
                                                                 <Linkedin size={15} /> Profile
                                                             </a>
                                                         ) : <span className="empty-val">Not linked</span>}
+                                                    </td>
+                                                    <td>
+                                                        <ResumeCell
+                                                            resume={resolveResume(candidate)}
+                                                            uploading={resumeUploadingIds.has(candidate.id)}
+                                                            onView={() => openResume(candidate)}
+                                                            onUpload={() => openResumePicker(candidate.id)}
+                                                        />
                                                     </td>
                                                     <td className="role-truncate-cell" title={candidate.company || candidate.current_company}>{candidate.company || candidate.current_company || '—'}</td>
                                                     <td className="role-truncate-cell" title={candidate.product_service}>{candidate.product_service || '—'}</td>
@@ -2195,7 +2242,7 @@ function Roles() {
                                         })}
                                         {filteredCandidates.length === 0 && (
                                             <tr>
-                                                <td colSpan={16 + dynamicRoleAiCols.length} style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
+                                                <td colSpan={17 + dynamicRoleAiCols.length} style={{ textAlign: 'center', padding: '40px', color: '#64748b' }}>
                                                     No candidates match the selected filters.
                                                 </td>
                                             </tr>
@@ -2243,6 +2290,20 @@ function Roles() {
                     onClose={() => setAiCellDrawer({ open: false, loading: false, detail: null, title: '' })}
                 />
 
+                <input
+                    ref={resumeFileRef}
+                    type="file"
+                    accept=".pdf,.docx,.txt,.md"
+                    style={{ display: 'none' }}
+                    onChange={handleResumeFileChange}
+                />
+                <ResumeModal
+                    open={resumeViewer.open}
+                    candidate={resumeViewer.candidate}
+                    resume={resumeViewer.resume}
+                    onClose={closeResume}
+                    onReparse={() => resumeViewer.candidate && reparseResume(resumeViewer.candidate.id)}
+                />
 
                 {showAddToListModal && (
                     <AddToListModal

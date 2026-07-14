@@ -25,6 +25,7 @@ def _apply_pool_migrations_blocking() -> None:
     from backend.db.ai_column_migrate import ensure_ai_column_migrations
     from backend.db.candidate_pool_migrate import ensure_candidate_pool_migrations
     from backend.db.outreach_migrate import ensure_outreach_migrations
+    from backend.db.resume_migrate import ensure_resume_migrations
 
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
@@ -34,6 +35,7 @@ def _apply_pool_migrations_blocking() -> None:
         ensure_candidate_pool_migrations(conn)
         ensure_ai_column_migrations(conn)
         ensure_outreach_migrations(conn)
+        ensure_resume_migrations(conn)
     finally:
         return_db_connection(conn)
 
@@ -42,12 +44,16 @@ def _apply_outreach_migrations_blocking() -> None:
     """Ensure durable outreach columns exist before role dispatchers start."""
     from backend.db.connection import get_db_connection, return_db_connection
     from backend.db.outreach_migrate import ensure_outreach_migrations
+    from backend.db.resume_migrate import ensure_resume_migrations
 
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise RuntimeError("Could not connect to DB for outreach migrations")
     try:
         ensure_outreach_migrations(conn)
+        # Resume storage rides the unconditional migration path because
+        # ENABLE_STARTUP_MIGRATIONS defaults to false in prod.
+        ensure_resume_migrations(conn)
     finally:
         return_db_connection(conn)
 
@@ -265,6 +271,8 @@ app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(roles.router, prefix="/api/roles", tags=["roles"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
 app.include_router(candidate_imports.router, prefix="/api", tags=["imports"])
+from backend.api.routes import resumes
+app.include_router(resumes.router, prefix="/api", tags=["resumes"])
 app.include_router(candidates.router, prefix="/api", tags=["candidates"])
 app.include_router(stats.router, prefix="/api/stats", tags=["stats"])
 app.include_router(outreach.router, prefix="/api/outreach", tags=["outreach"])
