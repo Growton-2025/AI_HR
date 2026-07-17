@@ -369,6 +369,9 @@ def test_warm_call_caches_publishes_one_consistent_snapshot(monkeypatch):
                 False,  # candidate mobile_phone_wrong
                 None,   # candidate notes
                 "To be started",  # candidate status
+                None,   # candidate linkedin
+                None,   # sentiment
+                None,   # sentiment_reason
             )],
         ]
     )

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import threading
@@ -125,7 +126,10 @@ CALLS_SELECT_QUERY = """
         c.due_time,
         COALESCE(cand.mobile_phone_wrong, FALSE),
         cand.notes,
-        COALESCE(NULLIF(TRIM(cand.status), ''), 'To be started')
+        COALESCE(NULLIF(TRIM(cand.status), ''), 'To be started'),
+        cand.linkedin,
+        c.sentiment,
+        c.sentiment_reason
     FROM calls c
     JOIN call_lists cl ON c.list_id = cl.id
     JOIN candidates cand ON c.candidate_id = cand.id
@@ -165,6 +169,9 @@ def call_row_to_dict(row) -> dict:
         "candidate_phone_wrong": bool(row[27]),
         "candidate_notes": row[28],
         "candidate_status": row[29],
+        "candidate_linkedin": row[30],
+        "sentiment": row[31],
+        "sentiment_reason": row[32],
     }
 
 
@@ -515,6 +522,9 @@ class CallResponse(BaseModel):
     candidate_phone_wrong: Optional[bool] = False
     candidate_notes: Optional[str] = None
     candidate_status: Optional[str] = None
+    candidate_linkedin: Optional[str] = None
+    sentiment: Optional[str] = None
+    sentiment_reason: Optional[str] = None
 
 
 def ensure_calls_schema_ready(force: bool = False):
@@ -602,6 +612,11 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_url TEXT;")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS transcript TEXT;")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS summary TEXT;")
+            # AI-derived call sentiment (Positive/Neutral/Negative) + a one-line reason,
+            # generated alongside the summary — distinct from `outcome`, which is the
+            # recruiter's own manual call disposition.
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS sentiment VARCHAR(20);")
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS sentiment_reason TEXT;")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_status VARCHAR(100);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_call_uuid VARCHAR(255);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_transaction_id VARCHAR(255);")
@@ -1558,11 +1573,21 @@ async def sync_call_recording(
     call_uuid = call.get("plivo_call_uuid") or call.get("plivo_transaction_id")
     from backend.integrations import plivo_service
     
+    record_url = None
     if call_uuid and call_uuid in plivo_service.recordings:
         record_url = plivo_service.recordings[call_uuid]
         logger.info(f"Syncing call using Plivo recording for UUID: {call_uuid}")
+    elif call_uuid and call.get("completed_at"):
+        # The in-memory recordings map is lost on restart and the webhook can
+        # be missed entirely (ngrok down) — recover via Plivo's REST API.
+        record_url = await asyncio.to_thread(plivo_service.lookup_recording_url, call_uuid)
+        if record_url:
+            plivo_service.recordings[call_uuid] = record_url
+            logger.info(f"Recovered recording for UUID {call_uuid} via Plivo REST lookup")
+
+    if record_url:
         await plivo_service.process_call_insights(call_uuid, record_url)
-        
+
         conn = get_calls_db_connection()
         if conn:
             cur = conn.cursor()

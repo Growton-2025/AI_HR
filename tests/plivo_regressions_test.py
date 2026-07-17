@@ -134,8 +134,11 @@ def test_setup_plivo_serializes_concurrent_endpoint_creation(monkeypatch):
     _reset_plivo_setup_state()
 
 
-def test_plivo_dial_maps_endpoint_username_to_call_uuid(monkeypatch):
+def test_plivo_dial_maps_endpoint_username_to_call_uuid(monkeypatch, tmp_path):
     _reset_plivo_setup_state()
+    # Keep persisted softphone state out of the real data/ directory so the
+    # concurrent-setup assertions below always exercise the fresh-create path.
+    monkeypatch.setattr(plivo_service, "_PLIVO_STATE_FILE", str(tmp_path / "plivo_state.json"))
     fake_conn = _FakeConnection()
 
     from backend.api.routes import calls

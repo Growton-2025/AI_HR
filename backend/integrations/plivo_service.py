@@ -1,6 +1,7 @@
 import os
 import logging
 import requests
+import threading
 import time
 import plivo
 from openai import AsyncOpenAI
@@ -43,10 +44,10 @@ def get_ngrok_url():
     env_url = os.getenv("PUBLIC_URL") or os.getenv("NGROK_URL")
     if env_url:
         return env_url.rstrip('/')
-        
+
     # Priority 2: Fallback to local active ngrok tunnel API
     try:
-        response = requests.get('http://127.0.0.1:4040/api/tunnels')
+        response = requests.get('http://127.0.0.1:4040/api/tunnels', timeout=3)
         response.raise_for_status()
         data = response.json()
         for tunnel in data.get('tunnels', []):
@@ -54,8 +55,21 @@ def get_ngrok_url():
                 return tunnel.get('public_url')
         if data.get('tunnels'):
             return data['tunnels'][0]['public_url']
-    except Exception as e:
-        logger.error(f"Failed to get ngrok URL: {e}")
+    except Exception:
+        pass
+
+    # Priority 3: Cloudflare quick tunnel (started by start_services.sh with
+    # --metrics 127.0.0.1:20241; needs no account, URL changes per session).
+    try:
+        response = requests.get('http://127.0.0.1:20241/quicktunnel', timeout=3)
+        response.raise_for_status()
+        hostname = response.json().get('hostname')
+        if hostname:
+            return f"https://{hostname}"
+    except Exception:
+        pass
+
+    logger.error("No public tunnel found: set PUBLIC_URL/NGROK_URL, or run ngrok / cloudflared.")
     return None
 
 def normalize_number(number):
@@ -70,9 +84,70 @@ def normalize_number(number):
         return f"+{digits}" if digits else ""
 
 
+# Bound concurrent REST recording lookups so a burst of frontend sync polls
+# cannot stack blocking Plivo calls (same pattern as resume_service._parse_semaphore).
+_recording_lookup_semaphore = threading.BoundedSemaphore(
+    int(os.getenv("PLIVO_MAX_CONCURRENT_RECORDING_LOOKUPS", "2"))
+)
+
+
+def lookup_recording_url(call_uuid: str):
+    """Blocking Plivo REST lookup of a call's recording URL (run via asyncio.to_thread).
+
+    Recovers recordings whose webhook callback was lost (e.g. backend restart
+    wiped the in-memory `recordings` map, or ngrok was down when Plivo called).
+    """
+    if not call_uuid or not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
+        return None
+    with _recording_lookup_semaphore:
+        try:
+            client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+            result = client.recordings.list(call_uuid=call_uuid, limit=1)
+            objects = getattr(result, "objects", None) or (result if isinstance(result, list) else [])
+            for rec in objects:
+                url = getattr(rec, "recording_url", None)
+                if url:
+                    return url
+        except Exception as e:
+            logger.warning(f"Plivo recording lookup failed for {call_uuid}: {e}")
+    return None
+
+
 def download_plivo_recording(record_url: str, timeout: int = 30):
     auth = (PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN) if PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN else None
     return requests.get(record_url, timeout=timeout, auth=auth)
+
+
+_PLIVO_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data",
+    "plivo_softphone_state.json",
+)
+
+
+def _load_persisted_softphone_state():
+    try:
+        with open(_PLIVO_STATE_FILE, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        if all(state.get(key) for key in ("app_id", "username", "password", "answer_url")):
+            return state
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not read persisted Plivo softphone state: {e}")
+    return None
+
+
+def _persist_softphone_state(app_id: str, username: str, password: str, answer_url: str):
+    try:
+        os.makedirs(os.path.dirname(_PLIVO_STATE_FILE), exist_ok=True)
+        with open(_PLIVO_STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"app_id": app_id, "username": username, "password": password, "answer_url": answer_url},
+                fh,
+            )
+    except Exception as e:
+        logger.warning(f"Could not persist Plivo softphone state: {e}")
 
 
 def record_browser_dial(username: str, call_uuid: str, to_number: str):
@@ -123,6 +198,11 @@ def record_browser_dial(username: str, call_uuid: str, to_number: str):
 
 async def setup_plivo(force: bool = False):
     global endpoint_username, endpoint_password, endpoint_public_url, setup_error, _last_setup_ngrok_url
+
+    # An explicit force (credentials/refresh) must re-provision from scratch;
+    # the auto-force below only re-enters setup so the persisted app can be
+    # reused with an updated answer_url.
+    explicit_force = force
 
     # Auto-force re-setup when the ngrok/public URL has changed since last init
     current_ngrok_url = get_ngrok_url() or ""
@@ -176,10 +256,40 @@ async def setup_plivo(force: bool = False):
             return {"success": False, "error": setup_error, "code": "plivo_credentials_missing"}
             
         client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+        answer_url = f"{ngrok_url}/api/plivo/dial"
+
+        # Reuse the previously provisioned app + endpoint when possible so a
+        # backend restart (or URL change) doesn't pay two Plivo REST calls and
+        # doesn't orphan apps/endpoints in the Plivo account.
+        persisted = None if explicit_force else _load_persisted_softphone_state()
+        if persisted:
+            try:
+                if persisted["answer_url"] != answer_url:
+                    await asyncio.to_thread(
+                        client.applications.update,
+                        app_id=persisted["app_id"],
+                        answer_url=answer_url,
+                        answer_method="POST",
+                    )
+                    _persist_softphone_state(persisted["app_id"], persisted["username"], persisted["password"], answer_url)
+                    logger.info(f"Updated answer_url on existing Plivo app {persisted['app_id']}")
+                endpoint_username = persisted["username"]
+                endpoint_password = persisted["password"]
+                _last_setup_ngrok_url = ngrok_url
+                setup_error = ""
+                logger.info(f"Reusing persisted Plivo endpoint: {endpoint_username}")
+                return {
+                    "success": True,
+                    "username": endpoint_username,
+                    "password": endpoint_password,
+                    "public_url": endpoint_public_url,
+                }
+            except Exception as reuse_err:
+                logger.warning(f"Could not reuse persisted Plivo app, provisioning fresh: {reuse_err}")
+
         setup_suffix = f"{time.time_ns()}{uuid.uuid4().hex[:8]}"
         app_name = f"Softphone_App_{setup_suffix}"
-        answer_url = f"{ngrok_url}/api/plivo/dial"
-        
+
         try:
             app_response = await asyncio.to_thread(
                 client.applications.create,
@@ -205,6 +315,7 @@ async def setup_plivo(force: bool = False):
             endpoint_password = password
             _last_setup_ngrok_url = ngrok_url
             setup_error = ""
+            _persist_softphone_state(app_id, endpoint_username, endpoint_password, answer_url)
             logger.info(f"Stored Credentials: {endpoint_username} / {endpoint_password}")
             return {
                 "success": True,
@@ -280,13 +391,28 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
             
         logger.info("Transcribing audio...")
         client = get_openai_client()
-        with open(temp_audio_path, "rb") as audio_file:
-            transcript = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                timeout=300.0
-            )
-        
+        try:
+            # gpt-4o-transcribe eliminates whisper-1's well-documented repetition/
+            # hallucination loops on quiet or long audio (e.g. transcripts that
+            # devolve into the same sentence repeated dozens of times, or drift
+            # into gibberish/other scripts). It caps at ~1400s of audio though,
+            # so fall back to whisper-1 for the rare call that runs longer.
+            with open(temp_audio_path, "rb") as audio_file:
+                transcript = await client.audio.transcriptions.create(
+                    model="gpt-4o-transcribe",
+                    file=audio_file,
+                    response_format="json",
+                    timeout=300.0
+                )
+        except Exception as e:
+            logger.warning(f"gpt-4o-transcribe failed for {call_uuid} ({e}); falling back to whisper-1")
+            with open(temp_audio_path, "rb") as audio_file:
+                transcript = await client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    timeout=300.0
+                )
+
         raw_text = transcript.text
         os.remove(temp_audio_path)
         
@@ -296,11 +422,18 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         Transcript:
         {raw_text}
         
+        Also analyze the Lead's overall sentiment toward the opportunity discussed
+        (not the recruiter's tone) — Positive (engaged/interested), Neutral
+        (noncommittal/mixed), or Negative (uninterested/pushback/hostile) — with a
+        one-sentence reason grounded in something they actually said.
+
         Output JSON object:
         {{
             "transcript": [{{"speaker": "Recruiter" or "Lead", "text": "What they said"}}],
             "summary": "...",
-            "insights": ["..."]
+            "insights": ["..."],
+            "sentiment": "Positive" or "Neutral" or "Negative",
+            "sentiment_reason": "..."
         }}
         """
         
@@ -323,6 +456,10 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
 
         call_insights[call_uuid] = result_json
         logger.info(f"Successfully generated direct audio insights for {call_uuid}")
+
+        sentiment_raw = str(result_json.get("sentiment") or "").strip().capitalize()
+        sentiment = sentiment_raw if sentiment_raw in ("Positive", "Neutral", "Negative") else None
+        sentiment_reason = (result_json.get("sentiment_reason") or "").strip() or None
 
         # Sync back to local SQL database
         try:
@@ -348,11 +485,13 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                         recording_url = %s,
                         transcript = %s,
                         summary = %s,
+                        sentiment = %s,
+                        sentiment_reason = %s,
                         duration = COALESCE(%s, duration),
                         status = 'completed',
                         updated_at = NOW()
                     WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
-                """, (record_url, t_str, result_json.get("summary"), duration_seconds, call_uuid, call_uuid))
+                """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, call_uuid, call_uuid))
                 conn.commit()
 
                 if cur.rowcount == 0:
@@ -363,11 +502,13 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                             recording_url = %s,
                             transcript = %s,
                             summary = %s,
+                            sentiment = %s,
+                            sentiment_reason = %s,
                             duration = COALESCE(%s, duration),
                             status = 'completed',
                             updated_at = NOW()
                         WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
-                    """, (record_url, t_str, result_json.get("summary"), duration_seconds))
+                    """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds))
                     conn.commit()
                 cur.close()
                 return_db_connection(conn)

@@ -1,4 +1,4 @@
-import { VoIPProvider, useVoIP } from '../context/VoIPContext';
+import { VoIPProvider, useVoIP, reportTiming } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
@@ -8,7 +8,8 @@ import {
   Search, RefreshCw, MoreHorizontal, User, 
   Trash2, X, ChevronLeft, Send, MessageSquare, 
   CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
-  ClipboardList, Layers, PhoneIncoming, Loader2
+  ClipboardList, Layers, PhoneIncoming, Loader2, Linkedin,
+  Smile, Meh, Frown
 } from 'lucide-react';
 import axios from 'axios';
 import { API_BASE, BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
@@ -250,6 +251,16 @@ const CALL_PANEL_STYLE = {
   boxShadow: '0 18px 36px rgba(15,23,42,0.05)',
 };
 
+// Klenty-style dense calls table: Prospect | Purpose | Status | Date | Outcome | Actions.
+// Single source of truth for colSpan so header/skeleton/empty-state/expanded-row spans
+// never drift — the exact "magic number colSpan" landmine that bit Roles.jsx.
+const CALLS_TABLE_COL_COUNT = 6;
+const CALLS_TABLE_TH_STYLE = {
+  textAlign: 'left', padding: '12px 16px', fontSize: '11px', fontWeight: 800,
+  color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em',
+  borderBottom: '1px solid #e2e8f0', whiteSpace: 'nowrap',
+};
+
 const CALL_PRIMARY_BUTTON = {
   background: '#111827',
   color: '#fff',
@@ -304,6 +315,45 @@ const needsPostCallArtifacts = (callData) => {
   if (hasPlaceholderSummary(callData.summary)) return true;
   return false;
 };
+
+// AI-derived sentiment of the Lead's side of the conversation (Klenty calls this
+// "Sentiments" in Call IQ) — distinct from `outcome`, which the recruiter sets by hand.
+const SENTIMENT_META = {
+  Positive: { icon: Smile, color: '#059669', bg: '#ecfdf5', border: '#a7f3d0' },
+  Neutral: { icon: Meh, color: '#64748b', bg: '#f8fafc', border: '#e2e8f0' },
+  Negative: { icon: Frown, color: '#dc2626', bg: '#fef2f2', border: '#fecaca' },
+};
+
+const SentimentBadge = ({ sentiment, reason, size = 12 }) => {
+  const meta = SENTIMENT_META[sentiment];
+  if (!meta) return null;
+  const Icon = meta.icon;
+  return (
+    <span
+      title={reason || sentiment}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '2px 8px',
+        borderRadius: '999px', background: meta.bg, color: meta.color, fontWeight: 700,
+        fontSize: size, border: `1px solid ${meta.border}`, width: 'fit-content',
+        // Dotted underline on the label signals "hover for why" in tight spaces
+        // (table cells) where the full reason can't be shown inline.
+        textDecoration: reason ? 'underline dotted' : 'none', textUnderlineOffset: '2px',
+      }}
+    >
+      <Icon size={size} /> {sentiment}
+    </span>
+  );
+};
+
+const PENDING_ANALYSIS_WINDOW_MS = 30 * 60 * 1000;
+const BACKGROUND_ANALYSIS_POLL_MS = 9000;
+
+const isPendingAnalysis = (callData) => (
+  callData?.status === 'completed'
+  && needsPostCallArtifacts(callData)
+  && Boolean(callData.completed_at)
+  && (Date.now() - new Date(callData.completed_at).getTime()) < PENDING_ANALYSIS_WINDOW_MS
+);
 
 const SOFTPHONE_PREPARING_TIMEOUT_MS = 12000;
 const SOFTPHONE_FIRST_CLICK_RECOVERY_MS = 18000;
@@ -1032,6 +1082,35 @@ export default function Calls() {
     fetchData();
   }, [fetchData]);
 
+  // Background post-call analysis poller: recently completed calls that are
+  // still missing recording/transcript/summary keep syncing even after the
+  // review modal closes, so their rows update in place when analysis lands.
+  // Requests run sequentially to keep backend load at one sync at a time.
+  useEffect(() => {
+    const pendingIds = (calls || []).filter(isPendingAnalysis).map(c => c.id);
+    if (!pendingIds.length) return undefined;
+
+    let cancelled = false;
+    let syncing = false;
+    const interval = setInterval(async () => {
+      if (cancelled || syncing || !isDocumentVisible()) return;
+      syncing = true;
+      try {
+        for (const id of pendingIds) {
+          if (cancelled) break;
+          await syncCallRecording(id);
+        }
+      } finally {
+        syncing = false;
+      }
+    }, BACKGROUND_ANALYSIS_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [calls, syncCallRecording]);
+
   useEffect(() => {
     if (!selectedList || !callListsLastFetchedAt) return;
     const selectedListStillExists = (callLists || []).some(list => Number(list.id) === Number(selectedList.id));
@@ -1156,6 +1235,7 @@ export default function Calls() {
   const showListsLoading = (activeTab === 'lists' && !selectedList && loading && !callLists.length);
 
   return (
+    <VoIPProvider>
     <div className="calls-page" style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
       <header className="calls-hero" style={{ ...CALL_PANEL_STYLE, marginBottom: '28px', padding: '24px 28px', borderRadius: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px 24px' }}>
         <div>
@@ -1390,235 +1470,285 @@ export default function Calls() {
               </div>
             </div>
 
-            <div className="calls-rows" style={{ padding: '0 24px' }}>
-              {showCallsLoading && Array.from({ length: 5 }).map((_, idx) => (
-                <div
-                  key={`call-skeleton-${idx}`}
-                  style={{ padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: '16px' }}
-                >
-                  <div style={{ width: 40, height: 40, borderRadius: '50%', background: '#e2e8f0' }} />
-                  <div style={{ flex: 1 }}>
-                    <div style={{ width: '28%', height: 14, borderRadius: 8, background: '#e2e8f0', marginBottom: 8 }} />
-                    <div style={{ width: '44%', height: 12, borderRadius: 8, background: '#f1f5f9', marginBottom: 8 }} />
-                    <div style={{ width: '36%', height: 10, borderRadius: 8, background: '#f8fafc' }} />
-                  </div>
-                </div>
-              ))}
-              {!showCallsLoading && (
-                <>
-              {(filteredCalls || []).map(call => {
-                const isDeletingCall = deletingCallIds.has(call.id);
-
-                return (
-                <React.Fragment key={call.id}>
-                <div
-                  className="calls-row"
-                  style={{ 
-                    padding: '20px 0', borderBottom: '1px solid #f1f5f9', display: 'flex', 
-                    alignItems: 'center', gap: '16px',
-                    opacity: isDeletingCall ? 0.55 : 1
-                  }}
-                >
-                  <div className="calls-row-avatar" style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 700, color: '#64748b' }}>
-                    {call.candidate_name?.split(' ').map(n => n[0]).join('') || '?' }
-                  </div>
-                  <div className="calls-row-main" style={{ flex: 1 }}>
-                    <h3 style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a', marginBottom: '2px' }}>{call.candidate_name || 'Anonymous'}</h3>
-                    <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '4px' }}>
-                      {call.task_title || call.candidate_title || 'No Title'}
-                    </p>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap', fontSize: '12px', color: '#94a3b8' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <Phone size={12} /> {call.candidate_phone || 'N/A'}
-                      </div>
-                      {call.candidate_phone_wrong && (
-                        <span style={{ padding: '2px 8px', borderRadius: '999px', background: '#fef2f2', color: '#b91c1c', fontWeight: 700, fontSize: '11px', border: '1px solid #fecaca' }}>
-                          Wrong number — calling paused
-                        </span>
-                      )}
-                      <StatusDropdown
-                        status={statusOverrides[call.candidate_id] ?? call.candidate_status}
-                        candidateId={call.candidate_id}
-                        optimistic
-                        onUpdate={(id, newStatus) => setStatusOverrides(prev => ({ ...prev, [id]: newStatus }))}
-                      />
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        <Calendar size={12} />
-                        {call.status === 'completed'
-                          ? `Completed: ${call.completed_at ? new Date(call.completed_at).toLocaleDateString() : 'Unknown'}`
-                          : `Due: ${formatLocalDate(call.due_date)}${call.due_time ? ` at ${formatDueTime(call.due_time)}` : ''}`
-                        }
-                      </div>
-                      {call.status === 'completed' && (
-                        <>
-                          <div style={{ color: '#2563eb', fontWeight: 600 }}>
-                            {call.duration ? `${Math.floor(call.duration / 60)}m ${call.duration % 60}s` : '0s'}
+            <div className="calls-table-wrap" style={{ padding: '0 24px 24px', overflowX: 'auto' }}>
+              <table className="calls-table" style={{ width: '100%', minWidth: 880, borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr>
+                    <th style={CALLS_TABLE_TH_STYLE}>Prospect</th>
+                    <th style={CALLS_TABLE_TH_STYLE}>Purpose</th>
+                    <th style={CALLS_TABLE_TH_STYLE}>Status</th>
+                    <th style={CALLS_TABLE_TH_STYLE}>{activeTab === 'completed' ? 'Completed' : 'Scheduled'}</th>
+                    <th style={CALLS_TABLE_TH_STYLE}>Outcome</th>
+                    <th style={{ ...CALLS_TABLE_TH_STYLE, textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {showCallsLoading && Array.from({ length: 5 }).map((_, idx) => (
+                    <tr key={`call-skeleton-${idx}`}>
+                      <td colSpan={CALLS_TABLE_COL_COUNT} style={{ padding: '16px', borderBottom: '1px solid #f1f5f9' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                          <div style={{ width: 36, height: 36, borderRadius: '50%', background: '#e2e8f0', flexShrink: 0 }} />
+                          <div style={{ flex: 1 }}>
+                            <div style={{ width: '28%', height: 14, borderRadius: 8, background: '#e2e8f0', marginBottom: 8 }} />
+                            <div style={{ width: '44%', height: 12, borderRadius: 8, background: '#f1f5f9' }} />
                           </div>
-                          <div style={{ color: call.outcome === 'Unreachable' ? '#b45309' : '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
-                            {call.outcome || 'No Outcome'}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  <div className="calls-row-actions" style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    {call.status === 'completed' && (
-                      <button
-                        onClick={() => setExpandedCallId(expandedCallId === call.id ? null : call.id)}
-                        style={{
-                          padding: '8px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
-                          background: '#fff', color: '#334155', border: '1px solid rgba(203,213,225,0.9)', cursor: 'pointer',
-                          display: 'flex', alignItems: 'center', gap: '6px'
-                        }}
-                      >
-                        {expandedCallId === call.id ? 'Hide Details' : 'View Insights'}
-                      </button>
-                    )}
-                    <button 
-                      onClick={() => handleDeleteCall(call.id)}
-                      disabled={isDeletingCall}
-                      style={{ padding: '8px', background: 'none', border: 'none', color: '#94a3b8', cursor: isDeletingCall ? 'wait' : 'pointer', borderRadius: '8px', opacity: isDeletingCall ? 0.6 : 1 }}
-                      onMouseEnter={e => { if (!isDeletingCall) e.currentTarget.style.color = '#ef4444'; }}
-                      onMouseLeave={e => { if (!isDeletingCall) e.currentTarget.style.color = '#94a3b8'; }}
-                      title="Remove from list"
-                    >
-                      {isDeletingCall ? <Loader2 size={18} className="animate-spin" /> : <Trash2 size={18} />}
-                    </button>
-                    {(() => {
-                      const dialDisabled = call.status === 'completed' || isDeletingCall || Boolean(call.candidate_phone_wrong);
-                      return (
-                    <button
-                      onClick={() => handleDial(call)}
-                      disabled={dialDisabled}
-                      title={call.candidate_phone_wrong ? 'Number tagged as wrong — update the candidate’s phone to resume calling' : undefined}
-                      style={{
-                        padding: '8px 16px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
-                        background: dialDisabled ? '#f1f5f9' : '#111827',
-                        color: dialDisabled ? '#94a3b8' : '#fff',
-                        border: dialDisabled ? '1px solid rgba(203,213,225,0.9)' : '1px solid #111827', cursor: dialDisabled ? 'not-allowed' : 'pointer',
-                        display: 'flex', alignItems: 'center', gap: '8px'
-                      }}
-                    >
-                      <PhoneCall size={16} />
-                    </button>
-                      );
-                    })()}
-                  </div>
-                </div>
-
-                {/* Expanded Details Section */}
-                {expandedCallId === call.id && (
-                  <div className="calls-expanded-details" style={{
-                    padding: '24px', background: '#f8fafc', borderRadius: '16px', margin: '0 0 20px 56px',
-                    border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
-                  }}>
-                    <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '12px' }}>
-                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Call Recording</h4>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                          {call.recording_url && (
-                            <a
-                              href={call.recording_url}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{ fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
-                            >
-                              <ExternalLink size={14} />
-                              Open Recording
-                            </a>
-                          )}
-                          {!call.recording_url && (
-                            <button
-                              onClick={() => handleSyncRecording(call.id)}
-                              disabled={syncingCallId === call.id}
-                              style={{
-                                padding: '8px 12px',
-                                borderRadius: '10px',
-                                border: '1px solid rgba(203,213,225,0.9)',
-                                background: '#fff',
-                                color: '#334155',
-                                fontSize: '12px',
-                                fontWeight: 700,
-                                cursor: syncingCallId === call.id ? 'wait' : 'pointer',
-                                display: 'inline-flex',
-                                alignItems: 'center',
-                                gap: '6px'
-                              }}
-                            >
-                              <RefreshCw size={14} style={{ animation: syncingCallId === call.id ? 'spin 1s linear infinite' : 'none' }} />
-                              {syncingCallId === call.id ? 'Syncing...' : 'Sync Recording'}
-                            </button>
-                          )}
                         </div>
-                      </div>
-                      {call.recording_url ? (
-                        <audio controls src={call.recording_url} style={{ width: '100%' }} />
-                      ) : (
-                        <div style={{ color: '#64748b', fontSize: '13px' }}>
-                          Recording not available for this call yet.
-                        </div>
-                      )}
-                      {(call.recording_source || call.recording_synced_at) && (
-                        <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8' }}>
-                          {call.recording_source ? `Source: ${call.recording_source}` : ''}
-                          {call.recording_source && call.recording_synced_at ? ' • ' : ''}
-                          {call.recording_synced_at ? `Synced ${formatDateTime(call.recording_synced_at)}` : ''}
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="calls-insights-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-                      <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>AI Summary</h4>
-                        <div style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
-                          {call.summary || (call.recording_url ? 'Processing summary...' : 'No summary available.')}
-                        </div>
-                      </div>
-                      <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                        <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Full Transcript</h4>
-                        <div style={{ 
-                          fontSize: '13px', color: '#64748b', lineHeight: '1.6', height: '200px', overflowY: 'auto', 
-                          paddingRight: '12px'
-                        }}>
-                          {call.transcript ? (
-                            <TranscriptView
-                              transcript={call.transcript}
-                              candidateName={call.candidate_name}
-                              recruiterName={recruiterDisplayName(call)}
-                            />
-                          ) : (
-                            <div style={{ whiteSpace: 'pre-wrap' }}>
-                              {call.recording_url ? 'Transcribing call...' : 'No transcript available.'}
+                      </td>
+                    </tr>
+                  ))}
+                  {!showCallsLoading && (filteredCalls || []).map(call => {
+                    const isDeletingCall = deletingCallIds.has(call.id);
+                    const isExpanded = expandedCallId === call.id;
+                    const dialDisabled = call.status === 'completed' || isDeletingCall || Boolean(call.candidate_phone_wrong);
+                    return (
+                      <React.Fragment key={call.id}>
+                        <tr
+                          className="calls-table-row"
+                          style={{ opacity: isDeletingCall ? 0.55 : 1, transition: 'background 0.15s' }}
+                          onMouseEnter={e => { e.currentTarget.style.background = '#fff7ed'; }}
+                          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                        >
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top' }}>
+                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                              <div style={{ width: '34px', height: '34px', borderRadius: '50%', background: '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '12px', fontWeight: 700, color: '#64748b', flexShrink: 0 }}>
+                                {call.candidate_name?.split(' ').map(n => n[0]).join('') || '?'}
+                              </div>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: '14px', fontWeight: 700, color: '#0f172a', whiteSpace: 'nowrap' }}>{call.candidate_name || 'Anonymous'}</div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '12px', color: '#94a3b8', marginTop: '3px' }}>
+                                  <span style={{ display: 'flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap' }}>
+                                    <Phone size={11} /> {call.candidate_phone || 'N/A'}
+                                  </span>
+                                  {call.candidate_linkedin && (
+                                    <a
+                                      href={call.candidate_linkedin}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      title="Open LinkedIn profile"
+                                      onClick={e => e.stopPropagation()}
+                                      style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--accent-primary)', fontWeight: 600, textDecoration: 'none', whiteSpace: 'nowrap' }}
+                                    >
+                                      <Linkedin size={11} /> LinkedIn
+                                    </a>
+                                  )}
+                                </div>
+                                {call.candidate_phone_wrong && (
+                                  <span style={{ display: 'inline-block', marginTop: '4px', padding: '2px 8px', borderRadius: '999px', background: '#fef2f2', color: '#b91c1c', fontWeight: 700, fontSize: '10px', border: '1px solid #fecaca' }}>
+                                    Wrong number — calling paused
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </React.Fragment>
-                );
-              })}
-              {(filteredCalls || []).length === 0 && !loading && (
-                <div style={{ padding: '60px', textAlign: 'center', color: '#94a3b8' }}>No candidates matching your query.</div>
-              )}
-                </>
-              )}
+                          </td>
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top', fontSize: '13px', color: '#475569', maxWidth: 200 }}>
+                            {call.task_title || call.candidate_title || '—'}
+                          </td>
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top' }}>
+                            <StatusDropdown
+                              status={statusOverrides[call.candidate_id] ?? call.candidate_status}
+                              candidateId={call.candidate_id}
+                              optimistic
+                              onUpdate={(id, newStatus) => setStatusOverrides(prev => ({ ...prev, [id]: newStatus }))}
+                            />
+                          </td>
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top', fontSize: '12px', color: '#94a3b8', whiteSpace: 'nowrap' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              <Calendar size={11} />
+                              {call.status === 'completed'
+                                ? (call.completed_at ? new Date(call.completed_at).toLocaleDateString() : 'Unknown')
+                                : `${formatLocalDate(call.due_date)}${call.due_time ? ` ${formatDueTime(call.due_time)}` : ''}`
+                              }
+                            </div>
+                          </td>
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top', fontSize: '12px', whiteSpace: 'nowrap' }}>
+                            {call.status === 'completed' ? (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                                <span style={{ color: call.outcome === 'Unreachable' ? '#b45309' : '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
+                                  {call.outcome || 'No Outcome'}
+                                </span>
+                                <span style={{ color: '#2563eb', fontWeight: 600 }}>
+                                  {call.duration ? `${Math.floor(call.duration / 60)}m ${call.duration % 60}s` : '0s'}
+                                </span>
+                                <SentimentBadge sentiment={call.sentiment} reason={call.sentiment_reason} size={10} />
+                                {isPendingAnalysis(call) && (
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '2px 8px', borderRadius: '999px', background: '#f5f3ff', color: '#8b5cf6', fontWeight: 700, fontSize: '10px', border: '1px solid #ddd6fe', width: 'fit-content' }}>
+                                    <RefreshCw size={9} className="animate-spin" /> Analyzing…
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span style={{ color: '#cbd5e1' }}>—</span>
+                            )}
+                          </td>
+                          <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top' }}>
+                            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                              {call.status === 'completed' && (
+                                <button
+                                  onClick={() => setExpandedCallId(isExpanded ? null : call.id)}
+                                  style={{
+                                    padding: '7px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
+                                    background: '#fff', color: '#334155', border: '1px solid rgba(203,213,225,0.9)', cursor: 'pointer',
+                                    display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap'
+                                  }}
+                                >
+                                  {isExpanded ? 'Hide Details' : 'View Insights'}
+                                </button>
+                              )}
+                              <button
+                                onClick={() => handleDeleteCall(call.id)}
+                                disabled={isDeletingCall}
+                                style={{ padding: '7px', background: 'none', border: 'none', color: '#94a3b8', cursor: isDeletingCall ? 'wait' : 'pointer', borderRadius: '8px', opacity: isDeletingCall ? 0.6 : 1 }}
+                                onMouseEnter={e => { if (!isDeletingCall) e.currentTarget.style.color = '#ef4444'; }}
+                                onMouseLeave={e => { if (!isDeletingCall) e.currentTarget.style.color = '#94a3b8'; }}
+                                title="Remove from list"
+                              >
+                                {isDeletingCall ? <Loader2 size={17} className="animate-spin" /> : <Trash2 size={17} />}
+                              </button>
+                              <button
+                                onClick={() => handleDial(call)}
+                                disabled={dialDisabled}
+                                title={call.candidate_phone_wrong ? 'Number tagged as wrong — update the candidate’s phone to resume calling' : undefined}
+                                style={{
+                                  padding: '7px 14px', borderRadius: '10px', fontSize: '13px', fontWeight: 700,
+                                  background: dialDisabled ? '#f1f5f9' : 'var(--accent-primary)',
+                                  color: dialDisabled ? '#94a3b8' : '#fff',
+                                  border: dialDisabled ? '1px solid rgba(203,213,225,0.9)' : '1px solid var(--accent-primary)',
+                                  cursor: dialDisabled ? 'not-allowed' : 'pointer',
+                                  display: 'flex', alignItems: 'center', gap: '8px'
+                                }}
+                              >
+                                <PhoneCall size={15} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                        {isExpanded && (
+                          <tr>
+                            <td colSpan={CALLS_TABLE_COL_COUNT} style={{ padding: 0, borderBottom: '1px solid #f1f5f9' }}>
+                              <div className="calls-expanded-details" style={{
+                                padding: '20px', background: '#f8fafc', margin: '0 16px 16px',
+                                borderRadius: '16px', border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
+                              }}>
+                                <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '12px' }}>
+                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Call Recording</h4>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                      {call.recording_url && (
+                                        <a
+                                          href={call.recording_url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          style={{ fontSize: '12px', fontWeight: 700, color: 'var(--accent-primary)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                                        >
+                                          <ExternalLink size={14} />
+                                          Open Recording
+                                        </a>
+                                      )}
+                                      {!call.recording_url && (
+                                        <button
+                                          onClick={() => handleSyncRecording(call.id)}
+                                          disabled={syncingCallId === call.id}
+                                          style={{
+                                            padding: '8px 12px',
+                                            borderRadius: '10px',
+                                            border: '1px solid rgba(203,213,225,0.9)',
+                                            background: '#fff',
+                                            color: '#334155',
+                                            fontSize: '12px',
+                                            fontWeight: 700,
+                                            cursor: syncingCallId === call.id ? 'wait' : 'pointer',
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '6px'
+                                          }}
+                                        >
+                                          <RefreshCw size={14} style={{ animation: syncingCallId === call.id ? 'spin 1s linear infinite' : 'none' }} />
+                                          {syncingCallId === call.id ? 'Syncing...' : 'Sync Recording'}
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                  {call.recording_url ? (
+                                    <audio controls src={call.recording_url} style={{ width: '100%' }} />
+                                  ) : (
+                                    <div style={{ color: '#64748b', fontSize: '13px' }}>
+                                      Recording not available for this call yet.
+                                    </div>
+                                  )}
+                                  {(call.recording_source || call.recording_synced_at) && (
+                                    <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8' }}>
+                                      {call.recording_source ? `Source: ${call.recording_source}` : ''}
+                                      {call.recording_source && call.recording_synced_at ? ' • ' : ''}
+                                      {call.recording_synced_at ? `Synced ${formatDateTime(call.recording_synced_at)}` : ''}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="calls-insights-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+                                  <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '12px' }}>
+                                      <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', margin: 0 }}>AI Summary</h4>
+                                      <SentimentBadge sentiment={call.sentiment} reason={call.sentiment_reason} />
+                                    </div>
+                                    <div style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
+                                      {call.summary || (call.recording_url ? 'Processing summary...' : 'No summary available.')}
+                                    </div>
+                                    {call.sentiment_reason && (
+                                      <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px dashed #e2e8f0', fontSize: '12px', color: '#94a3b8', fontStyle: 'italic' }}>
+                                        “{call.sentiment_reason}”
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Full Transcript</h4>
+                                    <div style={{
+                                      fontSize: '13px', color: '#64748b', lineHeight: '1.6', height: '200px', overflowY: 'auto',
+                                      paddingRight: '12px'
+                                    }}>
+                                      {call.transcript ? (
+                                        <TranscriptView
+                                          transcript={call.transcript}
+                                          candidateName={call.candidate_name}
+                                          recruiterName={recruiterDisplayName(call)}
+                                        />
+                                      ) : (
+                                        <div style={{ whiteSpace: 'pre-wrap' }}>
+                                          {call.recording_url ? 'Transcribing call...' : 'No transcript available.'}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                  {!showCallsLoading && (filteredCalls || []).length === 0 && !loading && (
+                    <tr>
+                      <td colSpan={CALLS_TABLE_COL_COUNT} style={{ padding: '60px', textAlign: 'center', color: '#94a3b8' }}>
+                        No candidates matching your query.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         )}
       </div>
 
       {callingCandidate && (
-        <VoIPProvider>
-          <CallingModal 
-            call={callingCandidate} 
-            onClose={() => setCallingCandidate(null)} 
-            onRefresh={fetchData} 
-          />
-        </VoIPProvider>
+        <CallingModal
+          call={callingCandidate}
+          onClose={() => setCallingCandidate(null)}
+          onRefresh={fetchData}
+        />
       )}
     </div>
+    </VoIPProvider>
   );
 }
 
@@ -1670,6 +1800,10 @@ function CallingModal({ call, onClose, onRefresh }) {
   const isInitiated = useRef(false);
   const lastHandledCallEventRef = useRef(0);
   const autoRetriedSoftphoneRef = useRef(false);
+  // Timing diagnostics: when the modal opened and what the softphone status
+  // was at that moment, so the wait-for-registration leg is measurable.
+  const modalOpenedAtRef = useRef(performance.now());
+  const voipStatusAtOpenRef = useRef(voipStatus);
   // Real call-duration tracking: stamp the wall-clock time when the call
   // actually connects and when it ends, so we can report true talk time
   // instead of a placeholder value.
@@ -1730,9 +1864,15 @@ function CallingModal({ call, onClose, onRefresh }) {
 
     setCallState('connecting');
     isInitiated.current = true;
+    if (modalOpenedAtRef.current) {
+      reportTiming('modal_open_to_dial_start', performance.now() - modalOpenedAtRef.current, `voipStatusAtOpen=${voipStatusAtOpenRef.current}`);
+    }
+    const clickStart = performance.now();
 
     try {
+      const micStart = performance.now();
       const micResult = await ensureMicrophonePermission();
+      reportTiming('mic_permission', performance.now() - micStart);
       if (!micResult?.success) {
         const message = micResult?.error || 'Microphone permission is required to place a Plivo browser call';
         setInitiationError(message);
@@ -1742,7 +1882,9 @@ function CallingModal({ call, onClose, onRefresh }) {
         return;
       }
 
+      const initiateStart = performance.now();
       const res = await initiateCall(call.id, { plivoUsername: endpointUsername });
+      reportTiming('initiate_api', performance.now() - initiateStart);
       if (!res.success) {
         const message = res.error || 'Failed to start browser VoIP call';
         setInitiationError(message);
@@ -1759,7 +1901,9 @@ function CallingModal({ call, onClose, onRefresh }) {
       }
 
       if (placeCall && call.candidate_phone) {
+        const placeStart = performance.now();
         const placeResult = await placeCall(call.candidate_phone);
+        reportTiming('place_call', performance.now() - placeStart);
         if (!placeResult?.success) {
           const message = placeResult?.error || 'Browser VoIP could not start the call';
           setInitiationError(message);
@@ -1770,7 +1914,10 @@ function CallingModal({ call, onClose, onRefresh }) {
         }
       }
 
+      const handshakeStart = performance.now();
       const dialState = await waitForPlivoDial(endpointUsername);
+      reportTiming('dial_handshake', performance.now() - handshakeStart);
+      reportTiming('click_to_webhook_total', performance.now() - clickStart);
       if (!dialState?.success) {
         const message = dialState?.error || 'Plivo browser call did not reach the backend';
         setInitiationError(message);
@@ -1963,7 +2110,7 @@ function CallingModal({ call, onClose, onRefresh }) {
 
   useEffect(() => {
     let t;
-    if (callState === 'review') {
+    if (callState === 'review' && needsPostCallArtifacts(reviewCallData)) {
       const fetchReviewData = async () => {
          if (!isDocumentVisible()) return;
          try {
@@ -2109,7 +2256,7 @@ function CallingModal({ call, onClose, onRefresh }) {
   const callStatusMeta = callState === 'preparing_softphone'
     ? { label: 'Connecting', tone: '#2563eb', bg: '#eff6ff', message: '' }
     : callState === 'connecting'
-      ? { label: 'Ringing', tone: '#2563eb', bg: '#eff6ff', message: '' }
+      ? { label: 'Connecting call…', tone: '#2563eb', bg: '#eff6ff', message: '' }
       : callState === 'waiting_for_invite'
         ? { label: 'Ringing', tone: '#2563eb', bg: '#eff6ff', message: '' }
         : callState === 'answer_required'
@@ -2142,7 +2289,20 @@ function CallingModal({ call, onClose, onRefresh }) {
       <div className="call-modal-shell" style={{ background: '#fff', borderRadius: '24px', width: '100%', maxWidth: '720px', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', border: '1px solid #e2e8f0' }}>
         <div className="call-modal-header" style={{ padding: '24px', borderBottom: '1px solid #f1f5f9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
-            <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '4px' }}>{call.candidate_name}</h2>
+            <h2 style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a', marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {call.candidate_name}
+              {call.candidate_linkedin && (
+                <a
+                  href={call.candidate_linkedin}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Open LinkedIn profile"
+                  style={{ display: 'inline-flex', alignItems: 'center', color: 'var(--accent-primary)' }}
+                >
+                  <Linkedin size={16} />
+                </a>
+              )}
+            </h2>
             <p style={{ fontSize: '13px', color: '#64748b' }}>Candidate Conversations</p>
           </div>
           <div className="call-modal-tabs" style={{ display: 'flex', background: '#f1f5f9', padding: '4px', borderRadius: '12px', gap: '4px' }}>
@@ -2493,14 +2653,22 @@ function CallingModal({ call, onClose, onRefresh }) {
                     
                     {showReviewSummary && (
                       <div style={{ marginBottom: '24px' }}>
-                        <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>AI Summary</div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '8px' }}>
+                          <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b' }}>AI Summary</div>
+                          <SentimentBadge sentiment={reviewCallData?.sentiment} reason={reviewCallData?.sentiment_reason} />
+                        </div>
                         <p style={{ fontSize: '14px', lineHeight: 1.6, color: '#334155' }}>{reviewSummary}</p>
+                        {reviewCallData?.sentiment_reason && (
+                          <p style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px dashed #e2e8f0', fontSize: '12px', color: '#94a3b8', fontStyle: 'italic' }}>
+                            “{reviewCallData.sentiment_reason}”
+                          </p>
+                        )}
                       </div>
                     )}
 
                     <div style={{ marginBottom: '16px' }}>
                       <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>
-                        Transcript {(!reviewTranscript && reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000) ? '(Fallback AI Triggered)' : ''}
+                        Transcript
                       </div>
                       {reviewTranscript ? (
                         <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', maxHeight: '200px', overflowY: 'auto', fontSize: '13px', lineHeight: 1.6, color: '#475569' }}>
@@ -2510,16 +2678,29 @@ function CallingModal({ call, onClose, onRefresh }) {
                             recruiterName={recruiterDisplayName(reviewCallData)}
                           />
                         </div>
+                      ) : reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > PENDING_ANALYSIS_WINDOW_MS ? (
+                        <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
+                          <div style={{ marginBottom: '12px' }}>Analysis didn't complete for this call.</div>
+                          <button
+                            onClick={() => syncCallRecording(call.id)}
+                            style={{ padding: '8px 16px', borderRadius: '10px', border: '1px solid #cbd5e1', background: '#fff', color: '#334155', fontSize: '12px', fontWeight: 700, cursor: 'pointer' }}
+                          >
+                            Retry sync
+                          </button>
+                        </div>
                       ) : (
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
-                          {reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > 600000 
-                            ? "Plivo native AI didn't reply in 10 mins. Running OpenAI fallback analysis..."
-                            : "Waiting for Plivo AI analysis..."}
+                          Transcribing recording...
                         </div>
                       )}
                     </div>
                   </div>
                   <button onClick={onClose} style={{ ...CALL_SECONDARY_BUTTON, width: '100%', padding: '14px', color: '#0f172a' }}>Close Window</button>
+                  {needsPostCallArtifacts(reviewCallData) && (
+                    <p style={{ marginTop: '10px', textAlign: 'center', fontSize: '12px', color: '#94a3b8' }}>
+                      Analysis continues in the background — this row will update when it's ready.
+                    </p>
+                  )}
                 </div>
               )}
             </div>

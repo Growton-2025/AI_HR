@@ -27,9 +27,24 @@ const PLIVO_SDK_URL = '/plivo.min.js';
 const PLIVO_SDK_LOAD_TIMEOUT_MS = 15000;
 const PLIVO_LOGIN_TIMEOUT_MS = 20000;
 const PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS = 12000;
-const PLIVO_DIAL_HANDSHAKE_POLL_MS = 750;
+const PLIVO_DIAL_HANDSHAKE_POLL_MS = 400;
 
 let plivoSdkPromise = null;
+
+// Diagnostic beacon: mirror timing logs into the backend log so call-setup
+// latency can be debugged without access to the recruiter's browser console.
+export const reportTiming = (leg, ms, detail = '') => {
+  console.log(`[VoIP][timing] ${leg}: ${Math.round(ms)}ms${detail ? ` (${detail})` : ''}`);
+  try {
+    fetch(`${API_BASE}/plivo/client-timing`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ leg, ms: Math.round(ms), detail }),
+    }).catch(() => {});
+  } catch (_) {
+    // Beacon must never affect the call path.
+  }
+};
 
 const resolvePlivoConstructor = () => {
   const ctor = window.Plivo
@@ -196,6 +211,7 @@ export function VoIPProvider({ children }) {
   const initDoneRef = useRef(false);
   const initInFlightRef = useRef(false);
   const activeCallRef = useRef(null);
+  const dialStartedAtRef = useRef(null);
   const voipStatusRef = useRef('disconnected');
   const voipConnectionEventRef = useRef(null);
   const endpointUsernameRef = useRef('');
@@ -245,6 +261,17 @@ export function VoIPProvider({ children }) {
 
     return () => {
       softphoneGenerationRef.current += 1;
+      // React 18 StrictMode double-invokes mount effects in dev (mount →
+      // cleanup → mount) to catch exactly this class of bug: bumping the
+      // generation here orphans the first initSoftphone() call mid-flight
+      // (it's still awaiting the credentials fetch), but initInFlightRef
+      // stays true, so the second mount's initSoftphone() call used to be
+      // silently swallowed as a no-op — nothing ever retried until the
+      // calling modal's own 12-18s rescue timer forced it. Reset the flags
+      // here so the next mount starts a genuinely fresh, unblocked init
+      // instead of stalling for that whole window.
+      initInFlightRef.current = false;
+      queuedForceInitRef.current = false;
       if (recoveryTimerRef.current) {
         window.clearTimeout(recoveryTimerRef.current);
         recoveryTimerRef.current = null;
@@ -262,9 +289,14 @@ export function VoIPProvider({ children }) {
   }, []);
 
   useEffect(() => {
-    if (initDoneRef.current) return;
+    if (initDoneRef.current) return undefined;
     initDoneRef.current = true;
     initSoftphone();
+    // StrictMode-safe: the paired cleanup of the audio-setup effect bumps the
+    // softphone generation, silently aborting this in-flight init. Reset the
+    // guard so the second effect invocation re-initializes instead of leaving
+    // the softphone stuck in 'connecting' until the modal's 12s rescue retry.
+    return () => { initDoneRef.current = false; };
   }, []);
 
   useEffect(() => {
@@ -408,8 +440,11 @@ export function VoIPProvider({ children }) {
         softphoneRef.current = null;
       }
 
+      const initStart = performance.now();
+      const credentialsStart = performance.now();
       const credentialsResponse = await fetch(`${API_BASE}/plivo/credentials`).catch(() => null);
       const res = credentialsResponse ? await credentialsResponse.json().catch(() => ({})) : {};
+      reportTiming('credentials_fetch', performance.now() - credentialsStart);
       if (!credentialsResponse?.ok) {
         const detail = res?.detail;
         const message = (detail && typeof detail === 'object' ? detail.message : '') || 'Unable to prepare Plivo softphone';
@@ -425,7 +460,9 @@ export function VoIPProvider({ children }) {
       setAgentEmail(res.username);
       setEndpointUsername(res.username);
 
+      const sdkLoadStart = performance.now();
       const Plivo = await loadPlivoSdk();
+      reportTiming('sdk_load', performance.now() - sdkLoadStart);
       if (softphoneGenerationRef.current !== instanceId) return;
 
       const options = {
@@ -436,6 +473,12 @@ export function VoIPProvider({ children }) {
       };
       const sdk = new Plivo(options);
       softphoneRef.current = sdk;
+      try {
+        sdk.client.setConnectTone?.(true);
+        sdk.client.setRingToneBack?.(true);
+      } catch (_) {
+        // Tone helpers are best-effort; older SDK builds may not expose them.
+      }
 
       const loginPromise = new Promise((resolve, reject) => {
         const timeoutId = window.setTimeout(() => {
@@ -461,7 +504,17 @@ export function VoIPProvider({ children }) {
         });
       });
 
+      sdk.client.on('onCallRemoteRinging', () => {
+        if (dialStartedAtRef.current) {
+          reportTiming('dial_to_remote_ringing', performance.now() - dialStartedAtRef.current);
+        }
+      });
+
       sdk.client.on('onCallAnswered', (callInfo) => {
+        if (dialStartedAtRef.current) {
+          reportTiming('dial_to_answered', performance.now() - dialStartedAtRef.current);
+          dialStartedAtRef.current = null;
+        }
         clearVoipErrorState();
         setVoipStatus('connected');
         setVoipCallEvent(buildVoipCallEvent('connected', callInfo, activeCallRef.current?.number));
@@ -481,8 +534,11 @@ export function VoIPProvider({ children }) {
         setActiveCall(null);
       });
 
+      const loginStart = performance.now();
       sdk.client.login(res.username, res.password);
       await loginPromise;
+      reportTiming('sip_login', performance.now() - loginStart);
+      reportTiming('softphone_init_total', performance.now() - initStart, `force=${force}`);
       return { success: true };
     } catch (error) {
       if (softphoneGenerationRef.current !== instanceId) return;
@@ -512,6 +568,7 @@ export function VoIPProvider({ children }) {
     try {
       setVoipCallEvent({ at: Date.now(), type: 'dialing', origin: 'local', number: dialNumber, reasonText: '', raw: null });
       setActiveCall({ state: 'dialing', number: dialNumber });
+      dialStartedAtRef.current = performance.now();
       softphoneRef.current.client.call(dialNumber);
       setVoipStatus('connecting');
       return { success: true, dialNumber, username: endpointUsernameRef.current };

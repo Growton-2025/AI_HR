@@ -71,7 +71,7 @@ async def plivo_dial(request: Request):
     
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Record action="{action_url}" startOnDialAnswer="true" redirect="false" fileFormat="mp3" />
+        <Record action="{action_url}" startOnDialAnswer="true" redirect="false" fileFormat="mp3" maxLength="14400" />
         <Dial callerId="{plivo_service.PLIVO_NUMBER}">
             <Number>{to_number}</Number>
         </Dial>
@@ -116,6 +116,37 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
             )
         
     return Response(status_code=200)
+
+@router.post("/test-answer")
+@router.get("/test-answer")
+async def plivo_test_answer():
+    """Diagnostic answer_url for server-initiated test calls: speaks a short
+    message and hangs up. Lets us verify Plivo can reach this backend through
+    the tunnel and measure dial->answer latency via CDRs, without the browser."""
+    logger.info("[TestCall] Plivo fetched /test-answer through the tunnel")
+    xml_response = """<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Speak>This is a Hayasa test call verifying the calling pipeline. Goodbye.</Speak>
+    </Response>
+    """
+    return Response(content=xml_response, media_type="application/xml")
+
+
+@router.post("/client-timing")
+async def client_timing(request: Request):
+    """Diagnostic beacon: the frontend reports per-leg call-setup timings here
+    so they land in the server log with timestamps (browser console is often
+    unavailable when debugging recruiter machines)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    logger.info(
+        "[ClientTiming] leg=%s ms=%s detail=%s",
+        payload.get("leg"), payload.get("ms"), payload.get("detail", ""),
+    )
+    return Response(status_code=204)
+
 
 @router.get("/credentials")
 async def get_credentials():
