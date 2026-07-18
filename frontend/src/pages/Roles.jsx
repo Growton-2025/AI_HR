@@ -1124,14 +1124,17 @@ function Roles() {
     }
 
     const toggleSelection = useCallback((id) => {
-        if (allFilteredSelected) return; // Prevent individual toggles when 'select all' is active
         setSelectedIds(prev => {
             const next = new Set(prev)
             if (next.has(id)) next.delete(id)
             else next.add(id)
             return next
         })
-    }, [allFilteredSelected])
+        // A manual toggle after "select all" means the set is no longer
+        // literally "every filtered candidate" — drop the flag so the count
+        // label and bulk action fall back to the precise selectedIds size.
+        setAllFilteredSelected(false)
+    }, [])
 
     const handleSelectAll = useCallback((e) => {
         if (e.target.checked) {
@@ -2017,7 +2020,7 @@ function Roles() {
                                                     <td style={{ textAlign: 'center' }}>
                                                         <input
                                                             type="checkbox"
-                                                            checked={allFilteredSelected || selectedIds.has(candidate.id)}
+                                                            checked={selectedIds.has(candidate.id)}
                                                             onChange={() => toggleSelection(candidate.id)}
                                                             style={{ cursor: 'pointer', transform: 'scale(1.1)' }}
                                                         />
@@ -2314,7 +2317,7 @@ function Roles() {
                             setAllFilteredSelected(false);
                             setShowAddToListModal(false);
                         }}
-                        candidateIds={allFilteredSelected ? filteredCandidates.map(c => c.id) : Array.from(selectedIds)}
+                        candidateIds={Array.from(selectedIds)}
                     />
                 )}
 
@@ -2330,7 +2333,15 @@ function Roles() {
                         </span>
                         <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.2)' }} />
                         <button
-                            onClick={() => setAllFilteredSelected(prev => !prev)}
+                            onClick={() => {
+                                if (allFilteredSelected) {
+                                    setAllFilteredSelected(false)
+                                    setSelectedIds(new Set())
+                                } else {
+                                    setAllFilteredSelected(true)
+                                    setSelectedIds(new Set(filteredCandidates.map(c => c.id)))
+                                }
+                            }}
                             style={{
                                 padding: '8px 16px', background: allFilteredSelected ? '#312e81' : '#fff', color: allFilteredSelected ? '#fff' : '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
                                 borderRadius: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
