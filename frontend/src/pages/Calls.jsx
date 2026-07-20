@@ -233,6 +233,14 @@ const OUTCOMES = [
 // in the Day 1 → 2 → 4 → 7 → 10 cadence (5 attempts, then auto-Unreachable).
 const FAILED_OUTCOMES = new Set(['Not Connected', 'Not Connected - Not Reachable']);
 const FOLLOWUP_OUTCOME = 'Connected - Follow-up';
+
+const formatCallTimer = (totalSeconds) => {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const mmss = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  return hours > 0 ? `${hours}:${mmss}` : mmss;
+};
 const WRONG_NUMBER_OUTCOME = 'Wrong Number';
 const FINAL_ATTEMPT_PREFIX = 'Call 5';
 
@@ -1796,6 +1804,8 @@ function CallingModal({ call, onClose, onRefresh }) {
     agentEmail,
     endpointUsername,
     retryVoip,
+    startDialTone,
+    stopDialTone,
   } = useVoIP();
   const isInitiated = useRef(false);
   const lastHandledCallEventRef = useRef(0);
@@ -1809,6 +1819,8 @@ function CallingModal({ call, onClose, onRefresh }) {
   // instead of a placeholder value.
   const connectedAtRef = useRef(null);
   const endedAtRef = useRef(null);
+  // Live call timer shown next to the "Connected" label while the call is active.
+  const [callElapsedSeconds, setCallElapsedSeconds] = useState(0);
   const [reviewCallData, setReviewCallData] = useState(call);
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
@@ -1864,6 +1876,9 @@ function CallingModal({ call, onClose, onRefresh }) {
 
     setCallState('connecting');
     isInitiated.current = true;
+    // Immediate audible feedback: the real Plivo ringback only starts once the
+    // remote leg rings (~5s in), so play a local ring for the setup gap.
+    startDialTone?.();
     if (modalOpenedAtRef.current) {
       reportTiming('modal_open_to_dial_start', performance.now() - modalOpenedAtRef.current, `voipStatusAtOpen=${voipStatusAtOpenRef.current}`);
     }
@@ -1935,7 +1950,15 @@ function CallingModal({ call, onClose, onRefresh }) {
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, onClose, onRefresh, placeCall, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
+  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, onClose, onRefresh, placeCall, startDialTone, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
+
+  // Kill the local dialing tone the moment the call reaches any state where
+  // it should not ring: connected, ended, errored, or an incoming-answer ask.
+  useEffect(() => {
+    if (['active', 'ended', 'review', 'error', 'answer_required'].includes(callState)) {
+      stopDialTone?.();
+    }
+  }, [callState, stopDialTone]);
 
   useEffect(() => {
     if (isInitiated.current) return;
@@ -2070,6 +2093,19 @@ function CallingModal({ call, onClose, onRefresh }) {
     if ((callState === 'ended' || callState === 'review') && connectedAtRef.current !== null && endedAtRef.current === null) {
       endedAtRef.current = Date.now();
     }
+  }, [callState]);
+
+  // Tick the visible timer once per second while the call is active.
+  useEffect(() => {
+    if (callState !== 'active') return undefined;
+    const tick = () => {
+      if (connectedAtRef.current !== null) {
+        setCallElapsedSeconds(Math.max(0, Math.floor((Date.now() - connectedAtRef.current) / 1000)));
+      }
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
   }, [callState]);
 
   useEffect(() => {
@@ -2394,13 +2430,18 @@ function CallingModal({ call, onClose, onRefresh }) {
                   <p style={{ fontSize: '13px', color: '#64748b', marginBottom: '20px' }}>
                     {call.candidate_phone}
                   </p>
-                  <div style={{ fontSize: '14px', fontWeight: 600, color: callStatusMeta.tone, marginBottom: '36px' }}>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: callStatusMeta.tone, marginBottom: callState === 'active' ? '8px' : '36px' }}>
                     {callState === 'active' ? 'Connected'
                       : callState === 'error' ? 'Not Reachable'
                       : callState === 'answer_required' ? 'Incoming Call'
                       : callState === 'preparing_softphone' || callState === 'invite_received' ? 'Connecting...'
                       : 'Ringing...'}
                   </div>
+                  {callState === 'active' && (
+                    <div style={{ fontSize: '22px', fontWeight: 700, color: '#0f172a', fontVariantNumeric: 'tabular-nums', marginBottom: '28px' }}>
+                      {formatCallTimer(callElapsedSeconds)}
+                    </div>
+                  )}
 
                   {callState === 'answer_required' ? (
                     <div className="call-modal-actions" style={{ display: 'flex', gap: '12px', width: '100%' }}>
@@ -2498,6 +2539,59 @@ function CallingModal({ call, onClose, onRefresh }) {
                     >
                       <X size={20} /> {callState === 'active' ? 'End Call' : 'Cancel Call'}
                     </button>
+                  )}
+
+                  {/* Wrap-up fields available during the live call — same state as the
+                      post-call log screen, so anything set here carries over on save. */}
+                  {callState === 'active' && (
+                    <div style={{ alignSelf: 'stretch', marginTop: '28px', textAlign: 'left' }}>
+                      <div style={{ marginBottom: '24px' }}>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Call Status</label>
+                        <select
+                          value={outcome}
+                          onChange={e => setOutcome(e.target.value)}
+                          style={{ width: '100%', padding: '12px 16px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', outline: 'none', background: '#fff' }}
+                        >
+                          <option value="">Select a status...</option>
+                          {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
+                        </select>
+                      </div>
+
+                      <div style={{ marginBottom: '24px' }}>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase' }}>Candidate Status</label>
+                        <div>
+                          <StatusDropdown
+                            status={candidateStatus}
+                            candidateId={call.candidate_id}
+                            optimistic
+                            onUpdate={(id, newStatus) => setCandidateStatus(newStatus)}
+                          />
+                        </div>
+                        <div style={{ marginTop: '6px', fontSize: '11px', color: '#94a3b8' }}>
+                          Updates across Manage Roles and Talent Pool.
+                        </div>
+                      </div>
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                          Notes
+                        </label>
+                        <textarea
+                          placeholder={notesLoading ? 'Loading notes…' : 'Add notes about this candidate...'}
+                          value={liveNotes}
+                          onChange={e => setLiveNotes(e.target.value)}
+                          disabled={notesLoading}
+                          style={{
+                            width: '100%', padding: '12px 16px',
+                            borderRadius: '12px',
+                            border: '1px solid rgba(203,213,225,0.9)', fontSize: '14px', minHeight: '120px',
+                            resize: 'none', background: notesLoading ? '#f8fafc' : '#fff',
+                            boxSizing: 'border-box', outline: 'none', lineHeight: 1.6,
+                            color: notesLoading ? '#94a3b8' : '#334155',
+                          }}
+                        />
+                      </div>
+                    </div>
                   )}
                 </>
               ) : callState === 'ended' ? (

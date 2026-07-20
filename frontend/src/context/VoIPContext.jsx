@@ -9,6 +9,8 @@ const VoIPContext = createContext({
   placeCall: async () => ({ success: false }),
   ensureMicrophonePermission: async () => ({ success: true }),
   waitForPlivoDial: async () => ({ success: false }),
+  startDialTone: () => {},
+  stopDialTone: () => {},
   voipStatus: 'disconnected',
   voipError: '',
   voipErrorCode: '',
@@ -22,7 +24,8 @@ const VoIPContext = createContext({
   retryVoip: () => {},
 });
 
-const SOFTPHONE_RECOVERY_WINDOW_MS = 5000;
+const RELOGIN_THROTTLE_MS = 4000;
+const RELOGIN_WAIT_AT_DIAL_MS = 8000;
 const PLIVO_SDK_URL = '/plivo.min.js';
 const PLIVO_SDK_LOAD_TIMEOUT_MS = 15000;
 const PLIVO_LOGIN_TIMEOUT_MS = 20000;
@@ -216,9 +219,66 @@ export function VoIPProvider({ children }) {
   const voipConnectionEventRef = useRef(null);
   const endpointUsernameRef = useRef('');
   const softphoneGenerationRef = useRef(0);
-  const recoveryInFlightRef = useRef(false);
-  const recoveryTimerRef = useRef(null);
   const queuedForceInitRef = useRef(false);
+  // Kept so a dropped WebSocket can re-register without refetching /credentials.
+  const credentialsRef = useRef(null);
+  const lastReloginAtRef = useRef(0);
+
+  // Locally generated ringback: the real Plivo ringback only starts once the
+  // remote leg is ringing (~5s after the click: backend initiate + SIP setup),
+  // which feels like a dead line. Play a soft synthetic ring immediately and
+  // stop it as soon as the SDK reports remote ringing or any terminal event.
+  const dialToneRef = useRef(null);
+
+  const stopDialTone = () => {
+    const tone = dialToneRef.current;
+    if (!tone) return;
+    dialToneRef.current = null;
+    try {
+      window.clearInterval(tone.intervalId);
+      tone.osc.stop();
+      tone.ctx.close();
+    } catch (_) {
+      // Best-effort audio teardown.
+    }
+  };
+
+  const startDialTone = () => {
+    if (dialToneRef.current) return;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      gain.connect(ctx.destination);
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 440;
+      osc.connect(gain);
+      osc.start();
+      // Not a ringback — a faint "connecting" blip. A synthetic ring here was
+      // misleading (the candidate's phone is not ringing yet) and grating next
+      // to the real carrier tone that follows. One soft 150ms pulse every 2s
+      // just signals the line is alive, with ramps to avoid clicks.
+      const cadence = () => {
+        const t = ctx.currentTime;
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.035, t + 0.02);
+        gain.gain.setValueAtTime(0.035, t + 0.13);
+        gain.gain.linearRampToValueAtTime(0, t + 0.15);
+      };
+      cadence();
+      const intervalId = window.setInterval(cadence, 2000);
+      dialToneRef.current = { ctx, osc, gain, intervalId };
+    } catch (_) {
+      // The tone is a nicety — never let it break the call path.
+    }
+  };
 
   const hangupSoftphoneCall = () => {
     const softphone = softphoneRef.current;
@@ -238,6 +298,7 @@ export function VoIPProvider({ children }) {
   };
 
   const stopCallAudio = () => {
+    stopDialTone();
     stopAudioElement(remoteAudioRef.current);
     stopAudioElement(localAudioRef.current);
     stopPlivoManagedAudio();
@@ -272,13 +333,12 @@ export function VoIPProvider({ children }) {
       // instead of stalling for that whole window.
       initInFlightRef.current = false;
       queuedForceInitRef.current = false;
-      if (recoveryTimerRef.current) {
-        window.clearTimeout(recoveryTimerRef.current);
-        recoveryTimerRef.current = null;
-      }
       hangupSoftphoneCall();
       stopCallAudio();
       try {
+        // logout() lives on .client in the Plivo v2 SDK — calling it on the
+        // instance is a silent no-op that leaves a zombie SIP registration.
+        softphoneRef.current?.client?.logout?.();
         softphoneRef.current?.logout?.();
       } catch (_) {
         // Ignore shutdown errors when the provider unmounts.
@@ -323,13 +383,6 @@ export function VoIPProvider({ children }) {
     setVoipMeta(null);
   };
 
-  const clearRecoveryTimer = () => {
-    if (recoveryTimerRef.current) {
-      window.clearTimeout(recoveryTimerRef.current);
-      recoveryTimerRef.current = null;
-    }
-  };
-
   const applyVoipErrorState = (detail, fallbackMessage) => {
     const parsed = (detail && typeof detail === 'object' && !Array.isArray(detail))
       ? {
@@ -367,52 +420,26 @@ export function VoIPProvider({ children }) {
     Boolean(activeCallRef.current) || ['answer_required', 'invite_received', 'connected'].includes(voipStatusRef.current)
   );
 
-  const recoverSoftphone = async (instanceId, { reconnect = false } = {}) => {
-    if (recoveryInFlightRef.current || softphoneGenerationRef.current !== instanceId || !softphoneRef.current) {
-      return;
-    }
-
-    recoveryInFlightRef.current = true;
-    clearRecoveryTimer();
-    clearVoipErrorState();
+  // Re-register the existing Plivo client after a silent WebSocket drop or SIP
+  // logout. Without this the UI keeps reporting 'registered' while dials go
+  // nowhere — "Connecting..." with no dialer tone until a full page refresh.
+  const requestRelogin = (reason, { bypassThrottle = false } = {}) => {
+    const client = softphoneRef.current?.client;
+    const creds = credentialsRef.current;
+    if (!client || !creds || hasLiveVoipActivity()) return false;
+    const now = Date.now();
+    if (!bypassThrottle && now - lastReloginAtRef.current < RELOGIN_THROTTLE_MS) return false;
+    lastReloginAtRef.current = now;
+    console.warn(`[VoIP] ${reason} — re-registering Plivo softphone`);
+    reportTiming('softphone_relogin', 0, reason);
     setVoipStatus(current => (
       ['answer_required', 'invite_received', 'connected'].includes(current) ? current : 'connecting'
     ));
-    recoveryTimerRef.current = window.setTimeout(() => {
-      if (softphoneGenerationRef.current !== instanceId) return;
-      recoveryInFlightRef.current = false;
-      recoveryTimerRef.current = null;
-
-      if (hasLiveVoipActivity() || voipStatusRef.current === 'registered') {
-        return;
-      }
-
-      const latestEvent = voipConnectionEventRef.current;
-      const message = latestEvent?.error || 'Plivo softphone registration failed';
-      applyVoipErrorState(
-        { message, code: 'softphone_registration_failed' },
-        'Plivo softphone registration failed',
-      );
-    }, SOFTPHONE_RECOVERY_WINDOW_MS);
-
     try {
-      await softphoneRef.current.reset(reconnect);
-    } catch (error) {
-      clearRecoveryTimer();
-      recoveryInFlightRef.current = false;
-      if (softphoneGenerationRef.current !== instanceId || hasLiveVoipActivity()) {
-        return;
-      }
-
-      const message = error?.message || 'Plivo softphone registration failed';
-      applyVoipErrorState(
-        { message, code: 'softphone_registration_failed' },
-        'Plivo softphone registration failed',
-      );
-    } finally {
-      if (softphoneGenerationRef.current === instanceId) {
-        recoveryInFlightRef.current = Boolean(recoveryTimerRef.current);
-      }
+      client.login(creds.username, creds.password);
+      return true;
+    } catch (_) {
+      return false;
     }
   };
 
@@ -424,8 +451,6 @@ export function VoIPProvider({ children }) {
     initInFlightRef.current = true;
     const instanceId = softphoneGenerationRef.current + 1;
     softphoneGenerationRef.current = instanceId;
-    clearRecoveryTimer();
-    recoveryInFlightRef.current = false;
 
     try {
       clearVoipErrorState();
@@ -433,6 +458,10 @@ export function VoIPProvider({ children }) {
       setVoipCallEvent(null);
       if (force && softphoneRef.current) {
         try {
+          // Deregister the old client for real (.client.logout, not .logout —
+          // the latter doesn't exist and left a zombie registration that
+          // fought the new client and stole call audio/events).
+          softphoneRef.current.client?.logout?.();
           softphoneRef.current.logout?.();
         } catch (_) {
           // Ignore stale SDK logout failures before rebuilding the client.
@@ -459,6 +488,7 @@ export function VoIPProvider({ children }) {
       }
       setAgentEmail(res.username);
       setEndpointUsername(res.username);
+      credentialsRef.current = { username: res.username, password: res.password };
 
       const sdkLoadStart = performance.now();
       const Plivo = await loadPlivoSdk();
@@ -474,8 +504,12 @@ export function VoIPProvider({ children }) {
       const sdk = new Plivo(options);
       softphoneRef.current = sdk;
       try {
-        sdk.client.setConnectTone?.(true);
-        sdk.client.setRingToneBack?.(true);
+        // Disable the SDK's own connect/ringback tones — they sound different
+        // from our local ring and produced a jarring two-tone dial experience.
+        // One synthetic Indian ringback (startDialTone) plays from click until
+        // answer instead.
+        sdk.client.setConnectTone?.(false);
+        sdk.client.setRingToneBack?.(false);
       } catch (_) {
         // Tone helpers are best-effort; older SDK builds may not expose them.
       }
@@ -504,13 +538,61 @@ export function VoIPProvider({ children }) {
         });
       });
 
+      // Detect silent registration loss (laptop sleep, network change, Plivo
+      // dropping the socket). Without these, voipStatus stays 'registered'
+      // forever and the next dial hangs on "Connecting..." with no tone.
+      sdk.client.on('onLogout', () => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        requestRelogin('SIP session logged out');
+      });
+
+      sdk.client.on('onConnectionChange', (info) => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        const state = typeof info === 'string' ? info : info?.state;
+        if (state === 'disconnected') {
+          // Socket died mid-dial: the server-side leg may still ring the
+          // candidate, but this client can no longer hear or control it.
+          // Fail the attempt immediately instead of showing "Connecting..."
+          // forever, then re-register so the retry works.
+          const pendingDial = activeCallRef.current && activeCallRef.current.state !== 'connected';
+          if (pendingDial) {
+            hangupSoftphoneCall();
+            stopCallAudio();
+            setVoipCallEvent(buildVoipCallEvent(
+              'failed',
+              { origin: 'local', reason: 'connection lost while dialing' },
+              activeCallRef.current?.number,
+            ));
+            setActiveCall(null);
+            // Sync the ref immediately — it normally updates via effect after
+            // render, and requestRelogin's live-activity guard reads it now.
+            activeCallRef.current = null;
+          }
+          requestRelogin('Plivo WebSocket disconnected');
+        } else if (state === 'connected' && sdk.client.isLoggedIn) {
+          clearVoipErrorState();
+          setVoipStatus(current => (
+            ['answer_required', 'invite_received', 'connected'].includes(current) ? current : 'registered'
+          ));
+        }
+      });
+
       sdk.client.on('onCallRemoteRinging', () => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        // Remote ringing means the carrier's real in-band audio (ringback,
+        // caller tune, busy/switched-off announcements) is now streaming in
+        // as early media. Silence the synthetic ring so the two never overlap
+        // — the SDK's own tones stay disabled, so from here the caller hears
+        // only the genuine network audio.
+        stopDialTone();
         if (dialStartedAtRef.current) {
           reportTiming('dial_to_remote_ringing', performance.now() - dialStartedAtRef.current);
         }
       });
 
       sdk.client.on('onCallAnswered', (callInfo) => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        stopDialTone();
         if (dialStartedAtRef.current) {
           reportTiming('dial_to_answered', performance.now() - dialStartedAtRef.current);
           dialStartedAtRef.current = null;
@@ -522,12 +604,16 @@ export function VoIPProvider({ children }) {
       });
 
       sdk.client.on('onCallTerminated', (reason) => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        stopDialTone();
         setVoipCallEvent(buildVoipCallEvent('terminated', reason, activeCallRef.current?.number));
         setVoipStatus('registered');
         setActiveCall(null);
       });
 
       sdk.client.on('onCallFailed', (reason) => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        stopDialTone();
         console.warn('[VoIP] Call failed', reason);
         setVoipCallEvent(buildVoipCallEvent('failed', reason, activeCallRef.current?.number));
         setVoipStatus('registered');
@@ -558,12 +644,29 @@ export function VoIPProvider({ children }) {
   };
 
   const placeCall = async (toNumber) => {
-    if (!softphoneRef.current?.client || typeof softphoneRef.current.client.call !== 'function') {
+    const client = softphoneRef.current?.client;
+    if (!client || typeof client.call !== 'function') {
       return { success: false, error: 'Softphone client not available' };
     }
     const dialNumber = normalizePlivoDialNumber(toNumber);
     if (!dialNumber) {
       return { success: false, error: 'Candidate phone number is missing' };
+    }
+    // Stale-registration guard: the UI can believe it is registered long after
+    // the SIP session died. Dialing on a dead session never rings, so confirm
+    // the SDK is actually logged in and re-register first if it is not.
+    if (client.isLoggedIn === false) {
+      reportTiming('dial_preflight_relogin', 0, 'client not logged in at dial time');
+      requestRelogin('softphone was not registered at dial time', { bypassThrottle: true });
+      const deadline = Date.now() + RELOGIN_WAIT_AT_DIAL_MS;
+      while (Date.now() < deadline && !client.isLoggedIn) {
+        await new Promise(resolve => window.setTimeout(resolve, 300));
+      }
+      if (!client.isLoggedIn) {
+        return { success: false, error: 'Plivo softphone lost its connection. Please try the call again.' };
+      }
+      clearVoipErrorState();
+      setVoipStatus('registered');
     }
     try {
       setVoipCallEvent({ at: Date.now(), type: 'dialing', origin: 'local', number: dialNumber, reasonText: '', raw: null });
@@ -647,6 +750,8 @@ export function VoIPProvider({ children }) {
         placeCall,
         ensureMicrophonePermission,
         waitForPlivoDial,
+        startDialTone,
+        stopDialTone,
         voipStatus,
         voipError,
         voipErrorCode,
