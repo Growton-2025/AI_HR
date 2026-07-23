@@ -107,13 +107,21 @@ export function TagFilterInput({ label, values, inputValue, onInputChange, onTag
   );
 }
 
-export function SelectFilter({ label, value, onChange, options, placeholder }) {
-  const opts = [...new Set((Array.isArray(options) ? options : []).map(o => String(o || '').trim()).filter(Boolean))];
+// `valueOptions` ({value,label} pairs) takes precedence over the string-array
+// `options`; `compact` drops the outer/label margins for inline toolbars.
+export function SelectFilter({ label, value, onChange, options, placeholder, valueOptions, compact }) {
+  const opts = Array.isArray(valueOptions)
+    ? valueOptions
+    : [...new Set((Array.isArray(options) ? options : []).map(o => String(o || '').trim()).filter(Boolean))]
+        .map(o => ({ value: o, label: o }));
+  const hasEmptyOption = opts.some(o => o.value === '');
   return (
-    <div style={{ marginBottom: 14 }}>
-      <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>
-        {label}
-      </label>
+    <div style={{ marginBottom: compact ? 0 : 14 }}>
+      {label && (
+        <label style={{ display: compact ? 'none' : 'block', fontSize: 11, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>
+          {label}
+        </label>
+      )}
       <div style={{ position: 'relative' }}>
         <select
           value={value}
@@ -138,8 +146,8 @@ export function SelectFilter({ label, value, onChange, options, placeholder }) {
             e.target.style.background = 'rgba(255,255,255,0.92)';
           }}
         >
-          <option value="">{placeholder}</option>
-          {opts.map(o => <option key={o} value={o}>{o}</option>)}
+          {!hasEmptyOption && <option value="">{placeholder}</option>}
+          {opts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <ChevronDown size={13} color="#94a3b8" style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
       </div>

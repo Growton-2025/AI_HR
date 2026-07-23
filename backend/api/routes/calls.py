@@ -3,12 +3,12 @@ import logging
 import os
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import psycopg2
 from datetime import time as dt_time
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from backend.api import deps, schemas
 from backend.db.connection import get_db_connection, return_db_connection, get_db_connection_context
@@ -54,6 +54,79 @@ TERMINAL_CALL_OUTCOMES = {
 FOLLOWUP_CALL_OUTCOMES = {"Connected - Follow-up", "Connected - Follow up later"}
 FOLLOWUP_TASK_TITLE = "Follow-up Call"
 WRONG_NUMBER_OUTCOME = "Wrong Number"
+
+# ── Slicer (date-range / outcome) filters for the Calls workspace ────────────
+# "Wrong Number" belongs to no group on purpose: those rows only show under
+# All Outcomes.
+OUTCOME_GROUPS: Dict[str, frozenset] = {
+    "connected": frozenset(TERMINAL_CALL_OUTCOMES),
+    "followup": frozenset(FOLLOWUP_CALL_OUTCOMES),
+    "not_connected": frozenset(FAILED_CALL_OUTCOMES | {UNREACHABLE_OUTCOME}),
+}
+RANGE_PRESETS = {"today", "yesterday", "last7", "last30", "custom"}
+# Inclusive day-offsets back from today for the non-custom presets.
+_RANGE_PRESET_DAYS = {"today": 0, "yesterday": 1, "last7": 6, "last30": 29}
+
+
+def validate_slicer_params(range_, date_from, date_to, outcome_group):
+    if range_ and range_ not in RANGE_PRESETS:
+        raise HTTPException(status_code=400, detail=f"Unknown range preset: {range_}")
+    if outcome_group and outcome_group not in OUTCOME_GROUPS:
+        raise HTTPException(status_code=400, detail=f"Unknown outcome group: {outcome_group}")
+    if range_ == "custom":
+        if date_from is None or date_to is None:
+            raise HTTPException(status_code=400, detail="Custom range requires date_from and date_to")
+        if date_from > date_to:
+            raise HTTPException(status_code=400, detail="date_from must not be after date_to")
+
+
+def resolve_range_bounds(range_, date_from, date_to, today: date):
+    """Inclusive (start, end) date bounds for a range preset, or None."""
+    if not range_:
+        return None
+    if range_ == "custom":
+        return (date_from, date_to)
+    if range_ == "yesterday":
+        return (today - timedelta(days=1), today - timedelta(days=1))
+    return (today - timedelta(days=_RANGE_PRESET_DAYS[range_]), today)
+
+
+def call_matches_slicer(call, bounds, outcome_set, *, use_completed_at: bool):
+    """In-memory-cache-path predicate. MUST stay behaviorally identical to the
+    SQL produced by build_range_sql / the outcome ANY() clause."""
+    if outcome_set is not None and call.get("outcome") not in outcome_set:
+        return False
+    if bounds is None:
+        return True
+    if use_completed_at:
+        value = call.get("completed_at")
+        if isinstance(value, datetime):
+            value = value.date()
+    else:
+        value = call.get("due_date")
+    return value is not None and bounds[0] <= value <= bounds[1]
+
+
+def build_range_sql(range_, date_from, date_to, *, use_completed_at: bool, col_prefix: str = "c."):
+    """SQL fragment (leading " AND ...") + params mirroring call_matches_slicer.
+    due_date is a DATE (inclusive compare); completed_at is a TIMESTAMP, so the
+    upper bound is half-open on the next day (same idiom as browse.py)."""
+    if not range_:
+        return "", []
+    col = f"{col_prefix}completed_at" if use_completed_at else f"{col_prefix}due_date"
+    params: List[Any] = []
+    if range_ == "custom":
+        lo, hi = "%s::date", "%s::date"
+        params = [date_from.isoformat(), date_to.isoformat()]
+    elif range_ == "today":
+        lo, hi = "CURRENT_DATE", "CURRENT_DATE"
+    elif range_ == "yesterday":
+        lo, hi = "CURRENT_DATE - 1", "CURRENT_DATE - 1"
+    else:
+        lo, hi = f"CURRENT_DATE - {_RANGE_PRESET_DAYS[range_]}", "CURRENT_DATE"
+    if use_completed_at:
+        return f" AND {col} >= {lo} AND {col} < {hi} + INTERVAL '1 day'", params
+    return f" AND {col} >= {lo} AND {col} <= {hi}", params
 
 
 def next_sequence_step(task_title: Optional[str]):
@@ -396,10 +469,9 @@ def get_cached_call_lists(owner: str) -> Optional[List[dict]]:
     with _calls_lock:
         if _call_lists_cache is None or _calls_cache is None:
             return None
-        # Stale worker (mutation happened on a sibling process): force the
-        # DB fallback so counts are always correct after a page refresh.
-        if not calls_cache_is_fresh():
-            return None
+        # Stale-while-revalidate: a stale cache is still served (the caller
+        # kicks a background rewarm) — blocking on the remote DB here made
+        # every page load pay ~0.7s per request.
 
         pending_counts: dict[int, int] = {}
         for call in _calls_cache:
@@ -717,6 +789,8 @@ def get_call_lists(current_user: schemas.User = Depends(deps.get_current_user)):
     owner = get_call_list_owner(current_user)
     cached_lists = get_cached_call_lists(owner)
     if cached_lists is not None:
+        if not calls_cache_is_fresh():
+            refresh_call_caches_async()
         return cached_lists
 
     conn = get_calls_db_connection()
@@ -916,17 +990,30 @@ def get_calls(
     status: Optional[str] = None,
     list_id: Optional[int] = None,
     due_filter: Optional[str] = None,
+    range_: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    outcome_group: Optional[str] = None,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     ensure_calls_schema_ready()
+    validate_slicer_params(range_, date_from, date_to, outcome_group)
     owner = get_call_list_owner(current_user)
+    # Completed views slice on completion date; pending/due views on due_date.
+    slice_on_completed = status == "completed"
+    outcome_set = OUTCOME_GROUPS.get(outcome_group) if outcome_group else None
 
     # ── HIGH PERFORMANCE IN-MEMORY FILTERING ──
-    # If cache is available AND fresh, filter in Python to avoid SQL latency.
-    # Freshness matters across gunicorn workers: a sibling process may have
-    # mutated data this worker's cache never saw.
+    # Stale-while-revalidate: the remote DB costs ~0.7s per request, so any
+    # populated cache is served instantly; when it is past its freshness
+    # window a background rewarm is kicked off (bounded staleness — a sibling
+    # gunicorn worker's mutation shows up after the ~1-2s rewarm lands).
+    # In-process mutations evict/None the cache, which forces the SQL path.
+    cached_result = None
+    cache_stale = False
     with _calls_lock:
-        if _calls_cache is not None and calls_cache_is_fresh():
+        if _calls_cache is not None:
+            cache_stale = not calls_cache_is_fresh()
             data = [c for c in _calls_cache if c.get("created_by") == owner]
             if status:
                 data = [c for c in data if c.get("status") == status]
@@ -940,6 +1027,13 @@ def get_calls(
                 today = date.today()
                 data = [c for c in data if c.get("due_date") and c["due_date"] > today]
 
+            bounds = resolve_range_bounds(range_, date_from, date_to, date.today())
+            if bounds is not None or outcome_set is not None:
+                data = [
+                    c for c in data
+                    if call_matches_slicer(c, bounds, outcome_set, use_completed_at=slice_on_completed)
+                ]
+
             # Custom Sorting for UX consistency
             if status == "completed":
                 data.sort(key=lambda x: x.get("completed_at") or datetime.min, reverse=True)
@@ -947,8 +1041,13 @@ def get_calls(
                 # Key tip: Python's sort is stable, we sort by created_at then due_date+due_time
                 data.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
                 data.sort(key=lambda x: (x.get("due_date") or date.min, x.get("due_time") or dt_time.min))
-            
-            return data
+
+            cached_result = data
+
+    if cached_result is not None:
+        if cache_stale:
+            refresh_call_caches_async()
+        return cached_result
 
     # ── FALLBACK TO DB IF CACHE EMPTY ──
     conn = get_calls_db_connection()
@@ -974,6 +1073,15 @@ def get_calls(
             query += " AND c.due_date <= CURRENT_DATE"
         elif due_filter == "upcoming":
             query += " AND c.due_date > CURRENT_DATE"
+
+        range_sql, range_params = build_range_sql(
+            range_, date_from, date_to, use_completed_at=slice_on_completed
+        )
+        query += range_sql
+        params.extend(range_params)
+        if outcome_set is not None:
+            query += " AND c.outcome = ANY(%s)"
+            params.append(sorted(outcome_set))
 
         if status == "completed":
             query += " ORDER BY c.completed_at DESC NULLS LAST"
@@ -1149,24 +1257,39 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
 
 
 @router.get("/stats")
-def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
+def get_call_stats(
+    range_: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    outcome_group: Optional[str] = None,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
     ensure_calls_schema_ready()
+    validate_slicer_params(range_, date_from, date_to, outcome_group)
     owner = get_call_list_owner(current_user)
+    outcome_set = OUTCOME_GROUPS.get(outcome_group) if outcome_group else None
+    # Stats are cached per owner + slicer params (invalidation always clears
+    # the whole dict, so the composite key needs no targeted eviction).
+    stats_key = f"{owner}|{range_ or ''}|{date_from or ''}|{date_to or ''}|{outcome_group or ''}"
 
     # ── INSTANT STATS CACHE ──
-    # Both stats layers are derived from this worker's calls cache, so they
-    # are only trustworthy while that cache is fresh (see calls_cache_is_fresh).
+    # Stale-while-revalidate (see get_calls): serve any populated cache
+    # immediately and rewarm in the background when past the fresh window.
     now = time.time()
     if (
-        owner in _stats_cache
-        and (now - _stats_cache_ts.get(owner, 0) < _STATS_TTL)
-        and calls_cache_is_fresh()
+        stats_key in _stats_cache
+        and (now - _stats_cache_ts.get(stats_key, 0) < _STATS_TTL)
     ):
-        return _stats_cache[owner]
+        if not calls_cache_is_fresh():
+            refresh_call_caches_async()
+        return _stats_cache[stats_key]
 
+    stats_cache_stale = False
     with _calls_lock:
-        if _calls_cache is not None and _call_lists_cache is not None and calls_cache_is_fresh():
+        if _calls_cache is not None and _call_lists_cache is not None:
+            stats_cache_stale = not calls_cache_is_fresh()
             today = date.today()
+            bounds = resolve_range_bounds(range_, date_from, date_to, today)
             due_today = 0
             upcoming = 0
             completed = 0
@@ -1176,7 +1299,9 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
                     continue
                 status = call.get("status")
                 if status == "completed":
-                    completed += 1
+                    # Completed counts slice on completion date AND outcome.
+                    if call_matches_slicer(call, bounds, outcome_set, use_completed_at=True):
+                        completed += 1
                     continue
                 # Only pending calls are bucketed into due_today / upcoming.
                 # This MUST match the SQL path below (status = 'pending')
@@ -1186,6 +1311,11 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
                     continue
                 due_date = call.get("due_date")
                 if not due_date:
+                    continue
+                # Pending rows have no outcome yet, so the outcome filter is
+                # NOT applied here (it would always zero these buckets) —
+                # only the date range slices pending calls.
+                if not call_matches_slicer(call, bounds, None, use_completed_at=False):
                     continue
                 if due_date <= today:
                     due_today += 1
@@ -1199,8 +1329,13 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
                 "completed": completed,
                 "active_lists": active_lists,
             }
-            _stats_cache[owner] = stats
-            _stats_cache_ts[owner] = now
+            if len(_stats_cache) > 64:
+                _stats_cache.clear()
+                _stats_cache_ts.clear()
+            _stats_cache[stats_key] = stats
+            _stats_cache_ts[stats_key] = now
+            if stats_cache_stale:
+                refresh_call_caches_async()
             return stats
 
     conn = get_calls_db_connection()
@@ -1212,7 +1347,20 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
         refresh_call_caches_async()
 
         cur = conn.cursor()
-        cur.execute("""
+        # Slicer predicates mirror the in-memory path above: pending buckets
+        # slice on due_date (never on outcome — pending rows have none),
+        # completed slices on completed_at and outcome.
+        due_sql, due_params = build_range_sql(range_, date_from, date_to, use_completed_at=False, col_prefix="")
+        comp_sql, comp_params = build_range_sql(range_, date_from, date_to, use_completed_at=True, col_prefix="")
+        outcome_sql = " AND outcome = ANY(%s)" if outcome_set is not None else ""
+        outcome_params = [sorted(outcome_set)] if outcome_set is not None else []
+        query_params = (
+            [owner]
+            + due_params
+            + due_params
+            + comp_params + outcome_params
+        )
+        cur.execute(f"""
             WITH owned_lists AS (
                 SELECT id
                 FROM call_lists
@@ -1220,9 +1368,9 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
             ),
             call_counts AS (
                 SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= CURRENT_DATE) AS due_today,
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date > CURRENT_DATE) AS upcoming,
-                    COUNT(*) FILTER (WHERE status = 'completed') AS completed
+                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= CURRENT_DATE{due_sql}) AS due_today,
+                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date > CURRENT_DATE{due_sql}) AS upcoming,
+                    COUNT(*) FILTER (WHERE status = 'completed'{comp_sql}{outcome_sql}) AS completed
                 FROM calls
                 WHERE list_id IN (SELECT id FROM owned_lists)
             ),
@@ -1237,7 +1385,7 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
                 list_counts.total_lists
             FROM call_counts
             CROSS JOIN list_counts
-        """, (owner,))
+        """, query_params)
         row = cur.fetchone()
         stats = {
             "due_today": row[0] or 0,
@@ -1245,8 +1393,11 @@ def get_call_stats(current_user: schemas.User = Depends(deps.get_current_user)):
             "completed": row[2] or 0,
             "active_lists": row[3] or 0,
         }
-        _stats_cache[owner] = stats
-        _stats_cache_ts[owner] = now
+        if len(_stats_cache) > 64:
+            _stats_cache.clear()
+            _stats_cache_ts.clear()
+        _stats_cache[stats_key] = stats
+        _stats_cache_ts[stats_key] = now
         return stats
     except Exception as e:
         conn.rollback()

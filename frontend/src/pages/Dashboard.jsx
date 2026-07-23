@@ -123,7 +123,9 @@ const Dashboard = () => {
       }
       await Promise.allSettled([
         fetchAnalytics(),
-        fetchCallStats(),
+        // Explicit empty params: the dashboard always shows all-time stats,
+        // even if the Calls page left a sliced scope active.
+        fetchCallStats({ params: {} }),
       ]);
       if (cancelled) return;
       hasLoadedRef.current = true;

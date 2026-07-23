@@ -62,6 +62,9 @@ async def warm_calls_backend():
     # Prime the DB-backed calls routes once so the first real page load
     # does not spend 10s+ initializing the pool and schema.
     try:
+        # Runs the per-process schema check here (sentinel = 1 round trip)
+        # so the first user request never pays for it.
+        await asyncio.to_thread(calls.ensure_calls_schema_ready)
         await asyncio.to_thread(calls.warm_call_caches)
         print("Calls cache warmed successfully.")
     except Exception as e:

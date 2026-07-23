@@ -1,7 +1,12 @@
 import { VoIPProvider, useVoIP, reportTiming } from '../context/VoIPContext';
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
+import { SelectFilter } from '../components/FilterComponents';
+import {
+  RANGE_OPTIONS, RANGE_DROPDOWN_OPTIONS, OUTCOME_GROUP_OPTIONS,
+  rangeScopeLabel, buildSlicerParams, isSlicerDefault, formatHeaderDate,
+} from '../utils/callSlicer';
 import { useSearchParams } from 'react-router-dom';
 import { 
   Phone, Calendar, CheckCircle2, List, PhoneCall, 
@@ -913,6 +918,7 @@ export default function Calls() {
     callStats,
     fetchCallStats,
     callStatsLastFetchedAt,
+    callStatsLastQueryKey,
     callsLastFetchedAt,
     updateCall,
     deleteCall,
@@ -931,6 +937,7 @@ export default function Calls() {
     callStats: state.callStats,
     fetchCallStats: state.fetchCallStats,
     callStatsLastFetchedAt: state.callStatsLastFetchedAt,
+    callStatsLastQueryKey: state.callStatsLastQueryKey,
     callsLastFetchedAt: state.callsLastFetchedAt,
     updateCall: state.updateCall,
     deleteCall: state.deleteCall,
@@ -955,6 +962,34 @@ export default function Calls() {
   const [isRevalidating, setIsRevalidating] = useState(false);
   const [selectedList, setSelectedList] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
+  // Slicer (date range / outcome) state, restored from the URL like activeTab.
+  const [rangeFilter, setRangeFilter] = useState(() => {
+    const range = searchParams.get('range');
+    return RANGE_DROPDOWN_OPTIONS.some(o => o.value === range) ? range : 'all';
+  });
+  const [customFrom, setCustomFrom] = useState(() => searchParams.get('from') || '');
+  const [customTo, setCustomTo] = useState(() => searchParams.get('to') || '');
+  const [outcomeGroup, setOutcomeGroup] = useState(() => {
+    const outcome = searchParams.get('outcome');
+    return OUTCOME_GROUP_OPTIONS.some(o => o.value === outcome) ? outcome : '';
+  });
+  const slicerParams = useMemo(
+    () => buildSlicerParams({ range: rangeFilter, customFrom, customTo, outcomeGroup }),
+    [rangeFilter, customFrom, customTo, outcomeGroup]
+  );
+  // Pending rows have no outcome yet, so pending views (Due Today, Upcoming,
+  // list contacts) only get the date params — sending outcome_group there
+  // would filter out every row. Completed views get the full slicer.
+  const dateSlicerParams = useMemo(() => {
+    const { outcome_group: _omit, ...rest } = slicerParams;
+    return rest;
+  }, [slicerParams]);
+  const resetSlicer = useCallback(() => {
+    setRangeFilter('all');
+    setCustomFrom('');
+    setCustomTo('');
+    setOutcomeGroup('');
+  }, []);
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
   const [expandedCallId, setExpandedCallId] = useState(null);
   const [syncingCallId, setSyncingCallId] = useState(null);
@@ -1003,7 +1038,7 @@ export default function Calls() {
     }
   }, [callLists, callListsLastFetchedAt, clearCallsState]);
 
-  // Keep tab + selected list in the URL so a refresh restores this exact view.
+  // Keep tab + selected list + slicer in the URL so a refresh restores this exact view.
   useEffect(() => {
     if (pendingListIdRef.current) return; // still restoring from the URL
     const next = {};
@@ -1013,8 +1048,16 @@ export default function Calls() {
     } else if (activeTab !== 'today') {
       next.tab = activeTab;
     }
+    if (rangeFilter !== 'all') {
+      next.range = rangeFilter;
+      if (rangeFilter === 'custom') {
+        if (customFrom) next.from = customFrom;
+        if (customTo) next.to = customTo;
+      }
+    }
+    if (outcomeGroup) next.outcome = outcomeGroup;
     setSearchParams(next, { replace: true });
-  }, [activeTab, selectedList, setSearchParams]);
+  }, [activeTab, selectedList, rangeFilter, customFrom, customTo, outcomeGroup, setSearchParams]);
 
   const fetchData = useCallback(async () => {
     if (retryTimerRef.current) {
@@ -1028,7 +1071,7 @@ export default function Calls() {
     if (!hasCache) setLoading(true);
     else setIsRevalidating(true);
 
-    const statsPromise = fetchCallStats({ force: true }).then(res => {
+    const statsPromise = fetchCallStats({ force: true, params: slicerParams }).then(res => {
       if (!res?.success) {
         console.error('Failed to refresh call stats:', res?.error);
       }
@@ -1060,6 +1103,7 @@ export default function Calls() {
         } else if (activeTab === 'today' || activeTab === 'upcoming') {
           params.status = 'pending';
         }
+        Object.assign(params, params.status === 'completed' ? slicerParams : dateSlicerParams);
 
         const [callsRes] = await Promise.all([
           fetchCalls(params),
@@ -1084,7 +1128,7 @@ export default function Calls() {
       setLoading(false);
       setIsRevalidating(false);
     }
-  }, [activeTab, selectedList, fetchCalls, fetchCallLists, fetchCallStats]);
+  }, [activeTab, selectedList, slicerParams, dateSlicerParams, fetchCalls, fetchCallLists, fetchCallStats]);
 
   useEffect(() => {
     fetchData();
@@ -1128,12 +1172,18 @@ export default function Calls() {
     }
   }, [selectedList, callLists, callListsLastFetchedAt, clearCallsState]);
 
+  const scopeLabel = rangeScopeLabel(rangeFilter);
   const stats = [
-    { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#334155', bg: '#f8fafc' },
-    { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#8b6b44', bg: '#fcf8f2' },
-    { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#166534', bg: '#f3faf5' },
-    { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#475569', bg: '#f8fafc' },
+    { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#334155', bg: '#f8fafc', scope: scopeLabel },
+    { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#8b6b44', bg: '#fcf8f2', scope: scopeLabel },
+    { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#166534', bg: '#f3faf5', scope: scopeLabel },
+    // Call lists are never sliced by the date/outcome filters.
+    { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#475569', bg: '#f8fafc', scope: 'All Time' },
   ];
+  // The displayed stats are trustworthy only once a fetch for the CURRENT
+  // slicer scope has landed; otherwise they still show the previous scope.
+  const statsReady = Boolean(callStatsLastFetchedAt) &&
+    callStatsLastQueryKey === canonicalCallsQuery(slicerParams);
 
   const handleDial = (call) => {
     setCallingCandidate(call);
@@ -1218,14 +1268,15 @@ export default function Calls() {
 
   // Build the key through the SAME canonicalizer the store uses so the view
   // never mismatches its cache entry (param order / number-vs-string list_id).
+  // Must mirror fetchData's params exactly — including the slicer params.
   const currentCallsQueryKey = selectedList
-    ? canonicalCallsQuery({ list_id: selectedList.id, status: 'pending' })
+    ? canonicalCallsQuery({ list_id: selectedList.id, status: 'pending', ...dateSlicerParams })
     : activeTab === 'today'
-      ? canonicalCallsQuery({ due_filter: 'today', status: 'pending' })
+      ? canonicalCallsQuery({ due_filter: 'today', status: 'pending', ...dateSlicerParams })
       : activeTab === 'upcoming'
-        ? canonicalCallsQuery({ due_filter: 'upcoming', status: 'pending' })
+        ? canonicalCallsQuery({ due_filter: 'upcoming', status: 'pending', ...dateSlicerParams })
         : activeTab === 'completed'
-          ? canonicalCallsQuery({ status: 'completed' })
+          ? canonicalCallsQuery({ status: 'completed', ...slicerParams })
           : '';
   const callsForCurrentQuery = callsLastQueryKey === currentCallsQueryKey ? (calls || []) : [];
   const filteredCalls = callsForCurrentQuery.filter(c =>
@@ -1258,12 +1309,82 @@ export default function Calls() {
             </div>
           )}
         </div>
-        {isRevalidating && (
-          <div style={{ padding: '8px 16px', borderRadius: '12px', background: '#f8fafc', color: '#475569', fontSize: '12px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid rgba(203,213,225,0.9)' }}>
-            <RefreshCw size={14} className="revalidating" /> Updating...
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          {isRevalidating && (
+            <div style={{ padding: '8px 16px', borderRadius: '12px', background: '#f8fafc', color: '#475569', fontSize: '12px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid rgba(203,213,225,0.9)' }}>
+              <RefreshCw size={14} className="revalidating" /> Updating...
+            </div>
+          )}
+          <div style={{ padding: '8px 16px', borderRadius: '20px', background: '#fcf8f2', color: '#8b6b44', fontSize: '13px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid rgba(194,124,63,0.2)' }}>
+            <Calendar size={14} /> {formatHeaderDate(new Date())}
+          </div>
+        </div>
+      </header>
+
+      {/* Slicer: date-range chips + range/outcome dropdowns (per RecruitDash
+          prototype — no Purpose filter, no Total Touchpoints card). */}
+      <div className="calls-slicer-bar" style={{ ...CALL_PANEL_STYLE, borderRadius: '20px', padding: '14px 20px', marginBottom: '24px', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '12px 16px' }}>
+        <span style={{ fontSize: '11px', fontWeight: 700, color: '#8b6b44', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Slicer:</span>
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+          {RANGE_OPTIONS.map(opt => {
+            const active = rangeFilter === opt.value;
+            return (
+              <button
+                key={opt.value}
+                onClick={() => setRangeFilter(opt.value)}
+                style={{
+                  padding: '5px 12px', borderRadius: '20px', fontSize: '12px', fontWeight: 700, cursor: 'pointer',
+                  background: active ? 'rgba(194,124,63,0.12)' : '#f8fafc',
+                  color: active ? '#8b6b44' : '#475569',
+                  border: active ? '1px solid rgba(194,124,63,0.35)' : '1px solid rgba(203,213,225,0.9)',
+                  transition: 'all 0.15s',
+                }}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '11px', fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Range</span>
+          <div style={{ width: '170px' }}>
+            <SelectFilter compact valueOptions={RANGE_DROPDOWN_OPTIONS} value={rangeFilter} onChange={setRangeFilter} />
+          </div>
+        </div>
+        {rangeFilter === 'custom' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input
+              type="date"
+              value={customFrom}
+              max={customTo || undefined}
+              onChange={e => setCustomFrom(e.target.value)}
+              style={{ padding: '8px 10px', border: '1.5px solid #e2e8f0', borderRadius: '10px', fontSize: '12px', color: '#334155', outline: 'none', fontFamily: 'inherit' }}
+            />
+            <span style={{ fontSize: '12px', color: '#94a3b8', fontWeight: 600 }}>to</span>
+            <input
+              type="date"
+              value={customTo}
+              min={customFrom || undefined}
+              onChange={e => setCustomTo(e.target.value)}
+              style={{ padding: '8px 10px', border: '1.5px solid #e2e8f0', borderRadius: '10px', fontSize: '12px', color: '#334155', outline: 'none', fontFamily: 'inherit' }}
+            />
           </div>
         )}
-      </header>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '11px', fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Outcome</span>
+          <div style={{ width: '245px' }}>
+            <SelectFilter compact valueOptions={OUTCOME_GROUP_OPTIONS} value={outcomeGroup} onChange={setOutcomeGroup} />
+          </div>
+        </div>
+        {!isSlicerDefault({ range: rangeFilter, outcomeGroup }) && (
+          <button
+            onClick={resetSlicer}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', fontSize: '12px', fontWeight: 700, padding: '4px 6px' }}
+          >
+            Reset Slicer
+          </button>
+        )}
+      </div>
 
       {/* Stats Cards */}
       <div className="calls-stats-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '20px', marginBottom: '40px' }}>
@@ -1274,9 +1395,12 @@ export default function Calls() {
                 <stat.icon size={20} color={stat.color} />
               </div>
               <span style={{ fontSize: '12px', fontWeight: 700, color: '#94a3b8', letterSpacing: '0.05em' }}>{stat.label}</span>
+              <span style={{ marginLeft: 'auto', fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '999px', background: '#fcf8f2', color: '#8b6b44', border: '1px solid rgba(194,124,63,0.2)', whiteSpace: 'nowrap' }}>
+                {stat.scope}
+              </span>
             </div>
             <div style={{ fontSize: '32px', fontWeight: 800, color: '#0f172a' }}>
-              {!callStatsLastFetchedAt ? <Loader2 size={24} className="animate-spin" color="#cbd5e1" /> : stat.value}
+              {!statsReady ? <Loader2 size={24} className="animate-spin" color="#cbd5e1" /> : stat.value}
             </div>
           </div>
         ))}
@@ -1284,7 +1408,14 @@ export default function Calls() {
 
       {/* Tabs */}
       <div className="calls-tabs" style={{ display: 'flex', flexWrap: 'wrap', borderBottom: '1px solid #e2e8f0', marginBottom: '32px', columnGap: '24px', rowGap: '10px' }}>
-      {TABS.map(tab => (
+      {TABS.map(tab => {
+          const tabCount = statsReady ? {
+            today: callStats.due_today,
+            upcoming: callStats.upcoming,
+            completed: callStats.completed,
+            lists: callStats.active_lists,
+          }[tab.id] : null;
+          return (
           <button
             key={tab.id}
             onClick={() => { clearCallsState(); setActiveTab(tab.id); setSelectedList(null); }}
@@ -1297,8 +1428,18 @@ export default function Calls() {
           >
             <tab.icon size={18} />
             {tab.label}
+            {tabCount !== null && tabCount !== undefined && (
+              <span style={{
+                fontSize: '11px', fontWeight: 700, padding: '1px 7px', borderRadius: '999px',
+                background: activeTab === tab.id ? 'rgba(194,124,63,0.12)' : '#f1f5f9',
+                color: activeTab === tab.id ? '#8b6b44' : '#64748b',
+              }}>
+                {tabCount}
+              </span>
+            )}
           </button>
-        ))}
+          );
+        })}
       </div>
 
       {/* Content Area */}

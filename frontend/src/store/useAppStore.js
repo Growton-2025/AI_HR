@@ -358,6 +358,7 @@ function clearCallRequestState() {
         callsRequestSeq: -1,
         callStatsRequest: null,
         callStatsRequestSeq: -1,
+        callStatsRequestQueryKey: '',
     }
 }
 
@@ -2321,8 +2322,11 @@ export const useAppStore = create(persist((set, get) => ({
     callsRequestSeq: 0,
     callsMutationSeq: 0,
     callStatsLastFetchedAt: 0,
+    callStatsLastQueryKey: '',
+    callStatsLastParams: {},
     callStatsRequest: null,
     callStatsRequestSeq: 0,
+    callStatsRequestQueryKey: '',
     callListsBackoffUntil: 0,
     callStatsBackoffUntil: 0,
     callsBackoffUntilByQuery: {},
@@ -2968,7 +2972,15 @@ export const useAppStore = create(persist((set, get) => ({
         const force = typeof options === 'boolean' ? options : options.force === true
         const maxAgeMs = 15 * 1000
         const state = get()
+        // `params` selects the slicer scope (see canonicalCallsQuery). Callers
+        // that omit it (mutation revalidations, warmAll) refresh whatever
+        // slice is currently displayed instead of clobbering it with all-time
+        // numbers; pages pass explicit params ({} = all-time) to switch scope.
+        const hasExplicitParams = typeof options === 'object' && options.params !== undefined
+        const statsParams = hasExplicitParams ? (options.params || {}) : (state.callStatsLastParams || {})
+        const statsKey = canonicalCallsQuery(statsParams)
         const isFresh = state.callStatsLastFetchedAt &&
+            state.callStatsLastQueryKey === statsKey &&
             (Date.now() - state.callStatsLastFetchedAt < maxAgeMs)
 
         if (!force && isFresh) {
@@ -2976,28 +2988,35 @@ export const useAppStore = create(persist((set, get) => ({
         }
 
         if (state.callStatsBackoffUntil && Date.now() < state.callStatsBackoffUntil) {
-            if (state.callStatsLastFetchedAt) {
+            if (state.callStatsLastFetchedAt && state.callStatsLastQueryKey === statsKey) {
                 return { success: true, data: state.callStats, cached: true, throttled: true }
             }
             return { success: false, error: 'Retrying call stats shortly' }
         }
 
-        if (state.callStatsRequest && (!force || state.callStatsRequestSeq === state.callsMutationSeq)) {
+        if (
+            state.callStatsRequest &&
+            state.callStatsRequestQueryKey === statsKey &&
+            (!force || state.callStatsRequestSeq === state.callsMutationSeq)
+        ) {
             return state.callStatsRequest
         }
 
         const requestSeq = state.callsMutationSeq
-        const request = axios.get(`${API_BASE}/calls/stats`, { timeout: CALL_REQUEST_TIMEOUT_MS })
+        const statsUrl = `${API_BASE}/calls/stats${statsKey ? `?${statsKey}` : ''}`
+        const request = axios.get(statsUrl, { timeout: CALL_REQUEST_TIMEOUT_MS })
             .then(res => {
                 const latestState = get()
                 // Only commit if this is still the latest stats request.
                 // Do NOT guard by callsMutationSeq — that discards real stats after mutations.
-                if (latestState.callStatsRequestSeq === requestSeq) {
+                if (latestState.callStatsRequestSeq === requestSeq && latestState.callStatsRequestQueryKey === statsKey) {
                     set({
                         callStats: res.data,
                         callStatsLastFetchedAt: Date.now(),
+                        callStatsLastQueryKey: statsKey,
                         callStatsRequest: null,
                         callStatsRequestSeq: 0,
+                        callStatsRequestQueryKey: '',
                         callStatsBackoffUntil: 0,
                     })
                 }
@@ -3009,13 +3028,19 @@ export const useAppStore = create(persist((set, get) => ({
                     set({
                         callStatsRequest: null,
                         callStatsRequestSeq: 0,
+                        callStatsRequestQueryKey: '',
                         callStatsBackoffUntil: Date.now() + CALL_RETRY_BACKOFF_MS,
                     })
                 }
                 return { success: false, error: e.response?.data?.detail || 'Failed to fetch call stats' }
             })
 
-        set({ callStatsRequest: request, callStatsRequestSeq: requestSeq })
+        set({
+            callStatsRequest: request,
+            callStatsRequestSeq: requestSeq,
+            callStatsRequestQueryKey: statsKey,
+            callStatsLastParams: statsParams,
+        })
         return request
     },
 
