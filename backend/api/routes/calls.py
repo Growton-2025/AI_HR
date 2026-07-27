@@ -54,6 +54,26 @@ TERMINAL_CALL_OUTCOMES = {
 FOLLOWUP_CALL_OUTCOMES = {"Connected - Follow-up", "Connected - Follow up later"}
 FOLLOWUP_TASK_TITLE = "Follow-up Call"
 WRONG_NUMBER_OUTCOME = "Wrong Number"
+NOT_INTERESTED_OUTCOME = "Connected - Not Interested"
+# Must match the RECRUITMENT_STAGES value in frontend/src/components/StatusDropdown.jsx.
+NOT_INTERESTED_CANDIDATE_STATUS = "Not Interested"
+
+# Candidate-status values that mean "this candidate is done" — once set, from
+# ANY UI surface (Roles, Talent Pool, the Calls list's own status dropdown, or
+# the call-log modal's "Candidate Status" dropdown — all of these hit the same
+# POST /candidates/{id}/status endpoint), any other still-pending call rows for
+# them stop showing up in the active calling loop. They're resolved to
+# 'completed' rather than deleted, so they stay visible as history.
+# Must match RECRUITMENT_STAGES values in frontend/src/components/StatusDropdown.jsx.
+TERMINAL_CANDIDATE_STATUSES = {
+    "not interested",
+    "high ctc",
+    "shared with customer",
+    "for future",
+    "shortlist - rejected",
+    "duplicate",
+    "rejected",
+}
 
 # ── Slicer (date-range / outcome) filters for the Calls workspace ────────────
 # "Wrong Number" belongs to no group on purpose: those rows only show under
@@ -202,7 +222,9 @@ CALLS_SELECT_QUERY = """
         COALESCE(NULLIF(TRIM(cand.status), ''), 'To be started'),
         cand.linkedin,
         c.sentiment,
-        c.sentiment_reason
+        c.sentiment_reason,
+        COALESCE(c.likely_voicemail, FALSE),
+        COALESCE(cand.cadence_paused, FALSE)
     FROM calls c
     JOIN call_lists cl ON c.list_id = cl.id
     JOIN candidates cand ON c.candidate_id = cand.id
@@ -245,6 +267,8 @@ def call_row_to_dict(row) -> dict:
         "candidate_linkedin": row[30],
         "sentiment": row[31],
         "sentiment_reason": row[32],
+        "likely_voicemail": bool(row[33]),
+        "cadence_paused": bool(row[34]),
     }
 
 
@@ -474,13 +498,19 @@ def get_cached_call_lists(owner: str) -> Optional[List[dict]]:
         # every page load pay ~0.7s per request.
 
         pending_counts: dict[int, int] = {}
+        completed_counts: dict[int, int] = {}
+        total_counts: dict[int, int] = {}
         for call in _calls_cache:
-            if call.get("created_by") != owner or call.get("status") != "pending":
+            if call.get("created_by") != owner:
                 continue
             list_id = call.get("list_id")
             if list_id is None:
                 continue
-            pending_counts[list_id] = pending_counts.get(list_id, 0) + 1
+            total_counts[list_id] = total_counts.get(list_id, 0) + 1
+            if call.get("status") == "pending":
+                pending_counts[list_id] = pending_counts.get(list_id, 0) + 1
+            elif call.get("status") == "completed":
+                completed_counts[list_id] = completed_counts.get(list_id, 0) + 1
 
         return [
             {
@@ -488,6 +518,9 @@ def get_cached_call_lists(owner: str) -> Optional[List[dict]]:
                 "name": item["name"],
                 "created_at": item["created_at"],
                 "candidate_count": pending_counts.get(item["id"], 0),
+                "pending_count": pending_counts.get(item["id"], 0),
+                "completed_count": completed_counts.get(item["id"], 0),
+                "total_count": total_counts.get(item["id"], 0),
             }
             for item in _call_lists_cache
             if item.get("created_by") == owner
@@ -533,7 +566,10 @@ class CallListResponse(BaseModel):
     id: int
     name: str
     created_at: datetime
-    candidate_count: int = 0
+    candidate_count: int = 0  # pending count — kept for backward compat
+    pending_count: int = 0
+    completed_count: int = 0
+    total_count: int = 0
 
 
 class AddCandidatesRequest(BaseModel):
@@ -597,6 +633,8 @@ class CallResponse(BaseModel):
     candidate_linkedin: Optional[str] = None
     sentiment: Optional[str] = None
     sentiment_reason: Optional[str] = None
+    likely_voicemail: Optional[bool] = False
+    cadence_paused: Optional[bool] = False
 
 
 def ensure_calls_schema_ready(force: bool = False):
@@ -630,6 +668,10 @@ def ensure_calls_schema_ready(force: bool = False):
                                 WHERE table_name = 'calls' AND column_name = 'due_time')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'candidates' AND column_name = 'mobile_phone_wrong')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'calls' AND column_name = 'likely_voicemail')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'candidates' AND column_name = 'cadence_paused')
                         AND NOT EXISTS (SELECT 1 FROM pg_constraint
                                         WHERE conname = 'unique_candidate_list')
                 """)
@@ -699,8 +741,15 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_synced_at TIMESTAMP;")
             # Follow-up calls carry an exact slot (date + time); cadence calls only a date.
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS due_time TIME;")
+            # Post-call heuristic (transcript phrases + short one-sided duration) — Plivo
+            # doesn't support real AMD on this app's browser-SDK/XML-Dial call flow, so
+            # this is a suggestion the recruiter confirms, not a live detection signal.
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS likely_voicemail BOOLEAN DEFAULT FALSE;")
             # Wrong-number tag lives on the candidate so every call list sees it.
             cur.execute("ALTER TABLE candidates ADD COLUMN IF NOT EXISTS mobile_phone_wrong BOOLEAN DEFAULT FALSE;")
+            # Manual "Stop cadence" toggle — same candidate-level scope as
+            # mobile_phone_wrong, gates the next-attempt insert the same way.
+            cur.execute("ALTER TABLE candidates ADD COLUMN IF NOT EXISTS cadence_paused BOOLEAN DEFAULT FALSE;")
             cur.execute(f"""
                 DO $$
                 BEGIN
@@ -803,8 +852,10 @@ def get_call_lists(current_user: schemas.User = Depends(deps.get_current_user)):
 
         cur = conn.cursor()
         cur.execute("""
-            SELECT cl.id, cl.name, cl.created_at, 
-                   COUNT(CASE WHEN c.status = 'pending' THEN c.id END) AS candidate_count
+            SELECT cl.id, cl.name, cl.created_at,
+                   COUNT(CASE WHEN c.status = 'pending' THEN c.id END) AS pending_count,
+                   COUNT(CASE WHEN c.status = 'completed' THEN c.id END) AS completed_count,
+                   COUNT(c.id) AS total_count
             FROM call_lists cl
             LEFT JOIN calls c ON cl.id = c.list_id
             WHERE LOWER(COALESCE(cl.created_by, '')) = %s
@@ -817,6 +868,9 @@ def get_call_lists(current_user: schemas.User = Depends(deps.get_current_user)):
                 "name": row[1],
                 "created_at": row[2],
                 "candidate_count": row[3],
+                "pending_count": row[3],
+                "completed_count": row[4],
+                "total_count": row[5],
             }
             for row in cur.fetchall()
         ]
@@ -867,7 +921,7 @@ def create_call_list(request: CallListCreate, current_user: schemas.User = Depen
         if not row:
             raise HTTPException(status_code=400, detail="A list with this name already exists")
         conn.commit()
-        result = {"id": row[0], "name": row[1], "created_at": row[2], "candidate_count": 0}
+        result = {"id": row[0], "name": row[1], "created_at": row[2], "candidate_count": 0, "pending_count": 0, "completed_count": 0, "total_count": 0}
         if cur:
             cur.close()
         return_db_connection(conn)
@@ -1184,6 +1238,7 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         scheduled_next_title = None
         auto_unreachable = False
         wrong_number_tagged = False
+        not_interested_removed = False
 
         if current_status == "completed" and current_outcome:
             if current_outcome in FAILED_CALL_OUTCOMES:
@@ -1199,14 +1254,14 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                 else:
                     step = next_sequence_step(task_title)
                     if step:
-                        # A wrong-number tag pauses the cadence until a new
-                        # number is sourced (flag cleared on phone update).
+                        # A wrong-number tag or a manual "Stop cadence" both pause
+                        # scheduling until cleared (phone update, or "Continue").
                         cur.execute(
-                            "SELECT COALESCE(mobile_phone_wrong, FALSE) FROM candidates WHERE id = %s",
+                            "SELECT COALESCE(mobile_phone_wrong, FALSE), COALESCE(cadence_paused, FALSE) FROM candidates WHERE id = %s",
                             (candidate_id,),
                         )
                         phone_row = cur.fetchone()
-                        if not (phone_row and phone_row[0]):
+                        if not (phone_row and (phone_row[0] or phone_row[1])):
                             delay_days, next_title = step
                             cur.execute(
                                 """
@@ -1217,8 +1272,18 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                             )
                             scheduled_next_title = next_title
             elif current_outcome in FOLLOWUP_CALL_OUTCOMES:
-                # The call row was already rescheduled in-place (status kept as
-                # 'pending', due_date/due_time updated above) — no new row needed.
+                # Each follow-up gets its own new row — same as every other
+                # retry — so this row's outcome/recording/transcript stays
+                # intact as history instead of being overwritten when the
+                # follow-up call happens (initiate_call reuses plivo_transaction_id
+                # for the SAME row, which previously clobbered the prior recording).
+                cur.execute(
+                    """
+                    INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
+                    VALUES (%s, %s, 'pending', %s, %s, %s)
+                    """,
+                    (candidate_id, list_id, request.due_date, request.due_time, FOLLOWUP_TASK_TITLE),
+                )
                 scheduled_next_title = FOLLOWUP_TASK_TITLE
             elif current_outcome == WRONG_NUMBER_OUTCOME:
                 # Tag the number on the candidate so every list sees it; the
@@ -1228,8 +1293,34 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                     (candidate_id,),
                 )
                 wrong_number_tagged = True
-            # Connected - Interested / Not Interested end the cadence: the call
-            # completes and nothing new is scheduled.
+            elif current_outcome == NOT_INTERESTED_OUTCOME:
+                # Not interested ends the relationship outright, immediately —
+                # not just "no next attempt scheduled". Set a terminal status
+                # everywhere the candidate is visible and resolve any other
+                # still-pending attempts for them (other call lists included) as
+                # completed too, so they stop appearing in the active calling
+                # loop but keep a visible record in Completed instead of just
+                # vanishing.
+                cur.execute(
+                    "UPDATE candidates SET status = %s, updated_at = NOW() WHERE id = %s",
+                    (NOT_INTERESTED_CANDIDATE_STATUS, candidate_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE calls
+                    SET status = 'completed', outcome = %s, completed_at = NOW(), updated_at = NOW()
+                    WHERE candidate_id = %s
+                      AND status = 'pending'
+                      AND list_id IN (
+                          SELECT id FROM call_lists
+                          WHERE LOWER(COALESCE(created_by, '')) = %s
+                      )
+                    """,
+                    (NOT_INTERESTED_OUTCOME, candidate_id, owner),
+                )
+                not_interested_removed = True
+            # Connected - Interested ends the cadence: the call completes and
+            # nothing new is scheduled.
 
         conn.commit()
         cur.close()
@@ -1237,12 +1328,80 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         return_db_connection(conn)
         conn = None
         invalidate_calls_cache()
+        if not_interested_removed:
+            try:
+                from backend.api.routes.candidates import invalidate_candidate_count_caches
+                from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
+                invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
+                invalidate_role_detail_cache_for_candidate(candidate_id)
+            except Exception:
+                pass
         return {
             "success": True,
             "scheduled_next_title": scheduled_next_title,
             "auto_unreachable": auto_unreachable,
             "wrong_number_tagged": wrong_number_tagged,
+            "not_interested_removed": not_interested_removed,
         }
+    except HTTPException:
+        if conn: conn.rollback()
+        raise
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            return_db_connection(conn)
+
+
+class CadenceToggleRequest(BaseModel):
+    paused: bool
+
+
+@router.post("/candidates/{candidate_id}/cadence")
+async def set_candidate_cadence_paused(
+    candidate_id: int,
+    request: CadenceToggleRequest,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Manual Stop/Continue cadence toggle — gates the next-attempt insert in
+    update_call the same way the Wrong Number tag already does. Does not touch
+    any currently-pending call row; it only pauses future auto-scheduling."""
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE candidates
+            SET cadence_paused = %s, updated_at = NOW()
+            WHERE id = %s
+              AND EXISTS (
+                  SELECT 1 FROM calls c
+                  JOIN call_lists cl ON c.list_id = cl.id
+                  WHERE c.candidate_id = candidates.id
+                    AND LOWER(COALESCE(cl.created_by, '')) = %s
+              )
+            """,
+            (request.paused, candidate_id, owner),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Candidate not found in your call lists")
+        conn.commit()
+        cur.close()
+        cur = None
+        return_db_connection(conn)
+        conn = None
+        invalidate_calls_cache()
+        return {"success": True, "paused": request.paused}
     except HTTPException:
         if conn: conn.rollback()
         raise
@@ -1737,7 +1896,11 @@ async def sync_call_recording(
             logger.info(f"Recovered recording for UUID {call_uuid} via Plivo REST lookup")
 
     if record_url:
-        await plivo_service.process_call_insights(call_uuid, record_url)
+        # Pass the recruiter-timed duration (already on this row) so a long
+        # call routed through this manual-sync fallback also skips
+        # gpt-4o-transcribe's silent-truncation risk on longer audio, same as
+        # the webhook path does.
+        await plivo_service.process_call_insights(call_uuid, record_url, duration_seconds=call.get("duration"))
 
         conn = get_calls_db_connection()
         if conn:

@@ -1,11 +1,14 @@
 
 import os
+import re
+import json
 import hashlib
 import base64
 import time
 import asyncio
 import logging
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -14,6 +17,7 @@ from backend.db.connection import (
     get_db_connection_context,
 )
 from backend.services.call_artifacts import transcript_preview
+from backend.services.linkedin_normalize import normalize_linkedin
 from backend.pipeline.query import (
     process_query_main,
     load_all_profiles_from_db,
@@ -30,7 +34,7 @@ from backend.pipeline.query import (
     initialize_cache,
     count_active_candidates_from_db,
 )
-from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER
+from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER, POOL_SOURCE_RECRUITER_UPLOAD
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -153,7 +157,12 @@ async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_
                 },
             )
 
-    key = f"{current_user.id}:{current_user.role}"
+    # Admin analytics are org-wide and identical for every admin user (see
+    # get_analytics_summary), so share one cache entry across all admins
+    # instead of missing per-admin-id — recruiters still get their own entry
+    # since their view is scoped to their own pool.
+    role_l = (current_user.role or "").strip().lower()
+    key = role_l if role_l == "admin" else f"{role_l}:{current_user.id}"
     cached = _analytics_cache.get(key)
     if cached and time.monotonic() - cached[0] < _ANALYTICS_CACHE_TTL:
         return cached[1]
@@ -613,7 +622,8 @@ async def get_candidate_activity(
                         c.transcript,
                         c.notes,
                         c.plivo_virtual_number,
-                        cand.mobile_phone
+                        cand.mobile_phone,
+                        COALESCE(c.likely_voicemail, FALSE)
                     FROM calls c
                     JOIN call_lists cl ON c.list_id = cl.id
                     JOIN candidates cand ON c.candidate_id = cand.id
@@ -644,10 +654,128 @@ async def get_candidate_activity(
                 "recording_url": row[5],
                 "summary": summary,
                 "transcript_preview": transcript_preview(row[7]),
+                "notes": (row[8] or "").strip() or None,
                 "from_number": row[9],
                 "to_number": row[10],
                 "source_url": row[5],
+                "likely_voicemail": bool(row[11]),
             }
         )
 
     return {"items": items}
+
+
+_LINKEDIN_HOST_RE = re.compile(r"linkedin\.com$", re.I)
+
+
+@router.post("/candidates")
+async def create_candidate(
+    payload: schemas.CandidateCreate,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Add a single candidate directly (the alternative to CSV upload).
+
+    Admins have no personal candidate pool of their own — same as the
+    "Role owner's pool" search scope elsewhere on this page, an admin acting
+    here is acting on behalf of the role's owning recruiter, so the new
+    candidate is owned by that recruiter (recruitment_roles.user_id), not the
+    admin account. This requires a role_id; an admin with no role context has
+    nowhere to attach the candidate to.
+    """
+    first_name = payload.first_name.strip()
+    last_name = payload.last_name.strip()
+    city = payload.city.strip()
+    title = payload.title.strip()
+    linkedin_raw = payload.linkedin.strip()
+    if not first_name or not last_name or not city or not title or not linkedin_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="First name, last name, LinkedIn URL, city, and title are required",
+        )
+
+    # Hard-validate the LinkedIn URL — stricter than CSV import, which only
+    # soft-flags mismatches for review. A manually typed field is more
+    # error-prone than a mapped CSV column.
+    probe_url = linkedin_raw if linkedin_raw.startswith("http") else f"https://{linkedin_raw.lstrip('/')}"
+    try:
+        parsed = urlparse(probe_url)
+    except Exception:
+        parsed = None
+    host = (parsed.netloc or "").lower() if parsed else ""
+    if host.startswith("www."):
+        host = host[4:]
+    if not parsed or not _LINKEDIN_HOST_RE.search(host):
+        raise HTTPException(status_code=400, detail="Enter a valid linkedin.com profile URL")
+
+    normalized_li = normalize_linkedin(linkedin_raw)
+    name = f"{first_name} {last_name}".strip()
+    raw_fields = json.dumps({"import_company": payload.company_name}) if payload.company_name else "{}"
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    if is_admin and not payload.role_id:
+        raise HTTPException(status_code=400, detail="Admins can only add a candidate from within a role")
+
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                owner_id = current_user.id
+                if is_admin:
+                    cur.execute("SELECT user_id FROM recruitment_roles WHERE id = %s", (payload.role_id,))
+                    role_row = cur.fetchone()
+                    if not role_row:
+                        raise HTTPException(status_code=404, detail="Role not found")
+                    owner_id = role_row[0]
+
+                cur.execute(
+                    "SELECT id FROM candidates WHERE normalized_linkedin = %s AND owner_user_id = %s",
+                    (normalized_li, owner_id),
+                )
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="A candidate with this LinkedIn URL already exists")
+
+                cur.execute(
+                    """
+                    INSERT INTO candidates (
+                        name, first_name, last_name, linkedin, normalized_linkedin, city, headline,
+                        location, email, mobile_phone, notes, about, raw_fields,
+                        owner_user_id, pool_source, created_by, status
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, COALESCE(%s::jsonb, '{}'::jsonb),
+                        %s, %s, %s, 'To be started'
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        name, first_name, last_name, linkedin_raw, normalized_li, city, title,
+                        payload.location or city, payload.email, payload.phone, payload.notes, payload.about, raw_fields,
+                        owner_id, POOL_SOURCE_RECRUITER_UPLOAD, current_user.email or str(owner_id),
+                    ),
+                )
+                candidate_id = cur.fetchone()[0]
+
+                if payload.role_id:
+                    cur.execute(
+                        """
+                        INSERT INTO recruitment_role_candidates (role_id, candidate_id, priority, feedback)
+                        VALUES (%s, %s, '--', '')
+                        ON CONFLICT (role_id, candidate_id) DO NOTHING
+                        """,
+                        (payload.role_id, candidate_id),
+                    )
+                conn.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create candidate: {exc}")
+
+    invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
+    if payload.role_id:
+        try:
+            from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
+            invalidate_role_detail_cache_for_candidate(candidate_id)
+        except Exception:
+            pass
+
+    return {"success": True, "candidate_id": candidate_id}

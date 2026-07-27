@@ -131,11 +131,14 @@ async def lifespan(app: FastAPI):
     await warm_calls_backend()
 
     # Optionally warm the full profile/candidate cache (heavier, off by default).
+    # Awaited directly (~20-30s, mostly cross-region pool init) so it is ready
+    # before the first request — previously fired via create_task() and left
+    # unawaited, so the server accepted traffic immediately and the first
+    # analytics/browse/dashboard request after every restart blocked on the
+    # cold cache instead.
     if _env_flag("ENABLE_STARTUP_CACHE_WARMUP", "false"):
-        try:
-            asyncio.create_task(warm_profiles_backend())
-        except Exception as e:
-            print(f"CRITICAL: Profile cache warmup scheduling failed: {e}")
+        print("Warming profiles cache...")
+        await warm_profiles_backend()
     else:
         print("Profile cache warmup skipped; will load lazily on first search.")
 

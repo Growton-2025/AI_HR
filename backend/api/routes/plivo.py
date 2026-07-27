@@ -69,9 +69,26 @@ async def plivo_dial(request: Request):
     ngrok_url = plivo_service.get_ngrok_url()
     action_url = f"{ngrok_url}/api/plivo/recording" if ngrok_url else ""
     
+    # `action` only ever gets Plivo's interim callback for a startOnDialAnswer
+    # recording (RecordingDuration=-1, fired the instant recording *starts*).
+    # The real, final callback — with the actual duration and a fully-written
+    # file — only ever arrives at `callbackUrl`, which was previously unset.
+    # Without it, process_call_insights had no authoritative "recording is
+    # done" signal and fell back to a flat 30s guess-delay before downloading,
+    # which truncated the audio/transcript for any call longer than that.
+    # Both point at the same endpoint on purpose: plivo_recording() already
+    # branches correctly on payload content (_recording_callback_is_final),
+    # so no new route is needed — Plivo will now actually invoke it twice
+    # (interim, then final) instead of once.
+    #
+    # `timeout` (silence-detection cutoff) also previously defaulted to
+    # Plivo's built-in 15s — any natural pause in conversation ≥15s
+    # permanently stopped the recording for the rest of the call (redirect is
+    # false, so it never re-arms). Set generously high so normal pauses in a
+    # screening call never trigger it.
     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Record action="{action_url}" startOnDialAnswer="true" redirect="false" fileFormat="mp3" maxLength="14400" />
+        <Record action="{action_url}" callbackUrl="{action_url}" callbackMethod="POST" startOnDialAnswer="true" redirect="false" fileFormat="mp3" maxLength="14400" timeout="300" />
         <Dial callerId="{plivo_service.PLIVO_NUMBER}">
             <Number>{to_number}</Number>
         </Dial>
@@ -103,18 +120,24 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
                 duration_seconds,
             )
         else:
+            # This is the interim callback (fired the instant a
+            # startOnDialAnswer recording *starts*, with -1 durations) — the
+            # file at recording_url is only a partial recording of a call
+            # still in progress. We now have `callbackUrl` configured to
+            # deliver the genuine final callback once Plivo confirms the file
+            # is complete, so there's no need to guess a delay and download
+            # early: doing so used to race the final callback and win (since
+            # process_call_insights skips reprocessing once call_insights has
+            # a result), permanently locking in the truncated recording and
+            # transcript for any call that outlasted the guess. Just record
+            # that we've seen this call_uuid and wait for the real signal —
+            # the manual "Sync Recording" button covers the rare case where
+            # the final callback never arrives (e.g. webhook delivery failure).
             logger.info(
-                "Recording callback for %s is not final yet; delaying processing until Plivo media is likely ready.",
+                "Recording callback for %s is not final yet; waiting for the final callbackUrl notification instead of guessing.",
                 call_uuid,
             )
-            background_tasks.add_task(
-                plivo_service.process_call_insights,
-                call_uuid,
-                recording_url,
-                30,
-                duration_seconds,
-            )
-        
+
     return Response(status_code=200)
 
 @router.post("/test-answer")

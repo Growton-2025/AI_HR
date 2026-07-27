@@ -12,9 +12,10 @@ import {
   Phone, Calendar, CheckCircle2, List, PhoneCall, 
   Search, RefreshCw, MoreHorizontal, User, 
   Trash2, X, ChevronLeft, Send, MessageSquare, 
-  CheckSquare, ExternalLink, Clock, PhoneForwarded, Mail,
+  ExternalLink, Clock, PhoneForwarded, Mail,
   ClipboardList, Layers, PhoneIncoming, Loader2, Linkedin,
-  Smile, Meh, Frown
+  Smile, Meh, Frown, PhoneOff, PhoneMissed, Voicemail, UserX, CalendarClock,
+  PauseCircle, PlayCircle
 } from 'lucide-react';
 import axios from 'axios';
 import { API_BASE, BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
@@ -228,6 +229,8 @@ const TABS = [
 const OUTCOMES = [
   'Not Connected',
   'Not Connected - Not Reachable',
+  'Left Voicemail',
+  'No Answer',
   'Connected - Interested',
   'Connected - Not Interested',
   'Connected - Follow-up',
@@ -236,7 +239,8 @@ const OUTCOMES = [
 
 // Outcomes that mean "did not connect": the backend schedules the next attempt
 // in the Day 1 → 2 → 4 → 7 → 10 cadence (5 attempts, then auto-Unreachable).
-const FAILED_OUTCOMES = new Set(['Not Connected', 'Not Connected - Not Reachable']);
+// Must match FAILED_CALL_OUTCOMES in backend/api/routes/calls.py.
+const FAILED_OUTCOMES = new Set(['Not Connected', 'Not Connected - Not Reachable', 'Left Voicemail', 'No Answer']);
 const FOLLOWUP_OUTCOME = 'Connected - Follow-up';
 
 const formatCallTimer = (totalSeconds) => {
@@ -331,10 +335,12 @@ const needsPostCallArtifacts = (callData) => {
 
 // AI-derived sentiment of the Lead's side of the conversation (Klenty calls this
 // "Sentiments" in Call IQ) — distinct from `outcome`, which the recruiter sets by hand.
+// Icon carries the sentiment signal; the pill itself stays neutral so the
+// list reads as one professional surface rather than a row of colored chips.
 const SENTIMENT_META = {
-  Positive: { icon: Smile, color: '#059669', bg: '#ecfdf5', border: '#a7f3d0' },
-  Neutral: { icon: Meh, color: '#64748b', bg: '#f8fafc', border: '#e2e8f0' },
-  Negative: { icon: Frown, color: '#dc2626', bg: '#fef2f2', border: '#fecaca' },
+  Positive: { icon: Smile, iconColor: '#059669' },
+  Neutral: { icon: Meh, iconColor: '#94a3b8' },
+  Negative: { icon: Frown, iconColor: '#dc2626' },
 };
 
 const SentimentBadge = ({ sentiment, reason, size = 12 }) => {
@@ -346,20 +352,23 @@ const SentimentBadge = ({ sentiment, reason, size = 12 }) => {
       title={reason || sentiment}
       style={{
         display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '2px 8px',
-        borderRadius: '999px', background: meta.bg, color: meta.color, fontWeight: 700,
-        fontSize: size, border: `1px solid ${meta.border}`, width: 'fit-content',
+        borderRadius: '999px', background: '#f8fafc', color: '#334155', fontWeight: 600,
+        fontSize: size, border: '1px solid #e2e8f0', width: 'fit-content',
         // Dotted underline on the label signals "hover for why" in tight spaces
         // (table cells) where the full reason can't be shown inline.
         textDecoration: reason ? 'underline dotted' : 'none', textUnderlineOffset: '2px',
       }}
     >
-      <Icon size={size} /> {sentiment}
+      <Icon size={size} color={meta.iconColor} /> {sentiment}
     </span>
   );
 };
 
 const PENDING_ANALYSIS_WINDOW_MS = 30 * 60 * 1000;
 const BACKGROUND_ANALYSIS_POLL_MS = 9000;
+// Matches the backend's calls-cache TTL (~15s) so the stat cards / list
+// overview don't sit stale for longer than the backend itself would.
+const STATS_POLL_MS = 15000;
 
 const isPendingAnalysis = (callData) => (
   callData?.status === 'completed'
@@ -741,6 +750,59 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
   );
 }
 
+// Per-outcome pill color + icon for the Activity History timeline. Hayasa's
+// own orange accent family for "needs another look" states — never Klenty's
+// blue — plus green/gray/red for the terminal Interested / Not Interested /
+// Wrong Number outcomes, matching the semantics already used by StatusDropdown.
+// One neutral pill style for every outcome — the icon tone is the only signal
+// (Hayasa accent = needs another look, slate = settled/terminal), so the list
+// reads as one professional surface instead of a wall of colored chips.
+const ACTIVITY_OUTCOME_META = {
+  'Left Voicemail': { tone: 'accent', icon: Voicemail },
+  'No Answer': { tone: 'accent', icon: PhoneMissed },
+  'Not Connected': { tone: 'accent', icon: PhoneOff },
+  'Not Connected - Not Reachable': { tone: 'accent', icon: PhoneOff },
+  'Connected - Interested': { tone: 'neutral', icon: PhoneCall },
+  'Connected - Not Interested': { tone: 'neutral', icon: UserX },
+  'Connected - Follow-up': { tone: 'accent', icon: CalendarClock },
+  'Wrong Number': { tone: 'accent', icon: PhoneOff },
+  'Unreachable': { tone: 'neutral', icon: PhoneOff },
+};
+const DEFAULT_ACTIVITY_OUTCOME_META = { tone: 'neutral', icon: PhoneIncoming };
+const OUTCOME_PILL_BASE = { bg: '#f8fafc', border: '#e2e8f0', textColor: '#334155' };
+const OUTCOME_PILL_ICON_COLOR = { accent: 'var(--accent-primary)', neutral: '#64748b' };
+
+const OutcomeBadge = ({ outcome, fallbackLabel = 'No Outcome', size = 11 }) => {
+  const meta = ACTIVITY_OUTCOME_META[outcome] || DEFAULT_ACTIVITY_OUTCOME_META;
+  const Icon = meta.icon;
+  const iconColor = OUTCOME_PILL_ICON_COLOR[meta.tone];
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: '5px',
+      padding: '2px 10px', borderRadius: '999px',
+      background: OUTCOME_PILL_BASE.bg, color: OUTCOME_PILL_BASE.textColor,
+      border: `1px solid ${OUTCOME_PILL_BASE.border}`,
+      fontSize: size, fontWeight: 700, whiteSpace: 'nowrap',
+    }}>
+      <Icon size={size} color={iconColor} />
+      {outcome || fallbackLabel}
+    </span>
+  );
+};
+
+const PossibleVoicemailBadge = ({ size = 11 }) => (
+  <span
+    title="Auto-flagged from the call transcript — not a live detection, just a suggestion to double-check the logged outcome."
+    style={{
+      padding: '2px 10px', borderRadius: '999px',
+      background: '#fff', color: '#64748b', border: '1px dashed #cbd5e1',
+      fontSize: size, fontWeight: 600, whiteSpace: 'nowrap',
+    }}
+  >
+    Possible Voicemail
+  </span>
+);
+
 function CandidateActivityPanel({ candidateId, candidateName }) {
   const fetchCandidateActivity = useAppStore(state => state.fetchCandidateActivity);
   const [items, setItems] = useState([]);
@@ -843,17 +905,23 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
             </div>
           </div>
         ) : (
-          items.map(item => (
+          items.map(item => {
+            const outcomeMeta = ACTIVITY_OUTCOME_META[item.outcome] || DEFAULT_ACTIVITY_OUTCOME_META;
+            const OutcomeIcon = outcomeMeta.icon;
+            const outcomeIconColor = OUTCOME_PILL_ICON_COLOR[outcomeMeta.tone];
+            return (
             <div key={item.id} style={{ position: 'relative', padding: '18px', borderRadius: '20px', background: '#fff', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', marginBottom: '14px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <div style={{ width: '36px', height: '36px', borderRadius: '12px', background: '#f8fafc', color: '#475569', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <PhoneIncoming size={18} />
+                  <div style={{ width: '36px', height: '36px', borderRadius: '12px', background: OUTCOME_PILL_BASE.bg, color: outcomeIconColor, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <OutcomeIcon size={18} />
                   </div>
                   <div>
                     <div style={{ fontSize: '15px', fontWeight: 800, color: '#0f172a' }}>Completed Call With {candidateName || 'Candidate'}</div>
-                    <div style={{ fontSize: '12px', color: '#64748b' }}>
-                      {item.status || 'completed'}{item.outcome ? ` • ${item.outcome}` : ''}
+                    <div style={{ marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <span style={{ fontSize: '12px', color: '#64748b' }}>{item.status || 'completed'}</span>
+                      {item.outcome && <OutcomeBadge outcome={item.outcome} />}
+                      {item.likely_voicemail && item.outcome !== 'Left Voicemail' && <PossibleVoicemailBadge />}
                     </div>
                   </div>
                 </div>
@@ -874,6 +942,13 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
                 <div><strong>Duration:</strong> {item.duration_seconds ? `${Math.floor(item.duration_seconds / 60)}m ${item.duration_seconds % 60}s` : '0s'}</div>
               </div>
 
+              {item.notes && (
+                <div style={{ marginBottom: '10px', padding: '12px 14px', borderRadius: '12px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <div style={{ fontSize: '11px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '4px' }}>Recruiter Notes</div>
+                  <div style={{ fontSize: '13px', color: '#334155', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>{item.notes}</div>
+                </div>
+              )}
+
               {item.summary && (
                 <div style={{ marginBottom: '10px', fontSize: '14px', color: '#334155', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
                   {item.summary}
@@ -892,7 +967,7 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
                     href={item.source_url}
                     target="_blank"
                     rel="noreferrer"
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 700, color: '#2563eb', textDecoration: 'none' }}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 700, color: 'var(--accent-primary)', textDecoration: 'none' }}
                   >
                     <ExternalLink size={14} />
                     Open Source
@@ -900,7 +975,8 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
                 </div>
               )}
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>
@@ -926,6 +1002,8 @@ export default function Calls() {
     createCallList,
     clearCallsState,
     syncCallRecording,
+    updateCandidateStatus,
+    setCandidateCadencePaused,
     sidebarWidth,
   } = useAppStore(useShallow((state) => ({
     calls: state.calls,
@@ -945,6 +1023,8 @@ export default function Calls() {
     createCallList: state.createCallList,
     clearCallsState: state.clearCallsState,
     syncCallRecording: state.syncCallRecording,
+    updateCandidateStatus: state.updateCandidateStatus,
+    setCandidateCadencePaused: state.setCandidateCadencePaused,
     sidebarWidth: state.sidebarWidth,
   })));
 
@@ -961,6 +1041,10 @@ export default function Calls() {
   const [loading, setLoading] = useState(false);
   const [isRevalidating, setIsRevalidating] = useState(false);
   const [selectedList, setSelectedList] = useState(null);
+  // Inside a single call list, recruiters need to see both what's still
+  // pending AND what's already completed (with its outcome/insights) —
+  // not just the pending queue.
+  const [listCallStatus, setListCallStatus] = useState('pending');
   const [searchQuery, setSearchQuery] = useState('');
   // Slicer (date range / outcome) state, restored from the URL like activeTab.
   const [rangeFilter, setRangeFilter] = useState(() => {
@@ -995,6 +1079,7 @@ export default function Calls() {
   const [syncingCallId, setSyncingCallId] = useState(null);
   const [deletingCallIds, setDeletingCallIds] = useState(() => new Set());
   const [deletingListIds, setDeletingListIds] = useState(() => new Set());
+  const [togglingCadenceIds, setTogglingCadenceIds] = useState(() => new Set());
   
   // List Creation State
   const [isCreatingList, setIsCreatingList] = useState(false);
@@ -1099,7 +1184,7 @@ export default function Calls() {
         
         if (selectedList) {
           params.list_id = selectedList.id;
-          params.status = 'pending'; // Default to pending in list view
+          params.status = listCallStatus;
         } else if (activeTab === 'today' || activeTab === 'upcoming') {
           params.status = 'pending';
         }
@@ -1128,7 +1213,7 @@ export default function Calls() {
       setLoading(false);
       setIsRevalidating(false);
     }
-  }, [activeTab, selectedList, slicerParams, dateSlicerParams, fetchCalls, fetchCallLists, fetchCallStats]);
+  }, [activeTab, selectedList, listCallStatus, slicerParams, dateSlicerParams, fetchCalls, fetchCallLists, fetchCallStats]);
 
   useEffect(() => {
     fetchData();
@@ -1162,6 +1247,22 @@ export default function Calls() {
       clearInterval(interval);
     };
   }, [calls, syncCallRecording]);
+
+  // The stat cards / per-list "Pending" counts only refetch on mount or
+  // tab/list change otherwise — a call completed elsewhere (another tab,
+  // another recruiter) wouldn't show up here until the next navigation.
+  // Poll them lightly so the overview stays live while this page is open.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!isDocumentVisible()) return;
+      fetchCallStats({ force: true, params: slicerParams });
+      if (activeTab === 'lists' && !selectedList) {
+        fetchCallLists({ force: true });
+      }
+    }, STATS_POLL_MS);
+
+    return () => clearInterval(interval);
+  }, [activeTab, selectedList, slicerParams, fetchCallStats, fetchCallLists]);
 
   useEffect(() => {
     if (!selectedList || !callListsLastFetchedAt) return;
@@ -1201,6 +1302,25 @@ export default function Calls() {
       setDeletingCallIds(prev => {
         const next = new Set(prev);
         next.delete(callId);
+        return next;
+      });
+    }
+  };
+
+  const handleToggleCadence = async (candidateId, currentlyPaused) => {
+    if (togglingCadenceIds.has(candidateId)) return;
+    setTogglingCadenceIds(prev => new Set(prev).add(candidateId));
+    try {
+      const res = await setCandidateCadencePaused(candidateId, !currentlyPaused);
+      if (res.success) {
+        toast.success(currentlyPaused ? 'Cadence resumed' : 'Cadence stopped — no further attempts will be auto-scheduled');
+      } else {
+        toast.error(res.error || 'Failed to update cadence');
+      }
+    } finally {
+      setTogglingCadenceIds(prev => {
+        const next = new Set(prev);
+        next.delete(candidateId);
         return next;
       });
     }
@@ -1270,7 +1390,7 @@ export default function Calls() {
   // never mismatches its cache entry (param order / number-vs-string list_id).
   // Must mirror fetchData's params exactly — including the slicer params.
   const currentCallsQueryKey = selectedList
-    ? canonicalCallsQuery({ list_id: selectedList.id, status: 'pending', ...dateSlicerParams })
+    ? canonicalCallsQuery({ list_id: selectedList.id, status: listCallStatus, ...(listCallStatus === 'completed' ? slicerParams : dateSlicerParams) })
     : activeTab === 'today'
       ? canonicalCallsQuery({ due_filter: 'today', status: 'pending', ...dateSlicerParams })
       : activeTab === 'upcoming'
@@ -1530,6 +1650,7 @@ export default function Calls() {
                   onClick={() => {
                     if (isListDisabled) return;
                     clearCallsState();
+                    setListCallStatus('pending');
                     setSelectedList(list);
                   }}
                   style={{ 
@@ -1570,12 +1691,54 @@ export default function Calls() {
                     </button>
                   </div>
                   <h3 style={{ fontSize: '16px', fontWeight: 700, color: '#0f172a', marginBottom: '4px' }}>{list.name}</h3>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <User size={12} color="#94a3b8" />
-                    <span style={{ fontSize: '13px', color: '#64748b' }}>
-                      {isDeletingList ? 'Deleting...' : isPendingList ? 'Saving...' : `${list.candidate_count} Pending`}
-                    </span>
-                  </div>
+                  {isDeletingList || isPendingList ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <User size={12} color="#94a3b8" />
+                      <span style={{ fontSize: '13px', color: '#64748b' }}>
+                        {isDeletingList ? 'Deleting...' : 'Saving...'}
+                      </span>
+                    </div>
+                  ) : (() => {
+                    const pending = list.pending_count ?? list.candidate_count ?? 0;
+                    const completed = list.completed_count ?? 0;
+                    const total = list.total_count ?? (pending + completed);
+                    const completionPct = total > 0 ? Math.round((completed / total) * 100) : 0;
+                    const stats = [
+                      { label: 'Pending', value: pending, icon: Clock },
+                      { label: 'Completed', value: completed, icon: CheckCircle2 },
+                      { label: 'Total', value: total, icon: List },
+                    ];
+                    return (
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'stretch' }}>
+                          {stats.map((stat, idx) => (
+                            <div
+                              key={stat.label}
+                              style={{
+                                flex: 1, minWidth: 0, padding: '0 12px',
+                                borderLeft: idx > 0 ? '1px solid #f1f5f9' : 'none',
+                                marginLeft: idx > 0 ? '0' : '0',
+                              }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginBottom: '2px' }}>
+                                <stat.icon size={12} color="#94a3b8" />
+                                <span style={{ fontSize: '10px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.03em' }}>{stat.label}</span>
+                              </div>
+                              <div style={{ fontSize: '18px', fontWeight: 800, color: '#0f172a' }}>{stat.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ marginTop: '14px' }}>
+                          <div style={{ height: '5px', borderRadius: '999px', background: '#f1f5f9', overflow: 'hidden' }}>
+                            <div style={{ height: '100%', width: `${completionPct}%`, background: 'var(--accent-primary, #f97316)', borderRadius: '999px', transition: 'width 0.3s ease' }} />
+                          </div>
+                          <div style={{ marginTop: '6px', fontSize: '11px', color: '#94a3b8', fontWeight: 600 }}>
+                            {completionPct}% complete
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
                 );
               })}
@@ -1603,7 +1766,26 @@ export default function Calls() {
                   {(filteredCalls || []).length} Contacts
                 </span>
               )}
-              
+              {selectedList && (
+                <div style={{ display: 'flex', gap: '4px', padding: '3px', background: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0' }}>
+                  {['pending', 'completed'].map(statusOption => (
+                    <button
+                      key={statusOption}
+                      onClick={() => { clearCallsState(); setListCallStatus(statusOption); }}
+                      style={{
+                        padding: '5px 12px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                        fontSize: '12px', fontWeight: 700, textTransform: 'capitalize',
+                        background: listCallStatus === statusOption ? '#fff' : 'transparent',
+                        color: listCallStatus === statusOption ? '#0f172a' : '#64748b',
+                        boxShadow: listCallStatus === statusOption ? '0 1px 2px rgba(15,23,42,0.08)' : 'none',
+                      }}
+                    >
+                      {statusOption}
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <div style={{ position: 'relative', marginLeft: 'auto', width: 'min(240px, 100%)', minWidth: '180px', flex: '1 1 220px' }}>
                 <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
                 <input 
@@ -1626,7 +1808,7 @@ export default function Calls() {
                     <th style={CALLS_TABLE_TH_STYLE}>Prospect</th>
                     <th style={CALLS_TABLE_TH_STYLE}>Purpose</th>
                     <th style={CALLS_TABLE_TH_STYLE}>Status</th>
-                    <th style={CALLS_TABLE_TH_STYLE}>{activeTab === 'completed' ? 'Completed' : 'Scheduled'}</th>
+                    <th style={CALLS_TABLE_TH_STYLE}>{(activeTab === 'completed' || (selectedList && listCallStatus === 'completed')) ? 'Completed' : 'Scheduled'}</th>
                     <th style={CALLS_TABLE_TH_STYLE}>Outcome</th>
                     <th style={{ ...CALLS_TABLE_TH_STYLE, textAlign: 'right' }}>Actions</th>
                   </tr>
@@ -1647,6 +1829,7 @@ export default function Calls() {
                   ))}
                   {!showCallsLoading && (filteredCalls || []).map(call => {
                     const isDeletingCall = deletingCallIds.has(call.id);
+                    const isTogglingCadence = togglingCadenceIds.has(call.candidate_id);
                     const isExpanded = expandedCallId === call.id;
                     const dialDisabled = call.status === 'completed' || isDeletingCall || Boolean(call.candidate_phone_wrong);
                     return (
@@ -1682,8 +1865,13 @@ export default function Calls() {
                                   )}
                                 </div>
                                 {call.candidate_phone_wrong && (
-                                  <span style={{ display: 'inline-block', marginTop: '4px', padding: '2px 8px', borderRadius: '999px', background: '#fef2f2', color: '#b91c1c', fontWeight: 700, fontSize: '10px', border: '1px solid #fecaca' }}>
+                                  <span style={{ display: 'inline-block', marginTop: '4px', padding: '2px 8px', borderRadius: '999px', background: '#f8fafc', color: '#334155', fontWeight: 700, fontSize: '10px', border: '1px solid #e2e8f0' }}>
                                     Wrong number — calling paused
+                                  </span>
+                                )}
+                                {call.cadence_paused && (
+                                  <span style={{ display: 'inline-block', marginTop: '4px', marginLeft: '6px', padding: '2px 8px', borderRadius: '999px', background: '#f1f5f9', color: '#475569', fontWeight: 700, fontSize: '10px', border: '1px solid #e2e8f0' }}>
+                                    Cadence stopped
                                   </span>
                                 )}
                               </div>
@@ -1697,6 +1885,7 @@ export default function Calls() {
                               status={statusOverrides[call.candidate_id] ?? call.candidate_status}
                               candidateId={call.candidate_id}
                               optimistic
+                              updateStatus={updateCandidateStatus}
                               onUpdate={(id, newStatus) => setStatusOverrides(prev => ({ ...prev, [id]: newStatus }))}
                             />
                           </td>
@@ -1711,16 +1900,15 @@ export default function Calls() {
                           </td>
                           <td style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', verticalAlign: 'top', fontSize: '12px', whiteSpace: 'nowrap' }}>
                             {call.status === 'completed' ? (
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
-                                <span style={{ color: call.outcome === 'Unreachable' ? '#b45309' : '#059669', fontWeight: 600, textTransform: 'capitalize' }}>
-                                  {call.outcome || 'No Outcome'}
-                                </span>
-                                <span style={{ color: '#2563eb', fontWeight: 600 }}>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: '5px', alignItems: 'flex-start' }}>
+                                <OutcomeBadge outcome={call.outcome} size={10} />
+                                {call.likely_voicemail && call.outcome !== 'Left Voicemail' && <PossibleVoicemailBadge size={10} />}
+                                <span style={{ color: '#64748b', fontWeight: 600 }}>
                                   {call.duration ? `${Math.floor(call.duration / 60)}m ${call.duration % 60}s` : '0s'}
                                 </span>
                                 <SentimentBadge sentiment={call.sentiment} reason={call.sentiment_reason} size={10} />
                                 {isPendingAnalysis(call) && (
-                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '2px 8px', borderRadius: '999px', background: '#f5f3ff', color: '#8b5cf6', fontWeight: 700, fontSize: '10px', border: '1px solid #ddd6fe', width: 'fit-content' }}>
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', padding: '2px 8px', borderRadius: '999px', background: '#f8fafc', color: '#64748b', fontWeight: 700, fontSize: '10px', border: '1px solid #e2e8f0', width: 'fit-content' }}>
                                     <RefreshCw size={9} className="animate-spin" /> Analyzing…
                                   </span>
                                 )}
@@ -1743,6 +1931,14 @@ export default function Calls() {
                                   {isExpanded ? 'Hide Details' : 'View Insights'}
                                 </button>
                               )}
+                              <button
+                                onClick={() => handleToggleCadence(call.candidate_id, call.cadence_paused)}
+                                disabled={isTogglingCadence}
+                                style={{ padding: '7px', background: 'none', border: 'none', color: call.cadence_paused ? 'var(--accent-primary)' : '#94a3b8', cursor: isTogglingCadence ? 'wait' : 'pointer', borderRadius: '8px', opacity: isTogglingCadence ? 0.6 : 1 }}
+                                title={call.cadence_paused ? 'Continue automated cadence' : 'Stop automated cadence — no further attempts will be scheduled'}
+                              >
+                                {isTogglingCadence ? <Loader2 size={17} className="animate-spin" /> : (call.cadence_paused ? <PlayCircle size={17} /> : <PauseCircle size={17} />)}
+                              </button>
                               <button
                                 onClick={() => handleDeleteCall(call.id)}
                                 disabled={isDeletingCall}
@@ -1833,6 +2029,15 @@ export default function Calls() {
                                   )}
                                 </div>
 
+                                {call.notes && (
+                                  <div style={{ background: '#f8fafc', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Recruiter Notes</h4>
+                                    <div style={{ fontSize: '13px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
+                                      {call.notes}
+                                    </div>
+                                  </div>
+                                )}
+
                                 <div className="calls-insights-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
                                   <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '12px' }}>
@@ -1920,12 +2125,13 @@ function CallingModal({ call, onClose, onRefresh }) {
   const [initiationActionLabel, setInitiationActionLabel] = useState('');
   const [initiationActionUrl, setInitiationActionUrl] = useState('');
   const [softphoneRecoveryAttempt, setSoftphoneRecoveryAttempt] = useState(0);
-  const { updateCall, initiateCall, fetchCalls, syncCallRecording, updateCandidateNotes } = useAppStore(useShallow((state) => ({
+  const { updateCall, initiateCall, fetchCalls, syncCallRecording, updateCandidateNotes, updateCandidateStatus } = useAppStore(useShallow((state) => ({
     updateCall: state.updateCall,
     initiateCall: state.initiateCall,
     fetchCalls: state.fetchCalls,
     syncCallRecording: state.syncCallRecording,
     updateCandidateNotes: state.updateCandidateNotes,
+    updateCandidateStatus: state.updateCandidateStatus,
   })));
   const {
     activeCall,
@@ -2378,7 +2584,10 @@ function CallingModal({ call, onClose, onRefresh }) {
         ? Math.max(0, Math.round((endedAtRef.current - connectedAtRef.current) / 1000))
         : 0;
       const payload = {
-        status: isFollowUpOutcome ? 'pending' : 'completed',
+        // Always 'completed' — a follow-up gets its own new call row (like every
+        // other retry), so this row's outcome/recording/transcript stays intact
+        // as history instead of being overwritten when the follow-up call happens.
+        status: 'completed',
         outcome,
         notes: liveNotes,
         duration: measuredDuration
@@ -2404,6 +2613,9 @@ function CallingModal({ call, onClose, onRefresh }) {
       const result = res.data || {};
       if (result.auto_unreachable) {
         toast.warning('5th failed attempt — candidate marked Unreachable and moved to cooldown');
+      } else if (result.not_interested_removed) {
+        setCandidateStatus('Not Interested');
+        toast.success('Marked Not Interested — removed from all active calling lists');
       } else if (result.wrong_number_tagged) {
         toast.warning('Number tagged as wrong. Calling is paused — source an alternate number to resume.');
       } else if (result.scheduled_next_title === 'Follow-up Call') {
@@ -2427,7 +2639,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     { id: 'linkedin', label: 'LinkedIn', icon: ExternalLink },
     { id: 'email', label: 'Email', icon: MessageSquare },
     { id: 'calls', label: 'Calls', icon: Phone },
-    { id: 'tasks', label: 'Tasks', icon: CheckSquare },
+    { id: 'activity', label: 'Activity History', icon: Clock },
   ];
   
   const callStatusMeta = callState === 'preparing_softphone'
@@ -2705,6 +2917,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                             status={candidateStatus}
                             candidateId={call.candidate_id}
                             optimistic
+                            updateStatus={updateCandidateStatus}
                             onUpdate={(id, newStatus) => setCandidateStatus(newStatus)}
                           />
                         </div>
@@ -2785,6 +2998,7 @@ function CallingModal({ call, onClose, onRefresh }) {
                         status={candidateStatus}
                         candidateId={call.candidate_id}
                         optimistic
+                        updateStatus={updateCandidateStatus}
                         onUpdate={(id, newStatus) => setCandidateStatus(newStatus)}
                       />
                     </div>
@@ -2945,7 +3159,7 @@ function CallingModal({ call, onClose, onRefresh }) {
               candidateName={call.candidate_name}
               platform={activeTab}
             />
-          ) : activeTab === 'tasks' ? (
+          ) : activeTab === 'activity' ? (
             <CandidateActivityPanel
               candidateId={call.candidate_id}
               candidateName={call.candidate_name}

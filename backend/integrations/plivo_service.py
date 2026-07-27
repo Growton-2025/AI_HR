@@ -9,6 +9,7 @@ import tempfile
 import asyncio
 import json
 import uuid
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,47 @@ def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: st
         logger.error(f"Failed to initiate Plivo call: {e}")
         return {"success": False, "error": str(e)}
 
+# Plivo's real AMD only works on calls placed via the REST API (calls.create with
+# machine_detection); this app's live flow bridges via XML <Dial> from a browser-SDK
+# answer_url, which Plivo does not support AMD on. This heuristic is a best-effort
+# suggestion from the post-call transcript, not a live detection signal — the
+# recruiter still confirms/overrides the outcome.
+VOICEMAIL_PHRASES = (
+    "leave a message", "leave your message", "leave a detailed message",
+    "after the tone", "after the beep", "record your message",
+    "voice mailbox", "voicemail box", "reached the voicemail",
+    "is not available", "cannot take your call", "unable to take your call",
+    "mailbox is full", "no one is available to take your call",
+)
+
+
+def detect_likely_voicemail(transcript_text: Optional[str], duration_seconds: Optional[int]) -> bool:
+    if transcript_text:
+        lowered = transcript_text.lower()
+        if any(phrase in lowered for phrase in VOICEMAIL_PHRASES):
+            return True
+        # A real conversation has "Lead:" turns; a voicemail greeting is one
+        # uninterrupted block from whichever speaker label got assigned to it.
+        has_two_sided_exchange = lowered.count("lead:") >= 1 and lowered.count("recruiter:") >= 1
+        if duration_seconds is not None and duration_seconds < 25 and not has_two_sided_exchange:
+            return True
+    elif duration_seconds is not None and duration_seconds < 8:
+        # No transcript at all plus a very short call is more consistent with an
+        # unanswered/voicemail pickup than a genuine conversation.
+        return True
+    return False
+
+
+# gpt-4o-transcribe has a hard 1500s (25 min) cap where it errors cleanly
+# (caught below, falls back to whisper-1) — but multiple OpenAI developer-
+# community reports document it silently truncating output well before that,
+# commonly around the 10-11 minute mark, WITHOUT raising an exception. A
+# silent truncation can't be caught by try/except, so for any call whose
+# duration we already know exceeds this safe margin, skip gpt-4o-transcribe
+# entirely and go straight to whisper-1 rather than gambling on it.
+GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS = 480  # 8 minutes
+
+
 async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0, duration_seconds: int = None):
     try:
         existing_insights = call_insights.get(call_uuid)
@@ -371,16 +413,19 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
             await asyncio.sleep(initial_delay_seconds)
 
         logger.info(f"Downloading recording for insights: {call_uuid}")
-        
+
         max_retries = 6
         response = None
         for attempt in range(max_retries):
-            response = await asyncio.to_thread(download_plivo_recording, record_url, 30)
+            # 90s (not 30s) — a longer call's recording is a bigger file, and a
+            # timeout too tight for the transfer used to look identical to "not
+            # ready yet" (both just retry), silently eating into the budget.
+            response = await asyncio.to_thread(download_plivo_recording, record_url, 90)
             if response.status_code == 200:
                 break
             logger.warning(f"Download failed with {response.status_code}. Retrying in 5s...")
             await asyncio.sleep(5)
-            
+
         if not response or response.status_code != 200:
             logger.error(f"Failed to download recording after retries.")
             return
@@ -388,30 +433,44 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
             temp_audio.write(response.content)
             temp_audio_path = temp_audio.name
-            
+
         logger.info("Transcribing audio...")
         client = get_openai_client()
-        try:
-            # gpt-4o-transcribe eliminates whisper-1's well-documented repetition/
-            # hallucination loops on quiet or long audio (e.g. transcripts that
-            # devolve into the same sentence repeated dozens of times, or drift
-            # into gibberish/other scripts). It caps at ~1400s of audio though,
-            # so fall back to whisper-1 for the rare call that runs longer.
-            with open(temp_audio_path, "rb") as audio_file:
-                transcript = await client.audio.transcriptions.create(
-                    model="gpt-4o-transcribe",
-                    file=audio_file,
-                    response_format="json",
-                    timeout=300.0
-                )
-        except Exception as e:
-            logger.warning(f"gpt-4o-transcribe failed for {call_uuid} ({e}); falling back to whisper-1")
+        skip_gpt4o = duration_seconds is not None and duration_seconds > GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS
+        if skip_gpt4o:
+            logger.info(
+                f"Call {call_uuid} is {duration_seconds}s (over the {GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS}s safe margin) — "
+                "using whisper-1 directly instead of risking gpt-4o-transcribe's silent truncation."
+            )
             with open(temp_audio_path, "rb") as audio_file:
                 transcript = await client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     timeout=300.0
                 )
+        else:
+            try:
+                # gpt-4o-transcribe eliminates whisper-1's well-documented repetition/
+                # hallucination loops on quiet or long audio (e.g. transcripts that
+                # devolve into the same sentence repeated dozens of times, or drift
+                # into gibberish/other scripts) — worth using when duration is
+                # unknown or safely short; see GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS
+                # above for why known-longer calls skip it entirely instead.
+                with open(temp_audio_path, "rb") as audio_file:
+                    transcript = await client.audio.transcriptions.create(
+                        model="gpt-4o-transcribe",
+                        file=audio_file,
+                        response_format="json",
+                        timeout=300.0
+                    )
+            except Exception as e:
+                logger.warning(f"gpt-4o-transcribe failed for {call_uuid} ({e}); falling back to whisper-1")
+                with open(temp_audio_path, "rb") as audio_file:
+                    transcript = await client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        timeout=300.0
+                    )
 
         raw_text = transcript.text
         os.remove(temp_audio_path)
@@ -426,6 +485,8 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         (not the recruiter's tone) — Positive (engaged/interested), Neutral
         (noncommittal/mixed), or Negative (uninterested/pushback/hostile) — with a
         one-sentence reason grounded in something they actually said.
+
+        Write in plain professional text — no emoji, no markdown formatting.
 
         Output JSON object:
         {{
@@ -475,7 +536,9 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                     t_str = t_items
                 else:
                     t_str = str(t_items) if t_items else raw_text
-                
+
+                likely_voicemail = detect_likely_voicemail(t_str, duration_seconds)
+
                 # Authoritative provider duration wins when present; COALESCE
                 # keeps any existing value (e.g. the client-side timer) when the
                 # webhook didn't carry a usable duration.
@@ -488,10 +551,11 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                         sentiment = %s,
                         sentiment_reason = %s,
                         duration = COALESCE(%s, duration),
+                        likely_voicemail = %s,
                         status = 'completed',
                         updated_at = NOW()
                     WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
-                """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, call_uuid, call_uuid))
+                """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail, call_uuid, call_uuid))
                 conn.commit()
 
                 if cur.rowcount == 0:
@@ -505,10 +569,11 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                             sentiment = %s,
                             sentiment_reason = %s,
                             duration = COALESCE(%s, duration),
+                            likely_voicemail = %s,
                             status = 'completed',
                             updated_at = NOW()
                         WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
-                    """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds))
+                    """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail))
                     conn.commit()
                 cur.close()
                 return_db_connection(conn)

@@ -13,6 +13,7 @@ import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterC
 import CandidateConversationModal from '../components/CandidateConversationModal'
 import EditableCandidateNotes from '../components/EditableCandidateNotes'
 import AddToListModal from '../components/AddToListModal'
+import AddCandidateModal from '../components/AddCandidateModal'
 import AiColumnConfigModal from '../components/AiColumnConfigModal'
 import AiColumnCellDrawer from '../components/AiColumnCellDrawer'
 import HayasaBrand from '../components/HayasaBrand'
@@ -245,6 +246,7 @@ function Roles() {
         setSearchParams({})
     }, [clearViewingRole, setSearchParams])
     const [addCandidateOpen, setAddCandidateOpen] = useState(false)
+    const [showCreateCandidateModal, setShowCreateCandidateModal] = useState(false)
     const [candidateSearch, setCandidateSearch] = useState('')
     const [candidateSearchResults, setCandidateSearchResults] = useState([])
     const [candidateSearchLoading, setCandidateSearchLoading] = useState(false)
@@ -1136,14 +1138,20 @@ function Roles() {
         setAllFilteredSelected(false)
     }, [])
 
+    // This is the header checkbox — "select the rows currently loaded/visible
+    // under the active filter", NOT "select every record matching the filter
+    // across the whole role". That escalation is a distinct, explicit action
+    // (the "Use All Filtered" button below), which is the only place
+    // allFilteredSelected should be set. Conflating the two here was why
+    // checking this box under a narrow filter (e.g. 4 matches) showed the
+    // unfiltered role total (e.g. 35) instead of the actual filtered count.
     const handleSelectAll = useCallback((e) => {
         if (e.target.checked) {
-            setAllFilteredSelected(true)
             setSelectedIds(new Set(filteredCandidates.map(c => c.id)))
         } else {
-            setAllFilteredSelected(false)
             setSelectedIds(new Set())
         }
+        setAllFilteredSelected(false)
     }, [filteredCandidates])
 
 
@@ -1500,9 +1508,23 @@ function Roles() {
                                     <strong>Add Candidate</strong>
                                     <span>{viewingRole.name}</span>
                                 </div>
-                                <button type="button" className="icon-btn" disabled={isAddingCandidates} onClick={() => setAddCandidateOpen(false)}>
-                                    <X size={18} />
-                                </button>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowCreateCandidateModal(true)}
+                                        style={{
+                                            display: 'flex', alignItems: 'center', gap: 6,
+                                            padding: '8px 14px', borderRadius: 10, border: 'none',
+                                            background: 'var(--accent-primary, #f97316)', color: '#fff',
+                                            fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap',
+                                        }}
+                                    >
+                                        <UserPlus size={15} /> New Candidate
+                                    </button>
+                                    <button type="button" className="icon-btn" disabled={isAddingCandidates} onClick={() => setAddCandidateOpen(false)}>
+                                        <X size={18} />
+                                    </button>
+                                </div>
                             </div>
                             <div className="role-add-search">
                                 <Search size={16} />
@@ -1554,7 +1576,9 @@ function Roles() {
                                     )
                                 })}
                                 {!candidateSearchLoading && candidateSearchResults.length === 0 && (
-                                    <div className="role-add-empty">No available candidates found.</div>
+                                    <div className="role-add-empty">
+                                        <span>No available candidates found.</span>
+                                    </div>
                                 )}
                             </div>
                             <div className="role-add-footer">
@@ -1569,6 +1593,19 @@ function Roles() {
                             </div>
                         </div>
                     </div>
+                )}
+
+                {showCreateCandidateModal && (
+                    <AddCandidateModal
+                        roleId={viewingRole.id}
+                        onClose={() => setShowCreateCandidateModal(false)}
+                        onSuccess={async () => {
+                            setShowCreateCandidateModal(false)
+                            setAddCandidateOpen(false)
+                            setCandidateSearch('')
+                            await fetchRoleDetails(viewingRole.name, { force: true })
+                        }}
+                    />
                 )}
 
                 {/* ── Compact toolbar bar ── */}
@@ -2310,7 +2347,7 @@ function Roles() {
 
                 {showAddToListModal && (
                     <AddToListModal
-                        selectedCount={allFilteredSelected ? roleFilteredTotal : selectedIds.size}
+                        selectedCount={allFilteredSelected ? (filteredCandidates.length) : selectedIds.size}
                         onClose={() => setShowAddToListModal(false)}
                         onSuccess={() => {
                             setSelectedIds(new Set());
@@ -2329,7 +2366,7 @@ function Roles() {
                         zIndex: 1000, border: '1px solid rgba(255,255,255,0.1)', animation: 'slideUp 0.3s ease-out'
                     }}>
                         <span style={{ fontSize: 14, fontWeight: 600 }}>
-                            {allFilteredSelected ? `${roleFilteredTotal} filtered candidates selected` : `${selectedIds.size} candidates selected`}
+                            {allFilteredSelected ? `${filteredCandidates.length} filtered candidates selected` : `${selectedIds.size} candidates selected`}
                         </span>
                         <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.2)' }} />
                         <button
@@ -2348,7 +2385,7 @@ function Roles() {
                                 display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s'
                             }}
                         >
-                            <Check size={14} /> {allFilteredSelected ? 'Using All Filtered' : `Use All Filtered (${roleFilteredTotal})`}
+                            <Check size={14} /> {allFilteredSelected ? 'Using All Filtered' : `Use All Filtered (${filteredCandidates.length})`}
                         </button>
                         {(selectedIds.size > 0 || allFilteredSelected) && (
                             <button

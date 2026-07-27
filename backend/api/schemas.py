@@ -62,6 +62,24 @@ class CandidateFeedback(BaseModel):
     priority: str
     feedback: str
 
+class CandidateCreate(BaseModel):
+    # Required set mirrors REQUIRED_IMPORT_TARGETS in backend/services/candidate_pool.py
+    # so single-add and CSV-import stay consistent. `title` is stored in the
+    # candidates.headline column — same slot the CSV import pipeline uses for
+    # its "title" target — so there's no separate headline field here.
+    first_name: str
+    last_name: str
+    linkedin: str
+    city: str
+    title: str
+    company_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    about: Optional[str] = None
+    role_id: Optional[int] = None
+
 class GoogleAuthRequest(BaseModel):
     token: str  # Google ID token from frontend
 

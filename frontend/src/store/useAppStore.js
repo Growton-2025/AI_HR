@@ -296,6 +296,37 @@ function patchCallAcrossCaches(callsCache = {}, updatedCall) {
     return { nextCache, found }
 }
 
+function updateCallsByCandidateId(collection = [], candidateId, patch) {
+    let found = false
+    const next = (collection || []).map(call => {
+        if (call?.candidate_id !== candidateId) {
+            return call
+        }
+        found = true
+        return { ...call, ...patch }
+    })
+
+    return { next, found }
+}
+
+function patchCallsByCandidateIdAcrossCaches(callsCache = {}, candidateId, patch) {
+    const nextCache = {}
+    let found = false
+
+    for (const [queryKey, entries] of Object.entries(callsCache || {})) {
+        if (!Array.isArray(entries)) {
+            nextCache[queryKey] = entries
+            continue
+        }
+
+        const result = updateCallsByCandidateId(entries, candidateId, patch)
+        nextCache[queryKey] = result.next
+        found = found || result.found
+    }
+
+    return { nextCache, found }
+}
+
 function removeCallAcrossCaches(callsCache = {}, callId) {
     const targetId = Number(callId)
     const nextCache = {}
@@ -631,6 +662,14 @@ export const useAppStore = create(persist((set, get) => ({
             // Rollback on error
             set({ recruiters: previousRecruiters });
             return { success: false, error: e.response?.data?.detail }
+        }
+    },
+    createCandidate: async (payload) => {
+        try {
+            const res = await axios.post(`${API_BASE}/candidates`, payload)
+            return { success: true, data: res.data }
+        } catch (e) {
+            return { success: false, error: getRequestErrorMessage(e, 'Failed to add candidate') }
         }
     },
     updateCandidateNotes: async (id, notes) => {
@@ -2774,6 +2813,56 @@ export const useAppStore = create(persist((set, get) => ({
         } catch (e) {
             console.error('Failed to update call:', e)
             return { success: false, error: getRequestErrorMessage(e, 'Failed to update call') }
+        }
+    },
+
+    // Candidate status is global (shared across every call list a candidate
+    // appears on), but each list caches its own `calls` rows with a denormalized
+    // candidate_status. StatusDropdown's default axios call bypasses this store
+    // entirely, so a status change made on one list wouldn't show up on another
+    // list's cached rows until that list's cache TTL expired. This patches every
+    // cached row for the candidate immediately, in every list, in one shot.
+    updateCandidateStatus: async (candidateId, newStatus) => {
+        try {
+            await axios.post(`${API_BASE}/candidates/${candidateId}/status`, { status: newStatus })
+
+            set(state => {
+                const currentCalls = updateCallsByCandidateId(state.calls, candidateId, { candidate_status: newStatus })
+                const cachePatch = patchCallsByCandidateIdAcrossCaches(state.callsCache, candidateId, { candidate_status: newStatus })
+
+                return {
+                    calls: currentCalls.found ? currentCalls.next : state.calls,
+                    callsCache: cachePatch.nextCache,
+                }
+            })
+
+            return { success: true }
+        } catch (error) {
+            console.error('Failed to update candidate status:', error)
+            return { success: false, error: getRequestErrorMessage(error, 'Failed to update status') }
+        }
+    },
+
+    // Manual Stop/Continue cadence toggle — patches every cached call row for
+    // this candidate (same cross-list concern as updateCandidateStatus above).
+    setCandidateCadencePaused: async (candidateId, paused) => {
+        try {
+            await axios.post(`${API_BASE}/calls/candidates/${candidateId}/cadence`, { paused })
+
+            set(state => {
+                const currentCalls = updateCallsByCandidateId(state.calls, candidateId, { cadence_paused: paused })
+                const cachePatch = patchCallsByCandidateIdAcrossCaches(state.callsCache, candidateId, { cadence_paused: paused })
+
+                return {
+                    calls: currentCalls.found ? currentCalls.next : state.calls,
+                    callsCache: cachePatch.nextCache,
+                }
+            })
+
+            return { success: true }
+        } catch (error) {
+            console.error('Failed to toggle candidate cadence:', error)
+            return { success: false, error: getRequestErrorMessage(error, 'Failed to update cadence') }
         }
     },
 

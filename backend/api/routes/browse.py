@@ -1640,6 +1640,61 @@ async def update_status(
 
     invalidate_candidate_count_caches(refresh_profile_ids=[candidate_id])
     invalidate_role_detail_cache_for_candidate(candidate_id)
+    # Calls rows carry candidate_status — refresh that cache too, so every
+    # list the candidate appears on reflects the new status immediately.
+    try:
+        from backend.api.routes.calls import invalidate_calls_cache
+        invalidate_calls_cache()
+    except Exception:
+        pass
+
+    # A set of statuses (Not Interested, High CTC, Shared with Customer, For
+    # Future, Shortlist - Rejected, Duplicate, Rejected) are settable directly
+    # from the generic status dropdown (Roles, Talent Pool, Calls list, and the
+    # call-log modal's own "Candidate Status" dropdown — all hit this same
+    # endpoint) — not only via the "Connected - Not Interested" call outcome.
+    # Any of them must stop the candidate from resurfacing in the calling
+    # loop: resolve any other still-pending call rows in this recruiter's
+    # lists as completed (same as update_call's outcome-branch does for the
+    # outcome-driven case), so they leave the active loop but stay visible as
+    # history in Completed instead of disappearing.
+    status_normalized = (update.status or "").strip().lower()
+    from backend.api.routes.calls import TERMINAL_CANDIDATE_STATUSES
+    if status_normalized in TERMINAL_CANDIDATE_STATUSES:
+        try:
+            from backend.api.routes.calls import (
+                get_call_list_owner, get_calls_db_connection, return_db_connection,
+                invalidate_calls_cache,
+            )
+
+            owner = get_call_list_owner(current_user)
+            # Synthetic, self-explanatory label — distinct from the real
+            # "Connected - Not Interested" call outcome, since this path isn't
+            # tied to an actual outcome the recruiter selected for a call.
+            closed_outcome = f"Closed - {(update.status or '').strip()}"
+            conn = get_calls_db_connection()
+            if conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE calls
+                    SET status = 'completed', outcome = %s, completed_at = NOW(), updated_at = NOW()
+                    WHERE candidate_id = %s
+                      AND status = 'pending'
+                      AND list_id IN (
+                          SELECT id FROM call_lists
+                          WHERE LOWER(COALESCE(created_by, '')) = %s
+                      )
+                    """,
+                    (closed_outcome, candidate_id, owner),
+                )
+                conn.commit()
+                cur.close()
+                return_db_connection(conn)
+                invalidate_calls_cache()
+        except Exception as exc:
+            logger.warning("Failed to clear pending calls for not-interested candidate_id=%s: %s", candidate_id, exc)
+
     logger.info(
         "candidate status updated candidate_id=%s status=%s duration_ms=%.1f",
         candidate_id,
