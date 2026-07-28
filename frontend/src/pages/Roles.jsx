@@ -1138,6 +1138,37 @@ function Roles() {
         setAllFilteredSelected(false)
     }, [])
 
+    // Selection is scoped to "currently visible under the active filter" (see
+    // handleSelectAll below) — so when the filter narrows, drop any selected
+    // ids that fell out of view instead of leaving them selected-but-hidden.
+    // Without this, "select all" (or manual picks) made before applying/
+    // changing a filter stayed in selectedIds after the filter narrowed the
+    // list, so e.g. checking 3 rows under a "Followup" filter still carried
+    // the other 112 previously-selected, now-hidden role candidates into
+    // "Add to Call List" (candidateIds={Array.from(selectedIds)} below) —
+    // the bottom bar's own count already reflected the stale total, the bug
+    // was that nothing signaled those ids were no longer what's on screen.
+    const prevVisibleIdsRef = useRef(new Set())
+    useEffect(() => {
+        const visibleIds = new Set(filteredCandidates.map(c => c.id))
+        const prevVisibleIds = prevVisibleIdsRef.current
+        const membershipChanged = visibleIds.size !== prevVisibleIds.size
+            || Array.from(visibleIds).some(id => !prevVisibleIds.has(id))
+        prevVisibleIdsRef.current = visibleIds
+        // Skip on a background refetch that reproduces the same visible ids
+        // under a new array reference — only prune when the filter actually
+        // changed which candidates are in view.
+        if (!membershipChanged) return
+
+        setSelectedIds(prev => {
+            if (prev.size === 0) return prev
+            const next = new Set(Array.from(prev).filter(id => visibleIds.has(id)))
+            return next.size === prev.size ? prev : next
+        })
+        setAllFilteredSelected(false)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [filteredCandidates])
+
     // This is the header checkbox — "select the rows currently loaded/visible
     // under the active filter", NOT "select every record matching the filter
     // across the whole role". That escalation is a distinct, explicit action
