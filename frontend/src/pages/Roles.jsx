@@ -27,21 +27,35 @@ const RESPONDED_TAB = '__responded__'
 const RESPONSE_TAB_LABEL = 'Responded'
 
 const NEW_BADGE_DAYS = 7
+const DISPLAY_TIME_ZONE = 'Asia/Kolkata'
+
+// The backend sends naive timestamps (no 'Z'/offset — Postgres columns here
+// are `timestamp without time zone`, and the DB session stores UTC wall-clock
+// values into them). Without a timezone suffix, `new Date(...)` parses the
+// string as browser-local time instead of UTC, so the raw UTC numbers were
+// displayed unchanged and mislabeled (e.g. a 07:38 UTC add showed as
+// "7:38 AM" instead of the correct 1:08 PM IST). Treat as UTC before use,
+// and always format in IST so the displayed time doesn't depend on whatever
+// timezone the viewer's machine happens to be set to.
+function parseUtcTimestamp(isoString) {
+    if (!isoString) return null
+    const hasTimezone = /Z$|[+-]\d{2}:?\d{2}$/.test(isoString)
+    const date = new Date(hasTimezone ? isoString : `${isoString}Z`)
+    return Number.isNaN(date.getTime()) ? null : date
+}
 
 function isRecentlyAdded(isoString) {
-    if (!isoString) return false
-    const added = new Date(isoString)
-    if (Number.isNaN(added.getTime())) return false
+    const added = parseUtcTimestamp(isoString)
+    if (!added) return false
     return (Date.now() - added.getTime()) < NEW_BADGE_DAYS * 86400000
 }
 
 function addedTooltip(isoString) {
-    if (!isoString) return ''
-    const added = new Date(isoString)
-    if (Number.isNaN(added.getTime())) return ''
-    const day = added.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
-    const time = added.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    return `Added on ${day} at ${time}`
+    const added = parseUtcTimestamp(isoString)
+    if (!added) return ''
+    const day = added.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: DISPLAY_TIME_ZONE })
+    const time = added.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: DISPLAY_TIME_ZONE })
+    return `Added on ${day} at ${time} IST`
 }
 
 function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
