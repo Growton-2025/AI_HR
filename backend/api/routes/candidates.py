@@ -90,6 +90,12 @@ def _reload_profile_cache_if_drifted() -> None:
 def schedule_profile_cache_drift_check() -> None:
     """Fire-and-forget drift check, rate-limited to once per _PROFILE_DRIFT_CHECK_TTL."""
     global _profile_drift_checked_at, _profile_drift_reload_running
+    # Nothing to compare against an unpopulated cache — a cold cache is already
+    # handled by the explicit warm/init path, and rebuilding from here would only
+    # race it. (This also keeps the background thread from perturbing global
+    # cache state in tests that deliberately start from an empty cache.)
+    if not PROFILES_BY_ID:
+        return
     now = time.monotonic()
     with _profile_drift_lock:
         if _profile_drift_reload_running:

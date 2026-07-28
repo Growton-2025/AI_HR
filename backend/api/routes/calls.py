@@ -979,10 +979,20 @@ def add_candidates_to_list(
                   AND candidate_id = ANY(%s::int[])
                   AND status = 'pending'
             ),
+            callable_ids AS (
+                SELECT c_id
+                FROM UNNEST(%s::int[]) AS c_id
+                WHERE EXISTS (
+                    SELECT 1 FROM candidates cand
+                    WHERE cand.id = c_id
+                      AND COALESCE(NULLIF(TRIM(cand.mobile_phone), ''),
+                                   NULLIF(TRIM(cand.phone), '')) IS NOT NULL
+                )
+            ),
             inserted AS (
                 INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
                 SELECT DISTINCT c_id, %s, 'pending', CURRENT_DATE, %s
-                FROM UNNEST(%s::int[]) AS c_id
+                FROM callable_ids
                 WHERE EXISTS (SELECT 1 FROM target_list)
                   AND (SELECT dup_count FROM duplicates) = 0
                   AND NOT EXISTS (
@@ -995,15 +1005,25 @@ def add_candidates_to_list(
             SELECT
                 (SELECT COUNT(*) FROM target_list) AS list_found,
                 (SELECT dup_count FROM duplicates) AS duplicate_count,
-                (SELECT COUNT(*) FROM inserted) AS inserted_count
+                (SELECT COUNT(*) FROM inserted) AS inserted_count,
+                (SELECT COUNT(DISTINCT c_id) FROM UNNEST(%s::int[]) AS c_id) AS requested_count,
+                (SELECT COUNT(DISTINCT c_id) FROM callable_ids) AS callable_count
             """,
             (
                 request.list_id, owner,
                 request.list_id, request.candidate_ids,
-                request.list_id, FIRST_ATTEMPT_TITLE, request.candidate_ids, request.list_id,
+                request.candidate_ids,
+                request.list_id, FIRST_ATTEMPT_TITLE, request.list_id,
+                request.candidate_ids,
             ),
         )
-        list_found, duplicate_count, inserted_count = cur.fetchone()
+        (
+            list_found,
+            duplicate_count,
+            inserted_count,
+            requested_count,
+            callable_count,
+        ) = cur.fetchone()
 
         if not list_found:
             raise HTTPException(status_code=404, detail="Call list not found")
@@ -1019,13 +1039,32 @@ def add_candidates_to_list(
                 detail = f"{duplicate_count} of {requested_count} selected candidates are already in this call list"
             raise HTTPException(status_code=400, detail=detail)
 
+        # Candidates with no phone number are silently unusable in a call list —
+        # they render as "N/A" rows the recruiter can never dial. Skip them at
+        # insert time and report how many, so the count is explainable rather
+        # than the list quietly coming up short.
+        skipped_no_phone = max(0, (requested_count or 0) - (callable_count or 0))
+        if not inserted_count and skipped_no_phone:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No phone number available for the selected candidate"
+                    if skipped_no_phone == 1
+                    else f"None of the {skipped_no_phone} selected candidates have a phone number"
+                ),
+            )
+
         conn.commit()
         cur.close()
         cur = None
         return_db_connection(conn)
         conn = None
         invalidate_calls_cache()
-        return {"success": True, "added_count": inserted_count}
+        return {
+            "success": True,
+            "added_count": inserted_count,
+            "skipped_no_phone": skipped_no_phone,
+        }
     except HTTPException:
         if conn: conn.rollback()
         raise
@@ -1256,12 +1295,21 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                     if step:
                         # A wrong-number tag or a manual "Stop cadence" both pause
                         # scheduling until cleared (phone update, or "Continue").
+                        # A missing number stops it too: the next attempt would
+                        # just be another undiallable "N/A" row in Due Today.
                         cur.execute(
-                            "SELECT COALESCE(mobile_phone_wrong, FALSE), COALESCE(cadence_paused, FALSE) FROM candidates WHERE id = %s",
+                            """
+                            SELECT COALESCE(mobile_phone_wrong, FALSE),
+                                   COALESCE(cadence_paused, FALSE),
+                                   COALESCE(NULLIF(TRIM(mobile_phone), ''),
+                                            NULLIF(TRIM(phone), '')) IS NULL AS no_phone
+                            FROM candidates WHERE id = %s
+                            """,
                             (candidate_id,),
                         )
                         phone_row = cur.fetchone()
-                        if not (phone_row and (phone_row[0] or phone_row[1])):
+                        blocked = bool(phone_row) and any(phone_row[:3])
+                        if not blocked:
                             delay_days, next_title = step
                             cur.execute(
                                 """

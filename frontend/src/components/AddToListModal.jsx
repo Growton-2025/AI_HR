@@ -37,9 +37,21 @@ export default function AddToListModal({ selectedCount, onClose, onSuccess, cand
         // Report the count the backend actually inserted — a concurrent add can
         // make it differ from the local selection size.
         const addedCount = Number(res.data?.added_count ?? selectedCount);
+        // Candidates with no phone number are refused server-side; say so
+        // explicitly rather than letting the list quietly come up short.
+        const skippedNoPhone = Number(res.data?.skipped_no_phone ?? 0);
         if (addedCount > 0) {
-          toast.success(
-            `Added ${addedCount} candidate${addedCount === 1 ? '' : 's'} to call list`
+          const added = `${addedCount} candidate${addedCount === 1 ? '' : 's'} added to call list`;
+          if (skippedNoPhone > 0) {
+            toast.success(added, {
+              description: `${skippedNoPhone} not added — no phone number available.`,
+            });
+          } else {
+            toast.success(added);
+          }
+        } else if (skippedNoPhone > 0) {
+          toast.warning(
+            `No candidates added — ${skippedNoPhone} had no phone number available.`
           );
         } else {
           toast.info('Selected candidates are already in this call list');
