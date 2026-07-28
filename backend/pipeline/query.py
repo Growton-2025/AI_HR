@@ -315,6 +315,24 @@ def count_active_candidates_from_db() -> Optional[int]:
         return_db_connection(conn)
 
 
+def count_all_candidates_from_db() -> Optional[int]:
+    """Total candidate rows, archived included — the comparable figure for
+    len(PROFILES_BY_ID), since the profile load has no is_archived filter."""
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM candidates")
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception as e:
+        logger.error("Failed to count all candidates: %s", e)
+        return None
+    finally:
+        return_db_connection(conn)
+
+
 def load_all_company_names_from_db():
     logger.info("Loading all unique company names from the database into cache...")
     conn = get_db_connection()
@@ -7250,6 +7268,100 @@ def profiles_to_excel(profiles_dict: Dict[str, Any]) -> bytes:
         df.to_excel(writer, index=False)
     return out.getvalue()
 
+# Groups duplicate rows for the same human: normalized LinkedIn, falling back to
+# the raw linkedin value, then to the row id (so contactless rows stay distinct).
+_ANALYTICS_DEDUPE_KEY = (
+    "COALESCE(NULLIF(c.normalized_linkedin, ''), NULLIF(c.linkedin, ''), 'id_' || c.id::text)"
+)
+_ANALYTICS_DISPLAY_STATUS = "COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')"
+
+
+def _fetch_analytics_counts_blocking(is_admin: bool, user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Pipeline counts read straight from Postgres instead of the PROFILES_BY_ID cache.
+
+    PROFILES_BY_ID is per-process. Under gunicorn (WEB_CONCURRENCY=4) only the
+    worker whose thread ran an upload refreshes it, so the other workers kept
+    serving pre-upload counts indefinitely — that is what made a 4681-candidate
+    pool report 4601 (and 136 shortlisted report 56) after an 80-row import.
+    Counting in SQL is correct regardless of which worker answers, and is also
+    faster than the previous full-cache Python scan.
+
+    Dedupe semantics mirror the loop this replaces: one row per person,
+    preferring a row with a real status over 'To be started', then an owned row
+    over an unowned master row. Verified against the old logic on live data
+    (same total_sourced / shortlisted / in-conversation numbers).
+    """
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            if is_admin:
+                scope_sql, scope_params = "", []
+            else:
+                # Recruiters see only their own pool, and it is not deduped —
+                # a recruiter holds at most one row per person by construction.
+                if user_id is None:
+                    return {"total_sourced": 0, "pipeline_health": {}, "recruiter_performance": []}
+                scope_sql, scope_params = " AND c.owner_user_id = %s", [user_id]
+
+            if is_admin:
+                scoped_sql = f"""
+                    SELECT DISTINCT ON ({_ANALYTICS_DEDUPE_KEY})
+                           c.id, c.owner_user_id, {_ANALYTICS_DISPLAY_STATUS} AS display_status
+                    FROM candidates c
+                    WHERE COALESCE(c.is_archived, FALSE) = FALSE
+                    ORDER BY {_ANALYTICS_DEDUPE_KEY},
+                             (CASE WHEN LOWER({_ANALYTICS_DISPLAY_STATUS}) <> 'to be started'
+                                   THEN 0 ELSE 1 END),
+                             (CASE WHEN c.owner_user_id IS NOT NULL THEN 0 ELSE 1 END),
+                             c.id
+                """
+            else:
+                scoped_sql = f"""
+                    SELECT c.id, c.owner_user_id, {_ANALYTICS_DISPLAY_STATUS} AS display_status
+                    FROM candidates c
+                    WHERE COALESCE(c.is_archived, FALSE) = FALSE{scope_sql}
+                """
+
+            cur.execute(
+                f"""
+                WITH scoped AS ({scoped_sql})
+                SELECT
+                    (SELECT COUNT(*) FROM scoped),
+                    (SELECT COALESCE(json_agg(row_to_json(s)), '[]'::json)
+                       FROM (SELECT display_status AS status, COUNT(*)::int AS n
+                               FROM scoped GROUP BY display_status) s),
+                    (SELECT COALESCE(json_agg(row_to_json(r)), '[]'::json)
+                       FROM (SELECT COALESCE(u.name, 'Unknown') AS recruiter,
+                                    COUNT(*)::int AS sourced,
+                                    COUNT(*) FILTER (
+                                        WHERE LOWER(sc.display_status) = 'shortlisted')::int AS shortlisted,
+                                    COUNT(*) FILTER (
+                                        WHERE LOWER(sc.display_status)
+                                              IN ('followup / in conversation', 'in conversation'))::int
+                                        AS in_conversation
+                               FROM scoped sc
+                               LEFT JOIN users u ON u.id = sc.owner_user_id
+                              GROUP BY COALESCE(u.name, 'Unknown')) r)
+                """,
+                scope_params,
+            )
+            total, pipeline_rows, recruiter_rows = cur.fetchone()
+    except Exception as exc:
+        logger.error("Analytics SQL counts failed, falling back to profile cache: %s", exc)
+        return None
+    finally:
+        return_db_connection(conn)
+
+    recruiters = sorted(recruiter_rows or [], key=lambda r: r.get("sourced", 0), reverse=True)
+    return {
+        "total_sourced": int(total or 0),
+        "pipeline_health": {row["status"]: row["n"] for row in (pipeline_rows or [])},
+        "recruiter_performance": recruiters,
+    }
+
+
 async def get_analytics_summary(user_email: str = None, role: str = "recruiter", user_id: int = None) -> Dict[str, Any]:
     """
     Generate pipeline and recruiter performance statistics.
@@ -7275,6 +7387,12 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
             finally:
                 return_db_connection(conn)
 
+    # Headline counts come from SQL so they stay correct no matter which gunicorn
+    # worker answers; `stats_profiles` below is still derived from the in-memory
+    # cache, but only to compute the geo/industry/segment/functional distributions
+    # (approximate visuals that need the taxonomy-mapping logic further down).
+    sql_counts = await asyncio.to_thread(_fetch_analytics_counts_blocking, is_admin, user_id)
+
     if is_admin:
         # Deduplicate to count unique candidates by LinkedIn
         unique_candidates = {}
@@ -7283,7 +7401,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
             if not li:
                 # If no linkedin, use ID as fallback for uniqueness
                 li = f"id_{p.get('id')}"
-            
+
             existing = unique_candidates.get(li)
             if not existing:
                 unique_candidates[li] = p
@@ -7292,7 +7410,7 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
                 # (Non-'To be started' is better for the global dashboard)
                 st = (p.get("status") or "").strip().lower()
                 est = (existing.get("status") or "").strip().lower()
-                
+
                 # Heuristic: If existing is "To be started" or empty, and new one has a real status, swap it.
                 if st and st != "to be started" and (not est or est == "to be started"):
                     unique_candidates[li] = p
@@ -7310,55 +7428,23 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
             if user_id is not None and p.get("owner_user_id") == user_id
         ]
 
-    team_pipeline_stats = {}
-    for p in stats_profiles:
-        status = p.get("status") or "To be started"
-        team_pipeline_stats[status] = team_pipeline_stats.get(status, 0) + 1
+    # Prefer the SQL counts; fall back to the cache-derived tally only if the
+    # query failed, so a DB hiccup degrades to (possibly stale) numbers rather
+    # than blanking the dashboard.
+    if sql_counts is not None:
+        team_pipeline_stats = dict(sql_counts["pipeline_health"])
+        recruiter_performance = sql_counts["recruiter_performance"] if is_admin else []
+        total_sourced = sql_counts["total_sourced"]
+    else:
+        team_pipeline_stats = {}
+        for p in stats_profiles:
+            status = p.get("status") or "To be started"
+            team_pipeline_stats[status] = team_pipeline_stats.get(status, 0) + 1
+        recruiter_performance = []
+        total_sourced = len(stats_profiles)
 
     personal_pipeline_stats = dict(team_pipeline_stats) if not is_admin else {}
-    personal_profiles = list(stats_profiles) if not is_admin else []
 
-    # 2. Recruiter Performance (Admin only)
-    recruiter_performance = []
-    if is_admin:
-        conn = get_db_connection(validate=False, register_pgvector=False)
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id, name FROM users")
-                    user_map = {row[0]: (row[1] or 'Unknown') for row in cur.fetchall()}
-                    
-                rp_dict = {}
-                for p in stats_profiles:
-                    owner_id = p.get("owner_user_id")
-                    rec_name = user_map.get(owner_id, "Unknown")
-                    if rec_name not in rp_dict:
-                        rp_dict[rec_name] = {"sourced": 0, "shortlisted": 0, "in_conversation": 0}
-                    
-                    rp_dict[rec_name]["sourced"] += 1
-                    st = (p.get("status") or "").strip().lower()
-                    if st == "shortlisted":
-                        rp_dict[rec_name]["shortlisted"] += 1
-                    elif st in ("followup / in conversation", "in conversation"):
-                        rp_dict[rec_name]["in_conversation"] += 1
-                        
-                for name, counts in rp_dict.items():
-                    recruiter_performance.append({
-                        "recruiter": name,
-                        "sourced": counts["sourced"],
-                        "shortlisted": counts["shortlisted"],
-                        "in_conversation": counts["in_conversation"],
-                    })
-                
-                recruiter_performance.sort(key=lambda x: x["sourced"], reverse=True)
-            except Exception as e:
-                logger.error(f"Error fetching admin recruiter perf: {e}")
-            finally:
-                return_db_connection(conn)
-
-    # 3. High-level aggregates (scoped: admin = all active; recruiter = own pool)
-    total_sourced = len(stats_profiles)
-    
     total_shortlisted = team_pipeline_stats.get("Shortlisted", 0)
     total_in_conversation = team_pipeline_stats.get("Followup / In conversation", 0)
 
@@ -7527,7 +7613,9 @@ async def get_analytics_summary(user_email: str = None, role: str = "recruiter",
             "functional": functional_distribution
         },
         "personal": {
-            "total_sourced": len(personal_profiles),
+            # A recruiter's personal pool IS the scoped set, so this is the same
+            # authoritative count as summary.total_sourced (not the cache length).
+            "total_sourced": total_sourced,
             "shortlisted": personal_pipeline_stats.get("Shortlisted", 0),
             "pipeline_health": personal_pipeline_stats
         } if not is_admin else None,

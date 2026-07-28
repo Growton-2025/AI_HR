@@ -22,6 +22,7 @@ import { renderFriendlyAiValue, resolveAiCellValue, summarizeAiRun, createOptimi
 import ResumeCell from '../components/ResumeCell'
 import ResumeModal from '../components/ResumeModal'
 import useResumes from '../hooks/useResumes'
+import { useDebouncedValue, useAbortableRequest, isAbortError } from '../hooks/useDebouncedValue'
 
 const RESPONDED_TAB = '__responded__'
 const RESPONSE_TAB_LABEL = 'Responded'
@@ -194,6 +195,11 @@ function Roles() {
     const [showOutreach, setShowOutreach] = useState(false)
     const [activeStatusTab, setActiveStatusTab] = useState('')
     const [roleSearch, setRoleSearch] = useState('')
+    // The input stays instant; only the value that drives the /candidates/browse
+    // effect is debounced, so a burst of keystrokes costs one request instead of
+    // one per character.
+    const debouncedRoleSearch = useDebouncedValue(roleSearch, 250)
+    const nextBrowseSignal = useAbortableRequest()
     const [filters, setFilters] = useState({
         title: [], titleInput: '',
         company: [], companyInput: '',
@@ -314,8 +320,12 @@ function Roles() {
         || Boolean(filters.added_to)
     ), [activeStatusTab, filters, roleSearch, splitFilterValues])
 
+    // Uses the debounced search text so this stays in lockstep with what the
+    // fetch effect actually sends; reading the raw input here would flip this
+    // true one render before the query text caught up, firing a throwaway
+    // unfiltered request on the first keystroke.
     const hasServerRoleFilters = useMemo(() => (
-        roleSearch.trim().length > 0
+        debouncedRoleSearch.trim().length > 0
         || splitFilterValues(filters.title, filters.titleInput).length > 0
         || splitFilterValues(filters.company, filters.companyInput).length > 0
         || splitFilterValues(filters.city, filters.cityInput).length > 0
@@ -326,7 +336,35 @@ function Roles() {
         || Number(filters.max_exp ?? 40) < 40
         || Boolean(filters.added_from)
         || Boolean(filters.added_to)
-    ), [activeStatusTab, filters, roleSearch, splitFilterValues])
+    ), [activeStatusTab, filters, debouncedRoleSearch, splitFilterValues])
+
+    // Status is the only filter dimension that doesn't need a round trip: a
+    // role's full candidate list is already loaded client-side in
+    // viewingRole.candidates (the role-detail fetch is unpaginated), and
+    // `candidate.status` is already present on every row, so filtering by
+    // status is a plain array filter. Every other dimension below (search,
+    // title, company, ...) still goes to /api/candidates/browse because it
+    // needs server-side matching. Clicking a status tab/pill was previously
+    // hitting that same browse endpoint with page_size=5000 just to filter
+    // ~100 already-loaded rows by an exact field already in hand — that's
+    // what made "just clicking a filter" feel as slow as a real search.
+    const hasNonStatusServerFilters = useMemo(() => (
+        debouncedRoleSearch.trim().length > 0
+        || splitFilterValues(filters.title, filters.titleInput).length > 0
+        || splitFilterValues(filters.company, filters.companyInput).length > 0
+        || splitFilterValues(filters.city, filters.cityInput).length > 0
+        || splitFilterValues(filters.product_service, filters.productInput).length > 0
+        || Number(filters.min_exp || 0) > 0
+        || Number(filters.max_exp ?? 40) < 40
+        || Boolean(filters.added_from)
+        || Boolean(filters.added_to)
+    ), [filters, debouncedRoleSearch, splitFilterValues])
+
+    const statusOnlyFilterValues = useMemo(() => (
+        (!hasNonStatusServerFilters && activeStatusTab !== RESPONDED_TAB)
+            ? splitFilterValues(filters.status, filters.statusInput)
+            : []
+    ), [activeStatusTab, hasNonStatusServerFilters, filters.status, filters.statusInput, splitFilterValues])
 
     const setFilter = useCallback((key, val) => {
         setFilters(prev => {
@@ -743,7 +781,7 @@ function Roles() {
         params.set('sort_by', 'name')
         params.set('sort_dir', 'asc')
 
-        const query = roleSearch.trim()
+        const query = debouncedRoleSearch.trim()
         const title = joinFilterParam(splitFilterValues(filters.title, filters.titleInput))
         const company = joinFilterParam(splitFilterValues(filters.company, filters.companyInput))
         const city = joinFilterParam(splitFilterValues(filters.city, filters.cityInput))
@@ -773,10 +811,30 @@ function Roles() {
             return undefined
         }
 
+        if (statusOnlyFilterValues.length > 0) {
+            const baseCandidates = viewingRole.candidates || []
+            const statusSet = new Set(statusOnlyFilterValues)
+            setRoleFilteredCandidates(baseCandidates.filter(candidate => statusSet.has(candidate.status || 'To be started')))
+            setRoleStatusCounts(baseCandidates.reduce((counts, candidate) => {
+                const stat = candidate.status || 'To be started'
+                counts[stat] = (counts[stat] || 0) + 1
+                return counts
+            }, {}))
+            setIsFilteringRole(false)
+            return undefined
+        }
+
         roleFilterDebounceRef.current = window.setTimeout(async () => {
             setIsFilteringRole(true)
+            // Abort whatever is still in flight: the seq guard below only drops a
+            // late *response*, so without this every superseded keystroke still ran
+            // a full query and competed for the small DB connection pool.
+            const signal = nextBrowseSignal()
             try {
-                const response = await axios.get(`${API_BASE}/candidates/browse?${params.toString()}&cb=${Date.now()}`, { timeout: 60000 })
+                const response = await axios.get(
+                    `${API_BASE}/candidates/browse?${params.toString()}&cb=${Date.now()}`,
+                    { timeout: 60000, signal },
+                )
                 if (requestSeq !== roleFilterRequestSeqRef.current) return
                 // Browse rows don't carry role-link fields (added_to_role_at) —
                 // merge them in from the role's own candidate list.
@@ -787,6 +845,7 @@ function Roles() {
                 }))
                 setRoleStatusCounts(response.data?.status_counts || {})
             } catch (error) {
+                if (isAbortError(error)) return
                 if (requestSeq === roleFilterRequestSeqRef.current) {
                     console.error('Failed to filter role candidates:', error)
                 }
@@ -799,12 +858,13 @@ function Roles() {
     }, [
         activeStatusTab,
         filters,
-        roleSearch,
+        debouncedRoleSearch,
         roleScopeParams,
         splitFilterValues,
         joinFilterParam,
         viewingRole?.id,
         hasServerRoleFilters,
+        statusOnlyFilterValues,
         viewingRole?.candidates,
     ])
 
@@ -863,17 +923,23 @@ function Roles() {
     }, [fetchOutreachStatus, viewingRole?.id])
 
     // Keep contact cells in sync with Clay without reloading the full role.
-    // This polls one lightweight role-scoped endpoint and stops after two minutes.
+    // Polls one lightweight role-scoped endpoint only while an enrichment is
+    // actually in flight, and stops as soon as none is (see the stop condition
+    // below — a missing email/phone is not by itself a reason to keep polling).
     useEffect(() => {
         const candidates = viewingRole?.candidates
         if (!viewingRole?.name || !Array.isArray(candidates) || candidates.length === 0) return undefined
-        if (!candidates.some(candidate => !candidate.email || !candidate.mobile_phone
-            || ['scheduled', 'waiting_for_email', 'email_enrolling'].includes(candidate.email_outreach_status)
+        if (!candidates.some(candidate =>
+            ['scheduled', 'waiting_for_email', 'email_enrolling'].includes(candidate.email_outreach_status)
             || ['scheduled', 'enrolling'].includes(candidate.linkedin_outreach_status))) return undefined
 
         let cancelled = false
         let timer = null
         let attempts = 0
+        // Seeded true because the guard above only lets us start when something
+        // is pending; refreshed after each successful poll so a transient error
+        // does not resurrect a poll loop that had already finished its work.
+        let hadPendingEnrichment = true
 
         const pollContacts = async () => {
             attempts += 1
@@ -887,7 +953,6 @@ function Roles() {
                 const contactById = new Map(
                     (res.data?.contacts || []).map(contact => [Number(contact.id), contact])
                 )
-                let hasMissingContacts = false
 
                 useAppStore.setState(state => {
                     if (state.viewingRole?.name !== viewingRole.name) return state
@@ -901,18 +966,34 @@ function Roles() {
                         }
                     }
 
+                    // Track whether this tick actually changed anything. Returning a
+                    // fresh candidates array every 2s (even when identical) gave
+                    // `viewingRole.candidates` a new identity, and that array is a
+                    // dependency of the role-filter effect below — so each poll tick
+                    // also fired a redundant /candidates/browse. Bail out unchanged
+                    // instead, so a steady state costs one request, not two.
+                    let changed = false
                     const updatedCandidates = (state.viewingRole.candidates || []).map(candidate => {
                         const contact = contactById.get(Number(candidate.id))
-                        const updated = contact ? {
+                        if (!contact) return candidate
+                        const updated = {
                             ...candidate,
                             email: contact.email || candidate.email || '',
                             mobile_phone: contact.mobile_phone || candidate.mobile_phone || '',
                             email_outreach_status: contact.email_status || candidate.email_outreach_status,
                             linkedin_outreach_status: contact.linkedin_status || candidate.linkedin_outreach_status,
-                        } : candidate
-                        if (!updated.email || !updated.mobile_phone) hasMissingContacts = true
-                        return updated
+                        }
+                        if (updated.email !== candidate.email
+                            || updated.mobile_phone !== candidate.mobile_phone
+                            || updated.email_outreach_status !== candidate.email_outreach_status
+                            || updated.linkedin_outreach_status !== candidate.linkedin_outreach_status) {
+                            changed = true
+                            return updated
+                        }
+                        return candidate
                     })
+                    if (!changed) return state
+
                     const updatedRole = { ...state.viewingRole, candidates: updatedCandidates }
 
                     return {
@@ -928,14 +1009,25 @@ function Roles() {
                     }
                 })
 
+                // Keep polling only while enrichment is genuinely in flight.
+                // This used to also continue on `hasMissingContacts` — "this row has
+                // no email/phone" — which is a data-absence test, not a pending test:
+                // a candidate who will never have a phone number kept it true forever,
+                // so every such role burned the full 150 attempts x 2s (~300 requests)
+                // for contacts that were never going to arrive.
                 const stillPending = (res.data?.contacts || []).some(contact =>
                     ['scheduled', 'waiting_for_email', 'email_enrolling'].includes(contact.email_status)
                     || ['scheduled', 'enrolling'].includes(contact.linkedin_status))
-                if ((hasMissingContacts || stillPending) && attempts < 150 && !cancelled) {
+                hadPendingEnrichment = stillPending
+                if (stillPending && attempts < 150 && !cancelled) {
                     timer = setTimeout(pollContacts, 2000)
                 }
             } catch {
-                if (attempts < 150 && !cancelled) timer = setTimeout(pollContacts, 2000)
+                // Only retry a failed poll while there was still something to wait
+                // for; retrying unconditionally kept the storm alive through outages.
+                if (hadPendingEnrichment && attempts < 150 && !cancelled) {
+                    timer = setTimeout(pollContacts, 2000)
+                }
             }
         }
 

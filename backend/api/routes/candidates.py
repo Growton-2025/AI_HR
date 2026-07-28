@@ -7,6 +7,7 @@ import base64
 import time
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
@@ -41,6 +42,67 @@ logger = logging.getLogger(__name__)
 _analytics_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _ANALYTICS_CACHE_TTL = 60
 _analytics_profile_cache_init_lock = asyncio.Lock()
+
+# Cross-worker drift detection for the in-memory profile cache.
+# PROFILES_BY_ID lives in one process; under gunicorn (WEB_CONCURRENCY=4) a write
+# handled by one worker leaves the other three holding a pre-write snapshot with
+# nothing to ever correct them. Headline counts no longer depend on that cache
+# (they are read from SQL), but /stats, the candidate list and the analytics
+# distributions still do — so cheaply notice the drift and rebuild in the
+# background. Deliberately never blocks a request: initialize_cache() is a full
+# reload measured in tens of seconds.
+_PROFILE_DRIFT_CHECK_TTL = 60
+_profile_drift_checked_at = 0.0
+_profile_drift_reload_running = False
+_profile_drift_lock = threading.Lock()
+
+
+def _reload_profile_cache_if_drifted() -> None:
+    """Compare the cached profile count against the DB and rebuild on mismatch."""
+    global _profile_drift_reload_running
+    try:
+        from backend.pipeline import query as query_mod
+
+        db_total = query_mod.count_all_candidates_from_db()
+        cached_total = len(query_mod.PROFILES_BY_ID)
+        if db_total is None or db_total == cached_total:
+            return
+        logger.warning(
+            "Profile cache drift detected (cached=%s db=%s); rebuilding in background.",
+            cached_total,
+            db_total,
+        )
+        query_mod.initialize_cache()
+        invalidate_candidate_analytics_cache()
+        try:
+            from backend.api.routes import browse as browse_mod
+
+            browse_mod._invalidate_browse_cache()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("Profile cache drift check failed: %s", exc)
+    finally:
+        with _profile_drift_lock:
+            _profile_drift_reload_running = False
+
+
+def schedule_profile_cache_drift_check() -> None:
+    """Fire-and-forget drift check, rate-limited to once per _PROFILE_DRIFT_CHECK_TTL."""
+    global _profile_drift_checked_at, _profile_drift_reload_running
+    now = time.monotonic()
+    with _profile_drift_lock:
+        if _profile_drift_reload_running:
+            return
+        if now - _profile_drift_checked_at < _PROFILE_DRIFT_CHECK_TTL:
+            return
+        _profile_drift_checked_at = now
+        _profile_drift_reload_running = True
+    threading.Thread(
+        target=_reload_profile_cache_if_drifted,
+        name="profile-cache-drift-check",
+        daemon=True,
+    ).start()
 
 
 def invalidate_candidate_analytics_cache() -> None:
@@ -131,6 +193,11 @@ async def get_candidates(
 async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_current_user)):
     """Get performance analytics for the recruiter/admin"""
     from backend.pipeline.query import get_analytics_summary
+
+    # Headline counts below come from SQL and are always current; this only
+    # keeps the cache-derived distributions from drifting on workers that did
+    # not handle the write. Runs in a background thread — never delays this call.
+    schedule_profile_cache_drift_check()
 
     if not is_cache_initialized() or not PROFILES_BY_ID:
         async with _analytics_profile_cache_init_lock:
