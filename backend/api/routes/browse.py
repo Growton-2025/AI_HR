@@ -771,30 +771,59 @@ async def fetch_browse_page_sql(
     # the filtered total are combined into ONE statement, and (2) that statement
     # runs CONCURRENTLY with the page-rows query on a second pooled connection.
     # Wall-clock cost ≈ one round trip instead of three sequential ones.
+    # `count_where_sql` is the same predicate as `row_where_sql` minus the status
+    # filter, so when no status filter is applied the two are identical and the
+    # filtered total is just the sum of the per-status buckets. Skipping the
+    # second COUNT(*) halves the DB work for the common unfiltered case — the
+    # scan is non-sargable (LOWER(...) LIKE '%x%'), so running it twice was the
+    # single most expensive thing this endpoint did.
+    status_filter_active = bool(_split_filter_values(status))
+
     def _run_counts_query():
         conn = get_db_connection(validate=False, register_pgvector=False)
         if not conn:
             raise HTTPException(status_code=500, detail="Database connection failed")
         try:
             with conn.cursor() as cur:
+                if status_filter_active:
+                    cur.execute(
+                        f"""
+                        WITH status_counts AS (
+                            SELECT
+                                COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                                COUNT(*)::int AS count
+                            FROM candidates c
+                            WHERE {count_where_sql}
+                            GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
+                        ),
+                        total_count AS (
+                            SELECT COUNT(*)::int AS total FROM candidates c WHERE {row_where_sql}
+                        )
+                        SELECT sc.status, sc.count, tc.total
+                        FROM total_count tc
+                        LEFT JOIN status_counts sc ON TRUE
+                        """,
+                        [*count_params, *row_params],
+                    )
+                    combined_rows = cur.fetchall()
+                    counts = {
+                        str(row[0]): int(row[1] or 0)
+                        for row in combined_rows
+                        if row[0] is not None
+                    }
+                    total_value = int(combined_rows[0][2] or 0) if combined_rows else 0
+                    return counts, total_value
+
                 cur.execute(
                     f"""
-                    WITH status_counts AS (
-                        SELECT
-                            COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
-                            COUNT(*)::int AS count
-                        FROM candidates c
-                        WHERE {count_where_sql}
-                        GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
-                    ),
-                    total_count AS (
-                        SELECT COUNT(*)::int AS total FROM candidates c WHERE {row_where_sql}
-                    )
-                    SELECT sc.status, sc.count, tc.total
-                    FROM total_count tc
-                    LEFT JOIN status_counts sc ON TRUE
+                    SELECT
+                        COALESCE(NULLIF(TRIM(c.status), ''), 'To be started') AS status,
+                        COUNT(*)::int AS count
+                    FROM candidates c
+                    WHERE {count_where_sql}
+                    GROUP BY COALESCE(NULLIF(TRIM(c.status), ''), 'To be started')
                     """,
-                    [*count_params, *row_params],
+                    count_params,
                 )
                 combined_rows = cur.fetchall()
             counts = {
@@ -802,8 +831,7 @@ async def fetch_browse_page_sql(
                 for row in combined_rows
                 if row[0] is not None
             }
-            total_value = int(combined_rows[0][2] or 0) if combined_rows else 0
-            return counts, total_value
+            return counts, sum(counts.values())
         finally:
             return_db_connection(conn)
 

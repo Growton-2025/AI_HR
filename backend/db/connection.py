@@ -20,7 +20,12 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
 DB_HOST = os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))
+# /candidates/browse checks out two connections per request (its counts and rows
+# queries run concurrently), so a max of 8 left room for only ~4 simultaneous
+# browses before callers hit the blocking 1s/2s/4s backoff in get_db_connection.
+# The server reports max_connections=429 with 10 reserved, and prod runs
+# WEB_CONCURRENCY=4, so 4 x 16 = 64 sits comfortably inside the budget.
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "16"))
 
 # Skip the SELECT 1 validation round-trip when the connection was used this
 # recently. Azure idle timeouts are minutes long, so 120s is safely inside it.

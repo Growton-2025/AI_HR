@@ -23,6 +23,7 @@ import AddToListModal from '../components/AddToListModal';
 import ResumeCell from '../components/ResumeCell';
 import ResumeModal from '../components/ResumeModal';
 import useResumes from '../hooks/useResumes';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 
 export function parseStructuredValue(val) {
   if (val == null) return null;
@@ -1572,6 +1573,10 @@ export default function TalentPool() {
   const page = useAppStore(state => state.tpPage);
   const pageSize = useAppStore(state => state.tpPageSize);
   const globalSearch = useAppStore(state => state.tpGlobalSearch);
+  // The text input keeps rendering `globalSearch` so typing stays instant; only
+  // the value that feeds the query key / fetch params is debounced, so a burst
+  // of keystrokes costs one /candidates/browse instead of one per character.
+  const debouncedGlobalSearch = useDebouncedValue(globalSearch, 250);
 
   const setFilters = useAppStore(state => state.setTpFilters);
   const setActiveStatusTab = useAppStore(state => state.setTpActiveStatusTab);
@@ -2063,7 +2068,7 @@ export default function TalentPool() {
   const focusCandidateIdsKey = useMemo(() => focusCandidateIds.join(','), [focusCandidateIds]);
   const talentPoolNonPageQueryKey = useMemo(() => JSON.stringify({
     pageSize,
-    globalSearch,
+    globalSearch: debouncedGlobalSearch,
     filters,
     activeStatusTab,
     sortBy,
@@ -2076,7 +2081,7 @@ export default function TalentPool() {
     focusStartedAt: tpAiRunFocus?.startedAt || null,
   }), [
     pageSize,
-    globalSearch,
+    debouncedGlobalSearch,
     filters,
     activeStatusTab,
     sortBy,
@@ -2150,7 +2155,7 @@ export default function TalentPool() {
       const paramsString = buildTalentPoolParamsString({
         page: isAiRunFocusActive ? 1 : pg,
         pageSize,
-        globalSearch,
+        globalSearch: debouncedGlobalSearch,
         filters,
         activeStatusTab,
         sortBy,
@@ -2212,7 +2217,7 @@ export default function TalentPool() {
         setIsRevalidating(false);
       }
     }
-  }, [globalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds, talentPoolScopeReady, role]);
+  }, [debouncedGlobalSearch, filters, activeStatusTab, sortBy, sortDir, pageSize, talentPoolRoleFilterId, mergeContactInfoFromRows, fetchTalentPool, buildTalentPoolQueryKey, isAiRunFocusActive, focusCandidateIds, talentPoolScopeReady, role]);
 
   fetchCandidatesRef.current = fetchCandidates;
 
