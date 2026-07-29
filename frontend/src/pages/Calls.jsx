@@ -2,7 +2,7 @@
 // call can surface on any page, not only here.
 import { useVoIP, reportTiming } from '../context/VoIPContext';
 import InboundCallbacksPanel from '../components/InboundCallbacksPanel';
-import CandidateConversationModal from '../components/CandidateConversationModal';
+import CallHistoryModal from '../components/CallHistoryModal';
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
@@ -1284,6 +1284,10 @@ export default function Calls() {
     { label: 'DUE TODAY', value: callStats.due_today, icon: Phone, color: '#334155', bg: '#f8fafc', scope: scopeLabel },
     { label: 'UPCOMING', value: callStats.upcoming, icon: Clock, color: '#8b6b44', bg: '#fcf8f2', scope: scopeLabel },
     { label: 'COMPLETED', value: callStats.completed, icon: CheckCircle2, color: '#166534', bg: '#f3faf5', scope: scopeLabel },
+    // Candidates who rang back and have not been called back yet. Like call
+    // lists, this is a live backlog rather than something the date slicer
+    // should hide, so it always reads All Time.
+    { label: 'INBOUND CALLBACKS', value: callStats.inbound_pending ?? 0, icon: PhoneIncoming, color: '#92400e', bg: '#fffbeb', scope: 'All Time' },
     // Call lists are never sliced by the date/outcome filters.
     { label: 'CALL LISTS', value: callStats.active_lists, icon: List, color: '#475569', bg: '#f8fafc', scope: 'All Time' },
   ];
@@ -1536,6 +1540,7 @@ export default function Calls() {
       {TABS.map(tab => {
           const tabCount = statsReady ? {
             today: callStats.due_today,
+            inbound: callStats.inbound_pending ?? 0,
             upcoming: callStats.upcoming,
             completed: callStats.completed,
             lists: callStats.active_lists,
@@ -2129,7 +2134,7 @@ export default function Calls() {
       )}
 
       {inboundHistoryCandidate && (
-        <CandidateConversationModal
+        <CallHistoryModal
           candidate={inboundHistoryCandidate}
           onClose={() => setInboundHistoryCandidate(null)}
         />
