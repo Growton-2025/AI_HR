@@ -1,6 +1,8 @@
 // VoIPProvider now wraps the whole authenticated app (see App.jsx) so an inbound
 // call can surface on any page, not only here.
 import { useVoIP, reportTiming } from '../context/VoIPContext';
+import InboundCallbacksPanel from '../components/InboundCallbacksPanel';
+import CandidateConversationModal from '../components/CandidateConversationModal';
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
@@ -222,6 +224,7 @@ const TranscriptView = ({ transcript, candidateName, recruiterName, fallback }) 
 
 const TABS = [
   { id: 'today', label: 'Due Today', icon: Clock },
+  { id: 'inbound', label: 'Inbound Callbacks', icon: PhoneIncoming },
   { id: 'upcoming', label: 'Upcoming', icon: Calendar },
   { id: 'completed', label: 'Completed', icon: CheckCircle2 },
   { id: 'lists', label: 'Call Lists', icon: Layers },
@@ -1077,6 +1080,7 @@ export default function Calls() {
     setOutcomeGroup('');
   }, []);
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
+  const [inboundHistoryCandidate, setInboundHistoryCandidate] = useState(null);
   const [expandedCallId, setExpandedCallId] = useState(null);
   const [syncingCallId, setSyncingCallId] = useState(null);
   const [deletingCallIds, setDeletingCallIds] = useState(() => new Set());
@@ -1565,7 +1569,28 @@ export default function Calls() {
 
       {/* Content Area */}
       <div className="calls-content-panel" style={{ ...CALL_PANEL_STYLE, borderRadius: '24px', overflow: 'hidden' }}>
-        {activeTab === 'lists' && !selectedList ? (
+        {activeTab === 'inbound' ? (
+          <div style={{ padding: '24px' }}>
+            <InboundCallbacksPanel
+              onCallBack={async (item) => {
+                if (!item.candidate_id) {
+                  toast.info('This number is not in the talent pool — dial it manually.');
+                  return;
+                }
+                setCallingCandidate({
+                  id: item.candidate_id,
+                  name: item.candidate_name,
+                  phone: item.from_number,
+                });
+              }}
+              onViewHistory={(item) => setInboundHistoryCandidate({
+                id: item.candidate_id,
+                name: item.candidate_name,
+              })}
+              onChanged={() => fetchCallStats({ force: true, params: slicerParams })}
+            />
+          </div>
+        ) : activeTab === 'lists' && !selectedList ? (
           <div className="calls-lists-section" style={{ padding: '24px' }}>
             <div className="calls-lists-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '20px' }}>
               {showListsLoading && Array.from({ length: 4 }).map((_, idx) => (
@@ -2100,6 +2125,13 @@ export default function Calls() {
           call={callingCandidate}
           onClose={() => setCallingCandidate(null)}
           onRefresh={fetchData}
+        />
+      )}
+
+      {inboundHistoryCandidate && (
+        <CandidateConversationModal
+          candidate={inboundHistoryCandidate}
+          onClose={() => setInboundHistoryCandidate(null)}
         />
       )}
     </div>
