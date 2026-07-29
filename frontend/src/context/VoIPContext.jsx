@@ -482,17 +482,31 @@ export function VoIPProvider({ children }) {
       // dialling fails AND inbound has no endpoint to ring.
       let res = {};
       let credentialsOk = false;
-      try {
-        const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`);
-        res = credentialsResponse.data || {};
-        credentialsOk = true;
-      } catch (error) {
-        res = error?.response?.data || {};
+      let lastStatus = 0;
+      // The bearer token is restored asynchronously on a cold page load, so this
+      // can fire before axios has an Authorization header and 401. Retry a few
+      // times instead of giving up: the softphone used to be rescued only by a
+      // retry living in Calls.jsx, which is why incoming calls appeared on that
+      // page and nowhere else.
+      for (let attempt = 0; attempt < 4 && !credentialsOk; attempt += 1) {
+        try {
+          const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`);
+          res = credentialsResponse.data || {};
+          credentialsOk = true;
+        } catch (error) {
+          lastStatus = error?.response?.status || 0;
+          res = error?.response?.data || {};
+          if (lastStatus !== 401 && lastStatus !== 403) break;
+          await new Promise(resolve => window.setTimeout(resolve, 400 * (attempt + 1)));
+        }
       }
       reportTiming('credentials_fetch', performance.now() - credentialsStart);
       if (!credentialsOk) {
         const detail = res?.detail;
-        const message = (detail && typeof detail === 'object' ? detail.message : '') || 'Unable to prepare Plivo softphone';
+        const message = (detail && typeof detail === 'object' ? detail.message : '')
+          || (lastStatus === 401 || lastStatus === 403
+            ? 'Not signed in yet — softphone will connect once your session is ready'
+            : 'Unable to prepare Plivo softphone');
         setVoipStatus('error');
         setVoipError(message);
         return;

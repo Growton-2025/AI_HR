@@ -1783,7 +1783,10 @@ export const useAppStore = create(persist((set, get) => ({
 
         } catch (error) {
             console.error(`Failed to fetch ${platform} chat history:`, error)
-            return { success: false, error: error.response?.data?.detail || `Failed to fetch ${platform} chat history` }
+            // Must be a string: a 422 returns `detail` as an array of validation
+            // objects, and this value is rendered directly, which crashed the
+            // conversation modal with "Objects are not valid as a React child".
+            return { success: false, error: getRequestErrorMessage(error, `Failed to fetch ${platform} chat history`) }
         }
     },
 

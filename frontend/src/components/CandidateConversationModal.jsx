@@ -74,12 +74,32 @@ export default function CandidateConversationModal({
   const sendChatReply = useAppStore(state => state.sendChatReply)
 
   const loadThread = useCallback(async (targetPlatform, force = false) => {
+    // Email/LinkedIn threads are role-scoped. Opened without a role — e.g. from
+    // an inbound callback, which belongs to a person rather than a role — the
+    // request would 422 rather than return anything useful, so say so instead.
+    if (!roleId) {
+      setThreads(previous => ({
+        ...previous,
+        [targetPlatform]: {
+          messages: [], loaded: true, syncing: false,
+          error: 'Outreach history is shown per role — open this candidate from a role to see it.',
+        },
+      }))
+      return { success: false }
+    }
     const result = await fetchChatHistory(roleId, candidate.id, targetPlatform, force)
     setThreads(previous => ({
       ...previous,
       [targetPlatform]: result.success
         ? { messages: result.messages || [], loaded: true, error: '', syncing: Boolean(result.syncing) }
-        : { messages: [], loaded: true, error: result.error || 'Failed to load conversation', syncing: false },
+        : {
+            messages: [], loaded: true, syncing: false,
+            // Coerce: some failures return a structured payload, and this value
+            // is rendered directly.
+            error: typeof result.error === 'string' && result.error
+              ? result.error
+              : 'Failed to load conversation',
+          },
     }))
     return result
   }, [candidate.id, fetchChatHistory, roleId])
