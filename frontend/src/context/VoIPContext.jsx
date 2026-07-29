@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import axios from 'axios';
 
 import { API_BASE } from '../store/useAppStore';
 
@@ -208,6 +209,9 @@ export function VoIPProvider({ children }) {
   const [voipCallEvent, setVoipCallEvent] = useState(null);
   const [agentEmail, setAgentEmail] = useState('');
   const [endpointUsername, setEndpointUsername] = useState('');
+  // Inbound call ringing this browser. Held here (not in Calls.jsx) so the
+  // banner follows the recruiter across every page.
+  const [incomingCall, setIncomingCall] = useState(null);
   const softphoneRef = useRef(null);
   const remoteAudioRef = useRef(null);
   const localAudioRef = useRef(null);
@@ -525,6 +529,8 @@ export function VoIPProvider({ children }) {
           setVoipConnectionEvent({ at: Date.now(), state: 'registered', maxRetriesReached: false, error: '' });
           setVoipStatus('registered');
           console.log('[VoIP] Connected to Plivo softphone');
+          // Tell the backend this endpoint is live so inbound calls ring it.
+          axios.post(`${API_BASE}/plivo/registered`).catch(() => { /* best effort */ });
           resolve();
         });
 
@@ -603,9 +609,31 @@ export function VoIPProvider({ children }) {
         setActiveCall({ state: 'connected', number: callInfo?.to || activeCallRef.current?.number || '' });
       });
 
+      // A candidate calling back rings every registered recruiter at once. It
+      // must never make a sound or steal focus — the recruiter is mid-task, so
+      // this only surfaces a dismissible banner they can choose to answer.
+      sdk.client.on('onIncomingCall', (callUUID, extraHeaders, callInfo) => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        try {
+          sdk.client.setRingTone?.(false);
+        } catch (_) { /* older SDK builds may not expose it */ }
+        stopPlivoManagedAudio();
+        const uuid = typeof callUUID === 'string' ? callUUID : callUUID?.callUUID;
+        const from = callInfo?.from || extraHeaders?.from || callInfo?.callerName || '';
+        setIncomingCall({ callUUID: uuid, from, at: Date.now() });
+      });
+
+      sdk.client.on('onIncomingCallCanceled', () => {
+        if (softphoneGenerationRef.current !== instanceId) return;
+        // Another recruiter answered first, or the caller hung up.
+        stopPlivoManagedAudio();
+        setIncomingCall(null);
+      });
+
       sdk.client.on('onCallTerminated', (reason) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         stopDialTone();
+        setIncomingCall(null);
         setVoipCallEvent(buildVoipCallEvent('terminated', reason, activeCallRef.current?.number));
         setVoipStatus('registered');
         setActiveCall(null);
@@ -725,6 +753,37 @@ export function VoIPProvider({ children }) {
      return { success: true };
   };
 
+  const acceptIncomingCall = async () => {
+    const pending = incomingCall;
+    if (!pending?.callUUID) return { success: false };
+    try {
+      await ensureMicrophonePermission();
+      // 'ignore' so a second inbound never rings over a live conversation.
+      softphoneRef.current?.client?.answer(pending.callUUID, 'ignore');
+      setIncomingCall(null);
+      setVoipStatus('connected');
+      setActiveCall({ state: 'connected', number: pending.from || '', direction: 'inbound' });
+      return { success: true };
+    } catch (error) {
+      console.error('[VoIP] Failed to answer inbound call', error);
+      setIncomingCall(null);
+      return { success: false, error: error?.message };
+    }
+  };
+
+  const dismissIncomingCall = () => {
+    const pending = incomingCall;
+    setIncomingCall(null);
+    if (!pending?.callUUID) return;
+    try {
+      // Stop it ringing here only. Other recruiters keep ringing, and the
+      // callback still lands in Inbound Callbacks either way.
+      softphoneRef.current?.client?.ignore?.(pending.callUUID);
+    } catch (error) {
+      console.warn('[VoIP] Could not ignore inbound call', error);
+    }
+  };
+
   const rejectCall = async () => {
     hangupSoftphoneCall();
     stopCallAudio();
@@ -762,6 +821,9 @@ export function VoIPProvider({ children }) {
         voipCallEvent,
         agentEmail,
         endpointUsername,
+        incomingCall,
+        acceptIncomingCall,
+        dismissIncomingCall,
         retryVoip: () => initSoftphone({ force: true }),
       }}
     >

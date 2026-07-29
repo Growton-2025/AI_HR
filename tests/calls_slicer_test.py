@@ -295,7 +295,7 @@ def test_call_stats_slicer_cache_and_sql_parity(monkeypatch):
     assert cache_res.status_code == 200
     # The outcome filter applies ONLY to the completed bucket — pending rows
     # have no outcome yet, so due_today/upcoming slice on the date range only.
-    assert cache_res.json() == {"due_today": 1, "upcoming": 0, "completed": 1, "active_lists": 1}
+    assert cache_res.json() == {"due_today": 1, "upcoming": 0, "completed": 1, "active_lists": 1, "inbound_pending": 0}
 
     cursor = _FakeCursor(fetchone_results=[(1, 0, 1, 1)])
     _use_db(monkeypatch, cursor)
@@ -323,7 +323,7 @@ def test_call_stats_outcome_filter_never_zeroes_pending_buckets(monkeypatch):
 
     res = _get(app, "/api/calls/stats?outcome_group=connected")
     assert res.status_code == 200
-    assert res.json() == {"due_today": 1, "upcoming": 1, "completed": 0, "active_lists": 1}
+    assert res.json() == {"due_today": 1, "upcoming": 1, "completed": 0, "active_lists": 1, "inbound_pending": 0}
 
 
 def test_call_stats_range_without_outcome_keeps_pending_buckets(monkeypatch):
@@ -338,7 +338,7 @@ def test_call_stats_range_without_outcome_keeps_pending_buckets(monkeypatch):
     res = _get(app, "/api/calls/stats?range=today")
     assert res.status_code == 200
     # Overdue call (id=2) falls outside the "today" range window.
-    assert res.json() == {"due_today": 1, "upcoming": 0, "completed": 0, "active_lists": 1}
+    assert res.json() == {"due_today": 1, "upcoming": 0, "completed": 0, "active_lists": 1, "inbound_pending": 0}
 
 
 def test_call_stats_cache_key_includes_slicer_params(monkeypatch):
@@ -377,7 +377,7 @@ def test_default_params_regression_unchanged(monkeypatch):
     _use_db(monkeypatch, cursor)
     res = _get(app, "/api/calls/stats")
     assert res.status_code == 200
-    assert res.json() == {"due_today": 1, "upcoming": 2, "completed": 3, "active_lists": 4}
+    assert res.json() == {"due_today": 1, "upcoming": 2, "completed": 3, "active_lists": 4, "inbound_pending": 0}
     query, params = cursor.executed[0]
     assert params == [OWNER]
     assert "INTERVAL" not in query

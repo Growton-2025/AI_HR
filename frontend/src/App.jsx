@@ -5,6 +5,8 @@ import { useShallow } from 'zustand/react/shallow'
 import { useAppStore } from './store/useAppStore'
 import Sidebar from './components/Sidebar'
 import ComingSoon from './pages/ComingSoon'
+import { VoIPProvider } from './context/VoIPContext'
+import IncomingCallBanner from './components/IncomingCallBanner'
 
 const Screening = lazy(() => import('./pages/Screening'))
 const Roles = lazy(() => import('./pages/Roles'))
@@ -308,7 +310,12 @@ function App() {
     )
 
     return (
+        <VoIPProvider>
         <div className="app-layout">
+            {/* A candidate can call back while the recruiter is anywhere in the
+                app, so the softphone and its silent incoming banner live at the
+                shell level rather than inside the Calls page. */}
+            <IncomingCallBanner />
             <Sidebar />
             <main
                 className="main-content"
@@ -338,6 +345,7 @@ function App() {
                 )}
             </main>
         </div>
+        </VoIPProvider>
     )
 }
 

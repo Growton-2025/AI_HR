@@ -108,7 +108,15 @@ async def lifespan(app: FastAPI):
     if _env_flag("ENABLE_PLIVO_SETUP", "false"):
         try:
             from backend.integrations import plivo_service
-            asyncio.create_task(plivo_service.setup_plivo())
+
+            async def _plivo_setup():
+                await plivo_service.setup_plivo()
+                # Inbound needs its own application bound to PLIVO_NUMBER, and it
+                # must be re-pointed whenever the public tunnel URL rotates —
+                # otherwise incoming calls silently stop reaching us.
+                await plivo_service.ensure_inbound_application()
+
+            asyncio.create_task(_plivo_setup())
         except Exception as e:
             print(f"Failed to kick off Plivo setup: {e}")
 

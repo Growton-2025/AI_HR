@@ -814,12 +814,12 @@ def test_stats_reflect_list_eviction_immediately(monkeypatch):
             return await client.get("/api/calls/stats")
 
     before = asyncio.run(fetch_stats())
-    assert before.json() == {"due_today": 2, "upcoming": 0, "completed": 0, "active_lists": 2}
+    assert before.json() == {"due_today": 2, "upcoming": 0, "completed": 0, "active_lists": 2, "inbound_pending": 0}
 
     calls.evict_call_list_from_cache(7)
 
     after = asyncio.run(fetch_stats())
-    assert after.json() == {"due_today": 1, "upcoming": 0, "completed": 0, "active_lists": 1}
+    assert after.json() == {"due_today": 1, "upcoming": 0, "completed": 0, "active_lists": 1, "inbound_pending": 0}
 
 
 def test_call_stats_route_matches_db_and_memory_cache_paths(monkeypatch):
@@ -852,6 +852,7 @@ def test_call_stats_route_matches_db_and_memory_cache_paths(monkeypatch):
         "upcoming": 1,
         "completed": 1,
         "active_lists": 1,
+        "inbound_pending": 0,
     }
 
     db_cursor = _FakeCursor(fetchone_results=[(1, 1, 1, 1)])

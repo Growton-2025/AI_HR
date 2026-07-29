@@ -531,6 +531,141 @@ def get_calls_db_connection():
     return get_db_connection(validate=True, register_pgvector=False)
 
 
+# ── Inbound call persistence (called from the Plivo webhooks) ────────────────
+# Every write keys on plivo_call_uuid: Plivo retries callbacks and may deliver
+# the same one repeatedly, so these must be safe to run more than once.
+
+def _inbound_conn():
+    ensure_calls_schema_ready()
+    return get_db_connection(validate=False, register_pgvector=False)
+
+
+def record_inbound_call(call_uuid, from_number, to_number, call_status) -> None:
+    """Upsert the inbound row and match the caller to a candidate by number."""
+    if not call_uuid:
+        return
+    conn = _inbound_conn()
+    if not conn:
+        return
+    from backend.integrations import plivo_service
+    try:
+        normalized = plivo_service.normalize_number(from_number) or from_number
+        digits = "".join(ch for ch in (normalized or "") if ch.isdigit())[-10:]
+        with conn.cursor() as cur:
+            candidate_id = None
+            if digits:
+                # Match on the last 10 digits so +91/0 prefixes and spacing
+                # variations still resolve to the same person.
+                cur.execute(
+                    """
+                    SELECT id FROM candidates
+                    WHERE RIGHT(REGEXP_REPLACE(COALESCE(NULLIF(TRIM(mobile_phone), ''),
+                                                        NULLIF(TRIM(phone), '')), '[^0-9]', '', 'g'), 10) = %s
+                      AND COALESCE(is_archived, FALSE) = FALSE
+                    ORDER BY id LIMIT 1
+                    """,
+                    (digits,),
+                )
+                row = cur.fetchone()
+                candidate_id = row[0] if row else None
+            cur.execute(
+                """
+                INSERT INTO inbound_calls (candidate_id, from_number, to_number,
+                                           plivo_call_uuid, call_status, status)
+                VALUES (%s, %s, %s, %s, %s, 'pending')
+                ON CONFLICT (plivo_call_uuid) DO UPDATE
+                   SET call_status = EXCLUDED.call_status,
+                       candidate_id = COALESCE(inbound_calls.candidate_id, EXCLUDED.candidate_id)
+                """,
+                (candidate_id, normalized or from_number, to_number, call_uuid, call_status),
+            )
+        conn.commit()
+        invalidate_calls_cache()
+    except Exception as exc:
+        conn.rollback()
+        logger.error("Failed to record inbound call %s: %s", call_uuid, exc)
+    finally:
+        return_db_connection(conn)
+
+
+def record_inbound_dial_result(call_uuid, dial_status, b_leg_uuid) -> None:
+    """Who (if anyone) answered the ring-all leg."""
+    if not call_uuid:
+        return
+    conn = _inbound_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            answered = dial_status == "completed" and bool(b_leg_uuid)
+            cur.execute(
+                """
+                UPDATE inbound_calls
+                   SET dial_status = %s,
+                       status = CASE WHEN %s THEN 'answered' ELSE status END,
+                       answered_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE answered_at END
+                 WHERE plivo_call_uuid = %s
+                """,
+                (dial_status, answered, answered, call_uuid),
+            )
+        conn.commit()
+        invalidate_calls_cache()
+    except Exception as exc:
+        conn.rollback()
+        logger.error("Failed to record dial result for %s: %s", call_uuid, exc)
+    finally:
+        return_db_connection(conn)
+
+
+def attach_inbound_recording(call_uuid, recording_url) -> None:
+    if not call_uuid or not recording_url:
+        return
+    conn = _inbound_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE inbound_calls SET recording_url = %s WHERE plivo_call_uuid = %s",
+                (recording_url, call_uuid),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.error("Failed to attach voicemail to %s: %s", call_uuid, exc)
+    finally:
+        return_db_connection(conn)
+
+
+def finalize_inbound_call(call_uuid, call_status, hangup_cause, duration) -> None:
+    if not call_uuid:
+        return
+    conn = _inbound_conn()
+    if not conn:
+        return
+    try:
+        try:
+            duration_int = int(duration or 0)
+        except (TypeError, ValueError):
+            duration_int = 0
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE inbound_calls
+                   SET call_status = %s, hangup_cause = %s, duration = %s
+                 WHERE plivo_call_uuid = %s
+                """,
+                (call_status, hangup_cause, duration_int, call_uuid),
+            )
+        conn.commit()
+        invalidate_calls_cache()
+    except Exception as exc:
+        conn.rollback()
+        logger.error("Failed to finalize inbound call %s: %s", call_uuid, exc)
+    finally:
+        return_db_connection(conn)
+
+
 def fetch_call_by_id(cur, call_id: int, owner: Optional[str] = None) -> Optional[dict]:
     query = f"{CALLS_SELECT_QUERY} WHERE c.id = %s"
     params: list[Any] = [call_id]
@@ -672,6 +807,10 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'calls' AND column_name = 'likely_voicemail')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'candidates' AND column_name = 'cadence_paused')
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'inbound_calls')
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'plivo_endpoints')
                         AND NOT EXISTS (SELECT 1 FROM pg_constraint
                                         WHERE conname = 'unique_candidate_list')
                 """)
@@ -776,6 +915,56 @@ def ensure_calls_schema_ready(force: bool = False):
                     END IF;
                 END $$;
             """)
+            # ── Inbound calls ────────────────────────────────────────────────
+            # Deliberately NOT rows in `calls`: that table is an outbound cadence
+            # task list, and Due Today counts, call-list counts and the
+            # next-attempt sequencing all assume outbound semantics. Inbound
+            # events living there would corrupt every one of those.
+            # plivo_call_uuid is UNIQUE because Plivo retries webhooks and may
+            # deliver the same callback more than once — it is the idempotency key.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inbound_calls (
+                    id SERIAL PRIMARY KEY,
+                    candidate_id INTEGER REFERENCES candidates(id) ON DELETE SET NULL,
+                    from_number VARCHAR(32) NOT NULL,
+                    to_number VARCHAR(32),
+                    plivo_call_uuid VARCHAR(128) UNIQUE,
+                    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    answered_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    answered_at TIMESTAMP,
+                    duration INTEGER DEFAULT 0,
+                    hangup_cause VARCHAR(120),
+                    call_status VARCHAR(50),
+                    dial_status VARCHAR(50),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    note TEXT,
+                    resolved_at TIMESTAMP,
+                    resolved_by VARCHAR(255),
+                    resolved_call_id INTEGER REFERENCES calls(id) ON DELETE SET NULL,
+                    recording_url TEXT,
+                    transcript TEXT,
+                    created_by VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_inbound_calls_status ON inbound_calls (status, received_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS ix_inbound_calls_candidate ON inbound_calls (candidate_id);")
+
+            # One SIP endpoint per recruiter. A single shared endpoint cannot be
+            # forked to ("ring everyone") and gives no way to tell who answered.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS plivo_endpoints (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                    endpoint_id VARCHAR(128),
+                    username VARCHAR(128) NOT NULL,
+                    password VARCHAR(128) NOT NULL,
+                    app_id VARCHAR(128),
+                    last_registered_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
             cur.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$
                 BEGIN
@@ -1463,6 +1652,192 @@ async def set_candidate_cadence_paused(
             return_db_connection(conn)
 
 
+class InboundResolveRequest(BaseModel):
+    note: Optional[str] = None
+    call_id: Optional[int] = None
+
+
+class InboundManualRequest(BaseModel):
+    from_number: str
+    candidate_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+@router.get("/inbound")
+def list_inbound_calls(
+    status: Optional[str] = None,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Inbound callbacks, newest first, joined to the matched candidate."""
+    ensure_calls_schema_ready()
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        where, params = "", []
+        normalized = (status or "").strip().lower()
+        if normalized == "pending":
+            where = "WHERE ic.status IN ('pending', 'answered')"
+        elif normalized == "resolved":
+            where = "WHERE ic.status = 'resolved'"
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ic.id, ic.from_number, ic.received_at, ic.status, ic.note,
+                       ic.duration, ic.recording_url, ic.dial_status, ic.answered_at,
+                       ic.candidate_id, c.name,
+                       COALESCE(NULLIF(TRIM(c.headline), ''), ''),
+                       COALESCE(c.raw_fields->>'import_company', ''),
+                       COALESCE(NULLIF(TRIM(c.status), ''), 'To be started'),
+                       u.name
+                  FROM inbound_calls ic
+                  LEFT JOIN candidates c ON c.id = ic.candidate_id
+                  LEFT JOIN users u ON u.id = ic.answered_by_user_id
+                  {where}
+                 ORDER BY ic.received_at DESC
+                 LIMIT 200
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        items = [
+            {
+                "id": r[0], "from_number": r[1],
+                "received_at": r[2].isoformat() if r[2] else None,
+                "status": r[3], "note": r[4] or "", "duration": r[5] or 0,
+                "recording_url": r[6], "dial_status": r[7],
+                "answered_at": r[8].isoformat() if r[8] else None,
+                "candidate_id": r[9], "candidate_name": r[10],
+                "candidate_title": r[11], "candidate_company": r[12],
+                "candidate_status": r[13], "answered_by": r[14],
+                # No candidate match means the number isn't in the pool — shown
+                # flagged rather than dropped, so a real callback is never lost.
+                "is_unknown": r[9] is None,
+            }
+            for r in rows
+        ]
+        return {"items": items, "pending_count": sum(1 for i in items if i["status"] != "resolved")}
+    finally:
+        return_db_connection(conn)
+
+
+@router.post("/inbound/{inbound_id}/resolve")
+def resolve_inbound_call(
+    inbound_id: int,
+    request: InboundResolveRequest,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Mark a callback done.
+
+    Deliberately outcome-independent: per the product owner, "the moment you
+    complete the callback, irrespective of whether it is connected or not, it
+    should be marked as callback completed and the number here will reduce."
+    So this never inspects the call outcome — attempting the callback clears it.
+    """
+    ensure_calls_schema_ready()
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE inbound_calls
+                   SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP,
+                       resolved_by = %s, resolved_call_id = COALESCE(%s, resolved_call_id),
+                       note = COALESCE(NULLIF(%s, ''), note)
+                 WHERE id = %s
+             RETURNING id
+                """,
+                (current_user.email, request.call_id, (request.note or "").strip(), inbound_id),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Inbound call not found")
+        conn.commit()
+        invalidate_calls_cache()
+        return {"success": True}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
+
+
+@router.post("/inbound/manual")
+def log_inbound_call_manually(
+    request: InboundManualRequest,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Backs '+ Log Incoming Call' — a callback that reached the recruiter
+    outside the system still belongs in the queue."""
+    ensure_calls_schema_ready()
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        from backend.integrations import plivo_service
+
+        number = plivo_service.normalize_number(request.from_number) or request.from_number
+        with conn.cursor() as cur:
+            candidate_id = request.candidate_id
+            if candidate_id is None:
+                digits = "".join(ch for ch in number if ch.isdigit())[-10:]
+                if digits:
+                    cur.execute(
+                        """
+                        SELECT id FROM candidates
+                        WHERE RIGHT(REGEXP_REPLACE(COALESCE(NULLIF(TRIM(mobile_phone), ''),
+                                                            NULLIF(TRIM(phone), '')), '[^0-9]', '', 'g'), 10) = %s
+                          AND COALESCE(is_archived, FALSE) = FALSE
+                        ORDER BY id LIMIT 1
+                        """,
+                        (digits,),
+                    )
+                    row = cur.fetchone()
+                    candidate_id = row[0] if row else None
+            cur.execute(
+                """
+                INSERT INTO inbound_calls (candidate_id, from_number, status, note, created_by)
+                VALUES (%s, %s, 'pending', %s, %s)
+                RETURNING id
+                """,
+                (candidate_id, number, (request.note or "").strip() or None, current_user.email),
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+        invalidate_calls_cache()
+        return {"success": True, "id": new_id, "candidate_id": candidate_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
+
+
+def inbound_pending_count() -> int:
+    """Unresolved inbound callbacks — drives the sidebar bubble.
+
+    Folded into /stats rather than given its own endpoint: Calls.jsx already
+    polls stats every 15s, and this codebase has a history of request storms.
+    The value rides the stats cache, so cache hits cost nothing.
+    """
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM inbound_calls WHERE status <> 'resolved'")
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+    finally:
+        return_db_connection(conn)
+
+
 @router.get("/stats")
 def get_call_stats(
     range_: Optional[str] = Query(None, alias="range"),
@@ -1535,6 +1910,7 @@ def get_call_stats(
                 "upcoming": upcoming,
                 "completed": completed,
                 "active_lists": active_lists,
+                "inbound_pending": inbound_pending_count(),
             }
             if len(_stats_cache) > 64:
                 _stats_cache.clear()
@@ -1599,6 +1975,7 @@ def get_call_stats(
             "upcoming": row[1] or 0,
             "completed": row[2] or 0,
             "active_lists": row[3] or 0,
+            "inbound_pending": inbound_pending_count(),
         }
         if len(_stats_cache) > 64:
             _stats_cache.clear()

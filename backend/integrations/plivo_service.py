@@ -151,6 +151,70 @@ def _persist_softphone_state(app_id: str, username: str, password: str, answer_u
         logger.warning(f"Could not persist Plivo softphone state: {e}")
 
 
+_INBOUND_STATE_FILE = os.path.join(os.path.dirname(_PLIVO_STATE_FILE), "plivo_inbound_state.json")
+
+
+async def ensure_inbound_application() -> Optional[str]:
+    """Provision (or re-point) the Application that answers calls to PLIVO_NUMBER.
+
+    This must be a SEPARATE application from the softphone one: that app answers
+    at /api/plivo/dial, which expects a `To` field to place an outbound leg, so
+    binding the number to it would push inbound calls into the outbound dialer.
+
+    Like the softphone app, the answer URL has to be re-pointed whenever the
+    public tunnel rotates, or inbound silently breaks.
+    """
+    if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN or not PLIVO_NUMBER:
+        return None
+    ngrok_url = get_ngrok_url()
+    if not ngrok_url:
+        logger.warning("No public URL yet — skipping inbound Plivo application setup.")
+        return None
+
+    answer_url = f"{ngrok_url}/api/plivo/incoming"
+    hangup_url = f"{ngrok_url}/api/plivo/incoming-hangup"
+    client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+
+    state = {}
+    try:
+        with open(_INBOUND_STATE_FILE, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Could not read inbound Plivo state: %s", exc)
+
+    app_id = state.get("app_id")
+    try:
+        if app_id:
+            if state.get("answer_url") != answer_url:
+                await asyncio.to_thread(
+                    client.applications.update,
+                    app_id=app_id, answer_url=answer_url, answer_method="POST",
+                    hangup_url=hangup_url, hangup_method="POST",
+                )
+                logger.info("Re-pointed inbound Plivo app %s to %s", app_id, answer_url)
+        else:
+            created = await asyncio.to_thread(
+                client.applications.create,
+                app_name=f"Inbound_App_{time.time_ns()}",
+                answer_url=answer_url, answer_method="POST",
+                hangup_url=hangup_url, hangup_method="POST",
+            )
+            app_id = created.app_id
+            logger.info("Created inbound Plivo app %s", app_id)
+
+        # Point the rented number at it. Idempotent — safe to repeat on restart.
+        await asyncio.to_thread(client.numbers.update, number=PLIVO_NUMBER, app_id=app_id)
+
+        with open(_INBOUND_STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"app_id": app_id, "answer_url": answer_url}, fh)
+        return app_id
+    except Exception as exc:
+        logger.error("Failed to set up inbound Plivo application: %s", exc)
+        return None
+
+
 def record_browser_dial(username: str, call_uuid: str, to_number: str):
     global latest_call_uuid
     if not username or not call_uuid:
@@ -332,6 +396,154 @@ async def setup_plivo(force: bool = False):
             setup_error = f"Failed to setup Plivo softphone components: {e}"
             logger.error(setup_error)
             return {"success": False, "error": setup_error, "code": "plivo_setup_failed"}
+
+_endpoint_provision_lock = asyncio.Lock()
+
+
+async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
+    """Return this user's own SIP endpoint, creating it on first use.
+
+    Inbound "ring everyone" dials one <User> per recruiter, so each recruiter
+    needs a distinct endpoint: a single shared endpoint cannot be forked to, and
+    gives no way to record who picked up. Endpoints reuse the softphone
+    Application (it only supplies the outbound answer_url), so this adds an
+    endpoint per user, not an app per user.
+
+    Returns None on failure so callers can fall back to the shared endpoint
+    rather than losing outbound dialling.
+    """
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    if not user_id:
+        return None
+
+    def _read():
+        conn = get_db_connection(validate=False, register_pgvector=False)
+        if not conn:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT username, password, endpoint_id, app_id FROM plivo_endpoints WHERE user_id = %s",
+                    (user_id,),
+                )
+                return cur.fetchone()
+        finally:
+            return_db_connection(conn)
+
+    existing = await asyncio.to_thread(_read)
+    if existing:
+        return {"username": existing[0], "password": existing[1],
+                "endpoint_id": existing[2], "app_id": existing[3]}
+
+    # Provisioning touches the Plivo API; serialise so two concurrent logins by
+    # the same user cannot create two endpoints.
+    async with _endpoint_provision_lock:
+        existing = await asyncio.to_thread(_read)
+        if existing:
+            return {"username": existing[0], "password": existing[1],
+                    "endpoint_id": existing[2], "app_id": existing[3]}
+
+        setup = await setup_plivo()
+        if not setup.get("success"):
+            return None
+        app_id = _load_persisted_softphone_state().get("app_id") if _load_persisted_softphone_state() else None
+        if not app_id:
+            return None
+
+        try:
+            client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+            username = f"user{uuid.uuid4().hex[:20]}"
+            password = f"Hy{uuid.uuid4().hex[:16]}!"
+            resp = await asyncio.to_thread(
+                client.endpoints.create,
+                username=username,
+                password=password,
+                alias=f"recruiter_{user_id}",
+                app_id=app_id,
+            )
+            endpoint_id = getattr(resp, "endpoint_id", None) or getattr(resp, "id", None)
+        except Exception as exc:
+            logger.error("Failed to create Plivo endpoint for user %s: %s", user_id, exc)
+            return None
+
+        def _write():
+            conn = get_db_connection(validate=False, register_pgvector=False)
+            if not conn:
+                return False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO plivo_endpoints (user_id, endpoint_id, username, password, app_id)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (user_id, str(endpoint_id) if endpoint_id else None, username, password, app_id),
+                    )
+                conn.commit()
+                return True
+            except Exception as exc:
+                conn.rollback()
+                logger.error("Failed to persist Plivo endpoint for user %s: %s", user_id, exc)
+                return False
+            finally:
+                return_db_connection(conn)
+
+        if not await asyncio.to_thread(_write):
+            return None
+        logger.info("Provisioned Plivo endpoint %s for user %s", username, user_id)
+        return {"username": username, "password": password,
+                "endpoint_id": str(endpoint_id) if endpoint_id else None, "app_id": app_id}
+
+
+def mark_endpoint_registered(user_id: int) -> None:
+    """Record that this user's softphone is live, so inbound only rings plausibly
+    online endpoints. Stale rows simply do not answer — the <Dial timeout> covers it."""
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE plivo_endpoints SET last_registered_at = CURRENT_TIMESTAMP WHERE user_id = %s",
+                (user_id,),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Could not mark endpoint registered for user %s: %s", user_id, exc)
+    finally:
+        return_db_connection(conn)
+
+
+def get_registered_endpoint_usernames(within_seconds: int = 900) -> list:
+    """Usernames to ring on an inbound call: endpoints seen registering recently."""
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT username FROM plivo_endpoints
+                WHERE last_registered_at IS NOT NULL
+                  AND last_registered_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
+                ORDER BY last_registered_at DESC
+                """,
+                (within_seconds,),
+            )
+            return [r[0] for r in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("Could not list registered endpoints: %s", exc)
+        return []
+    finally:
+        return_db_connection(conn)
+
 
 def initiate_call(candidate_phone: str, recruiter_email: str, candidate_name: str, candidate_id: str, transaction_id: str):
     logger.info(f"Initiating outbound Plivo call to {candidate_phone} for recruiter {recruiter_email}")

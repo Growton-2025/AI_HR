@@ -1,4 +1,6 @@
-import { VoIPProvider, useVoIP, reportTiming } from '../context/VoIPContext';
+// VoIPProvider now wraps the whole authenticated app (see App.jsx) so an inbound
+// call can surface on any page, not only here.
+import { useVoIP, reportTiming } from '../context/VoIPContext';
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
@@ -1414,7 +1416,6 @@ export default function Calls() {
   const showListsLoading = (activeTab === 'lists' && !selectedList && loading && !callLists.length);
 
   return (
-    <VoIPProvider>
     <div className="calls-page" style={{ padding: '24px 0 12px', background: 'transparent', minHeight: '100vh', fontFamily: '"Inter", sans-serif', width: '100%', overflowX: 'hidden' }}>
       <header className="calls-hero" style={{ ...CALL_PANEL_STYLE, marginBottom: '28px', padding: '24px 28px', borderRadius: '24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px 24px' }}>
         <div>
@@ -2102,7 +2103,6 @@ export default function Calls() {
         />
       )}
     </div>
-    </VoIPProvider>
   );
 }
 

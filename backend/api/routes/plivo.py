@@ -1,9 +1,13 @@
 import logging
 import os
 import asyncio
-from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
+from fastapi import APIRouter, Request, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import Response
 from backend.integrations import plivo_service
+from backend.api import schemas, deps
+# Inbound persistence lives with the rest of the call storage; imported lazily
+# inside the handlers would re-import per webhook, so bind it once here.
+from backend.api.routes import calls as calls_module
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -96,6 +100,98 @@ async def plivo_dial(request: Request):
     """
     return Response(content=xml_response, media_type="application/xml")
 
+# ── Inbound calls ────────────────────────────────────────────────────────────
+# Plivo carries no bearer token, so these are unauthenticated by necessity.
+# They are also retried and may be delivered more than once, so every write is
+# keyed on CallUUID.
+
+def _voicemail_xml() -> str:
+    """Short greeting + record, used when nobody picks up."""
+    ngrok_url = plivo_service.get_ngrok_url() or ""
+    action = f"{ngrok_url}/api/plivo/incoming-voicemail" if ngrok_url else ""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Speak>Thanks for calling. Our team is unavailable right now. Please leave a short message after the beep and we will call you back.</Speak>
+        <Record action="{action}" method="POST" maxLength="120" finishOnKey="#" playBeep="true" redirect="false" />
+    </Response>
+    """
+
+
+@router.post("/incoming")
+async def plivo_incoming(request: Request):
+    """Answer URL for the inbound number: ring every registered recruiter at once."""
+    form = await request.form()
+    call_uuid = form.get("CallUUID")
+    from_number = form.get("From") or ""
+    to_number = form.get("To") or ""
+    logger.info("Inbound call %s from %s to %s", call_uuid, from_number, to_number)
+
+    await asyncio.to_thread(
+        calls_module.record_inbound_call,
+        call_uuid, from_number, to_number, form.get("CallStatus"),
+    )
+
+    usernames = await asyncio.to_thread(plivo_service.get_registered_endpoint_usernames)
+    if not usernames:
+        logger.info("No registered softphones for inbound %s — going to voicemail.", call_uuid)
+        return Response(content=_voicemail_xml(), media_type="application/xml")
+
+    ngrok_url = plivo_service.get_ngrok_url() or ""
+    action = f"{ngrok_url}/api/plivo/incoming-unanswered" if ngrok_url else ""
+    # Multiple <User> entries ring simultaneously; the first to answer wins and
+    # Plivo cancels the rest.
+    users = "".join(f"<User>sip:{u}@phone.plivo.com</User>" for u in usernames)
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Dial timeout="25" action="{action}" method="POST" redirect="false" callerId="{from_number}">
+            {users}
+        </Dial>
+    </Response>
+    """
+    return Response(content=xml, media_type="application/xml")
+
+
+@router.post("/incoming-unanswered")
+async def plivo_incoming_unanswered(request: Request):
+    """`action` URL of the ring-all <Dial>. Answered → record who took it.
+    Timed out / no answer → fall through to a short voicemail."""
+    form = await request.form()
+    call_uuid = form.get("CallUUID")
+    dial_status = (form.get("DialStatus") or "").lower()
+    b_leg = form.get("DialBLegUUID") or ""
+
+    await asyncio.to_thread(
+        calls_module.record_inbound_dial_result, call_uuid, dial_status, b_leg,
+    )
+
+    if dial_status == "completed" and b_leg:
+        return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
+                        media_type="application/xml")
+    return Response(content=_voicemail_xml(), media_type="application/xml")
+
+
+@router.post("/incoming-voicemail")
+async def plivo_incoming_voicemail(request: Request):
+    form = await request.form()
+    await asyncio.to_thread(
+        calls_module.attach_inbound_recording,
+        form.get("CallUUID"), form.get("RecordUrl") or form.get("RecordingUrl"),
+    )
+    return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
+                    media_type="application/xml")
+
+
+@router.post("/incoming-hangup")
+async def plivo_incoming_hangup(request: Request):
+    form = await request.form()
+    await asyncio.to_thread(
+        calls_module.finalize_inbound_call,
+        form.get("CallUUID"), form.get("CallStatus"),
+        form.get("HangupCause"), form.get("Duration"),
+    )
+    return Response(status_code=200)
+
+
 @router.post("/recording")
 async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
     form_data = await request.form()
@@ -172,7 +268,13 @@ async def client_timing(request: Request):
 
 
 @router.get("/credentials")
-async def get_credentials():
+async def get_credentials(current_user: schemas.User = Depends(deps.get_current_user)):
+    """SIP credentials for the caller's own softphone.
+
+    Now authenticated and per-user: inbound "ring everyone" dials one <User> per
+    recruiter, which needs distinct endpoints, and this route previously handed
+    working SIP credentials to any unauthenticated caller.
+    """
     result = await plivo_service.setup_plivo()
     if not result.get("success"):
         raise HTTPException(
@@ -185,11 +287,34 @@ async def get_credentials():
                 },
             },
         )
+
+    # Fall back to the shared endpoint if per-user provisioning fails, so a
+    # Plivo hiccup degrades to the previous behaviour instead of killing dialling.
+    own = await plivo_service.ensure_endpoint_for_user(current_user.id)
+    if not own:
+        logger.warning(
+            "Falling back to shared Plivo endpoint for user %s; inbound ring-all will skip them.",
+            current_user.id,
+        )
+        return {
+            "username": plivo_service.endpoint_username,
+            "password": plivo_service.endpoint_password,
+            "public_url": plivo_service.endpoint_public_url or None,
+        }
+
     return {
-        "username": plivo_service.endpoint_username,
-        "password": plivo_service.endpoint_password,
+        "username": own["username"],
+        "password": own["password"],
         "public_url": plivo_service.endpoint_public_url or None,
     }
+
+
+@router.post("/registered")
+async def mark_registered(current_user: schemas.User = Depends(deps.get_current_user)):
+    """Called when the browser softphone finishes SIP registration, so inbound
+    calls only ring endpoints that are plausibly online."""
+    await asyncio.to_thread(plivo_service.mark_endpoint_registered, current_user.id)
+    return {"success": True}
 
 @router.get("/credentials/refresh")
 async def refresh_credentials():

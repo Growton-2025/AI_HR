@@ -17,13 +17,16 @@ const normalizeCount = (value) => {
 
 function Sidebar() {
     const analytics = useAppStore(state => state.analytics)
-    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, fetchAnalytics } = useAppStore(useShallow((state) => ({
+    const { user, sidebarWidth, setSidebarWidth, toggleSidebar, fetchAnalytics, fetchCallStats } = useAppStore(useShallow((state) => ({
         user: state.user,
         sidebarWidth: state.sidebarWidth,
         setSidebarWidth: state.setSidebarWidth,
         toggleSidebar: state.toggleSidebar,
         fetchAnalytics: state.fetchAnalytics,
+        fetchCallStats: state.fetchCallStats,
     })))
+    // Rides the existing call-stats payload — no extra endpoint and no extra poll.
+    const inboundPending = Number(useAppStore(state => state.callStats?.inbound_pending) || 0)
     const role = user?.role
     const permissions = user?.permissions || {}
     const isDragging = useRef(false)
@@ -35,7 +38,10 @@ function Sidebar() {
     useEffect(() => {
         if (!user) return
         fetchAnalytics?.()
-    }, [user, fetchAnalytics])
+        // Seeds the inbound bubble on first paint; the Calls page's existing 15s
+        // stats poll keeps it current from there.
+        fetchCallStats?.({ params: {} })
+    }, [user, fetchAnalytics, fetchCallStats])
 
     const allNavItems = [
         { path: "/",            label: "Dashboard",    icon: BarChart2,         id: "dashboard"   },
@@ -157,6 +163,23 @@ function Sidebar() {
                             >
                                 <Icon size={17} style={{ flexShrink: 0, marginRight: iconMr }} />
                                 {!isIconOnly && <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.label}</span>}
+                                {/* Unreturned inbound callbacks. Deliberately the ONLY
+                                    indicator for this — a top-right pill was explicitly
+                                    rejected as UX clutter. Decrements as callbacks are made. */}
+                                {item.id === 'calls' && inboundPending > 0 && (
+                                    <span
+                                        title={`${inboundPending} inbound call${inboundPending === 1 ? '' : 's'} awaiting a callback`}
+                                        style={{
+                                            marginLeft: 'auto', minWidth: 18, height: 18, padding: '0 5px',
+                                            borderRadius: 9, background: 'var(--accent-primary, #f97316)',
+                                            color: '#fff', fontSize: 11, fontWeight: 700,
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                            flexShrink: 0,
+                                        }}
+                                    >
+                                        {inboundPending > 99 ? '99+' : inboundPending}
+                                    </span>
+                                )}
                             </NavLink>
                         )
                     })}
