@@ -475,10 +475,22 @@ export function VoIPProvider({ children }) {
 
       const initStart = performance.now();
       const credentialsStart = performance.now();
-      const credentialsResponse = await fetch(`${API_BASE}/plivo/credentials`).catch(() => null);
-      const res = credentialsResponse ? await credentialsResponse.json().catch(() => ({})) : {};
+      // Must go through axios, not bare fetch: /plivo/credentials is now
+      // authenticated and per-user, and the bearer token lives on
+      // axios.defaults.headers.common. A raw fetch() sends no Authorization
+      // header, which 401s — leaving the softphone unregistered, so outbound
+      // dialling fails AND inbound has no endpoint to ring.
+      let res = {};
+      let credentialsOk = false;
+      try {
+        const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`);
+        res = credentialsResponse.data || {};
+        credentialsOk = true;
+      } catch (error) {
+        res = error?.response?.data || {};
+      }
       reportTiming('credentials_fetch', performance.now() - credentialsStart);
-      if (!credentialsResponse?.ok) {
+      if (!credentialsOk) {
         const detail = res?.detail;
         const message = (detail && typeof detail === 'object' ? detail.message : '') || 'Unable to prepare Plivo softphone';
         setVoipStatus('error');

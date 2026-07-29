@@ -463,6 +463,11 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
                 app_id=app_id,
             )
             endpoint_id = getattr(resp, "endpoint_id", None) or getattr(resp, "id", None)
+            # Plivo appends its own digits to the requested username, so the
+            # endpoint that actually exists is NOT the name we asked for.
+            # Storing the requested name makes SIP registration fail with
+            # "Authentication Error" — always take the username Plivo returns.
+            username = getattr(resp, "username", None) or username
         except Exception as exc:
             logger.error("Failed to create Plivo endpoint for user %s: %s", user_id, exc)
             return None
