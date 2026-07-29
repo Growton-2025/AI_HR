@@ -630,8 +630,20 @@ export function VoIPProvider({ children }) {
           sdk.client.setRingTone?.(false);
         } catch (_) { /* older SDK builds may not expose it */ }
         stopPlivoManagedAudio();
+        // The SDK's argument shape varies by version and call type, so pull the
+        // caller id out of whichever slot carries it and treat it as optional —
+        // the banner resolves the name from the backend, which has already
+        // matched the number to a candidate.
         const uuid = typeof callUUID === 'string' ? callUUID : callUUID?.callUUID;
-        const from = callInfo?.from || extraHeaders?.from || callInfo?.callerName || '';
+        const from =
+          callInfo?.from
+          || callInfo?.callerId
+          || callInfo?.callerName
+          || extraHeaders?.from
+          || extraHeaders?.['X-Ph-From']
+          || (typeof callUUID === 'object' ? callUUID?.from : '')
+          || '';
+        console.log('[VoIP] Incoming call', { uuid, from, callInfo, extraHeaders });
         setIncomingCall({ callUUID: uuid, from, at: Date.now() });
       });
 

@@ -18,32 +18,44 @@ export default function IncomingCallBanner() {
   const [caller, setCaller] = useState(null);
 
   useEffect(() => {
-    if (!incomingCall?.from) {
+    if (!incomingCall) {
       setCaller(null);
       return undefined;
     }
     let cancelled = false;
-    // Resolve the number to a candidate so the recruiter knows who it is before
-    // deciding to pick up. An unmatched number still shows — a real callback
-    // from an unknown number is worse to hide than to show.
+    // Ask the backend who is calling rather than trusting the SDK's caller-ID:
+    // the inbound webhook has already matched the number to a candidate, and
+    // the browser SDK does not reliably surface a From on every call shape
+    // (which is what made every caller show as "Unknown").
     axios
       .get(`${API_BASE}/calls/inbound`, { params: { status: 'pending' } })
       .then(res => {
         if (cancelled) return;
-        const digits = String(incomingCall.from).replace(/\D/g, '').slice(-10);
-        const match = (res.data?.items || []).find(
-          item => String(item.from_number || '').replace(/\D/g, '').slice(-10) === digits
-        );
-        setCaller(match || null);
+        const items = res.data?.items || [];
+        const digits = String(incomingCall.from || '').replace(/\D/g, '').slice(-10);
+        const byNumber = digits
+          ? items.find(item => String(item.from_number || '').replace(/\D/g, '').slice(-10) === digits)
+          : null;
+        // Fallback when the SDK gave us no number: the call currently ringing is
+        // the one the webhook just recorded, so take the newest very recent row.
+        const recent = items.find(item => {
+          if (!item.received_at) return false;
+          const raw = item.received_at;
+          const at = new Date(/Z$|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : `${raw}Z`);
+          return !Number.isNaN(at.getTime()) && Date.now() - at.getTime() < 120000;
+        });
+        setCaller(byNumber || recent || null);
       })
       .catch(() => { /* the banner is still useful without the name */ });
     return () => { cancelled = true; };
-  }, [incomingCall?.from]);
+  }, [incomingCall?.callUUID, incomingCall?.from]);
 
   if (!incomingCall) return null;
 
-  const name = caller?.candidate_name || 'Unknown caller';
-  const subtitle = [caller?.candidate_title, caller?.candidate_company].filter(Boolean).join(' at ');
+  const number = caller?.from_number || incomingCall.from || '';
+  const name = caller?.candidate_name || (number ? number : 'Unknown caller');
+  const subtitle = [caller?.candidate_title, caller?.candidate_company].filter(Boolean).join(' at ')
+    || (caller?.candidate_name ? number : '');
 
   return (
     <div
@@ -72,7 +84,7 @@ export default function IncomingCallBanner() {
           {name}
         </div>
         <div style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {subtitle || incomingCall.from}
+          {subtitle}
         </div>
       </div>
       <button
