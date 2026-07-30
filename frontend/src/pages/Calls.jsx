@@ -1873,7 +1873,12 @@ export default function Calls() {
                     const isDeletingCall = deletingCallIds.has(call.id);
                     const isTogglingCadence = togglingCadenceIds.has(call.candidate_id);
                     const isExpanded = expandedCallId === call.id;
-                    const dialDisabled = call.status === 'completed' || isDeletingCall || Boolean(call.candidate_phone_wrong);
+                    // Completed calls stay dialable: recruiters need to call a
+                    // candidate back after a finished attempt (a callback, a
+                    // follow-up, or simply reaching someone who did not pick up
+                    // last time). Only a wrong number or an in-flight delete
+                    // genuinely blocks dialling.
+                    const dialDisabled = isDeletingCall || Boolean(call.candidate_phone_wrong);
                     return (
                       <React.Fragment key={call.id}>
                         <tr
