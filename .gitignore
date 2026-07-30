@@ -129,3 +129,6 @@ test_sync.py
 # Plivo softphone provisioning state (contains endpoint credentials)
 data/plivo_softphone_state.json
 data/plivo_inbound_state.json
+
+# Local backups of pre-env_key Plivo state files (contain another environment's app ids)
+data/_env_backup/

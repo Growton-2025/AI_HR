@@ -7,6 +7,7 @@ import Sidebar from './components/Sidebar'
 import ComingSoon from './pages/ComingSoon'
 import { VoIPProvider } from './context/VoIPContext'
 import IncomingCallBanner from './components/IncomingCallBanner'
+import DegradedCallingBanner from './components/DegradedCallingBanner'
 
 const Screening = lazy(() => import('./pages/Screening'))
 const Roles = lazy(() => import('./pages/Roles'))
@@ -316,6 +317,7 @@ function App() {
                 app, so the softphone and its silent incoming banner live at the
                 shell level rather than inside the Calls page. */}
             <IncomingCallBanner />
+            <DegradedCallingBanner />
             <Sidebar />
             <main
                 className="main-content"

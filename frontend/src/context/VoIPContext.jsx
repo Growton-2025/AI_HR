@@ -22,6 +22,7 @@ const VoIPContext = createContext({
   voipCallEvent: null,
   agentEmail: '',
   endpointUsername: '',
+  voipDegraded: null,
   retryVoip: () => {},
 });
 
@@ -32,6 +33,10 @@ const PLIVO_SDK_LOAD_TIMEOUT_MS = 15000;
 const PLIVO_LOGIN_TIMEOUT_MS = 20000;
 const PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS = 12000;
 const PLIVO_DIAL_HANDSHAKE_POLL_MS = 400;
+// Sends the per-attempt X-PH-DialToken on each outbound dial so the backend can
+// attribute the call to an exact `calls` row. See docs/call-attribution-plan.md.
+// Flip to false to fall back to username matching everywhere.
+const SEND_DIAL_TOKEN = true;
 
 let plivoSdkPromise = null;
 
@@ -209,9 +214,18 @@ export function VoIPProvider({ children }) {
   const [voipCallEvent, setVoipCallEvent] = useState(null);
   const [agentEmail, setAgentEmail] = useState('');
   const [endpointUsername, setEndpointUsername] = useState('');
+  // Set when the backend could not provision this recruiter their own SIP
+  // endpoint and handed back the shared one. Deliberately NOT folded into
+  // voipError: the softphone works, so the error path would wrongly show it as
+  // broken and trigger reconnect retries. This is a standing warning about
+  // silent misattribution, not a failure. See docs/call-attribution-plan.md.
+  const [voipDegraded, setVoipDegraded] = useState(null);
   // Inbound call ringing this browser. Held here (not in Calls.jsx) so the
   // banner follows the recruiter across every page.
   const [incomingCall, setIncomingCall] = useState(null);
+  // Read inside SDK callbacks, which close over the state value from the render
+  // that registered them.
+  const incomingCallRef = useRef(null);
   const softphoneRef = useRef(null);
   const remoteAudioRef = useRef(null);
   const localAudioRef = useRef(null);
@@ -368,6 +382,24 @@ export function VoIPProvider({ children }) {
   }, [activeCall]);
 
   useEffect(() => {
+    incomingCallRef.current = incomingCall;
+  }, [incomingCall]);
+
+  // Tell the backend whether this recruiter is on a call, so an inbound
+  // "ring everyone" fork skips them rather than ringing over a live
+  // conversation. Driven off activeCall so every path is covered — outbound
+  // dial, connect, hangup, and accepting an inbound call — instead of having to
+  // remember the beacon in each handler. Best effort: the server ages the flag
+  // out, so a dropped 'idle' post cannot strand the endpoint as busy forever.
+  const busyBeaconRef = useRef(null);
+  useEffect(() => {
+    const busy = Boolean(activeCall);
+    if (busyBeaconRef.current === busy) return;
+    busyBeaconRef.current = busy;
+    axios.post(`${API_BASE}/plivo/busy`, { busy }).catch(() => { /* best effort */ });
+  }, [activeCall]);
+
+  useEffect(() => {
     voipStatusRef.current = voipStatus;
   }, [voipStatus]);
 
@@ -518,6 +550,16 @@ export function VoIPProvider({ children }) {
       }
       setAgentEmail(res.username);
       setEndpointUsername(res.username);
+      setVoipDegraded(res.degraded
+        ? {
+            reason: res.degraded_reason
+              || 'Your softphone is running on a shared line. Call recordings may be attached to the wrong candidate.',
+            at: Date.now(),
+          }
+        : null);
+      if (res.degraded) {
+        console.error('[VoIP] DEGRADED — shared Plivo endpoint in use:', res.degraded_reason);
+      }
       credentialsRef.current = { username: res.username, password: res.password };
 
       const sdkLoadStart = performance.now();
@@ -658,13 +700,44 @@ export function VoIPProvider({ children }) {
           || (typeof callUUID === 'object' ? callUUID?.from : '')
           || '';
         console.log('[VoIP] Incoming call', { uuid, from, callInfo, extraHeaders });
+
+        // Already on a call: do not surface a banner over a live conversation.
+        // The backend now excludes busy endpoints from the fork, but this can
+        // still fire — the busy flag is set a moment after the call starts, and
+        // a shared fallback endpoint marks every recruiter on it at once. Drop
+        // it here; the call still rings other recruiters and still lands in
+        // Inbound Callbacks, so nothing is lost.
+        if (activeCallRef.current) {
+          console.log('[VoIP] Suppressing incoming banner — already on a call');
+          try {
+            sdk.client.ignore?.(uuid);
+          } catch (_) { /* best effort — the <Dial timeout> covers it */ }
+          return;
+        }
+
+        // Single slot: a second caller arriving inside the ring window would
+        // silently replace the first banner. Keep the one already showing —
+        // the newcomer still rings every other recruiter, and both rows appear
+        // in Inbound Callbacks regardless.
+        if (incomingCallRef.current?.callUUID && incomingCallRef.current.callUUID !== uuid) {
+          console.log('[VoIP] Suppressing incoming banner — one already pending');
+          return;
+        }
+
         setIncomingCall({ callUUID: uuid, from, at: Date.now() });
       });
 
-      sdk.client.on('onIncomingCallCanceled', () => {
+      sdk.client.on('onIncomingCallCanceled', (canceledUUID) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         // Another recruiter answered first, or the caller hung up.
         stopPlivoManagedAudio();
+        // Only clear the banner if this cancel is for the call it is showing —
+        // a concurrent caller we suppressed above also cancels, and must not
+        // take down a banner the recruiter can still answer. When the SDK gives
+        // us no UUID, fall back to the old unconditional clear.
+        const uuid = typeof canceledUUID === 'string' ? canceledUUID : canceledUUID?.callUUID;
+        const pending = incomingCallRef.current?.callUUID;
+        if (uuid && pending && uuid !== pending) return;
         setIncomingCall(null);
       });
 
@@ -709,7 +782,7 @@ export function VoIPProvider({ children }) {
     }
   };
 
-  const placeCall = async (toNumber) => {
+  const placeCall = async (toNumber, dialToken = '') => {
     const client = softphoneRef.current?.client;
     if (!client || typeof client.call !== 'function') {
       return { success: false, error: 'Softphone client not available' };
@@ -738,7 +811,21 @@ export function VoIPProvider({ children }) {
       setVoipCallEvent({ at: Date.now(), type: 'dialing', origin: 'local', number: dialNumber, reasonText: '', raw: null });
       setActiveCall({ state: 'dialing', number: dialNumber });
       dialStartedAtRef.current = performance.now();
-      softphoneRef.current.client.call(dialNumber);
+      // The token identifies this specific dial attempt, so the backend can
+      // attribute the call to the exact `calls` row instead of guessing the
+      // most recently updated row for this SIP username. Hex only: Plivo
+      // requires X-PH-* header values to be alphanumeric.
+      //
+      // Whether Plivo forwards X-PH-* to the answer URL is documented but
+      // unverified against this account's SDK build. Nothing breaks if it does
+      // not arrive — the backend logs [DialAttribution] and falls back to the
+      // old username matching. Set SEND_DIAL_TOKEN to false to revert entirely.
+      if (SEND_DIAL_TOKEN && dialToken) {
+        console.log('[VoIP] Dialing with token', dialToken);
+        softphoneRef.current.client.call(dialNumber, { 'X-PH-DialToken': dialToken });
+      } else {
+        softphoneRef.current.client.call(dialNumber);
+      }
       setVoipStatus('connecting');
       return { success: true, dialNumber, username: endpointUsernameRef.current };
     } catch (error) {
@@ -760,19 +847,56 @@ export function VoIPProvider({ children }) {
     }
   };
 
-  const waitForPlivoDial = async (username = endpointUsernameRef.current, timeoutMs = PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS) => {
+  const waitForPlivoDial = async (
+    username = endpointUsernameRef.current,
+    timeoutMs = PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS,
+    dialToken = '',
+    dialedNumber = '',
+  ) => {
     const cleanUsername = String(username || '').trim();
-    if (!cleanUsername) {
+    const cleanToken = String(dialToken || '').trim();
+    if (!cleanUsername && !cleanToken) {
       return { success: false, error: 'Plivo endpoint username is missing' };
     }
+
+    const tokenUrl = cleanToken
+      ? `${API_BASE}/plivo/call-state-by-token/${encodeURIComponent(cleanToken)}`
+      : '';
+    const usernameUrl = cleanUsername
+      ? `${API_BASE}/plivo/call-state/${encodeURIComponent(cleanUsername)}`
+      : '';
+    const dialedTail = String(dialedNumber || '').replace(/\D/g, '').slice(-10);
+
+    const readState = async (url) => {
+      const response = await fetch(url);
+      const state = await response.json().catch(() => ({}));
+      return response.ok ? state : null;
+    };
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        const response = await fetch(`${API_BASE}/plivo/call-state/${encodeURIComponent(cleanUsername)}`);
-        const state = await response.json().catch(() => ({}));
-        if (response.ok && state?.call_uuid) {
-          return { success: true, state };
+        // Token first — an exact match on this attempt.
+        if (tokenUrl) {
+          const state = await readState(tokenUrl);
+          if (state?.call_uuid) return { success: true, state };
+        }
+
+        // Fallback for when Plivo does not forward the X-PH header (documented
+        // but unverified on this account) — without it a working call would
+        // fail the handshake and look broken to the recruiter.
+        //
+        // The username state is never cleared, so it happily returns the
+        // *previous* call's UUID. Require the number to match the one we are
+        // dialing, which rejects a stale attempt to a different candidate. A
+        // stale entry for the same candidate can still pass, but that is a
+        // redial of the same person and harmless for a liveness gate.
+        if (usernameUrl) {
+          const state = await readState(usernameUrl);
+          const stateTail = String(state?.to_number || '').replace(/\D/g, '').slice(-10);
+          if (state?.call_uuid && (!dialedTail || stateTail === dialedTail)) {
+            return { success: true, state };
+          }
         }
       } catch (_) {
         // Keep polling until the deadline so transient dev-server hiccups do not fail the call immediately.
@@ -862,6 +986,7 @@ export function VoIPProvider({ children }) {
         incomingCall,
         acceptIncomingCall,
         dismissIncomingCall,
+        voipDegraded,
         retryVoip: () => initSoftphone({ force: true }),
       }}
     >

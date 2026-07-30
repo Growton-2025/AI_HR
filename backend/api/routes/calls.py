@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -811,6 +812,14 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'inbound_calls')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'plivo_endpoints')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'plivo_endpoints' AND column_name = 'in_call_since')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'calls' AND column_name = 'dial_token')
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'plivo_app_state')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'plivo_endpoints' AND column_name = 'env_key')
                         AND NOT EXISTS (SELECT 1 FROM pg_constraint
                                         WHERE conname = 'unique_candidate_list')
                 """)
@@ -876,6 +885,12 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_recruiter_email VARCHAR(255);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_virtual_number VARCHAR(50);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_endpoint_username VARCHAR(255);")
+            # Per-dial-attempt identifier. Attribution used to match the most
+            # recently updated row for a SIP username, which picks the wrong row
+            # whenever two attempts share a username (two recruiters on the
+            # shared fallback endpoint, or one recruiter redialling quickly) and
+            # silently writes a recording onto the wrong candidate.
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS dial_token VARCHAR(64);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_source VARCHAR(100);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_synced_at TIMESTAMP;")
             # Follow-up calls carry an exact slot (date + time); cadence calls only a date.
@@ -964,6 +979,41 @@ def ensure_calls_schema_ready(force: bool = False):
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Set while this recruiter is on a call, so inbound "ring everyone"
+            # skips them instead of ringing over a live conversation.
+            cur.execute("ALTER TABLE plivo_endpoints ADD COLUMN IF NOT EXISTS in_call_since TIMESTAMP;")
+
+            # Which Plivo Application each environment owns. Previously two JSON
+            # files under data/, which are gitignored and wiped by every Azure
+            # deploy — so hosted always started blank and created a brand new
+            # Application per deploy (20 accumulated), while endpoints stayed
+            # bound to older ones carrying dead tunnel URLs.
+            #
+            # env_key keeps local and hosted from claiming each other's app:
+            # this Postgres is shared between them.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS plivo_app_state (
+                    kind VARCHAR(32) NOT NULL,
+                    env_key VARCHAR(255) NOT NULL,
+                    app_id VARCHAR(128) NOT NULL,
+                    answer_url TEXT,
+                    username VARCHAR(128),
+                    password VARCHAR(128),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (kind, env_key)
+                );
+            """)
+
+            # Endpoints are bound to an app_id, and app_ids are per-environment,
+            # so the same recruiter needs a distinct endpoint per environment.
+            # Without this a laptop-created endpoint gets handed to hosted along
+            # with the laptop's ngrok answer URL.
+            cur.execute("ALTER TABLE plivo_endpoints ADD COLUMN IF NOT EXISTS env_key VARCHAR(255) NOT NULL DEFAULT 'legacy';")
+            cur.execute("ALTER TABLE plivo_endpoints DROP CONSTRAINT IF EXISTS plivo_endpoints_user_id_key;")
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_plivo_endpoints_user_env
+                ON plivo_endpoints (user_id, env_key);
+            """)
 
             cur.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$
@@ -997,6 +1047,7 @@ def ensure_calls_schema_ready(force: bool = False):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_plivo_call_uuid ON calls(plivo_call_uuid);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_plivo_transaction_id ON calls(plivo_transaction_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_plivo_endpoint_username ON calls(plivo_endpoint_username);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_calls_dial_token ON calls(dial_token);")
             cur.execute(f"""
                 ALTER TABLE calls
                     DROP COLUMN IF EXISTS {legacy_provider_prefix}_status,
@@ -1721,6 +1772,116 @@ def list_inbound_calls(
         return_db_connection(conn)
 
 
+@router.post("/inbound/{inbound_id}/callback-task")
+def create_callback_task(
+    inbound_id: int,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Return a real `calls` task to dial this callback through.
+
+    "1-Click Call Back" used to hand the CallingModal the *candidate* id as if
+    it were a call-task id, so /calls/initiate answered 404 "Call task not
+    found" and the callback could never be placed. The outbound dial path needs
+    an actual `calls` row, so reuse the candidate's open task when there is one
+    and create a task otherwise.
+    """
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT candidate_id FROM inbound_calls WHERE id = %s", (inbound_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Inbound call not found")
+            candidate_id = row[0]
+            if not candidate_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This number is not in the talent pool — dial it manually.",
+                )
+
+            # Prefer an open task so the callback closes out real cadence work
+            # instead of leaving a duplicate behind.
+            #
+            # Both lookups are scoped to the caller's own lists. fetch_call_by_id
+            # below filters by list owner, so a task sitting in a colleague's
+            # list would come back as null and leave the dialer with no call to
+            # place — candidates routinely appear in several recruiters' lists.
+            cur.execute(
+                """
+                SELECT c.id FROM calls c
+                  JOIN call_lists cl ON cl.id = c.list_id
+                 WHERE c.candidate_id = %s AND c.status IN ('pending', 'in_progress')
+                   AND LOWER(COALESCE(cl.created_by, '')) = %s
+                 ORDER BY c.due_date ASC NULLS LAST, c.created_at ASC
+                 LIMIT 1
+                """,
+                (candidate_id, owner),
+            )
+            found = cur.fetchone()
+            call_id = found[0] if found else None
+
+            if not call_id:
+                # Fall back to the candidate's most recent list *of ours* so the
+                # new task stays with their existing calling history.
+                cur.execute(
+                    """
+                    SELECT c.list_id FROM calls c
+                      JOIN call_lists cl ON cl.id = c.list_id
+                     WHERE c.candidate_id = %s
+                       AND LOWER(COALESCE(cl.created_by, '')) = %s
+                     ORDER BY c.created_at DESC LIMIT 1
+                    """,
+                    (candidate_id, owner),
+                )
+                list_row = cur.fetchone()
+                list_id = list_row[0] if list_row else None
+
+                if not list_id:
+                    # `calls.list_id` is NOT NULL, so a candidate who has never
+                    # been called needs somewhere to live.
+                    cur.execute(
+                        "SELECT id FROM call_lists WHERE name = %s AND LOWER(COALESCE(created_by, '')) = %s LIMIT 1",
+                        ("Inbound Callbacks", owner),
+                    )
+                    existing_list = cur.fetchone()
+                    if existing_list:
+                        list_id = existing_list[0]
+                    else:
+                        cur.execute(
+                            "INSERT INTO call_lists (name, created_by) VALUES (%s, %s) RETURNING id",
+                            ("Inbound Callbacks", owner),
+                        )
+                        list_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO calls (candidate_id, list_id, status, task_title, due_date)
+                    VALUES (%s, %s, 'pending', %s, CURRENT_DATE)
+                    RETURNING id
+                    """,
+                    (candidate_id, list_id, "Inbound callback"),
+                )
+                call_id = cur.fetchone()[0]
+
+            call = fetch_call_by_id(cur, call_id, owner)
+        conn.commit()
+        invalidate_calls_cache()
+        return {"success": True, "call": call}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("Failed to build a callback task for inbound %s", inbound_id)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
+
+
 @router.post("/inbound/{inbound_id}/resolve")
 def resolve_inbound_call(
     inbound_id: int,
@@ -2217,6 +2378,10 @@ def initiate_call(
     )
     returned_virtual_number = plivo_service.normalize_number(plivo_service.PLIVO_NUMBER)
     returned_status = "pending"
+    # Fresh per attempt, never reused: a redial must not be satisfiable by the
+    # previous attempt's token. Hex only — Plivo requires X-PH-* header values
+    # to be alphanumeric.
+    dial_token = uuid.uuid4().hex
 
     conn = get_calls_db_connection()
     if not conn:
@@ -2234,6 +2399,7 @@ def initiate_call(
                 plivo_virtual_number = COALESCE(NULLIF(plivo_virtual_number, ''), %s),
                 plivo_endpoint_username = COALESCE(NULLIF(%s, ''), plivo_endpoint_username),
                 plivo_status = %s,
+                dial_token = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -2243,6 +2409,9 @@ def initiate_call(
                 returned_virtual_number,
                 endpoint_username or None,
                 returned_status,
+                # Overwritten, not COALESCEd: each attempt needs its own token,
+                # or a redial would be attributed to the first attempt's row.
+                dial_token,
                 call_id,
             ),
         )
@@ -2271,6 +2440,7 @@ def initiate_call(
             "virtual_number": returned_virtual_number,
             "endpoint_username": endpoint_username or None,
             "status": returned_status,
+            "dial_token": dial_token,
         },
         "call": updated_call,
     }

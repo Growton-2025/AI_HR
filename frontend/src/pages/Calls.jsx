@@ -1080,6 +1080,10 @@ export default function Calls() {
     setOutcomeGroup('');
   }, []);
   const [callingCandidate, setCallingCandidate] = useState(null); // The call object
+  // Inbound row this call was launched from, so it can be cleared off the
+  // Pending list once the callback has actually been made.
+  const [pendingInboundId, setPendingInboundId] = useState(null);
+  const [inboundRefreshKey, setInboundRefreshKey] = useState(0);
   const [inboundHistoryCandidate, setInboundHistoryCandidate] = useState(null);
   const [expandedCallId, setExpandedCallId] = useState(null);
   const [syncingCallId, setSyncingCallId] = useState(null);
@@ -1577,16 +1581,23 @@ export default function Calls() {
         {activeTab === 'inbound' ? (
           <div style={{ padding: '24px' }}>
             <InboundCallbacksPanel
+              refreshKey={inboundRefreshKey}
               onCallBack={async (item) => {
                 if (!item.candidate_id) {
                   toast.info('This number is not in the talent pool — dial it manually.');
                   return;
                 }
-                setCallingCandidate({
-                  id: item.candidate_id,
-                  name: item.candidate_name,
-                  phone: item.from_number,
-                });
+                // The dial path needs a real `calls` task. Passing the
+                // candidate id here is what produced "This call task no longer
+                // exists" — /calls/initiate looked it up as a call-task id.
+                try {
+                  const res = await axios.post(`${API_BASE}/calls/inbound/${item.id}/callback-task`);
+                  setPendingInboundId(item.id);
+                  setCallingCandidate(res.data.call);
+                } catch (e) {
+                  const detail = e?.response?.data?.detail;
+                  toast.error(typeof detail === 'string' ? detail : 'Could not start the callback');
+                }
               }}
               onViewHistory={(item) => setInboundHistoryCandidate({
                 id: item.candidate_id,
@@ -2128,7 +2139,25 @@ export default function Calls() {
       {callingCandidate && (
         <CallingModal
           call={callingCandidate}
-          onClose={() => setCallingCandidate(null)}
+          onClose={async () => {
+            setCallingCandidate(null);
+            const inboundId = pendingInboundId;
+            if (!inboundId) return;
+            setPendingInboundId(null);
+            // Resolution is outcome-independent by design: per the product
+            // owner, completing the callback clears the row "irrespective of
+            // whether it is connected or not". So the row leaves Pending once
+            // the callback has been made, and the sidebar count drops.
+            try {
+              await axios.post(`${API_BASE}/calls/inbound/${inboundId}/resolve`, {
+                call_id: callingCandidate?.id ?? null,
+              });
+              setInboundRefreshKey(k => k + 1);
+              fetchCallStats({ force: true, params: slicerParams });
+            } catch (e) {
+              toast.error('Called back, but the callback could not be marked complete');
+            }
+          }}
           onRefresh={fetchData}
         />
       )}
@@ -2299,9 +2328,14 @@ function CallingModal({ call, onClose, onRefresh }) {
         return;
       }
 
+      // Identifies this dial attempt end-to-end (browser → Plivo → answer URL →
+      // calls row), so the recording cannot be attributed to another
+      // recruiter's call. See docs/call-attribution-plan.md.
+      const dialToken = res?.data?.plivo_data?.dial_token || '';
+
       if (placeCall && call.candidate_phone) {
         const placeStart = performance.now();
-        const placeResult = await placeCall(call.candidate_phone);
+        const placeResult = await placeCall(call.candidate_phone, dialToken);
         reportTiming('place_call', performance.now() - placeStart);
         if (!placeResult?.success) {
           const message = placeResult?.error || 'Browser VoIP could not start the call';
@@ -2314,7 +2348,7 @@ function CallingModal({ call, onClose, onRefresh }) {
       }
 
       const handshakeStart = performance.now();
-      const dialState = await waitForPlivoDial(endpointUsername);
+      const dialState = await waitForPlivoDial(endpointUsername, undefined, dialToken, call.candidate_phone);
       reportTiming('dial_handshake', performance.now() - handshakeStart);
       reportTiming('click_to_webhook_total', performance.now() - clickStart);
       if (!dialState?.success) {

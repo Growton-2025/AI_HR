@@ -34,7 +34,7 @@ function relativeTime(iso) {
  * here will reduce." So the callback attempt clears the row — we never inspect
  * whether it actually connected.
  */
-export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onChanged }) {
+export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onChanged, refreshKey = 0 }) {
   const [items, setItems] = useState([]);
   const [filter, setFilter] = useState('pending');
   const [loading, setLoading] = useState(true);
@@ -55,26 +55,20 @@ export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onCha
     }
   }, [filter]);
 
-  useEffect(() => { void load(); }, [load]);
+  // refreshKey lets the parent force a reload after it resolves a row, so a
+  // completed callback disappears from Pending without a manual refresh.
+  useEffect(() => { void load(); }, [load, refreshKey]);
 
-  const resolve = async (item) => {
+  const handleCallBack = async (item) => {
+    // Only opens the dialer. Resolution happens when the call ends — resolving
+    // here marked the row complete the instant the button was pressed, before
+    // the callback had actually been made.
     setBusyId(item.id);
     try {
-      await axios.post(`${API_BASE}/calls/inbound/${item.id}/resolve`, {});
-      toast.success(`Callback to ${item.candidate_name || item.from_number} marked complete`);
-      await load();
-      onChanged?.();
-    } catch (e) {
-      toast.error(e.response?.data?.detail || 'Could not mark the callback complete');
+      await onCallBack?.(item);
     } finally {
       setBusyId(null);
     }
-  };
-
-  const handleCallBack = async (item) => {
-    // Dial first, then resolve regardless of how the dial went.
-    try { await onCallBack?.(item); } catch (_) { /* resolve anyway */ }
-    await resolve(item);
   };
 
   const logManual = async () => {
