@@ -23,6 +23,8 @@ const VoIPContext = createContext({
   agentEmail: '',
   endpointUsername: '',
   voipDegraded: null,
+  connectedInbound: null,
+  clearConnectedInbound: () => {},
   retryVoip: () => {},
 });
 
@@ -223,6 +225,10 @@ export function VoIPProvider({ children }) {
   // broken and trigger reconnect retries. This is a standing warning about
   // silent misattribution, not a failure. See docs/call-attribution-plan.md.
   const [voipDegraded, setVoipDegraded] = useState(null);
+  // Set when an inbound call is answered, so the app shell can open the same
+  // in-call modal outbound uses. Lives here (not in Calls.jsx) because a
+  // candidate can call back while the recruiter is on any page.
+  const [connectedInbound, setConnectedInbound] = useState(null);
   // Inbound call ringing this browser. Held here (not in Calls.jsx) so the
   // banner follows the recruiter across every page.
   const [incomingCall, setIncomingCall] = useState(null);
@@ -939,7 +945,11 @@ export function VoIPProvider({ children }) {
      return { success: true };
   };
 
-  const acceptIncomingCall = async () => {
+  // `caller` is the inbound_calls row the banner already resolved (it carries
+  // the row id and matched candidate). Passing it through lets the shell open
+  // the same in-call modal used for outbound, so an answered callback gets the
+  // same notes / outcome / wrap-up treatment instead of a bare audio session.
+  const acceptIncomingCall = async (caller = null) => {
     const pending = incomingCall;
     if (!pending?.callUUID) return { success: false };
     try {
@@ -949,6 +959,13 @@ export function VoIPProvider({ children }) {
       setIncomingCall(null);
       setVoipStatus('connected');
       setActiveCall({ state: 'connected', number: pending.from || '', direction: 'inbound' });
+      setConnectedInbound({
+        inboundId: caller?.id ?? null,
+        candidateId: caller?.candidate_id ?? null,
+        candidateName: caller?.candidate_name || '',
+        fromNumber: caller?.from_number || pending.from || '',
+        at: Date.now(),
+      });
       return { success: true };
     } catch (error) {
       console.error('[VoIP] Failed to answer inbound call', error);
@@ -956,6 +973,8 @@ export function VoIPProvider({ children }) {
       return { success: false, error: error?.message };
     }
   };
+
+  const clearConnectedInbound = () => setConnectedInbound(null);
 
   const dismissIncomingCall = () => {
     const pending = incomingCall;
@@ -1011,6 +1030,8 @@ export function VoIPProvider({ children }) {
         acceptIncomingCall,
         dismissIncomingCall,
         voipDegraded,
+        connectedInbound,
+        clearConnectedInbound,
         retryVoip: () => initSoftphone({ force: true }),
       }}
     >

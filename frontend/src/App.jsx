@@ -16,6 +16,10 @@ const UserManagement = lazy(() => import('./pages/UserManagement'))
 const TalentPool = lazy(() => import('./pages/TalentPool'))
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const Calls = lazy(() => import('./pages/Calls'))
+// Lazy so answering an inbound call is what pulls in the Calls chunk
+// (CallingModal lives there); importing it eagerly would drag the whole
+// Calls page into the main bundle for every user.
+const InboundCallModal = lazy(() => import('./components/InboundCallModal'))
 
 class TalentPoolErrorBoundary extends Component {
     constructor(props) {
@@ -317,6 +321,7 @@ function App() {
                 app, so the softphone and its silent incoming banner live at the
                 shell level rather than inside the Calls page. */}
             <IncomingCallBanner />
+            <Suspense fallback={null}><InboundCallModal /></Suspense>
             <DegradedCallingBanner />
             <Sidebar />
             <main

@@ -88,7 +88,9 @@ export default function IncomingCallBanner() {
         </div>
       </div>
       <button
-        onClick={() => { void acceptIncomingCall(); }}
+        // Hand over the resolved inbound row so the shell can open the same
+        // in-call modal outbound uses (it needs the row id to build a task).
+        onClick={() => { void acceptIncomingCall(caller); }}
         title="Answer"
         style={{
           background: '#16a34a', color: '#fff', border: 'none', borderRadius: 10,

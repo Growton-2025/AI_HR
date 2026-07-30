@@ -2177,7 +2177,10 @@ export default function Calls() {
   );
 }
 
-function CallingModal({ call, onClose, onRefresh }) {
+// Exported so the app shell can show the same in-call UI when an INBOUND
+// call is answered. `alreadyConnected` skips the outbound dial: the media
+// path is already up, so triggering a dial would place a second call.
+export function CallingModal({ call, onClose, onRefresh, alreadyConnected = false }) {
   const [activeTab, setActiveTab] = useState('calls');
   const [callState, setCallState] = useState('preparing_softphone');
   const [callWrapUpMeta, setCallWrapUpMeta] = useState(null);
@@ -2386,6 +2389,15 @@ function CallingModal({ call, onClose, onRefresh }) {
   useEffect(() => {
     if (isInitiated.current) return;
 
+    // An answered inbound call is already connected — there is nothing to dial,
+    // and calling triggerCall() here would place a second, outbound call to the
+    // candidate while we are talking to them.
+    if (alreadyConnected) {
+      isInitiated.current = true;
+      setCallState('active');
+      return;
+    }
+
     if (voipStatus === 'error') {
       setInitiationError(voipError || 'Browser VoIP is unavailable.');
       setInitiationErrorCode(voipErrorCode || '');
@@ -2401,7 +2413,7 @@ function CallingModal({ call, onClose, onRefresh }) {
     }
 
     triggerCall();
-  }, [triggerCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
+  }, [alreadyConnected, triggerCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
 
   useEffect(() => {
     if (callState === 'review') return;
