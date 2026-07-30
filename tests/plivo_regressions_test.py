@@ -700,3 +700,100 @@ def test_endpoint_adoption_alias_is_environment_scoped(monkeypatch):
     # must NOT be adopted and its password must not be reset.
     assert asyncio.run(plivo_service._adopt_orphaned_endpoint(4)) is None
     assert "updated" not in seen
+
+
+class _RowsCursor(_FakeCtxCursor):
+    def __init__(self, rows):
+        super().__init__(rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _RowsConnection(_FakeCtxConnection):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.cursor_obj = _RowsCursor(rows)
+
+
+def _inbound_row(rid, candidate_id, number, received, name):
+    import datetime
+    return (rid, number, datetime.datetime(2026, 7, 30, 10, received), 'pending', '', 0,
+            None, 'no-answer', None, candidate_id, name, '', '', 'To be started', None)
+
+
+def test_repeat_callers_collapse_into_one_card(monkeypatch):
+    """A candidate who rings three times because nobody answers is still ONE
+    callback. Listing each call made the queue grow the more desperate the
+    caller was."""
+    from backend.api.routes import calls as calls_module
+
+    rows = [
+        _inbound_row(22, 11092, '+919834620024', 46, 'Anchal Shukla'),
+        _inbound_row(21, 11092, '+919834620024', 39, 'Anchal Shukla'),
+        _inbound_row(20, 11092, '+919834620024', 37, 'Anchal Shukla'),
+        _inbound_row(11, 1126, '+918240691859', 51, 'Prateek Sharma'),
+    ]
+    conn = _RowsConnection(rows)
+    monkeypatch.setattr(calls_module, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls_module, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls_module, "return_db_connection", lambda c: None)
+
+    from backend.api import schemas
+    result = calls_module.list_inbound_calls(
+        status="pending",
+        current_user=schemas.User(id=4, username="a@b.c", email="a@b.c"),
+    )
+
+    assert len(result["items"]) == 2
+    assert result["pending_count"] == 2
+    anchal = result["items"][0]
+    assert anchal["call_count"] == 3
+    assert anchal["inbound_ids"] == [22, 21, 20]
+    # The card represents the most recent call.
+    assert anchal["id"] == 22
+
+
+def test_unknown_callers_group_by_number(monkeypatch):
+    """No candidate match means no candidate_id, so grouping must fall back to
+    the number or every ring from one stranger becomes its own card."""
+    from backend.api.routes import calls as calls_module
+
+    rows = [
+        _inbound_row(31, None, '+919999000011', 40, None),
+        _inbound_row(30, None, '09999000011', 20, None),
+    ]
+    conn = _RowsConnection(rows)
+    monkeypatch.setattr(calls_module, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls_module, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls_module, "return_db_connection", lambda c: None)
+
+    from backend.api import schemas
+    result = calls_module.list_inbound_calls(
+        status="pending",
+        current_user=schemas.User(id=4, username="a@b.c", email="a@b.c"),
+    )
+
+    assert len(result["items"]) == 1
+    assert result["items"][0]["call_count"] == 2
+    assert result["items"][0]["is_unknown"] is True
+
+
+def test_answered_live_calls_are_excluded_from_pending(monkeypatch):
+    """A recruiter who picked up and spoke has nothing to call back."""
+    from backend.api.routes import calls as calls_module
+
+    conn = _RowsConnection([])
+    monkeypatch.setattr(calls_module, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls_module, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls_module, "return_db_connection", lambda c: None)
+
+    from backend.api import schemas
+    calls_module.list_inbound_calls(
+        status="pending",
+        current_user=schemas.User(id=4, username="a@b.c", email="a@b.c"),
+    )
+
+    query, _ = conn.cursor_obj.executed[0]
+    assert "ic.status = 'pending'" in query
+    assert "'answered'" not in query

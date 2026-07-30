@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { PhoneIncoming, Phone, FileClock, Plus, Loader2 } from 'lucide-react';
+import { PhoneIncoming, Phone, FileClock, Plus, Loader2, Check } from 'lucide-react';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { API_BASE } from '../store/useAppStore';
@@ -58,6 +58,22 @@ export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onCha
   // refreshKey lets the parent force a reload after it resolves a row, so a
   // completed callback disappears from Pending without a manual refresh.
   useEffect(() => { void load(); }, [load, refreshKey]);
+
+  // Clears the callback without dialling — wrong number, junk, or the
+  // candidate was already handled over email/LinkedIn.
+  const markResolved = async (item) => {
+    setBusyId(item.id);
+    try {
+      await axios.post(`${API_BASE}/calls/inbound/${item.id}/resolve`, { resolution: 'manual' });
+      toast.success(`Callback from ${item.candidate_name || item.from_number} cleared`);
+      await load();
+      onChanged?.();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Could not clear the callback');
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   const handleCallBack = async (item) => {
     // Only opens the dialer. Resolution happens when the call ends — resolving
@@ -192,6 +208,13 @@ export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onCha
                       <Phone size={12} /> {item.from_number}
                     </span>
                     <span>{relativeTime(item.received_at)}</span>
+                    {item.call_count > 1 && (
+                      // They rang more than once because nobody answered — that
+                      // is urgency, not extra work, so it is one card with a count.
+                      <span style={{ fontWeight: 700, color: '#b45309' }}>
+                        {item.call_count} calls
+                      </span>
+                    )}
                     {item.candidate_status && (
                       <span style={{ color: '#2563eb', fontWeight: 600 }}>
                         Current Status: {item.candidate_status}
@@ -214,6 +237,18 @@ export default function InboundCallbacksPanel({ onCallBack, onViewHistory, onCha
                       display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'inherit', flexShrink: 0,
                     }}>
                     <FileClock size={13} /> View History
+                  </button>
+                )}
+                {!resolved && (
+                  <button onClick={() => markResolved(item)} disabled={busyId === item.id}
+                    title="Clear without calling — wrong number, or already handled elsewhere"
+                    style={{
+                      padding: '8px 13px', borderRadius: 9, border: '1px solid #e2e8f0', background: '#fff',
+                      fontSize: 12, fontWeight: 700, color: '#64748b',
+                      cursor: busyId === item.id ? 'wait' : 'pointer', fontFamily: 'inherit',
+                      display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+                    }}>
+                    <Check size={13} /> Mark Resolved
                   </button>
                 )}
                 {!resolved && (

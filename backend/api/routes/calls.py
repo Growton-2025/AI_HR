@@ -653,7 +653,14 @@ def finalize_inbound_call(call_uuid, call_status, hangup_cause, duration) -> Non
             cur.execute(
                 """
                 UPDATE inbound_calls
-                   SET call_status = %s, hangup_cause = %s, duration = %s
+                   SET call_status = %s, hangup_cause = %s, duration = %s,
+                       -- A call a recruiter answered live needs no callback: the
+                       -- conversation happened. Resolve it on hangup so it never
+                       -- reappears as outstanding work. Covers the case where the
+                       -- in-call modal never opened (unknown caller, tab closed).
+                       status = CASE WHEN status = 'answered' THEN 'resolved' ELSE status END,
+                       resolved_at = CASE WHEN status = 'answered' THEN CURRENT_TIMESTAMP ELSE resolved_at END,
+                       resolution = CASE WHEN status = 'answered' THEN 'answered_live' ELSE resolution END
                  WHERE plivo_call_uuid = %s
                 """,
                 (call_status, hangup_cause, duration_int, call_uuid),
@@ -820,6 +827,8 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'plivo_app_state')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'plivo_endpoints' AND column_name = 'env_key')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'inbound_calls' AND column_name = 'resolution')
                         AND NOT EXISTS (SELECT 1 FROM pg_constraint
                                         WHERE conname = 'unique_candidate_list')
                 """)
@@ -962,6 +971,9 @@ def ensure_calls_schema_ready(force: bool = False):
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # How a row left the queue, so a dropping count is auditable:
+            # answered_live | called_back | manual | auto
+            cur.execute("ALTER TABLE inbound_calls ADD COLUMN IF NOT EXISTS resolution VARCHAR(32);")
             cur.execute("CREATE INDEX IF NOT EXISTS ix_inbound_calls_status ON inbound_calls (status, received_at DESC);")
             cur.execute("CREATE INDEX IF NOT EXISTS ix_inbound_calls_candidate ON inbound_calls (candidate_id);")
 
@@ -1706,12 +1718,79 @@ async def set_candidate_cadence_paused(
 class InboundResolveRequest(BaseModel):
     note: Optional[str] = None
     call_id: Optional[int] = None
+    # answered_live | called_back | manual | auto — defaults to called_back.
+    resolution: Optional[str] = None
 
 
 class InboundManualRequest(BaseModel):
     from_number: str
     candidate_id: Optional[int] = None
     note: Optional[str] = None
+
+
+def _ensure_open_call_task(cur, candidate_id: int, owner: str) -> Optional[int]:
+    """Guarantee the candidate still has somewhere to be pursued.
+
+    Resolution is deliberately outcome-independent, so a callback that never
+    connected still clears the queue. Without this the candidate would leave the
+    inbox with nothing chasing them. Only creates a task when the candidate has
+    none open — an existing cadence task is left alone so this never duplicates
+    scheduled work.
+    """
+    cur.execute(
+        """
+        SELECT c.id FROM calls c
+          JOIN call_lists cl ON cl.id = c.list_id
+         WHERE c.candidate_id = %s AND c.status IN ('pending', 'in_progress')
+           AND LOWER(COALESCE(cl.created_by, '')) = %s
+         LIMIT 1
+        """,
+        (candidate_id, owner),
+    )
+    if cur.fetchone():
+        return None
+
+    cur.execute(
+        """
+        SELECT c.list_id FROM calls c
+          JOIN call_lists cl ON cl.id = c.list_id
+         WHERE c.candidate_id = %s AND LOWER(COALESCE(cl.created_by, '')) = %s
+         ORDER BY c.created_at DESC LIMIT 1
+        """,
+        (candidate_id, owner),
+    )
+    row = cur.fetchone()
+    list_id = row[0] if row else None
+    if not list_id:
+        cur.execute(
+            "SELECT id FROM call_lists WHERE name = %s AND LOWER(COALESCE(created_by, '')) = %s LIMIT 1",
+            ("Inbound Callbacks", owner),
+        )
+        existing = cur.fetchone()
+        if existing:
+            list_id = existing[0]
+        else:
+            cur.execute(
+                "INSERT INTO call_lists (name, created_by) VALUES (%s, %s) RETURNING id",
+                ("Inbound Callbacks", owner),
+            )
+            list_id = cur.fetchone()[0]
+
+    cur.execute(
+        """
+        INSERT INTO calls (candidate_id, list_id, status, task_title, due_date)
+        VALUES (%s, %s, 'pending', %s, CURRENT_DATE)
+        RETURNING id
+        """,
+        (candidate_id, list_id, "Follow up on missed callback"),
+    )
+    return cur.fetchone()[0]
+
+
+def _last10(number) -> str:
+    """Last 10 digits — the codebase's standard way of comparing phone numbers
+    across the +91 / 0-prefixed / bare formats candidates arrive in."""
+    return "".join(ch for ch in str(number or "") if ch.isdigit())[-10:]
 
 
 @router.get("/inbound")
@@ -1728,7 +1807,10 @@ def list_inbound_calls(
         where, params = "", []
         normalized = (status or "").strip().lower()
         if normalized == "pending":
-            where = "WHERE ic.status IN ('pending', 'answered')"
+            # 'answered' means a recruiter picked the call up live, so the
+            # conversation already happened — there is nothing to call back and
+            # it must not sit in the queue asking to be actioned.
+            where = "WHERE ic.status = 'pending'"
         elif normalized == "resolved":
             where = "WHERE ic.status = 'resolved'"
         with conn.cursor() as cur:
@@ -1751,23 +1833,56 @@ def list_inbound_calls(
                 params,
             )
             rows = cur.fetchall()
-        items = [
-            {
-                "id": r[0], "from_number": r[1],
-                "received_at": r[2].isoformat() if r[2] else None,
-                "status": r[3], "note": r[4] or "", "duration": r[5] or 0,
-                "recording_url": r[6], "dial_status": r[7],
-                "answered_at": r[8].isoformat() if r[8] else None,
-                "candidate_id": r[9], "candidate_name": r[10],
-                "candidate_title": r[11], "candidate_company": r[12],
-                "candidate_status": r[13], "answered_by": r[14],
-                # No candidate match means the number isn't in the pool — shown
-                # flagged rather than dropped, so a real callback is never lost.
-                "is_unknown": r[9] is None,
-            }
-            for r in rows
-        ]
-        return {"items": items, "pending_count": sum(1 for i in items if i["status"] != "resolved")}
+        # One card per PERSON, not per call. A candidate who rings three times
+        # because nobody picks up is still one callback to make; listing each
+        # call made the queue grow the more desperate the caller was.
+        #
+        # Grouping happens here in the read model only — every inbound_calls row
+        # is a real event and stays as the audit trail.
+        groups: dict = {}
+        order: list = []
+        for r in rows:
+            candidate_id = r[9]
+            # Unknown callers have no candidate, so fall back to the number.
+            key = f"c{candidate_id}" if candidate_id else f"n{_last10(r[1])}"
+            item = groups.get(key)
+            if item is None:
+                item = {
+                    # Latest call in the group — rows arrive newest-first, so the
+                    # first one seen is the one the card represents.
+                    "id": r[0], "from_number": r[1],
+                    "received_at": r[2].isoformat() if r[2] else None,
+                    "status": r[3], "note": r[4] or "", "duration": r[5] or 0,
+                    "recording_url": r[6], "dial_status": r[7],
+                    "answered_at": r[8].isoformat() if r[8] else None,
+                    "candidate_id": candidate_id, "candidate_name": r[10],
+                    "candidate_title": r[11], "candidate_company": r[12],
+                    "candidate_status": r[13], "answered_by": r[14],
+                    # No candidate match means the number isn't in the pool —
+                    # shown flagged rather than dropped, so a real callback is
+                    # never lost.
+                    "is_unknown": candidate_id is None,
+                    "call_count": 0,
+                    "inbound_ids": [],
+                    "first_received_at": None,
+                }
+                groups[key] = item
+                order.append(key)
+            item["call_count"] += 1
+            item["inbound_ids"].append(r[0])
+            if r[2]:
+                item["first_received_at"] = r[2].isoformat()
+            # Keep any note we have, even if the newest call carried none.
+            if not item["note"] and r[4]:
+                item["note"] = r[4]
+
+        items = [groups[k] for k in order]
+        return {
+            "items": items,
+            # Counts people awaiting a callback, not calls received — three
+            # rings from one candidate is one piece of work.
+            "pending_count": sum(1 for i in items if i["status"] != "resolved"),
+        }
     finally:
         return_db_connection(conn)
 
@@ -1902,21 +2017,53 @@ def resolve_inbound_call(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                "SELECT candidate_id, from_number FROM inbound_calls WHERE id = %s",
+                (inbound_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Inbound call not found")
+            candidate_id, from_number = row
+
+            # Clear every outstanding call from this person, not just the row the
+            # card happened to be built from. A candidate who rang three times is
+            # one callback — resolving one row would leave two cards behind and
+            # the count wrong.
+            if candidate_id:
+                where, params = "candidate_id = %s", [candidate_id]
+            else:
+                where, params = (
+                    "candidate_id IS NULL AND RIGHT(REGEXP_REPLACE(from_number, '\\D', '', 'g'), 10) = %s",
+                    [_last10(from_number)],
+                )
+            cur.execute(
+                f"""
                 UPDATE inbound_calls
                    SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP,
                        resolved_by = %s, resolved_call_id = COALESCE(%s, resolved_call_id),
-                       note = COALESCE(NULLIF(%s, ''), note)
-                 WHERE id = %s
+                       note = COALESCE(NULLIF(%s, ''), note),
+                       resolution = COALESCE(%s, 'called_back')
+                 WHERE status <> 'resolved' AND {where}
              RETURNING id
                 """,
-                (current_user.email, request.call_id, (request.note or "").strip(), inbound_id),
+                [current_user.email, request.call_id, (request.note or "").strip(),
+                 (request.resolution or "").strip() or None] + params,
             )
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Inbound call not found")
+            resolved_ids = [r[0] for r in cur.fetchall()]
+            if not resolved_ids:
+                # Already resolved by someone else — not an error, the queue is
+                # shared and two recruiters can act on the same callback.
+                resolved_ids = []
+
+            # A resolution must never silently drop a candidate. The founder's
+            # rule clears the row whether or not the callback connected, so the
+            # safety net is here: if the candidate has no open call task left,
+            # the cadence has nothing to pursue them with, so create one.
+            if candidate_id:
+                _ensure_open_call_task(cur, candidate_id, get_call_list_owner(current_user))
         conn.commit()
         invalidate_calls_cache()
-        return {"success": True}
+        return {"success": True, "resolved_count": len(resolved_ids)}
     except HTTPException:
         conn.rollback()
         raise
@@ -1990,7 +2137,22 @@ def inbound_pending_count() -> int:
         return 0
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM inbound_calls WHERE status <> 'resolved'")
+            # Distinct PEOPLE awaiting a callback, matching the grouped list.
+            # Counting rows made three rings from one candidate read as three
+            # pieces of work, so the badge disagreed with the cards on screen.
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT
+                           COALESCE(
+                               candidate_id::text,
+                               'n' || RIGHT(REGEXP_REPLACE(from_number, '\\D', '', 'g'), 10)
+                           )
+                      FROM inbound_calls
+                     WHERE status <> 'resolved'
+                ) AS people
+                """
+            )
             row = cur.fetchone()
             return int(row[0] or 0) if row else 0
     except Exception:
