@@ -261,14 +261,17 @@ def test_ring_all_skips_recruiters_already_on_a_call(monkeypatch):
 def test_busy_flag_set_and_cleared_by_user_id(monkeypatch):
     conn = _FakeCtxConnection()
     _patch_endpoint_db(monkeypatch, conn)
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    monkeypatch.delenv("NGROK_URL", raising=False)
 
     plivo_service.mark_endpoint_busy(7)
     plivo_service.clear_endpoint_busy(7)
 
     busy_query, busy_params = conn.cursor_obj.executed[0]
     idle_query, idle_params = conn.cursor_obj.executed[1]
-    assert "in_call_since = CURRENT_TIMESTAMP" in busy_query and busy_params == (7,)
-    assert "in_call_since = NULL" in idle_query and idle_params == (7,)
+    # env_key is part of the key: rows are per (user, environment).
+    assert "in_call_since = CURRENT_TIMESTAMP" in busy_query and busy_params == (7, "local")
+    assert "in_call_since = NULL" in idle_query and idle_params == (7, "local")
     assert "user_id = %s" in busy_query
     assert conn.commits == 2
 
@@ -650,3 +653,50 @@ def test_local_cannot_steal_the_inbound_number_from_hosted(monkeypatch):
     monkeypatch.setenv("PLIVO_CLAIM_NUMBER", "true")
     asyncio.run(plivo_service.ensure_inbound_application())
     assert rebinds and rebinds[0]["app_id"] == "APP_LOCAL"
+
+
+def test_registration_and_busy_writes_are_environment_scoped(monkeypatch):
+    """A user holds one endpoint row per environment. Marking a laptop's row
+    registered or busy must not touch the hosted row — the hosted endpoint would
+    otherwise be dropped from the inbound ring-all and callers hit voicemail."""
+    conn = _FakeCtxConnection()
+    _patch_endpoint_db(monkeypatch, conn)
+    monkeypatch.setenv("PUBLIC_URL", "https://hosted.example.com")
+
+    plivo_service.mark_endpoint_registered(4)
+    plivo_service.mark_endpoint_busy(4)
+
+    reg_query, reg_params = conn.cursor_obj.executed[0]
+    busy_query, busy_params = conn.cursor_obj.executed[1]
+    assert "env_key = %s" in reg_query and reg_params == (4, "hosted.example.com")
+    assert "env_key = %s" in busy_query and busy_params == (4, "hosted.example.com")
+
+
+def test_endpoint_adoption_alias_is_environment_scoped(monkeypatch):
+    """A bare recruiter_<id> alias let a second environment adopt the FIRST
+    environment's live endpoint and reset its password, locking the original out
+    of SIP registration entirely."""
+    monkeypatch.setenv("PUBLIC_URL", "https://hosted.example.com")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_ID", "auth-id")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_TOKEN", "auth-token")
+
+    seen = {}
+
+    class _Endpoints:
+        def list(self, limit=20):
+            return [type("E", (), {"alias": "recruiter_4", "endpoint_id": "EP1",
+                                   "username": "u1"})()]
+
+        def update(self, **kw):
+            seen["updated"] = kw
+
+    class _Client:
+        def __init__(self, *a, **k):
+            self.endpoints = _Endpoints()
+
+    monkeypatch.setattr(plivo_service.plivo, "RestClient", _Client)
+
+    # The only endpoint present belongs to another environment's alias, so it
+    # must NOT be adopted and its password must not be reset.
+    assert asyncio.run(plivo_service._adopt_orphaned_endpoint(4)) is None
+    assert "updated" not in seen

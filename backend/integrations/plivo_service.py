@@ -836,7 +836,12 @@ async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
     if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
         return None
 
-    alias = f"recruiter_{user_id}"
+    # Environment-scoped. A bare "recruiter_<id>" alias made a second
+    # environment adopt the FIRST environment's live endpoint and reset its
+    # password — which silently locked the original out of SIP registration, so
+    # its softphone could not register, outbound reported "Not Reachable" and
+    # every inbound call went straight to voicemail with nothing to ring.
+    alias = f"recruiter_{user_id}_{_env_key()}"
     try:
         client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
         listing = await asyncio.to_thread(client.endpoints.list, limit=20)
@@ -961,7 +966,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
                 client.endpoints.create,
                 username=username,
                 password=password,
-                alias=f"recruiter_{user_id}",
+                alias=f"recruiter_{user_id}_{_env_key()}",
                 app_id=app_id,
             )
             endpoint_id = getattr(resp, "endpoint_id", None) or getattr(resp, "id", None)
@@ -1015,8 +1020,9 @@ def mark_endpoint_registered(user_id: int) -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE plivo_endpoints SET last_registered_at = CURRENT_TIMESTAMP WHERE user_id = %s",
-                (user_id,),
+                "UPDATE plivo_endpoints SET last_registered_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = %s AND env_key = %s",
+                (user_id, _env_key()),
             )
         conn.commit()
     except Exception as exc:
@@ -1049,9 +1055,13 @@ def _set_endpoint_busy(busy: bool, *, user_id: int = None, username: str = None)
         value = "CURRENT_TIMESTAMP" if busy else "NULL"
         column, key = ("user_id", user_id) if user_id else ("username", username)
         with conn.cursor() as cur:
+            # Scoped to this environment: a user can hold an endpoint row per
+            # environment, and marking a laptop's row busy must not remove the
+            # hosted endpoint from the inbound ring-all.
             cur.execute(
-                f"UPDATE plivo_endpoints SET in_call_since = {value} WHERE {column} = %s",
-                (key,),
+                f"UPDATE plivo_endpoints SET in_call_since = {value} "
+                f"WHERE {column} = %s AND env_key = %s",
+                (key, _env_key()),
             )
         conn.commit()
     except Exception as exc:

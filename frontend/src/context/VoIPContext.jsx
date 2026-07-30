@@ -33,6 +33,9 @@ const PLIVO_SDK_LOAD_TIMEOUT_MS = 15000;
 const PLIVO_LOGIN_TIMEOUT_MS = 20000;
 const PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS = 12000;
 const PLIVO_DIAL_HANDSHAKE_POLL_MS = 400;
+// Comfortably inside the backend's 15-minute "recently registered" window, so
+// a live softphone is never mistaken for offline and sent to voicemail.
+const REGISTRATION_HEARTBEAT_MS = 5 * 60 * 1000;
 // Sends the per-attempt X-PH-DialToken on each outbound dial so the backend can
 // attribute the call to an exact `calls` row. See docs/call-attribution-plan.md.
 // Flip to false to fall back to username matching everywhere.
@@ -385,6 +388,21 @@ export function VoIPProvider({ children }) {
     incomingCallRef.current = incomingCall;
   }, [incomingCall]);
 
+  // Keep the endpoint's registration fresh. The inbound webhook only rings
+  // endpoints seen registering in the last 15 minutes, but the SDK fires
+  // onLogin exactly once and a SIP session stays up for hours — so a recruiter
+  // who logged in and kept working silently dropped off the ring list, and
+  // every candidate callback went straight to voicemail with nobody rung.
+  useEffect(() => {
+    if (voipStatus !== 'registered' && voipStatus !== 'connected') return undefined;
+    const beat = () => {
+      axios.post(`${API_BASE}/plivo/registered`).catch(() => { /* best effort */ });
+    };
+    beat();
+    const id = window.setInterval(beat, REGISTRATION_HEARTBEAT_MS);
+    return () => window.clearInterval(id);
+  }, [voipStatus]);
+
   // Tell the backend whether this recruiter is on a call, so an inbound
   // "ring everyone" fork skips them rather than ringing over a live
   // conversation. Driven off activeCall so every path is covered — outbound
@@ -528,7 +546,13 @@ export function VoIPProvider({ children }) {
         } catch (error) {
           lastStatus = error?.response?.status || 0;
           res = error?.response?.data || {};
-          if (lastStatus !== 401 && lastStatus !== 403) break;
+          // Retry when the response is unreadable (status 0) as well as on
+          // 401/403. The bearer token is restored asynchronously on a cold
+          // load, and that race can surface either as a 401 or as an error
+          // with no response at all — breaking out on the latter left the
+          // softphone permanently unregistered after a single 72ms attempt,
+          // which sends every inbound call to voicemail.
+          if (lastStatus && lastStatus !== 401 && lastStatus !== 403) break;
           await new Promise(resolve => window.setTimeout(resolve, 400 * (attempt + 1)));
         }
       }
