@@ -209,6 +209,35 @@ def _save_app_state(kind: str, app_id: str, answer_url: str,
         return_db_connection(conn)
 
 
+def _clear_app_state(kind: str) -> None:
+    """Forget this environment's Application record.
+
+    Called when the stored app turns out not to exist in Plivo any more (it was
+    deleted, or the row was written by something that never created a real one).
+    Without this the recovery path is a loop: reuse fails, we fall through to
+    provisioning, and _provision_app_once reads the same broken row back and
+    returns it again — so the environment can never heal itself.
+    """
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM plivo_app_state WHERE kind = %s AND env_key = %s",
+                (kind, _env_key()),
+            )
+        conn.commit()
+        logger.warning("Cleared unusable Plivo %s app state for %s", kind, _env_key())
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Could not clear plivo_app_state(%s): %s", kind, exc)
+    finally:
+        return_db_connection(conn)
+
+
 def _provision_app_once(kind: str, answer_url: str, create_fn):
     """Create this environment's Application exactly once across all workers.
 
@@ -296,25 +325,46 @@ def _inbound_number_owner_env() -> Optional[str]:
 
     There is one DID for the whole account, so inbound cannot be shared between
     a laptop and the hosted backend — the last writer wins and the other goes
-    dark. This makes that ownership explicit instead of implicit in whoever
-    restarted most recently.
+    dark.
+
+    Ownership is read from **Plivo**, not from our own most-recently-updated
+    row. The latter is self-defeating: an environment provisions its inbound app
+    (writing its own row) moments before this check, so it always looked like
+    the owner and every local restart happily stole the number.
     """
     from backend.db.connection import get_db_connection, return_db_connection
 
+    if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN or not PLIVO_NUMBER:
+        return None
+
+    try:
+        client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+        number = client.numbers.get(PLIVO_NUMBER)
+        bound_app = str(getattr(number, "application", "") or "").rstrip("/").split("/")[-1]
+    except Exception as exc:
+        # Fail closed: if we cannot tell who owns it, do not take it.
+        logger.warning("Could not read the inbound number's current app: %s", exc)
+        return "unknown"
+
+    if not bound_app:
+        return None  # unbound — free to claim
+
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
-        return None
+        return "unknown"
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT env_key FROM plivo_app_state WHERE kind = 'inbound' "
-                "ORDER BY updated_at DESC LIMIT 1"
+                "SELECT env_key FROM plivo_app_state WHERE kind = 'inbound' AND app_id = %s",
+                (bound_app,),
             )
             row = cur.fetchone()
-        return row[0] if row else None
+        # An app we have no record of belongs to something else (a hand-made
+        # app, another deployment) — treat it as owned, not free.
+        return row[0] if row else "unknown"
     except Exception as exc:
         logger.warning("Could not determine inbound number owner: %s", exc)
-        return None
+        return "unknown"
     finally:
         return_db_connection(conn)
 
@@ -358,13 +408,22 @@ async def ensure_inbound_application() -> Optional[str]:
     try:
         if app_id:
             if (state or {}).get("answer_url") != answer_url:
-                await asyncio.to_thread(
-                    client.applications.update,
-                    app_id=app_id, answer_url=answer_url, answer_method="POST",
-                    hangup_url=hangup_url, hangup_method="POST",
-                )
-                logger.info("Re-pointed inbound Plivo app %s to %s", app_id, answer_url)
-        else:
+                try:
+                    await asyncio.to_thread(
+                        client.applications.update,
+                        app_id=app_id, answer_url=answer_url, answer_method="POST",
+                        hangup_url=hangup_url, hangup_method="POST",
+                    )
+                    logger.info("Re-pointed inbound Plivo app %s to %s", app_id, answer_url)
+                except Exception as reuse_err:
+                    # The stored app no longer exists — forget it and create one,
+                    # rather than failing inbound setup on every restart.
+                    logger.warning("Inbound app %s unusable (%s); provisioning fresh.",
+                                   app_id, reuse_err)
+                    await asyncio.to_thread(_clear_app_state, "inbound")
+                    app_id = None
+
+        if not app_id:
             def _create_inbound():
                 created = client.applications.create(
                     app_name=f"Inbound_App_{time.time_ns()}",
@@ -644,6 +703,10 @@ async def setup_plivo(force: bool = False):
                 }
             except Exception as reuse_err:
                 logger.warning(f"Could not reuse persisted Plivo app, provisioning fresh: {reuse_err}")
+                # Drop the unusable record, or the fresh-provision path below
+                # reads it straight back and returns the same dead app.
+                await asyncio.to_thread(_clear_app_state, "softphone")
+                persisted = None
 
         setup_suffix = f"{time.time_ns()}{uuid.uuid4().hex[:8]}"
         app_name = f"Softphone_App_{setup_suffix}"

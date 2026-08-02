@@ -631,7 +631,13 @@ def test_local_cannot_steal_the_inbound_number_from_hosted(monkeypatch):
     monkeypatch.setattr(plivo_service, "get_ngrok_url", lambda: "https://laptop.trycloudflare.com")
     monkeypatch.setattr(plivo_service, "_load_app_state",
                         lambda kind: {"app_id": "APP_LOCAL", "answer_url": "https://laptop.trycloudflare.com/api/plivo/incoming"})
+    # Every DB touch must be stubbed. Without _clear_app_state and
+    # _provision_app_once the test wrote its fixture app id ("APP_LOCAL") into
+    # the real plivo_app_state table, which then wedged local Plivo setup.
     monkeypatch.setattr(plivo_service, "_save_app_state", lambda *a, **k: True)
+    monkeypatch.setattr(plivo_service, "_clear_app_state", lambda kind: None)
+    monkeypatch.setattr(plivo_service, "_provision_app_once",
+                        lambda kind, answer_url, create_fn: {"app_id": "APP_LOCAL"})
 
     rebinds = []
 
@@ -797,3 +803,52 @@ def test_answered_live_calls_are_excluded_from_pending(monkeypatch):
     query, _ = conn.cursor_obj.executed[0]
     assert "ic.status = 'pending'" in query
     assert "'answered'" not in query
+
+
+def test_number_owner_is_read_from_plivo_not_our_own_latest_row(monkeypatch):
+    """Ownership must come from the number's ACTUAL binding. Deriving it from
+    our most-recently-updated inbound row was self-defeating: an environment
+    writes its own row moments before the check, so it always looked like the
+    owner and every local restart stole the number from hosted."""
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_ID", "auth-id")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_TOKEN", "auth-token")
+    monkeypatch.setattr(plivo_service, "PLIVO_NUMBER", "918035312881")
+
+    class _Numbers:
+        def get(self, number):
+            return type("N", (), {
+                "application": "/v1/Account/X/Application/14190034175082649/"})()
+
+    class _Client:
+        def __init__(self, *a, **k):
+            self.numbers = _Numbers()
+
+    monkeypatch.setattr(plivo_service.plivo, "RestClient", _Client)
+
+    conn = _FakeCtxConnection()
+
+    class _OwnerCursor(_FakeCtxCursor):
+        def fetchone(self):
+            return ("growton-backend-v2.azurewebsites.net",)
+
+    conn.cursor_obj = _OwnerCursor()
+    _patch_endpoint_db(monkeypatch, conn)
+
+    assert plivo_service._inbound_number_owner_env() == "growton-backend-v2.azurewebsites.net"
+    _query, params = conn.cursor_obj.executed[0]
+    assert params == ("14190034175082649",)
+
+
+def test_unknown_binding_is_treated_as_owned_not_free(monkeypatch):
+    """Fail closed. An app we have no record of belongs to something else, and
+    an unreadable Plivo response is not permission to take the number."""
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_ID", "auth-id")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_TOKEN", "auth-token")
+    monkeypatch.setattr(plivo_service, "PLIVO_NUMBER", "918035312881")
+
+    class _Client:
+        def __init__(self, *a, **k):
+            raise RuntimeError("plivo unreachable")
+
+    monkeypatch.setattr(plivo_service.plivo, "RestClient", _Client)
+    assert plivo_service._inbound_number_owner_env() == "unknown"
