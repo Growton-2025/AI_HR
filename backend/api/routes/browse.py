@@ -154,6 +154,16 @@ def _log_browse_timing(
 class StatusUpdate(BaseModel):
     status: str
 
+
+class BulkStatusUpdate(BaseModel):
+    candidate_ids: List[int]
+    status: str
+
+
+# One request cannot rewrite an unbounded number of rows. Matches the page cap
+# the UI loads with (page_size=5000), so "Use All Filtered" can never exceed it.
+BULK_STATUS_MAX = 5000
+
 class NotesUpdate(BaseModel):
     notes: str
 
@@ -1651,6 +1661,180 @@ async def browse_metadata(
         return result
     finally:
         return_db_connection(conn)
+
+@router.post("/candidates/bulk-status")
+async def bulk_update_status(
+    update: BulkStatusUpdate,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Set the same status on many candidates in one round trip.
+
+    Looping the single-candidate endpoint was not an option: each statement
+    costs ~0.6s against the remote DB, so 77 candidates meant ~77 requests and
+    several hundred statements, with cache invalidation thrashing throughout.
+    Everything here is set-based and the caches are invalidated once.
+
+    Also note "Add to Shortlist" is not a separate feature — 'Shortlisted' is a
+    value in RECRUITMENT_STAGES, so it is this endpoint with a fixed status.
+    """
+    started = time.monotonic()
+
+    status = (update.status or "").strip()
+    # The dropdown is a fixed vocabulary. A typo would create a stage nothing
+    # can filter by, on an unbounded number of rows.
+    if status not in RECRUITMENT_STAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown status {status!r}. Expected one of: {', '.join(RECRUITMENT_STAGES)}",
+        )
+
+    ids = sorted({int(cid) for cid in (update.candidate_ids or []) if cid})
+    if not ids:
+        return {"success": True, "updated": 0, "skipped": 0, "status": status}
+    if len(ids) > BULK_STATUS_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many candidates in one request ({len(ids)}); the limit is {BULK_STATUS_MAX}.",
+        )
+
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        with conn.cursor() as cur:
+            # Same rule as _authorize_candidate_update(allow_role_access=True),
+            # expressed as a set: admin, or owner, or the candidate sits on a
+            # role this user owns. Unauthorized ids are skipped rather than
+            # failing the batch — one foreign id in a 77-row selection must not
+            # make the action unusable, and silently editing rows the user
+            # cannot edit is worse.
+            if is_admin:
+                cur.execute(
+                    """
+                    SELECT id FROM candidates
+                     WHERE id = ANY(%s::int[]) AND COALESCE(is_archived, FALSE) = FALSE
+                    """,
+                    (ids,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT c.id FROM candidates c
+                     WHERE c.id = ANY(%s::int[])
+                       AND COALESCE(c.is_archived, FALSE) = FALSE
+                       AND (
+                            c.owner_user_id = %s
+                            OR EXISTS (
+                                SELECT 1 FROM recruitment_role_candidates rrc
+                                JOIN recruitment_roles rr ON rr.id = rrc.role_id
+                                WHERE rrc.candidate_id = c.id AND rr.user_id = %s
+                            )
+                       )
+                    """,
+                    (ids, current_user.id, current_user.id),
+                )
+            allowed = [r[0] for r in cur.fetchall()]
+
+            if allowed:
+                cur.execute(
+                    "UPDATE candidates SET status = %s WHERE id = ANY(%s::int[])",
+                    (status, allowed),
+                )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Bulk status update failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        return_db_connection(conn)
+
+    skipped = len(ids) - len(allowed)
+    if not allowed:
+        return {"success": True, "updated": 0, "skipped": skipped, "status": status}
+
+    # Keep the in-memory profile cache in step, exactly as the single-candidate
+    # write does — otherwise reads served from cache report the old status.
+    for cid in allowed:
+        if cid in PROFILES_BY_ID:
+            PROFILES_BY_ID[cid]["status"] = status
+
+    # A terminal status must stop the candidate resurfacing in the calling
+    # loop. The single endpoint does this per candidate; bulk does it once for
+    # the whole batch, or candidates marked e.g. "Not Interested" would keep
+    # being dialled.
+    # Imported here, not at module scope: browse and calls import each other's
+    # helpers, and a top-level import would be circular.
+    from backend.api.routes.calls import TERMINAL_CANDIDATE_STATUSES
+
+    closed_calls = 0
+    if status.lower() in TERMINAL_CANDIDATE_STATUSES:
+        try:
+            from backend.api.routes.calls import (
+                get_call_list_owner, get_calls_db_connection,
+                return_db_connection as return_calls_conn,
+            )
+
+            owner = get_call_list_owner(current_user)
+            closed_outcome = f"Closed - {status}"
+            calls_conn = get_calls_db_connection()
+            if calls_conn:
+                try:
+                    cur = calls_conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE calls
+                           SET status = 'completed', outcome = %s,
+                               completed_at = NOW(), updated_at = NOW()
+                         WHERE candidate_id = ANY(%s::int[])
+                           AND status = 'pending'
+                           AND list_id IN (
+                               SELECT id FROM call_lists
+                                WHERE LOWER(COALESCE(created_by, '')) = %s
+                           )
+                        """,
+                        (closed_outcome, allowed, owner),
+                    )
+                    closed_calls = cur.rowcount or 0
+                    calls_conn.commit()
+                    cur.close()
+                finally:
+                    return_calls_conn(calls_conn)
+        except Exception:
+            # The status change already succeeded; failing to close call tasks
+            # must not report the whole operation as failed.
+            logger.exception("Bulk status: could not close pending call tasks")
+
+    # Invalidated once for the batch, not once per candidate.
+    from backend.api.routes.candidates import invalidate_candidate_count_caches
+    from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
+
+    invalidate_candidate_count_caches(refresh_profile_ids=allowed)
+    for cid in allowed:
+        invalidate_role_detail_cache_for_candidate(cid)
+    try:
+        from backend.api.routes.calls import invalidate_calls_cache
+        invalidate_calls_cache()
+    except Exception:
+        pass
+
+    logger.info(
+        "Bulk status: %s -> %d updated, %d skipped, %d call tasks closed in %.2fs",
+        status, len(allowed), skipped, closed_calls, time.monotonic() - started,
+    )
+    return {
+        "success": True,
+        "updated": len(allowed),
+        "skipped": skipped,
+        "status": status,
+        "updated_ids": allowed,
+        "closed_call_tasks": closed_calls,
+    }
+
 
 @router.post("/candidates/{candidate_id}/status")
 async def update_status(

@@ -5,6 +5,16 @@ import { API_BASE, useAppStore } from '../store/useAppStore'
 import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus, Play, Edit2, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
+
+// Mirrors TERMINAL_CANDIDATE_STATUSES in backend/api/routes/calls.py. Setting
+// one of these also completes the candidate's pending call tasks, which is a
+// surprising thing to discover after bulk-applying it to hundreds of rows — so
+// the confirm dialog warns. Kept in sync manually; the backend remains the
+// authority and applies the rule regardless of what the UI says.
+const TERMINAL_STATUSES_UI = new Set([
+    'not interested', 'high ctc', 'shared with customer', 'for future',
+    'shortlist - rejected', 'duplicate', 'rejected',
+])
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
@@ -131,6 +141,7 @@ function Roles() {
         fetchAnalytics: state.fetchAnalytics,
         deactivateRole: state.deactivateRole,
         assignCandidatesToRole: state.assignCandidatesToRole,
+        bulkUpdateCandidateStatus: state.bulkUpdateCandidateStatus,
         user: state.user
     })))
 
@@ -189,6 +200,8 @@ function Roles() {
     const [selectedIds, setSelectedIds] = useState(new Set())
     const [allFilteredSelected, setAllFilteredSelected] = useState(false)
     const [showAddToListModal, setShowAddToListModal] = useState(false)
+    const [showBulkStatusMenu, setShowBulkStatusMenu] = useState(false)
+    const [bulkStatusBusy, setBulkStatusBusy] = useState(false)
 
     // Filtering State
     const [showFilters, setShowFilters] = useState(true)
@@ -1254,6 +1267,44 @@ function Roles() {
     // "Add to Call List" (candidateIds={Array.from(selectedIds)} below) —
     // the bottom bar's own count already reflected the stale total, the bug
     // was that nothing signaled those ids were no longer what's on screen.
+    // Bulk status change. This is the first action in the app that can rewrite
+    // hundreds of records at once and there is no undo, so it always confirms
+    // with the exact count — and says out loud when the status will also close
+    // pending call tasks, which is a surprising side effect to discover later.
+    const applyBulkStatus = useCallback(async (status) => {
+        const ids = Array.from(selectedIds)
+        if (!ids.length) return
+        const terminal = TERMINAL_STATUSES_UI.has(status.toLowerCase())
+        const warning = terminal
+            ? `\n\nThis status also closes any pending call tasks for these candidates, removing them from the calling loop.`
+            : ''
+        if (!window.confirm(`Set status to "${status}" for ${ids.length} candidate${ids.length === 1 ? '' : 's'}?${warning}`)) return
+
+        setShowBulkStatusMenu(false)
+        setBulkStatusBusy(true)
+        try {
+            const res = await bulkUpdateCandidateStatus(ids, status)
+            if (!res.success) {
+                toast.error(res.error || 'Could not update statuses')
+                return
+            }
+            const skipped = res.skipped
+                ? ` · ${res.skipped} skipped (not yours)`
+                : ''
+            const closed = res.closedCallTasks
+                ? ` · ${res.closedCallTasks} call task${res.closedCallTasks === 1 ? '' : 's'} closed`
+                : ''
+            toast.success(`${res.updated} candidate${res.updated === 1 ? '' : 's'} set to "${status}"${skipped}${closed}`)
+            setSelectedIds(new Set())
+            setAllFilteredSelected(false)
+            // The grid reads status from the role detail payload, so refetch it
+            // rather than hand-patching every row here.
+            if (viewingRole?.name) await fetchRoleDetails(viewingRole.name, { force: true })
+        } finally {
+            setBulkStatusBusy(false)
+        }
+    }, [selectedIds, bulkUpdateCandidateStatus, viewingRole, fetchRoleDetails])
+
     const prevVisibleIdsRef = useRef(new Set())
     useEffect(() => {
         const visibleIds = new Set(filteredCandidates.map(c => c.id))
@@ -2538,8 +2589,65 @@ function Roles() {
                                 <Phone size={14} /> Add to Call List
                             </button>
                         )}
+                        {(selectedIds.size > 0 || allFilteredSelected) && (
+                            <button
+                                onClick={() => applyBulkStatus('Shortlisted')}
+                                disabled={bulkStatusBusy}
+                                style={{
+                                    padding: '8px 16px', background: '#16a34a', color: '#fff', border: '1px solid rgba(255,255,255,0.18)',
+                                    borderRadius: '10px', fontSize: 13, fontWeight: 700,
+                                    cursor: bulkStatusBusy ? 'wait' : 'pointer',
+                                    display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s',
+                                    opacity: bulkStatusBusy ? 0.7 : 1,
+                                }}
+                            >
+                                <Check size={14} /> Add to Shortlist
+                            </button>
+                        )}
+                        {(selectedIds.size > 0 || allFilteredSelected) && (
+                            <div style={{ position: 'relative' }}>
+                                <button
+                                    onClick={() => setShowBulkStatusMenu(v => !v)}
+                                    disabled={bulkStatusBusy}
+                                    style={{
+                                        padding: '8px 16px', background: '#fff', color: '#0f172a', border: '1px solid rgba(255,255,255,0.18)',
+                                        borderRadius: '10px', fontSize: 13, fontWeight: 700,
+                                        cursor: bulkStatusBusy ? 'wait' : 'pointer',
+                                        display: 'flex', alignItems: 'center', gap: 8, transition: 'all 0.2s',
+                                        opacity: bulkStatusBusy ? 0.7 : 1,
+                                    }}
+                                >
+                                    {bulkStatusBusy ? 'Updating…' : 'Set Status'} <ChevronDown size={14} />
+                                </button>
+                                {showBulkStatusMenu && !bulkStatusBusy && (
+                                    <div style={{
+                                        position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 1100,
+                                        background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+                                        boxShadow: '0 20px 40px rgba(15,23,42,0.28)', padding: 6,
+                                        minWidth: 230, maxHeight: 320, overflowY: 'auto',
+                                    }}>
+                                        {RECRUITMENT_STAGES.map(stage => (
+                                            <button
+                                                key={stage}
+                                                onClick={() => applyBulkStatus(stage)}
+                                                style={{
+                                                    display: 'block', width: '100%', textAlign: 'left',
+                                                    padding: '9px 12px', borderRadius: 8, border: 'none',
+                                                    background: 'transparent', color: '#0f172a',
+                                                    fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+                                                }}
+                                                onMouseEnter={e => e.currentTarget.style.background = '#f1f5f9'}
+                                                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                            >
+                                                {stage}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        )}
                         <button
-                            onClick={() => { setSelectedIds(new Set()); setAllFilteredSelected(false); }}
+                            onClick={() => { setShowBulkStatusMenu(false); setSelectedIds(new Set()); setAllFilteredSelected(false); }}
                             style={{ background: 'none', border: 'none', color: '#94a3b8', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
                         >
                             Cancel

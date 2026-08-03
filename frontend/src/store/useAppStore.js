@@ -2819,6 +2819,47 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
+    // Same status onto many candidates in ONE request. Looping
+    // updateCandidateStatus would be one HTTP round trip per candidate against
+    // a remote DB where each statement costs ~0.6s — a 77-row selection would
+    // take about a minute and thrash the caches throughout.
+    //
+    // "Add to Shortlist" is this with status 'Shortlisted': shortlisting is a
+    // status value, not separate membership.
+    bulkUpdateCandidateStatus: async (candidateIds, newStatus) => {
+        const ids = [...new Set((candidateIds || []).map(Number).filter(Boolean))]
+        if (!ids.length) return { success: true, updated: 0, skipped: 0 }
+        try {
+            const res = await axios.post(`${API_BASE}/candidates/bulk-status`, {
+                candidate_ids: ids,
+                status: newStatus,
+            })
+            // Patch only what the server actually changed — a mixed-ownership
+            // selection can legitimately skip some ids, and showing those as
+            // updated would be a lie the next refetch quietly corrects.
+            const updatedIds = res.data?.updated_ids || []
+            set(state => {
+                let calls = state.calls
+                let callsCache = state.callsCache
+                for (const id of updatedIds) {
+                    const patched = updateCallsByCandidateId(calls, id, { candidate_status: newStatus })
+                    if (patched.found) calls = patched.next
+                    callsCache = patchCallsByCandidateIdAcrossCaches(callsCache, id, { candidate_status: newStatus }).nextCache
+                }
+                return { calls, callsCache }
+            })
+            return {
+                success: true,
+                updated: res.data?.updated ?? 0,
+                skipped: res.data?.skipped ?? 0,
+                closedCallTasks: res.data?.closed_call_tasks ?? 0,
+            }
+        } catch (error) {
+            console.error('Failed to bulk update candidate status:', error)
+            return { success: false, error: getRequestErrorMessage(error, 'Failed to update statuses') }
+        }
+    },
+
     // Candidate status is global (shared across every call list a candidate
     // appears on), but each list caches its own `calls` rows with a denormalized
     // candidate_status. StatusDropdown's default axios call bypasses this store
