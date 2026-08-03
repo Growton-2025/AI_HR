@@ -19,7 +19,8 @@ import Select, { components } from 'react-select';
 import { TagFilterInput, SelectFilter, RangeSlider, uniqueSortedOptions } from '../components/FilterComponents';
 import CsvMappingModal from '../components/CsvMappingModal';
 import HayasaBrand from '../components/HayasaBrand';
-import AddToListModal from '../components/AddToListModal';
+import AddToListModal from '../components/AddToListModal'
+import BulkStatusActions from '../components/BulkStatusActions';
 import ResumeCell from '../components/ResumeCell';
 import ResumeModal from '../components/ResumeModal';
 import useResumes from '../hooks/useResumes';
@@ -3985,6 +3986,22 @@ export default function TalentPool() {
             >
               <Briefcase size={14} /> Add to Role
             </button>
+          )}
+          {selectedIds.size > 0 && (
+            // Driven by the explicit selection only. Unlike Roles, this page's
+            // "Use All Filtered" is a separate flag that never populates
+            // selectedIds, so acting on it here would silently target rows the
+            // user never picked.
+            <BulkStatusActions
+              candidateIds={Array.from(selectedIds)}
+              onApplied={async () => {
+                setSelectedIds(new Set())
+                setAllFilteredSelected(false)
+                // force: true — the page cache would otherwise serve the
+                // pre-update statuses straight back.
+                await fetchCandidates(page, { force: true })
+              }}
+            />
           )}
           <button
             onClick={() => { setSelectedIds(new Set()); setAllFilteredSelected(false); }}
