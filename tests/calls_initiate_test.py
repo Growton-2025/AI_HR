@@ -355,7 +355,7 @@ def test_create_call_list_success_invalidates_cache(monkeypatch):
 
 
 def test_update_call_success_invalidates_cache(monkeypatch):
-    cursor = _FakeCursor(fetchone_results=[(101, 7, "pending", None, "Call 1 - Day 1")])
+    cursor = _FakeCursor(fetchone_results=[(101, 7, "pending", None, "Call 1 - Day 1", date(2026, 8, 3))])
     conn = _FakeConnection(cursor)
     invalidated = []
 
@@ -455,7 +455,7 @@ def test_calls_mutation_routes_return_contracts_and_invalidate(monkeypatch):
     ))
     update_conn = _FakeConnection(_FakeCursor(
         fetchone_results=[
-            (101, 7, "completed", "No Answer", "Call 1 - Day 1 - Second Half"),
+            (101, 7, "completed", "No Answer", "Call 1 - Day 1 - Second Half", date(2026, 8, 3)),
             (False,),  # phone not tagged wrong → cadence continues
         ]
     ))
@@ -563,7 +563,7 @@ def test_add_candidates_all_duplicates_report_clear_message(monkeypatch):
 def test_update_call_no_answer_schedules_next_sequence_step(monkeypatch):
     # Legacy "No Answer" outcome still advances the cadence.
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "No Answer", "Call 1 - Day 1 - Second Half"),
+        (101, 7, "completed", "No Answer", "Call 1 - Day 1 - Second Half", date(2026, 8, 3)),
         (False,),  # candidate phone is not tagged wrong
     ])
     conn = _FakeConnection(cursor)
@@ -590,12 +590,14 @@ def test_update_call_no_answer_schedules_next_sequence_step(monkeypatch):
     ]
     assert len(insert_queries) == 1
     _, insert_params = insert_queries[0]
-    assert insert_params == (101, 7, 1, "Call 2 - Day 2 - First Half")
+    # The next step is anchored on THIS task's due date, not on when the
+    # outcome was saved — otherwise the ladder drifts by the logging delay.
+    assert insert_params == (101, 7, date(2026, 8, 3), 1, "Call 2 - Day 2 - First Half")
 
 
 def test_update_call_not_connected_schedules_next_cadence_step(monkeypatch):
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "Not Connected", "Call 2 - Day 2 - First Half"),
+        (101, 7, "completed", "Not Connected", "Call 2 - Day 2 - First Half", date(2026, 8, 3)),
         (False,),
     ])
     conn = _FakeConnection(cursor)
@@ -615,12 +617,12 @@ def test_update_call_not_connected_schedules_next_cadence_step(monkeypatch):
     insert_queries = [
         params for query, params in cursor.executed if "INSERT INTO calls" in query
     ]
-    assert insert_queries == [(101, 7, 2, "Call 3 - Day 4 - Second Half")]
+    assert insert_queries == [(101, 7, date(2026, 8, 3), 2, "Call 3 - Day 4 - Second Half")]
 
 
 def test_update_call_fifth_failed_attempt_marks_unreachable(monkeypatch):
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "Not Connected - Not Reachable", "Call 5 - Day 10 - Second Half"),
+        (101, 7, "completed", "Not Connected - Not Reachable", "Call 5 - Day 10 - Second Half", date(2026, 8, 3)),
     ])
     conn = _FakeConnection(cursor)
 
@@ -647,7 +649,7 @@ def test_update_call_fifth_failed_attempt_marks_unreachable(monkeypatch):
 
 def test_update_call_cadence_pauses_while_phone_tagged_wrong(monkeypatch):
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "Not Connected", "Call 2 - Day 2 - First Half"),
+        (101, 7, "completed", "Not Connected", "Call 2 - Day 2 - First Half", date(2026, 8, 3)),
         (True,),  # wrong-number tag set → cadence paused
     ])
     conn = _FakeConnection(cursor)
@@ -683,7 +685,7 @@ def test_update_call_followup_outcome_requires_slot(monkeypatch):
 
 def test_update_call_followup_outcome_schedules_slot(monkeypatch):
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "Connected - Follow-up", "Call 2 - Day 2 - First Half"),
+        (101, 7, "completed", "Connected - Follow-up", "Call 2 - Day 2 - First Half", date(2026, 8, 3)),
     ])
     conn = _FakeConnection(cursor)
 
@@ -713,7 +715,7 @@ def test_update_call_followup_outcome_schedules_slot(monkeypatch):
 
 def test_update_call_wrong_number_tags_candidate_and_pauses(monkeypatch):
     cursor = _FakeCursor(fetchone_results=[
-        (101, 7, "completed", "Wrong Number", "Call 1 - Day 1 - Second Half"),
+        (101, 7, "completed", "Wrong Number", "Call 1 - Day 1 - Second Half", date(2026, 8, 3)),
     ])
     conn = _FakeConnection(cursor)
 
@@ -740,7 +742,7 @@ def test_update_call_wrong_number_tags_candidate_and_pauses(monkeypatch):
 
 
 def test_update_call_interested_outcome_does_not_schedule_followup(monkeypatch):
-    cursor = _FakeCursor(fetchone_results=[(101, 7, "completed", "Connected - Interested", "Call 1 - Day 1")])
+    cursor = _FakeCursor(fetchone_results=[(101, 7, "completed", "Connected - Interested", "Call 1 - Day 1", date(2026, 8, 3))])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)

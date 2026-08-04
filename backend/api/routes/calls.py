@@ -1550,7 +1550,7 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                   SELECT id FROM call_lists
                   WHERE LOWER(COALESCE(created_by, '')) = %s
               )
-            RETURNING candidate_id, list_id, status, outcome, task_title
+            RETURNING candidate_id, list_id, status, outcome, task_title, due_date
             """,
             params,
         )
@@ -1558,7 +1558,7 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
         if not row:
             raise HTTPException(status_code=404, detail="Call task not found")
 
-        candidate_id, list_id, current_status, current_outcome, task_title = row
+        candidate_id, list_id, current_status, current_outcome, task_title, current_due_date = row
 
         scheduled_next_title = None
         auto_unreachable = False
@@ -1597,12 +1597,29 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                         blocked = bool(phone_row) and any(phone_row[:3])
                         if not blocked:
                             delay_days, next_title = step
+                            # Anchor the ladder on THIS task's due date, not on
+                            # when the outcome happened to be saved. The titles
+                            # encode a fixed schedule (Day 1, 2, 4, 7, 10) from
+                            # the start of the sequence; scheduling from
+                            # CURRENT_DATE made every step drift by however long
+                            # the recruiter took to log the previous one, so a
+                            # "Day 1" call logged the next morning produced a
+                            # "Day 2" task dated two days out.
+                            #
+                            # GREATEST(..., today) so catching up on an overdue
+                            # task never creates one already in the past — it
+                            # lands today instead.
+                            anchor = current_due_date or ist_today()
                             cur.execute(
-                                """
+                                f"""
                                 INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
-                                VALUES (%s, %s, 'pending', CURRENT_DATE + %s * INTERVAL '1 day', %s)
+                                VALUES (
+                                    %s, %s, 'pending',
+                                    GREATEST(%s::date + %s * INTERVAL '1 day', {SQL_IST_TODAY})::date,
+                                    %s
+                                )
                                 """,
-                                (candidate_id, list_id, delay_days, next_title)
+                                (candidate_id, list_id, anchor, delay_days, next_title)
                             )
                             scheduled_next_title = next_title
             elif current_outcome in FOLLOWUP_CALL_OUTCOMES:
