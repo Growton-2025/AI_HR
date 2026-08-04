@@ -138,6 +138,26 @@ def _sync_li_messages(
         # ── PERSISTENT DB CACHE ──────────────────────────────────────────────
         # Save the fetched history to DB so it lives across restarts
         if final_messages:
+            # When this live fetch contains a reply, promote it into the columns
+            # the candidate LIST reads (li_status / li_response_text). Without
+            # this the modal could show a reply pulled straight from HeyReach
+            # while the list kept saying "No response yet" indefinitely — the
+            # two views read different sources, and only the manual "Sync
+            # Responses" button ever wrote these columns.
+            #
+            # Folded into the existing UPDATE rather than a second statement:
+            # connections to this database cost ~2s to establish and ~370ms per
+            # round trip, so an extra query here would be expensive.
+            newest_reply = max(
+                (m for m in final_messages
+                 if str(m.get("direction") or "").lower() == "inbound"),
+                key=lambda m: str(m.get("time") or ""),
+                default=None,
+            )
+            reply_text = str((newest_reply or {}).get("email_body") or "").strip()
+            has_reply = bool(reply_text)
+            reply_at = (newest_reply or {}).get("time") or None
+
             try:
                 with get_db_connection_context(validate=False, register_pgvector=False) as conn:
                     if not conn:
@@ -147,10 +167,23 @@ def _sync_li_messages(
                             """
                             UPDATE candidate_outreach
                             SET li_chat_history_cache = %s,
-                                li_chat_history_updated_at = %s
+                                li_chat_history_updated_at = %s,
+                                -- Only ever promote; never clear a stored reply
+                                -- from a fetch that happens to come back empty.
+                                li_status = CASE WHEN %s THEN 'replied' ELSE li_status END,
+                                li_response_text = CASE WHEN %s THEN %s ELSE li_response_text END,
+                                li_response_received_at = CASE
+                                    WHEN %s THEN COALESCE(%s::timestamptz, li_response_received_at)
+                                    ELSE li_response_received_at END
                             WHERE candidate_id = %s
                         """,
-                            (json.dumps(final_messages), datetime.now(tz_module.utc), candidate_id),
+                            (
+                                json.dumps(final_messages), datetime.now(tz_module.utc),
+                                has_reply,
+                                has_reply, reply_text or None,
+                                has_reply, reply_at,
+                                candidate_id,
+                            ),
                         )
                         conn.commit()
             except Exception as db_err:
