@@ -163,17 +163,34 @@ def test_outcome_groups_cover_known_outcomes():
 def test_custom_range_inclusive_of_end_date():
     today = date(2026, 7, 23)
     bounds = calls.resolve_range_bounds("custom", date(2026, 7, 18), date(2026, 7, 20), today)
+    # 23:59 IST on the end date. completed_at holds UTC, so that is 18:29 UTC
+    # the same day — buckets are IST days, matching what the recruiter picked
+    # in the date box.
     late_on_end_date = _cache_call(
         1, status="completed", due_date=date(2026, 7, 1),
-        completed_at=datetime(2026, 7, 20, 23, 59),
+        completed_at=datetime(2026, 7, 20, 18, 29),
     )
     assert calls.call_matches_slicer(late_on_end_date, bounds, None, use_completed_at=True)
+
+    # 23:59 UTC is 05:29 IST the NEXT day, so it belongs to the 21st and falls
+    # outside an 18th-20th range. Bucketing on the raw UTC date used to pull it
+    # in, which is the mismatch that made calls appear to move between days.
+    just_past_midnight_ist = _cache_call(
+        2, status="completed", due_date=date(2026, 7, 1),
+        completed_at=datetime(2026, 7, 20, 23, 59),
+    )
+    assert not calls.call_matches_slicer(
+        just_past_midnight_ist, bounds, None, use_completed_at=True
+    )
 
     sql, params = calls.build_range_sql(
         "custom", date(2026, 7, 18), date(2026, 7, 20), use_completed_at=True
     )
-    assert "c.completed_at >= %s::date" in sql
-    assert "c.completed_at < %s::date + INTERVAL '1 day'" in sql
+    # The picked dates are IST days; the bounds are converted to UTC instants so
+    # completed_at (a naive UTC timestamp) can be compared without wrapping the
+    # column, keeping any index on it usable.
+    assert "c.completed_at >= ((%s::date)::timestamp AT TIME ZONE 'Asia/Kolkata')" in sql
+    assert "c.completed_at < ((((%s::date) + 1))::timestamp AT TIME ZONE 'Asia/Kolkata')" in sql
     assert params == ["2026-07-18", "2026-07-20"]
 
     due_sql, due_params = calls.build_range_sql(
@@ -235,8 +252,11 @@ def test_get_calls_sql_path_builds_expected_predicates(monkeypatch):
     res = _get(app, "/api/calls?status=completed&range=last7&outcome_group=not_connected")
     assert res.status_code == 200
     query, params = cursor.executed[0]
-    assert "c.completed_at >= CURRENT_DATE - 6" in query
-    assert "c.completed_at < CURRENT_DATE + INTERVAL '1 day'" in query
+    # Day boundaries are IST, converted to UTC for comparison so the column
+    # stays bare and any index on completed_at remains usable.
+    assert "Asia/Kolkata" in query
+    assert "CURRENT_DATE" not in query
+    assert "c.completed_at >=" in query and "c.completed_at <" in query
     assert "c.outcome = ANY(%s)" in query
     assert params == [OWNER, "completed", sorted(calls.OUTCOME_GROUPS["not_connected"])]
 
@@ -246,9 +266,10 @@ def test_get_calls_sql_path_builds_expected_predicates(monkeypatch):
     assert res.status_code == 200
     query, params = cursor.executed[0]
     # The existing due_filter predicate and the new range predicate coexist.
-    assert "c.due_date <= CURRENT_DATE" in query
-    assert "c.due_date >= CURRENT_DATE - 1" in query
-    assert "c.due_date <= CURRENT_DATE - 1" in query
+    ist_today = "((NOW() AT TIME ZONE 'Asia/Kolkata')::date)"
+    assert f"c.due_date <= {ist_today}" in query
+    assert f"c.due_date >= ({ist_today} - 1)" in query
+    assert f"c.due_date <= ({ist_today} - 1)" in query
     assert params == [OWNER, "pending"]
 
 

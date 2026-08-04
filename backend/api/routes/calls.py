@@ -4,7 +4,8 @@ import os
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import psycopg2
@@ -101,6 +102,34 @@ def validate_slicer_params(range_, date_from, date_to, outcome_group):
             raise HTTPException(status_code=400, detail="date_from must not be after date_to")
 
 
+# The team works in IST but the database session and the container clock are
+# both UTC, so "today" used to roll over at 05:30 IST. Any call made between
+# midnight and 05:30 IST counted as *yesterday*, which reads to a recruiter as
+# their calls silently moving days.
+IST_TZ_NAME = "Asia/Kolkata"
+IST = ZoneInfo(IST_TZ_NAME)
+# `(NOW() AT TIME ZONE 'Asia/Kolkata')::date` — today's date as the recruiter
+# sees it, not as UTC sees it.
+SQL_IST_TODAY = f"((NOW() AT TIME ZONE '{IST_TZ_NAME}')::date)"
+
+
+def ist_today() -> date:
+    """Today in IST. Replaces date.today(), which follows the server clock."""
+    return datetime.now(timezone.utc).astimezone(IST).date()
+
+
+def ist_date_of(value):
+    """The IST calendar date of a stored timestamp.
+
+    completed_at is a naive TIMESTAMP holding UTC, so `.date()` on it gives the
+    UTC day — the very mismatch this fixes.
+    """
+    if isinstance(value, datetime):
+        aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+        return aware.astimezone(IST).date()
+    return value
+
+
 def resolve_range_bounds(range_, date_from, date_to, today: date):
     """Inclusive (start, end) date bounds for a range preset, or None."""
     if not range_:
@@ -120,9 +149,9 @@ def call_matches_slicer(call, bounds, outcome_set, *, use_completed_at: bool):
     if bounds is None:
         return True
     if use_completed_at:
-        value = call.get("completed_at")
-        if isinstance(value, datetime):
-            value = value.date()
+        # IST date, not the stored UTC date — otherwise the cache path and the
+        # SQL path disagree for anything completed between 00:00 and 05:30 IST.
+        value = ist_date_of(call.get("completed_at"))
     else:
         value = call.get("due_date")
     return value is not None and bounds[0] <= value <= bounds[1]
@@ -140,13 +169,18 @@ def build_range_sql(range_, date_from, date_to, *, use_completed_at: bool, col_p
         lo, hi = "%s::date", "%s::date"
         params = [date_from.isoformat(), date_to.isoformat()]
     elif range_ == "today":
-        lo, hi = "CURRENT_DATE", "CURRENT_DATE"
+        lo, hi = SQL_IST_TODAY, SQL_IST_TODAY
     elif range_ == "yesterday":
-        lo, hi = "CURRENT_DATE - 1", "CURRENT_DATE - 1"
+        lo, hi = f"({SQL_IST_TODAY} - 1)", f"({SQL_IST_TODAY} - 1)"
     else:
-        lo, hi = f"CURRENT_DATE - {_RANGE_PRESET_DAYS[range_]}", "CURRENT_DATE"
+        lo, hi = f"({SQL_IST_TODAY} - {_RANGE_PRESET_DAYS[range_]})", SQL_IST_TODAY
     if use_completed_at:
-        return f" AND {col} >= {lo} AND {col} < {hi} + INTERVAL '1 day'", params
+        # completed_at is a naive TIMESTAMP holding UTC. Convert the IST day
+        # boundaries into UTC rather than converting the column, so the column
+        # stays bare and any index on it remains usable.
+        lo_utc = f"(({lo})::timestamp AT TIME ZONE '{IST_TZ_NAME}') AT TIME ZONE 'UTC'"
+        hi_utc = f"(((({hi}) + 1))::timestamp AT TIME ZONE '{IST_TZ_NAME}') AT TIME ZONE 'UTC'"
+        return f" AND {col} >= {lo_utc} AND {col} < {hi_utc}", params
     return f" AND {col} >= {lo} AND {col} <= {hi}", params
 
 
@@ -1366,13 +1400,13 @@ def get_calls(
                 data = [c for c in data if c.get("list_id") == list_id]
             
             if due_filter == "today":
-                today = date.today()
+                today = ist_today()
                 data = [c for c in data if c.get("due_date") and c["due_date"] <= today]
             elif due_filter == "upcoming":
-                today = date.today()
+                today = ist_today()
                 data = [c for c in data if c.get("due_date") and c["due_date"] > today]
 
-            bounds = resolve_range_bounds(range_, date_from, date_to, date.today())
+            bounds = resolve_range_bounds(range_, date_from, date_to, ist_today())
             if bounds is not None or outcome_set is not None:
                 data = [
                     c for c in data
@@ -1415,9 +1449,9 @@ def get_calls(
             params.append(list_id)
 
         if due_filter == "today":
-            query += " AND c.due_date <= CURRENT_DATE"
+            query += f" AND c.due_date <= {SQL_IST_TODAY}"
         elif due_filter == "upcoming":
-            query += " AND c.due_date > CURRENT_DATE"
+            query += f" AND c.due_date > {SQL_IST_TODAY}"
 
         range_sql, range_params = build_range_sql(
             range_, date_from, date_to, use_completed_at=slice_on_completed
@@ -2193,7 +2227,7 @@ def get_call_stats(
     with _calls_lock:
         if _calls_cache is not None and _call_lists_cache is not None:
             stats_cache_stale = not calls_cache_is_fresh()
-            today = date.today()
+            today = ist_today()
             bounds = resolve_range_bounds(range_, date_from, date_to, today)
             due_today = 0
             upcoming = 0
@@ -2274,8 +2308,8 @@ def get_call_stats(
             ),
             call_counts AS (
                 SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= CURRENT_DATE{due_sql}) AS due_today,
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date > CURRENT_DATE{due_sql}) AS upcoming,
+                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= {SQL_IST_TODAY}{due_sql}) AS due_today,
+                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date > {SQL_IST_TODAY}{due_sql}) AS upcoming,
                     COUNT(*) FILTER (WHERE status = 'completed'{comp_sql}{outcome_sql}) AS completed
                 FROM calls
                 WHERE list_id IN (SELECT id FROM owned_lists)
