@@ -2507,6 +2507,58 @@ async def send_chat_reply(
         raise HTTPException(status_code=500, detail=f"Failed to send reply: {e}")
 
 
+def _build_outreach_update_fields(upd: dict) -> list:
+    """SET fragments for the candidate_outreach sync UPDATE.
+
+    Email and LinkedIn are INDEPENDENT channels. The LinkedIn block used to be
+    nested inside `if "status" in upd`, and `status` is only ever set by the
+    Smartlead/email branch — so a candidate with a HeyReach campaign but no
+    Smartlead campaign_id had their reply silently discarded, while the caller
+    still counted the row as synced. That is the majority case here: 167 of 390
+    candidate_outreach rows are LinkedIn-only.
+
+    Extracted as a pure function so this stays testable without a database.
+    """
+    fields = ["updated_at = NOW()"]
+
+    if "status" in upd:
+        fields += [
+            "status = %(status)s",
+            "message_sent_count = %(message_sent_count)s",
+            "last_message_sent_at = %(last_message_sent_at)s",
+            "response_received_at = %(response_received_at)s",
+            "response_text = %(response_text)s",
+        ]
+
+    if "li_status" in upd:
+        # Never downgrade a known reply. The batch get_campaign_activities path
+        # can return an entry with no reply data, which would otherwise flip a
+        # 'replied' row back to 'message_sent'. Postgres evaluates the CASE
+        # against the pre-UPDATE row, so this needs no extra query.
+        fields.append(
+            "li_status = CASE WHEN li_status = 'replied' THEN 'replied' ELSE %(li_status)s END"
+        )
+        fields += [
+            "li_last_action_at = %(li_last_action_at)s",
+            "li_sent_count = %(li_sent_count)s",
+        ]
+        # Only touch the reply columns when there is actually a reply. The batch
+        # path carries no reply_at and may carry no text, and writing NULL over a
+        # previously-synced reply is exactly how a responded candidate reverts to
+        # reading "No response yet".
+        if str(upd.get("li_response_text") or "").strip():
+            fields += [
+                "li_response_text = %(li_response_text)s",
+                "li_response_received_at = COALESCE(%(li_response_received_at)s, li_response_received_at)",
+            ]
+        if "li_conversation_id" in upd:
+            fields.append("li_conversation_id = %(li_conversation_id)s")
+        if "li_account_id" in upd:
+            fields.append("li_account_id = %(li_account_id)s")
+
+    return fields
+
+
 @router.post("/sync-responses/{role_id}")
 def sync_responses(
     role_id: int, current_user: schemas.User = Depends(deps.get_current_user)
@@ -2653,29 +2705,14 @@ def sync_responses(
                 with conn.cursor() as cur:
                     for upd in updates:
                         # Build dynamic update statement based on what was fetched
-                        fields = ["updated_at = NOW()"]
+                        fields = _build_outreach_update_fields(upd)
                         params = upd
 
-                        if "status" in upd:
-                            fields.append("status = %(status)s")
-                            fields.append("message_sent_count = %(message_sent_count)s")
-                            fields.append("last_message_sent_at = %(last_message_sent_at)s")
-                            fields.append("response_received_at = %(response_received_at)s")
-                            fields.append("response_text = %(response_text)s")
-
-                            if "li_status" in upd:
-                                fields.append("li_status = %(li_status)s")
-                                fields.append("li_response_text = %(li_response_text)s")
-                                fields.append("li_last_action_at = %(li_last_action_at)s")
-                                fields.append("li_sent_count = %(li_sent_count)s")
-                                fields.append("li_response_received_at = %(li_response_received_at)s")
-
-                                # Use values from the upd dictionary to avoid outer-scope variable leaks
-                                if "li_conversation_id" in upd:
-                                    fields.append("li_conversation_id = %(li_conversation_id)s")
-
-                                if "li_account_id" in upd:
-                                    fields.append("li_account_id = %(li_account_id)s")
+                        # Only `updated_at` means we learned nothing worth
+                        # storing. Skip the write rather than issuing a no-op and
+                        # reporting it to the user as a synced response.
+                        if len(fields) == 1:
+                            continue
 
                         if role_id == 0:
                             role_where_update = "recruitment_role_id IS NULL"
@@ -2687,7 +2724,11 @@ def sync_responses(
                             WHERE candidate_id = %(candidate_id)s AND {role_where_update}
                         """
                         cur.execute(sql, params)
-                        updated_count += 1
+                        # Count rows we actually persisted. Incrementing
+                        # unconditionally reported "Synced N new responses" even
+                        # when the WHERE matched nothing or the write was a no-op.
+                        if cur.rowcount:
+                            updated_count += 1
                 conn.commit()
         except Exception as e:
             print(f"Error updating database: {e}")

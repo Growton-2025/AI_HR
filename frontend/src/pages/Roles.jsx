@@ -127,6 +127,7 @@ function Roles() {
         openRole: state.openRole,
         outreachStatusCache: state.outreachStatusCache,
         fetchOutreachStatus: state.fetchOutreachStatus,
+        syncOutreachResponses: state.syncOutreachResponses,
         removeCandidateFromRole: state.removeCandidateFromRole,
         invalidateTalentPoolCaches: state.invalidateTalentPoolCaches,
         fetchTalentPoolSummary: state.fetchTalentPoolSummary,
@@ -889,22 +890,11 @@ function Roles() {
         return () => { cancelled = true }
     }, [viewingRole?.id])
 
-    // Silent sync function with useCallback to prevent stale closures
-    const silentSync = useCallback(async () => {
-        if (!viewingRole?.id) return
-        try {
-            const token = localStorage.getItem('token')
-            const response = await fetch(`/api/outreach/sync-responses/${viewingRole.id}`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${token}` }
-            })
-            if (response.ok) {
-                fetchOutreachStatus(viewingRole.id)
-            }
-        } catch (error) {
-            console.error("Silent sync failed", error)
-        }
-    }, [viewingRole?.id, fetchOutreachStatus])
+    // (Removed: a `silentSync` helper that was defined but never called, and
+    // carried the same relative-/api bug as the sync button. Deleting rather
+    // than wiring it up — an un-backed-off poller here would fan out per-campaign
+    // HeyReach/Smartlead calls on every open role page. If auto-refresh is
+    // wanted, port TalentPool's visibility-gated, backed-off loop instead.)
 
     // Fetch outreach status when viewing role
     useEffect(() => {
@@ -1139,26 +1129,26 @@ function Roles() {
 
         setIsSyncing(true)
         try {
-            const token = localStorage.getItem('token')
-            const response = await fetch(`/api/outreach/sync-responses/${viewingRole.id}`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${token}` }
-            })
-
-            if (response.ok) {
-                const data = await response.json()
-                if (data.updated_count > 0) {
-                    toast.success(`Synced ${data.updated_count} new responses`)
-                } else {
-                    toast.info('No new responses found')
-                }
-                fetchOutreachStatus(viewingRole.id)
-            } else {
-                toast.error('Failed to sync responses')
+            // Goes through the store action, which builds the URL from API_BASE.
+            // This used to be a raw fetch to a root-relative api path with a
+            // hand-built auth header: on the hosted app the frontend is a
+            // Static Web App on a
+            // different host from the backend, so a relative /api path hit the
+            // static host (405) and the sync never ran — "Failed to sync
+            // responses" every time. It looked fine locally only because the
+            // vite dev server proxies /api to the backend.
+            const res = await syncOutreachResponses(viewingRole.id)
+            if (!res.success) {
+                toast.error(res.error || 'Failed to sync responses')
+                return
             }
-        } catch (error) {
-            toast.error('Failed to sync responses')
-            console.error(error)
+            const updated = Number(res.data?.updated_count || 0)
+            if (updated > 0) {
+                toast.success(`Synced ${updated} new responses`)
+            } else {
+                toast.info('No new responses found')
+            }
+            await fetchOutreachStatus(viewingRole.id)
         } finally {
             setIsSyncing(false)
         }
