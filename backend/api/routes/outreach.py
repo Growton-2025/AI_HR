@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import logging
 import threading
 import time
 import asyncio
@@ -25,6 +26,9 @@ from backend.services.heyreach_role_campaigns import dispatch_due_linkedin
 from backend.services.smartlead_role_dispatcher import dispatch_due_email
 
 router = APIRouter()
+# This module otherwise uses print(); webhooks need real log records so
+# delivery problems are visible in the hosted log stream.
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # In-memory LinkedIn chat cache
@@ -2942,6 +2946,96 @@ async def find_heyreach_campaign(
     raise HTTPException(
         status_code=404, detail=f"No campaign found matching '{role_name}'"
     )
+
+
+@router.post("/smartlead/webhook")
+async def smartlead_webhook(payload: Dict):
+    """Real-time email replies from Smartlead.
+
+    Counterpart to /heyreach/webhook. Without this, `response_text` (the column
+    the candidate list reads for email) is only ever written by someone pressing
+    "Sync Responses", so a replied-to candidate can read as "No response yet"
+    indefinitely.
+
+    Register with:
+        POST https://server.smartlead.ai/api/v1/webhook/create?api_key=...
+    selecting the EMAIL_REPLY event and pointing at
+        {public_url}/api/outreach/smartlead/webhook
+
+    Smartlead retries 5xx at 1min / 5min / 30min and treats 4xx as permanent, so
+    this returns 200 for anything it cannot act on — an unmatched lead is not a
+    delivery failure and must not be retried for half an hour.
+    """
+    # The payload shape is documented but unverified against this account, so
+    # log the keys of the first events to confirm before trusting any field.
+    logger.info("[SmartleadWebhook] event=%s keys=%s",
+                payload.get("event_type"), sorted(payload.keys()))
+
+    event = str(payload.get("event_type") or "").strip().upper()
+    if event != "EMAIL_REPLY":
+        return {"status": "ignored", "reason": f"unhandled_event:{event or 'none'}"}
+
+    # Smartlead sends the LEAD's address as to_email on a reply event.
+    lead_email = str(payload.get("to_email") or "").strip().lower()
+    if not lead_email:
+        return {"status": "ignored", "reason": "no_lead_email"}
+
+    # preview_text is already plain; reply_body is HTML.
+    reply_text = str(payload.get("preview_text") or "").strip()
+    if not reply_text:
+        raw = str(payload.get("reply_body") or "")
+        reply_text = re.sub(r"<[^<]+?>", "", raw).strip()
+    replied_at = payload.get("time_replied")
+
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return {"status": "error", "reason": "db_connection_failed"}
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM candidates WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+                    (lead_email,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"status": "ignored", "reason": "candidate_not_found"}
+                candidate_id = row[0]
+
+                # Promote only — a malformed event must never blank a stored reply.
+                cur.execute(
+                    """
+                    UPDATE candidate_outreach
+                       SET status = 'replied',
+                           response_text = COALESCE(NULLIF(%s, ''), response_text),
+                           response_received_at = COALESCE(%s::timestamptz, response_received_at, NOW()),
+                           updated_at = NOW()
+                     WHERE candidate_id = %s
+                    """,
+                    (reply_text, replied_at, candidate_id),
+                )
+                updated = cur.rowcount
+            conn.commit()
+
+        # Drop the cached thread so the conversation modal shows the reply now
+        # rather than after the 300s TTL.
+        with _email_chat_lock:
+            if candidate_id in _email_chat_cache:
+                _email_chat_cache[candidate_id]["ts"] = 0
+
+        try:
+            from backend.api.routes.browse import _invalidate_browse_cache
+            _invalidate_browse_cache()
+        except Exception:
+            pass
+
+        logger.info("[SmartleadWebhook] reply stored for candidate %s (%d rows)",
+                    candidate_id, updated)
+        return {"status": "ok", "candidate_id": candidate_id, "updated": updated}
+    except Exception as exc:
+        logger.exception("[SmartleadWebhook] failed")
+        # 200 with an error body: a 5xx would put Smartlead into a 30-minute
+        # retry cycle for what is most likely a permanent parsing problem.
+        return {"status": "error", "reason": str(exc)}
 
 
 @router.post("/heyreach/webhook")
