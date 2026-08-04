@@ -19,7 +19,14 @@ DB_USER = os.getenv("DB_USER", "growton")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
 DB_HOST = os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
-DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+# Default 4, not 1. /candidates/browse checks out TWO connections per request
+# (counts and rows run concurrently), so a 1-connection pool guarantees that
+# every search creates a fresh connection — and connection setup, not the query,
+# is what makes search feel slow: the query itself is ~75ms server-side while a
+# single DB interaction on the hosted box measures ~390ms end to end.
+# Prod runs WEB_CONCURRENCY=4, so 4 x 4 = 16 pre-warmed connections against a
+# server reporting max_connections=429 (33 currently in use) — negligible.
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "4"))
 # /candidates/browse checks out two connections per request (its counts and rows
 # queries run concurrently), so a max of 8 left room for only ~4 simultaneous
 # browses before callers hit the blocking 1s/2s/4s backoff in get_db_connection.

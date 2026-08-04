@@ -201,7 +201,10 @@ function Roles() {
     // The input stays instant; only the value that drives the /candidates/browse
     // effect is debounced, so a burst of keystrokes costs one request instead of
     // one per character.
-    const debouncedRoleSearch = useDebouncedValue(roleSearch, 250)
+    // 250 -> 150. This stacks with the 120ms timer on the fetch effect below,
+    // so the old pair cost 370ms of pure waiting before a request even started —
+    // a third of the delay users read as "the search is slow".
+    const debouncedRoleSearch = useDebouncedValue(roleSearch, 150)
     const nextBrowseSignal = useAbortableRequest()
     const [filters, setFilters] = useState({
         title: [], titleInput: '',

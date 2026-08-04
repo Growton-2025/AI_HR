@@ -7,7 +7,7 @@ calls._calls_cache while fresh; SQL path by making the cache stale and
 asserting on the captured query text/params)."""
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI
@@ -77,6 +77,18 @@ def _get(app, path):
             return await client.get(path)
 
     return asyncio.run(run())
+
+
+def _utc_now():
+    """A naive UTC timestamp, which is what completed_at actually holds.
+
+    The DB session is UTC and completed_at is written with NOW(), so rows come
+    back naive-UTC. Seeding datetime.now() (naive LOCAL) made these tests
+    time-of-day dependent once buckets became IST-aware: after 18:30 IST a local
+    timestamp read as UTC lands on tomorrow and falls outside a range ending
+    today, so the suite passed in the morning and failed in the evening.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _cache_call(call_id, *, status, due_date, outcome=None, completed_at=None, list_id=7):
@@ -223,7 +235,7 @@ def test_slicer_param_validation(monkeypatch):
 def test_get_calls_cache_path_slices_range_and_outcome(monkeypatch):
     app = _build_calls_app(monkeypatch)
     today = date.today()
-    now = datetime.now()
+    now = _utc_now()
     _seed_cache([
         _cache_call(1, status="completed", due_date=today - timedelta(days=20), outcome="Connected - Interested", completed_at=now),
         _cache_call(2, status="completed", due_date=today, outcome="Connected - Interested", completed_at=now - timedelta(days=10)),
@@ -275,7 +287,7 @@ def test_get_calls_sql_path_builds_expected_predicates(monkeypatch):
 
 def test_get_calls_cache_and_sql_parity(monkeypatch):
     app = _build_calls_app(monkeypatch)
-    now = datetime.now()
+    now = _utc_now()
     matching = dict(
         status="completed", due_date=date.today(),
         outcome="Connected - Interested", completed_at=now,
@@ -302,7 +314,7 @@ def test_get_calls_cache_and_sql_parity(monkeypatch):
 def test_call_stats_slicer_cache_and_sql_parity(monkeypatch):
     app = _build_calls_app(monkeypatch)
     today = date.today()
-    now = datetime.now()
+    now = _utc_now()
     _seed_cache([
         _cache_call(1, status="pending", due_date=today),
         _cache_call(2, status="pending", due_date=date(today.year + 1, 1, 1)),
@@ -339,7 +351,7 @@ def test_call_stats_outcome_filter_never_zeroes_pending_buckets(monkeypatch):
     _seed_cache([
         _cache_call(1, status="pending", due_date=today),
         _cache_call(2, status="pending", due_date=date(today.year + 1, 1, 1)),
-        _cache_call(3, status="completed", due_date=today, outcome="Not Connected", completed_at=datetime.now()),
+        _cache_call(3, status="completed", due_date=today, outcome="Not Connected", completed_at=_utc_now()),
     ])
 
     res = _get(app, "/api/calls/stats?outcome_group=connected")
@@ -366,8 +378,8 @@ def test_call_stats_cache_key_includes_slicer_params(monkeypatch):
     app = _build_calls_app(monkeypatch)
     today = date.today()
     _seed_cache([
-        _cache_call(1, status="completed", due_date=today, outcome="Connected - Interested", completed_at=datetime.now()),
-        _cache_call(2, status="completed", due_date=today, outcome="Connected - Interested", completed_at=datetime.now() - timedelta(days=40)),
+        _cache_call(1, status="completed", due_date=today, outcome="Connected - Interested", completed_at=_utc_now()),
+        _cache_call(2, status="completed", due_date=today, outcome="Connected - Interested", completed_at=_utc_now() - timedelta(days=40)),
     ])
 
     default_res = _get(app, "/api/calls/stats")
