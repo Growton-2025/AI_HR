@@ -1875,8 +1875,15 @@ async def get_linkedin_chat_history(
         # ---------------------------------------------------------------
         # Cache logic - optimized for performance
         # ---------------------------------------------------------------
-        # Strategy: Return cached data ASAP, refresh in background if
-        li_chat_history_cache = outreach_row[8] if len(outreach_row) > 8 else None
+        # Strategy: Return cached data ASAP, refresh in background if stale.
+        #
+        # (Removed a duplicate `li_chat_history_cache = outreach_row[8] if
+        # len(outreach_row) > 8 else None` here. It was never read — the code
+        # below uses li_chat_history_cache_raw, computed above WITH an
+        # `outreach_row and` guard — and it crashed with "object of type
+        # 'NoneType' has no len()" for any candidate that has no
+        # candidate_outreach row for the role, turning the whole conversation
+        # into "Conversation unavailable".)
 
         t2 = time.time()
         with _li_chat_lock:
