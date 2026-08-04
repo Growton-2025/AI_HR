@@ -3,7 +3,7 @@
 import { useVoIP, reportTiming } from '../context/VoIPContext';
 import InboundCallbacksPanel from '../components/InboundCallbacksPanel';
 import CallHistoryModal from '../components/CallHistoryModal';
-import CandidateActivityPanel, { OutcomeBadge, PossibleVoicemailBadge } from '../components/CandidateActivityPanel';
+import CandidateActivityPanel, { OutcomeBadge, PossibleVoicemailBadge, formatDateTime } from '../components/CandidateActivityPanel';
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
@@ -37,18 +37,6 @@ const formatLocalDate = (dateString) => {
     month: 'short', 
     day: 'numeric', 
     year: 'numeric' 
-  });
-};
-
-const formatDateTime = (value) => {
-  if (!value) return 'Unknown';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
   });
 };
 

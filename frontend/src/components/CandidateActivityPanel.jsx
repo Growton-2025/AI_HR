@@ -22,6 +22,18 @@ import { useAppStore } from '../store/useAppStore';
 // One neutral pill style for every outcome — the icon tone is the only signal
 // (Hayasa accent = needs another look, slate = settled/terminal), so the list
 // reads as one professional surface instead of a wall of colored chips.
+const formatDateTime = (value) => {
+  if (!value) return 'Unknown';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+};
+
 const ACTIVITY_OUTCOME_META = {
   'Left Voicemail': { tone: 'accent', icon: Voicemail },
   'No Answer': { tone: 'accent', icon: PhoneMissed },
@@ -249,4 +261,4 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
 }
 
 export default CandidateActivityPanel;
-export { OutcomeBadge, PossibleVoicemailBadge, ACTIVITY_OUTCOME_META };
+export { OutcomeBadge, PossibleVoicemailBadge, ACTIVITY_OUTCOME_META, formatDateTime };

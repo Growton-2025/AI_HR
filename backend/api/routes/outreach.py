@@ -1838,6 +1838,28 @@ async def get_linkedin_chat_history(
                     )
 
                 outreach_row = cur.fetchone()
+
+                # A LinkedIn thread belongs to a PERSON, not a role. Candidates
+                # commonly sit on several roles while outreach ran under only one
+                # (43 of 77 on one live role have no row for that role), so a
+                # role-scoped miss used to render "Conversation unavailable" even
+                # though the recruiter had messaged them — just from a different
+                # role. Fall back to their most recent outreach from any role.
+                if not outreach_row and role_id != 0:
+                    cur.execute(
+                        """
+                        SELECT updated_at, heyreach_campaign_id, li_conversation_id, initial_li_message, initial_li_message_at, li_account_id, li_response_text, response_received_at,
+                               li_chat_history_cache
+                        FROM candidate_outreach
+                        WHERE candidate_id = %s
+                        ORDER BY heyreach_campaign_id DESC NULLS LAST, updated_at DESC LIMIT 1
+                        """,
+                        (candidate_id,),
+                    )
+                    outreach_row = cur.fetchone()
+                    if outreach_row:
+                        print(f"DEBUG: cand {candidate_id} has no outreach for role {role_id}; using their most recent row instead")
+
                 print(f"DEBUG: Outreach record for cand {candidate_id}: {outreach_row}")
 
         if not cand_row or not cand_row[0]:
@@ -2159,10 +2181,30 @@ async def get_chat_history(
                 )
                 row = cur.fetchone()
 
+                # Same reasoning as the LinkedIn path: an email thread belongs to
+                # the person. A candidate on several roles whose outreach ran
+                # under a different one would otherwise see "Conversation
+                # unavailable" despite having been emailed.
+                if not row and role_id != 0:
+                    cur.execute(
+                        """
+                        SELECT c.email, co.campaign_id, co.initial_message, co.initial_message_at,
+                               co.email_chat_history_cache, co.email_chat_history_updated_at
+                        FROM candidate_outreach co
+                        JOIN candidates c ON c.id = co.candidate_id
+                        WHERE co.candidate_id = %s
+                        ORDER BY (co.campaign_id IS NOT NULL) DESC, co.updated_at DESC
+                        LIMIT 1
+                        """,
+                        (candidate_id,),
+                    )
+                    row = cur.fetchone()
+
         if not row:
-            raise HTTPException(
-                status_code=404, detail="Candidate outreach record not found"
-            )
+            # Genuinely never contacted — not an error state. Returning 404 here
+            # rendered as a red "Conversation unavailable" for a candidate who
+            # simply has no outreach yet.
+            return {"messages": [], "syncing": False}
 
         email, campaign_id, initial_msg_text, initial_msg_at, db_cache, db_updated_at = row
         print(f"DEBUG: Email chat — email={email}, campaign_id={campaign_id}")
