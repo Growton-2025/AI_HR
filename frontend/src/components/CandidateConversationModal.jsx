@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Linkedin, Loader2, Mail, MessageSquare, RefreshCcw, Send, X } from 'lucide-react'
+import { Linkedin, Loader2, Mail, MessageSquare, Phone, RefreshCcw, Send, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAppStore } from '../store/useAppStore'
 import StatusDropdown from './StatusDropdown'
+import CandidateActivityPanel from './CandidateActivityPanel'
 
 const EMPTY_THREAD = { messages: [], loaded: false, error: '' }
 
@@ -134,9 +135,13 @@ export default function CandidateConversationModal({
     return () => clearInterval(intervalId);
   }, [threads.email?.syncing, threads.linkedin?.syncing, loadThread]);
 
+  // Calls sits alongside the message threads: a recruiter opening a candidate's
+  // conversation needs to see they have already been spoken to, not just what
+  // was written. Same timeline the Calls workspace shows.
   const tabs = useMemo(() => ([
     { id: 'linkedin', label: 'LinkedIn', icon: Linkedin, hasResponse: Boolean(candidate.li_response_text) },
     { id: 'email', label: 'Email', icon: Mail, hasResponse: Boolean(candidate.response) },
+    { id: 'calls', label: 'Calls', icon: Phone },
   ]), [candidate.li_response_text, candidate.response])
 
   const handleRefresh = async () => {
@@ -231,7 +236,12 @@ export default function CandidateConversationModal({
         </nav>
 
         <main className="candidate-conversation-messages">
-          {!activeThread.loaded ? (
+          {platform === 'calls' ? (
+            <CandidateActivityPanel
+              candidateId={candidate.id}
+              candidateName={candidate.first_name || candidate.name}
+            />
+          ) : !activeThread.loaded ? (
             <div className="candidate-conversation-empty">
               <Loader2 size={32} className="animate-spin" />
               <strong>Loading latest messages…</strong>
@@ -267,6 +277,7 @@ export default function CandidateConversationModal({
           <div ref={endRef} />
         </main>
 
+        {platform !== 'calls' && (
         <footer className="candidate-conversation-composer">
           <div>
             <textarea
@@ -287,6 +298,7 @@ export default function CandidateConversationModal({
           </div>
           <span>Press Enter to send · Shift + Enter for new line</span>
         </footer>
+        )}
       </div>
     </div>
   )
