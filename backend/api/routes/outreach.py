@@ -3111,8 +3111,19 @@ async def smartlead_webhook(payload: Dict):
             if not conn:
                 return {"status": "error", "reason": "db_connection_failed"}
             with conn.cursor() as cur:
+                # Duplicate candidate records can share an email; the reply
+                # must land on the record that actually has outreach rows, not
+                # whichever duplicate has the lowest id.
                 cur.execute(
-                    "SELECT id FROM candidates WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+                    """
+                    SELECT c.id
+                    FROM candidates c
+                    LEFT JOIN candidate_outreach co ON co.candidate_id = c.id
+                    WHERE LOWER(TRIM(c.email)) = %s
+                    GROUP BY c.id
+                    ORDER BY COUNT(co.candidate_id) DESC, c.id
+                    LIMIT 1
+                    """,
                     (lead_email,),
                 )
                 row = cur.fetchone()
