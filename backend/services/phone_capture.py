@@ -126,12 +126,43 @@ def extract_phone(text: str) -> Optional[str]:
         return None
 
 
-def add_to_role_call_lists(cur, candidate_id: int) -> None:
+def add_to_role_call_lists(cur, candidate_id: int, restart_cadence: bool = False) -> None:
     """
     Enroll the candidate in the linked call list of every role they belong to.
-    sync_shortlisted_to_call_list self-guards on linked list existence,
-    'Shortlisted' status, phone presence and duplicates.
+
+    Default mode defers to sync_shortlisted_to_call_list, which self-guards on
+    linked list existence, 'Shortlisted' status, phone presence and duplicates
+    — but refuses candidates with ANY prior row in the list.
+
+    restart_cadence mode (a candidate shared a NEW number): start a fresh
+    "Call 1" even for previously-called candidates, as long as there is no
+    pending task already and the candidate isn't rejected/not interested.
     """
+    if restart_cadence:
+        from backend.api.routes.calls import FIRST_ATTEMPT_TITLE
+
+        cur.execute(
+            """
+            INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
+            SELECT DISTINCT rrc.candidate_id, r.linked_call_list_id, 'pending', CURRENT_DATE, %s
+            FROM recruitment_role_candidates rrc
+            JOIN recruitment_roles r ON r.id = rrc.role_id
+            JOIN candidates c ON c.id = rrc.candidate_id
+            WHERE rrc.candidate_id = %s
+              AND r.linked_call_list_id IS NOT NULL
+              AND LOWER(COALESCE(c.status, '')) NOT LIKE '%%reject%%'
+              AND LOWER(COALESCE(c.status, '')) NOT LIKE '%%not interested%%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM calls p
+                  WHERE p.candidate_id = rrc.candidate_id
+                    AND p.list_id = r.linked_call_list_id
+                    AND p.status = 'pending'
+              )
+            """,
+            (FIRST_ATTEMPT_TITLE, candidate_id),
+        )
+        return
+
     from backend.services.auto_call_list import sync_shortlisted_to_call_list
 
     cur.execute(
@@ -215,7 +246,9 @@ def capture_phone_from_reply(candidate_id: int, reply_text: str) -> Optional[str
                         (candidate_id,),
                     )
 
-                add_to_role_call_lists(cur, candidate_id)
+                # A CHANGED number restarts the cadence even for previously
+                # called candidates; a first number uses the standard sync.
+                add_to_role_call_lists(cur, candidate_id, restart_cadence=bool(current_phone))
             conn.commit()
 
         logger.info(f"Captured phone {number} for candidate {candidate_id} from reply")
