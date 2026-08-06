@@ -1280,11 +1280,19 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
 
         logger.info("Transcribing audio...")
         client = get_openai_client()
-        skip_gpt4o = duration_seconds is not None and duration_seconds > GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS
-        if skip_gpt4o:
+        # Only a KNOWN-short call may use gpt-4o-transcribe. The manual
+        # sync-recording path passes duration 0 for calls the recruiter hasn't
+        # saved yet — a 23-minute call arriving as duration=0 used to slip past
+        # this guard and get silently cut around the 10-minute mark.
+        known_short = (
+            duration_seconds is not None
+            and 0 < duration_seconds <= GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS
+        )
+        if not known_short:
             logger.info(
-                f"Call {call_uuid} is {duration_seconds}s (over the {GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS}s safe margin) — "
-                "using whisper-1 directly instead of risking gpt-4o-transcribe's silent truncation."
+                f"Call {call_uuid} duration is {duration_seconds}s (unknown or over the "
+                f"{GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS}s safe margin) — using whisper-1 directly "
+                "instead of risking gpt-4o-transcribe's silent truncation."
             )
             with open(temp_audio_path, "rb") as audio_file:
                 transcript = await client.audio.transcriptions.create(
@@ -1381,16 +1389,34 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                 else:
                     t_str = str(t_items) if t_items else raw_text
 
+                # The speaker-labelled version comes from gpt-4o-mini RE-EMITTING
+                # the conversation, and on long calls it abridges heavily (23-min
+                # calls came back as ~1.2k-char digests full of "..." elisions).
+                # Labels are a nicety; the words are the record. If the rewrite
+                # lost a meaningful share of the ASR text, store the ASR text.
+                if raw_text and len(t_str) < 0.7 * len(raw_text):
+                    logger.warning(
+                        f"LLM transcript rewrite for {call_uuid} is {len(t_str)} chars vs "
+                        f"{len(raw_text)} raw — storing the raw transcription instead."
+                    )
+                    t_str = raw_text
+
                 likely_voicemail = detect_likely_voicemail(t_str, duration_seconds)
 
                 # Authoritative provider duration wins when present; COALESCE
                 # keeps any existing value (e.g. the client-side timer) when the
                 # webhook didn't carry a usable duration.
+                # Concurrent syncs (review-modal poll + background poll + the
+                # provider's final callback) can race for the same call, and an
+                # early run may have transcribed a not-yet-final recording.
+                # Words are never lost by keeping the longer transcript.
                 cur.execute("""
                     UPDATE calls
                     SET
                         recording_url = %s,
-                        transcript = %s,
+                        transcript = CASE
+                            WHEN LENGTH(%s) > LENGTH(COALESCE(transcript, '')) THEN %s
+                            ELSE transcript END,
                         summary = %s,
                         sentiment = %s,
                         sentiment_reason = %s,
@@ -1399,7 +1425,7 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                         status = 'completed',
                         updated_at = NOW()
                     WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
-                """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail, call_uuid, call_uuid))
+                """, (record_url, t_str, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail, call_uuid, call_uuid))
                 conn.commit()
 
                 if cur.rowcount == 0:
@@ -1408,7 +1434,9 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                         UPDATE calls
                         SET
                             recording_url = %s,
-                            transcript = %s,
+                            transcript = CASE
+                                WHEN LENGTH(%s) > LENGTH(COALESCE(transcript, '')) THEN %s
+                                ELSE transcript END,
                             summary = %s,
                             sentiment = %s,
                             sentiment_reason = %s,
@@ -1417,7 +1445,7 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                             status = 'completed',
                             updated_at = NOW()
                         WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
-                    """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail))
+                    """, (record_url, t_str, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail))
                     conn.commit()
                 cur.close()
                 return_db_connection(conn)

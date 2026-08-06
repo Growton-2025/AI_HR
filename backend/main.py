@@ -133,6 +133,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"ROLE OUTREACH DISPATCHERS FAILED TO START: {e}")
 
+    # Register the HeyReach reply webhook (EVERY_MESSAGE_REPLY_RECEIVED) so
+    # candidate replies land in near real-time instead of waiting for a manual
+    # sync. Requires the backend to be publicly reachable; set e.g.
+    # HEYREACH_WEBHOOK_URL=https://<host>/api/outreach/heyreach/webhook
+    heyreach_webhook_url = os.getenv("HEYREACH_WEBHOOK_URL")
+    if heyreach_webhook_url:
+        try:
+            from backend.integrations.heyreach import HeyReachBot
+
+            await asyncio.to_thread(
+                HeyReachBot().ensure_reply_webhook, heyreach_webhook_url
+            )
+        except Exception as e:
+            print(f"HEYREACH WEBHOOK REGISTRATION FAILED (non-fatal): {e}")
+
     # Warm calls cache AFTER migrations so the DB pool is fully available.
     # This is awaited directly (takes ~2-3s) so it is ready before the first request.
     print("Warming calls cache...")

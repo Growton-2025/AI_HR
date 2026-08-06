@@ -116,9 +116,19 @@ export default function CandidateConversationModal({
   const activeThread = threads[platform] || EMPTY_THREAD
   const messages = activeThread.messages || []
 
+  // Only scroll when a message is actually added — the steady poll below
+  // replaces the array every cycle, and yanking the recruiter back to the
+  // bottom while they are reading older messages would be hostile.
+  const lastMessageKey = messages.length
+    ? `${messages.length}-${messageTime(messages[messages.length - 1])}`
+    : ''
+  const lastMessageKeyRef = useRef('')
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    if (lastMessageKey && lastMessageKey !== lastMessageKeyRef.current) {
+      lastMessageKeyRef.current = lastMessageKey
+      endRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [lastMessageKey])
 
   // Fast poll whichever thread is currently syncing
   useEffect(() => {
@@ -134,6 +144,23 @@ export default function CandidateConversationModal({
 
     return () => clearInterval(intervalId);
   }, [threads.email?.syncing, threads.linkedin?.syncing, loadThread]);
+
+  // Steady poll of the open thread so replies that land while the modal is
+  // open appear on their own — recruiters shouldn't need "Manual Sync" to see
+  // a candidate answer. The backend serves this from its in-memory cache and
+  // refreshes itself from HeyReach/Smartlead when stale, so a 15s cadence is
+  // cheap on both sides.
+  const threadsRef = useRef(threads)
+  useEffect(() => { threadsRef.current = threads }, [threads])
+  useEffect(() => {
+    if (platform === 'calls') return undefined
+    const intervalId = setInterval(() => {
+      if (document.visibilityState !== 'visible') return
+      const thread = threadsRef.current[platform]
+      if (thread?.loaded && !thread.error && !thread.syncing) void loadThread(platform)
+    }, 15000)
+    return () => clearInterval(intervalId)
+  }, [platform, loadThread])
 
   // Calls sits alongside the message threads: a recruiter opening a candidate's
   // conversation needs to see they have already been spoken to, not just what

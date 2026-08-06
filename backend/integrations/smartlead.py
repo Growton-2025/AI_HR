@@ -162,15 +162,41 @@ class SmartleadBot:
         
         return self._handle_response(requests.post(url, json=payload, timeout=15), "Settings Update")
 
-    def add_leads(self, leads_list):
+    def add_leads(self, leads_list, settings=None):
         """Step 5: Add leads to the campaign"""
         if not self.campaign_id: return
         print(f"\n🚀 Adding {len(leads_list)} Leads...")
-        
+
         url = f"{self.base_url}/api/v1/campaigns/{self.campaign_id}/leads?api_key={self.api_key}"
-        payload = {"lead_list": leads_list}
-        
-        return self._handle_response(requests.post(url, json=payload, timeout=30), "Lead Addition")
+        # Smartlead silently skips leads that already exist in another campaign
+        # unless this override is set — for Quick Chat threads the lead is
+        # almost always already enrolled somewhere else.
+        payload = {
+            "lead_list": leads_list,
+            "settings": settings
+            or {"ignore_duplicate_leads_in_other_campaign": True},
+        }
+
+        data = self._handle_response(requests.post(url, json=payload, timeout=30), "Lead Addition")
+        if isinstance(data, dict):
+            # "upload_count" counts processed rows, not accepted ones — a lead
+            # dropped by a block/bounce list still shows upload_count 1 with
+            # block_count 1 and total_leads 0.
+            accepted = int(data.get("total_leads") or 0) + int(
+                data.get("already_added_to_campaign") or 0
+            )
+            if accepted < len(leads_list):
+                print(
+                    f"⚠️ Lead Addition accepted {accepted}/{len(leads_list)}: "
+                    f"blocked={data.get('block_count')}, "
+                    f"duplicates={data.get('duplicate_count')}, "
+                    f"invalid={data.get('invalid_email_count')}, "
+                    f"unsubscribed={data.get('unsubscribed_leads')}, "
+                    f"bounced={data.get('bounce_count')}"
+                )
+            if accepted == 0:
+                return None
+        return data
 
     def get_campaign_analytics(self):
         """Get campaign stats (Sent, Replied, etc)"""

@@ -40,18 +40,21 @@ def sync_shortlisted_to_call_list(cur, role_id: int, candidate_ids: list[int]):
         if not enriched_candidate_ids:
             return
 
-        # Insert them into the call list (ignoring if they already exist)
+        # Insert them into the call list (ignoring if they already exist).
+        # Import here to avoid a circular import at module load time.
+        from backend.api.routes.calls import FIRST_ATTEMPT_TITLE
+
         cur.execute(
             """
             INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
-            SELECT DISTINCT c_id, %s, 'pending', CURRENT_DATE, 'Call 1 - Day 1'
+            SELECT DISTINCT c_id, %s, 'pending', CURRENT_DATE, %s
             FROM UNNEST(%s::int[]) AS c_id
             WHERE NOT EXISTS (
                 SELECT 1 FROM calls existing
                 WHERE existing.candidate_id = c_id AND existing.list_id = %s
             )
             """,
-            (linked_call_list_id, enriched_candidate_ids, linked_call_list_id)
+            (linked_call_list_id, FIRST_ATTEMPT_TITLE, enriched_candidate_ids, linked_call_list_id)
         )
         logger.info(f"Auto-synced {len(enriched_candidate_ids)} candidates to call list {linked_call_list_id} for role {role_id}.")
         

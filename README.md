@@ -40,6 +40,7 @@ A growton.co product for Candidate Search & Talent Intelligence, built with Reac
     - `OPENAI_API_KEY`
     - `DB_` connection params
     - `REDIS_` params (optional)
+    - `HEYREACH_WEBHOOK_URL` (optional) — public URL of `/api/outreach/heyreach/webhook`; when set, the backend auto-registers a HeyReach `EVERY_MESSAGE_REPLY_RECEIVED` webhook at startup so LinkedIn replies sync in near real-time
 
 ## Running the Services
 

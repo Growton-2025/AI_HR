@@ -237,7 +237,7 @@ CALLS_SELECT_QUERY = """
         c.task_title,
         cand.name AS candidate_name,
         cand.headline AS candidate_title,
-        cand.mobile_phone AS candidate_phone,
+        COALESCE(NULLIF(TRIM(cand.mobile_phone), ''), NULLIF(TRIM(cand.phone), '')) AS candidate_phone,
         c.completed_at,
         c.recording_url,
         c.transcript,
@@ -2528,7 +2528,8 @@ def initiate_call(
 
                 cur.execute(
                     """
-                    SELECT name, mobile_phone
+                    SELECT name,
+                           COALESCE(NULLIF(TRIM(mobile_phone), ''), NULLIF(TRIM(phone), ''))
                     FROM candidates
                     WHERE id = %s
                     """,
@@ -2695,6 +2696,12 @@ async def sync_call_recording(
     if call_uuid and call_uuid in plivo_service.recordings:
         record_url = plivo_service.recordings[call_uuid]
         logger.info(f"Syncing call using Plivo recording for UUID: {call_uuid}")
+    elif call.get("recording_url"):
+        # The row already knows its recording (written by a previous insights
+        # run) — the in-memory map is empty after every restart, and the REST
+        # lookup is a network round-trip that can fail; use what we have.
+        record_url = call["recording_url"]
+        logger.info(f"Syncing call {call_id} using stored recording_url")
     elif call_uuid and call.get("completed_at"):
         # The in-memory recordings map is lost on restart and the webhook can
         # be missed entirely (ngrok down) — recover via Plivo's REST API.

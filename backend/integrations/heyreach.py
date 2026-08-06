@@ -2,7 +2,7 @@ import requests
 import os
 import re
 from typing import List, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -35,6 +35,70 @@ class HeyReachBot:
         self.api_key = api_key or os.getenv("HEYREACH_API_KEY")
         self.push_url = "https://api.heyreach.io/api/public/campaign/AddLeadsToCampaign"
         self._session = _get_session()
+
+    @staticmethod
+    def _is_outbound_sender(sender_val) -> bool:
+        """
+        HeyReach message objects carry direction only in `sender`: the literal
+        string "ME" for messages we sent; anything else (the correspondent's
+        name, or null) is an inbound message from the lead.
+        """
+        if isinstance(sender_val, dict):
+            s_type = str(sender_val.get("senderType") or "").strip().lower()
+            return s_type in ("user", "account", "self", "me")
+        return str(sender_val or "").strip().upper() == "ME"
+
+    def _api_headers(self) -> Dict[str, str]:
+        return {
+            "X-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "accept": "application/json",
+        }
+
+    def _chatroom_url(self, account_id, conversation_id) -> str:
+        # Conversation ids are base64-ish and can contain '=' padding
+        return (
+            "https://api.heyreach.io/api/public/inbox/GetChatroom/"
+            f"{account_id}/{quote(str(conversation_id), safe='')}"
+        )
+
+    def _list_conversations(
+        self,
+        filters: Optional[Dict] = None,
+        limit: int = 100,
+        max_items: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        Page through the cursor-based GetConversationsV3 endpoint and return
+        the collected conversation items. Errors are logged and whatever was
+        collected so far is returned.
+        """
+        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV3"
+        items: List[Dict] = []
+        cursor = None
+        try:
+            while True:
+                payload = {
+                    "limit": min(limit, 100),
+                    "cursor": cursor,
+                    "filters": filters or {},
+                }
+                res = self._session.post(
+                    url, headers=self._api_headers(), json=payload, timeout=12
+                )
+                if res.status_code != 200:
+                    print(f"DEBUG API ERROR ({res.status_code}): {res.text}")
+                    break
+                data = res.json()
+                items.extend(data.get("items", []))
+                cursor = data.get("nextCursor")
+                if not data.get("hasNextPage") or not cursor:
+                    break
+                if max_items and len(items) >= max_items:
+                    break
+        except Exception as e:
+            print(f"⚠️ HeyReach conversation listing failed: {e}")
+        return items
 
     @staticmethod
     def _normalize_linkedin_url(profile_url: Optional[str]) -> str:
@@ -107,33 +171,14 @@ class HeyReachBot:
         Find a LinkedIn conversation by profile URL, campaign ID, or conversation ID.
         Uses HeyReach API filters for efficiency.
         """
-        headers = {
-            "X-API-KEY": self.api_key,
-            "Content-Type": "application/json",
-            "accept": "application/json",
-        }
-        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-
-        # 1. If we have a conversation_id, try fetching it directly first (though GetConversations doesn't support specific ID filter easily,
-        # we can still look it up in the filtered result).
-
-        # 2. Prefer using the official leadProfileUrl filter
-        payload = {"filters": {"leadProfileUrl": profile_url}, "offset": 0, "limit": 50}
-
-        # Add campaign filter if provided
+        # Prefer the official leadProfileUrl filter
+        filters = {"leadProfileUrl": profile_url}
         if campaign_id:
-            payload["filters"]["campaignId"] = campaign_id
+            filters["campaignIds"] = [int(campaign_id)]
 
         try:
             print(f"DEBUG: HeyReach lookup for {profile_url} (campaign: {campaign_id})")
-            res = self._session.post(url, headers=headers, json=payload, timeout=8)
-
-            items = []
-            if res.status_code == 200:
-                items = res.json().get("items", [])
-            else:
-                print(f"DEBUG API ERROR ({res.status_code}): {res.text}")
-                # Don't raise_for_status yet, let it try the fallback or return empty
+            items = self._list_conversations(filters, limit=50, max_items=200)
 
             if campaign_id and items:
                 has_match = any(
@@ -144,16 +189,15 @@ class HeyReachBot:
                     print(
                         f"DEBUG: No matching conversation in campaign {campaign_id}, trying global lookup."
                     )
-                    payload["filters"].pop("campaignId")
-                    res = self._session.post(
-                        url, headers=headers, json=payload, timeout=8
-                    )
-                    if res.status_code == 200:
-                        items = res.json().get("items", [])
-                    else:
-                        print(
-                            f"DEBUG API ERROR ({res.status_code}) on fallback: {res.text}"
-                        )
+                    filters.pop("campaignIds")
+                    items = self._list_conversations(filters, limit=50, max_items=200)
+
+            if not items and campaign_id:
+                # The profile-url filter 400s if HeyReach doesn't know the lead;
+                # a plain campaign listing can still contain the conversation.
+                items = self._list_conversations(
+                    {"campaignIds": [int(campaign_id)]}, limit=50, max_items=500
+                )
 
             for conversation in items:
                 conv_id = conversation.get("id")
@@ -165,21 +209,14 @@ class HeyReachBot:
                 if self._conversation_matches_profile(conversation, profile_url):
                     return conversation
 
-            # 3. Final fallback: If filter failed (API quirk), try a small manual search of recent items
+            # Final fallback: try a small manual search of recent items
             if not items:
                 print(
                     f"DEBUG: Filtered lookup returned nothing for {profile_url}, trying 20 most recent."
                 )
-                fallback_payload = {"offset": 0, "limit": 20}
-                res = self._session.post(
-                    url, headers=headers, json=fallback_payload, timeout=8
-                )
-                if res.status_code == 200:
-                    for conversation in res.json().get("items", []):
-                        if self._conversation_matches_profile(
-                            conversation, profile_url
-                        ):
-                            return conversation
+                for conversation in self._list_conversations({}, limit=20, max_items=20):
+                    if self._conversation_matches_profile(conversation, profile_url):
+                        return conversation
 
         except Exception as e:
             print(f"⚠️ HeyReach conversation lookup failed: {e}")
@@ -349,21 +386,19 @@ class HeyReachBot:
                         # This is necessary because GetLeadsFromCampaign doesn't return text
                         last_reply_text = None
                         try:
-                            conv_url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-                            conv_payload = {
-                                "filters": {"leadProfileUrl": profile_url},
-                                "limit": 1,
-                            }
-                            conv_res = self._session.post(
-                                conv_url, headers=headers, json=conv_payload, timeout=8
+                            conv_items = self._list_conversations(
+                                {"leadProfileUrl": profile_url},
+                                limit=1,
+                                max_items=1,
                             )
-                            if conv_res.status_code == 200:
-                                conv_data = conv_res.json()
-                                conv_items = conv_data.get("items", [])
-                                if conv_items:
-                                    last_reply_text = conv_items[0].get(
-                                        "lastMessageText"
-                                    )
+                            if conv_items:
+                                conv = conv_items[0]
+                                # Only surface the last message as a reply when
+                                # the lead sent it, not our own follow-up.
+                                if not self._is_outbound_sender(
+                                    conv.get("lastMessageSender")
+                                ):
+                                    last_reply_text = conv.get("lastMessageText")
                         except Exception as e:
                             print(f"⚠️ Failed to fetch conversation text: {e}")
 
@@ -416,9 +451,9 @@ class HeyReachBot:
                 return None
 
             # 2. Try fetching messages via GetChatroom
-            msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{final_acc_id}/{conv_id}"
+            msg_url = self._chatroom_url(final_acc_id, conv_id)
             msg_res = self._session.get(msg_url, headers=headers, timeout=8)
-            
+
             # 3. Handle specific errors with Auto-Recovery
             if msg_res.status_code in [400, 401, 404]:
                 print(f"DEBUG: HeyReach get_lead_activity direct fetch failed ({msg_res.status_code}). Attempting recovery for {profile_url}...")
@@ -430,7 +465,7 @@ class HeyReachBot:
                     ).get("id")
                     print(f"DEBUG: Recovered new IDs for activity: conv={conv_id}, acc={final_acc_id}")
                     # Final attempt with new IDs
-                    msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{final_acc_id}/{conv_id}"
+                    msg_url = self._chatroom_url(final_acc_id, conv_id)
                     msg_res = self._session.get(msg_url, headers=headers, timeout=8)
 
             msg_res.raise_for_status()
@@ -454,26 +489,9 @@ class HeyReachBot:
 
                 # Messages are usually returned in descending order (newest first)
                 for msg in messages:
-                    # HeyReach structure has 'sender' which can be dict or 'ME' string
-                    sender_val = msg.get("sender")
-                    sender_type = None
-                    if isinstance(sender_val, dict):
-                        sender_type = sender_val.get("senderType")
-                    elif isinstance(sender_val, str):
-                        if sender_val.upper() == "ME":
-                            sender_type = "User"
-                        else:
-                            sender_type = "Lead"
-
-                    # Fallback to top-level if not found
-                    sender_type = sender_type or msg.get("senderType")
                     timestamp = msg.get("createdAt")
-
-                    # Determine "incoming" (from Candidate)
-                    is_incoming = any(
-                        x in (sender_type or "").lower()
-                        for x in ["lead", "contact", "correspondent", "inbox"]
-                    )
+                    # sender == "ME" is us; anything else is the lead
+                    is_incoming = not self._is_outbound_sender(msg.get("sender"))
 
                     if not is_incoming:  # Sent by us
                         stats["sent_count"] += 1
@@ -510,101 +528,76 @@ class HeyReachBot:
         Fetch all conversation activities for a specific campaign in batch.
         Returns a mapping of normalized linkedin profile URLs to activity stats.
         """
-        headers = {
-            "X-API-KEY": self.api_key,
-            "Content-Type": "application/json",
-            "accept": "application/json",
-        }
-        url = "https://api.heyreach.io/api/public/inbox/GetConversationsV2"
-
-        offset = 0
-        limit = 100
         activities = {}
 
         try:
-            while True:
-                payload = {
-                    "filters": {"campaignId": campaign_id},
-                    "offset": offset,
-                    "limit": limit,
+            import re
+
+            items = self._list_conversations(
+                {"campaignIds": [int(campaign_id)]}, limit=100
+            )
+
+            for conv in items:
+                corr_profile = conv.get("correspondentProfile") or {}
+                profile_url = corr_profile.get("profileUrl") or corr_profile.get(
+                    "publicProfileUrl"
+                )
+                if not profile_url:
+                    continue
+
+                norm_url = self._normalize_linkedin_url(profile_url)
+                if not norm_url:
+                    continue
+
+                stats = {
+                    "sent_count": 0,
+                    "last_sent_at": None,
+                    "reply_text": None,
+                    "reply_at": None,
+                    "is_replied": False,
+                    "conversation_id": conv.get("id"),
+                    "account_id": conv.get("linkedInAccountId")
+                    or (conv.get("linkedInAccount") or {}).get("id"),
                 }
-                res = self._session.post(url, headers=headers, json=payload, timeout=12)
-                res.raise_for_status()
-                data = res.json()
 
-                items = data.get("items", [])
-                if not items:
-                    break
-
-                for conv in items:
-                    corr_profile = conv.get("correspondentProfile") or {}
-                    profile_url = corr_profile.get("profileUrl") or corr_profile.get(
-                        "publicProfileUrl"
-                    )
-                    if not profile_url:
-                        continue
-
-                    norm_url = self._normalize_linkedin_url(profile_url)
-                    if not norm_url:
-                        continue
-
-                    messages = conv.get("messages", [])
-
-                    stats = {
-                        "sent_count": 0,
-                        "last_sent_at": None,
-                        "reply_text": None,
-                        "reply_at": None,
-                        "is_replied": False,
-                        "conversation_id": conv.get("id"),
-                    }
-
-                    import re
-
-                    for msg in messages:
-                        sender_val = msg.get("sender")
-                        sender_type = None
-                        if isinstance(sender_val, dict):
-                            sender_type = sender_val.get("senderType")
-                        elif isinstance(sender_val, str):
-                            if sender_val.upper() == "ME":
-                                sender_type = "User"
-                            else:
-                                sender_type = "Lead"
-
-                        sender_type = sender_type or msg.get("senderType")
-                        timestamp = msg.get("createdAt")
-
-                        is_incoming = any(
-                            x in (sender_type or "").lower()
-                            for x in ["lead", "contact", "correspondent", "inbox"]
+                # The list endpoint's messages[] is only a preview of the
+                # thread (totalMessages is the true count) — scan whatever is
+                # there, but don't treat it as the whole conversation.
+                for msg in conv.get("messages") or []:
+                    timestamp = msg.get("createdAt")
+                    if self._is_outbound_sender(msg.get("sender")):
+                        stats["sent_count"] += 1
+                        if not stats["last_sent_at"] or timestamp > (
+                            stats["last_sent_at"] or ""
+                        ):
+                            stats["last_sent_at"] = timestamp
+                    else:
+                        text = (
+                            msg.get("body")
+                            or msg.get("text")
+                            or msg.get("messageText")
+                            or ""
                         )
+                        clean_text = re.sub("<[^<]+?>", "", str(text or "")).strip()
 
-                        if not is_incoming:
-                            stats["sent_count"] += 1
-                            if not stats["last_sent_at"] or timestamp > (
-                                stats["last_sent_at"] or ""
-                            ):
-                                stats["last_sent_at"] = timestamp
-                        else:
-                            text = (
-                                msg.get("body")
-                                or msg.get("text")
-                                or msg.get("messageText")
-                                or ""
-                            )
-                            clean_text = re.sub("<[^<]+?>", "", str(text or "")).strip()
+                        if not stats["reply_at"] or timestamp > stats["reply_at"]:
+                            stats["reply_text"] = clean_text
+                            stats["reply_at"] = timestamp
+                            stats["is_replied"] = True
 
-                            if not stats["reply_at"] or timestamp > stats["reply_at"]:
-                                stats["reply_text"] = clean_text
-                                stats["reply_at"] = timestamp
-                                stats["is_replied"] = True
+                # Conversation-level fields are authoritative for the newest
+                # message and don't depend on the truncated preview.
+                last_sender = conv.get("lastMessageSender")
+                last_at = conv.get("lastMessageAt")
+                if last_at and last_sender and not self._is_outbound_sender(last_sender):
+                    if not stats["reply_at"] or last_at > stats["reply_at"]:
+                        stats["reply_text"] = re.sub(
+                            "<[^<]+?>", "", str(conv.get("lastMessageText") or "")
+                        ).strip()
+                        stats["reply_at"] = last_at
+                        stats["is_replied"] = True
 
-                    activities[norm_url] = stats
-
-                if len(items) < limit:
-                    break
-                offset += limit
+                activities[norm_url] = stats
 
             return activities
         except Exception as e:
@@ -648,9 +641,9 @@ class HeyReachBot:
                 ).get("id")
 
             # 2. Try fetching messages via GetChatroom
-            msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{final_acc_id}/{final_conv_id}"
+            msg_url = self._chatroom_url(final_acc_id, final_conv_id)
             msg_res = self._session.get(msg_url, headers=headers, timeout=8)
-            
+
             # 3. Handle specific errors with Auto-Recovery
             if msg_res.status_code in [400, 401, 404]:
                 print(f"DEBUG: HeyReach direct fetch failed ({msg_res.status_code}). Attempting recovery for {profile_url}...")
@@ -662,7 +655,7 @@ class HeyReachBot:
                     ).get("id")
                     print(f"DEBUG: Recovered new IDs: conv={final_conv_id}, acc={final_acc_id}")
                     # Final attempt with new IDs
-                    msg_url = f"https://api.heyreach.io/api/public/inbox/GetChatroom/{final_acc_id}/{final_conv_id}"
+                    msg_url = self._chatroom_url(final_acc_id, final_conv_id)
                     msg_res = self._session.get(msg_url, headers=headers, timeout=8)
 
             msg_res.raise_for_status()
@@ -687,48 +680,22 @@ class HeyReachBot:
                     print(
                         f"DEBUG: Msg Sample - Sender: {m.get('sender')} | SenderType: {m.get('senderType')} | Body: {raw_body[:30]}"
                     )
-                # 'sender' can be dict (Lead) or 'ME' string (User)
+                # Direction comes solely from `sender`: the literal "ME" means
+                # we sent it; any other value (the lead's name, or null) is an
+                # inbound reply from the candidate.
                 sender_val = m.get("sender")
-                s_type = m.get("senderType") or ""
-                s_name = m.get("senderName") or ""
+                is_incoming = not self._is_outbound_sender(sender_val)
 
+                # Sender name is display-only. The live API returns the
+                # literal "CORRESPONDENT" for the lead, not their name.
                 if isinstance(sender_val, dict):
-                    s_type = s_type or sender_val.get("senderType") or ""
-                    s_name = s_name or sender_val.get("name") or ""
-                elif isinstance(sender_val, str):
-                    if sender_val.upper() == "ME":
-                        s_type = "USER"
-                        s_name = "Me"
-                    else:
-                        s_name = s_name or sender_val
-
-                # Determine "direction" (inbound = from candidate, outbound = from us)
-                # HeyReach uses various labels: 'LEAD', 'CORRESPONDENT', 'PROSPECT' for candidates.
-                # It uses 'ME', 'USER', 'ACCOUNT' for us.
-                is_incoming = True  # Assume incoming unless proven otherwise
-
-                # The 'sender' field directly is often 'ME' or 'CORRESPONDENT'
-                sender_val_lower = (
-                    str(sender_val).lower() if isinstance(sender_val, str) else ""
-                )
-
-                if sender_val_lower == "me":
-                    is_incoming = False
-                elif sender_val_lower == "correspondent":
-                    is_incoming = True
+                    s_name = sender_val.get("name") or ""
+                elif isinstance(sender_val, str) and not self._is_outbound_sender(
+                    sender_val
+                ):
+                    s_name = sender_val if sender_val.upper() != "CORRESPONDENT" else ""
                 else:
-                    # Fallback to type/name checking
-                    s_type_lower = (s_type or "").lower()
-                    s_name_lower = (s_name or "").lower()
-
-                    if any(
-                        x in s_type_lower for x in ["user", "account", "self", "me"]
-                    ):
-                        is_incoming = False
-                    elif any(x in s_name_lower for x in ["me", "you", "ashwin"]):
-                        is_incoming = False
-                    elif not s_type and not s_name:
-                        pass
+                    s_name = ""
 
                 # Content extraction
                 text_content = (
@@ -749,7 +716,7 @@ class HeyReachBot:
                         "type": "REPLY" if is_incoming else "SENT",
                         "time": msg_time,
                         "email_body": text_content,
-                        "sender_name": s_name if is_incoming else "You",
+                        "sender_name": (s_name or "Candidate") if is_incoming else "You",
                         "direction": "inbound" if is_incoming else "outbound",
                     }
                 )
@@ -853,4 +820,48 @@ class HeyReachBot:
             return True
         except Exception as e:
             print(f"❌ Failed to send LI message: {e}")
+            return False
+
+    def ensure_reply_webhook(self, public_url: str) -> bool:
+        """
+        Idempotently register a webhook so HeyReach POSTs to `public_url` on
+        EVERY reply (EVERY_MESSAGE_REPLY_RECEIVED covers messages and InMails;
+        MESSAGE_REPLY_RECEIVED would fire only on the first reply per lead).
+        Returns True if the webhook exists or was created.
+        """
+        event_type = "EVERY_MESSAGE_REPLY_RECEIVED"
+        base = "https://api.heyreach.io/api/public/webhooks"
+        try:
+            res = self._session.post(
+                f"{base}/GetAllWebhooks",
+                headers=self._api_headers(),
+                json={"offset": 0, "limit": 100, "includeCustomHeaders": False},
+                timeout=10,
+            )
+            res.raise_for_status()
+            for hook in res.json().get("items", []):
+                if (
+                    hook.get("webhookUrl") == public_url
+                    and hook.get("eventType") == event_type
+                    and hook.get("isActive", True)
+                ):
+                    print(f"✅ HeyReach reply webhook already registered (id={hook.get('id')})")
+                    return True
+
+            res = self._session.post(
+                f"{base}/CreateWebhook",
+                headers=self._api_headers(),
+                json={
+                    "webhookName": "ai-hr-replies",
+                    "webhookUrl": public_url,
+                    "eventType": event_type,
+                    "campaignIds": [],  # empty = listen across all campaigns
+                },
+                timeout=10,
+            )
+            res.raise_for_status()
+            print(f"✅ HeyReach reply webhook registered for {public_url}")
+            return True
+        except Exception as e:
+            print(f"⚠️ HeyReach webhook registration failed: {e}")
             return False

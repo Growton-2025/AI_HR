@@ -37,7 +37,11 @@ logger = logging.getLogger(__name__)
 _li_chat_cache: Dict[int, Dict] = {}
 _li_chat_lock = threading.Lock()
 _LI_CACHE_TTL = 300
-_LI_CACHE_STALE_THRESHOLD = 45
+# The conversation modal polls every 15s while open; a 20s staleness window
+# means an open thread refetches from HeyReach roughly every other poll
+# (~3 req/min per viewed candidate, against HeyReach's 300/min budget), so a
+# candidate reply appears within ~35s of HeyReach ingesting it.
+_LI_CACHE_STALE_THRESHOLD = 20
 
 # In-memory Email chat cache
 _email_chat_cache: Dict[int, Dict] = {}
@@ -108,9 +112,13 @@ def _sync_li_messages(
         if (new_conv_id and new_conv_id != conversation_id) or (new_acc_id and str(new_acc_id) != str(account_id)):
              _update_outreach_identifiers(candidate_id, new_conv_id, new_acc_id)
 
-        # Clean messages before caching
+        # Clean messages before caching. Only strip quoted trails from OUR
+        # outbound messages — running a candidate's reply through the email
+        # quote-stripper can truncate it to nothing (see _clean_email_body).
         if messages:
             for msg in messages:
+                if str(msg.get("direction") or "").lower() == "inbound":
+                    continue
                 raw_body = msg.get("email_body", "")
                 if raw_body:
                     msg["email_body"] = _clean_email_body(raw_body)
@@ -192,6 +200,13 @@ def _sync_li_messages(
                         conn.commit()
             except Exception as db_err:
                 print(f"WARNING: Failed to persist LI cache to DB: {db_err}")
+
+    # A fresh reply may contain the candidate's mobile number — capture it for
+    # phoneless candidates and enroll them in call cadences. Outside the chat
+    # lock: extraction may call the LLM and must not block other threads.
+    if final_messages and has_reply:
+        from backend.services.phone_capture import capture_phone_from_reply
+        capture_phone_from_reply(candidate_id, reply_text)
 
     print(f"DEBUG: LI cache refreshed for cand {candidate_id}: {len(final_messages or [])} msgs")
     return final_messages or []
@@ -2009,8 +2024,12 @@ async def get_linkedin_chat_history(
         # synthesize a virtual message so the user sees the content immediately.
         if not final_msgs and li_response_text:
             print(f"DEBUG: Using optimistic fallback for candidate {candidate_id}")
+            # type must be one the renderers recognize as inbound
+            # (CandidateConversationModal / Calls / TalentPool check for REPLY
+            # or direction == "inbound"; "RECEIVED" rendered as outgoing).
             final_msgs = [{
-                "type": "RECEIVED",
+                "type": "REPLY",
+                "direction": "inbound",
                 "email_body": li_response_text,
                 "time": response_received_at.isoformat() if response_received_at else None,
                 "sender_name": "Candidate"
@@ -2496,9 +2515,27 @@ async def send_chat_reply(
         cand = candidates[0]
 
         bot = get_smartlead_bot()
-        sender_email = os.getenv("SMARTLEAD_SENDER_EMAIL")
         timezone = os.getenv("SMARTLEAD_DEFAULT_TIMEZONE", "Asia/Kolkata")
         campaign_name = f"Quick Chat - {cand['name']}"
+
+        # Resolve the sender BEFORE creating the campaign: without a mailbox,
+        # Smartlead silently "completes" an empty campaign and no email is
+        # ever sent. Fall back to the first healthy workspace mailbox when
+        # SMARTLEAD_SENDER_EMAIL is not configured.
+        sender_email = os.getenv("SMARTLEAD_SENDER_EMAIL")
+        if not sender_email:
+            healthy = [
+                acc for acc in bot.list_email_accounts()
+                if acc.get("is_smtp_success")
+            ]
+            if healthy:
+                sender_email = healthy[0].get("from_email") or healthy[0].get("id")
+                print(f"DEBUG: SMARTLEAD_SENDER_EMAIL unset; using workspace mailbox {sender_email}")
+        if not sender_email:
+            raise HTTPException(
+                status_code=500,
+                detail="No Smartlead sender mailbox available — set SMARTLEAD_SENDER_EMAIL or connect an email account in Smartlead",
+            )
 
         campaign_id = bot.create_campaign(campaign_name)
         if not campaign_id:
@@ -2506,7 +2543,11 @@ async def send_chat_reply(
                 status_code=500, detail="Failed to create Smartlead campaign"
             )
 
-        bot.add_email_account(sender_email)
+        if not bot.add_email_account(sender_email):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to attach sender mailbox {sender_email} to Smartlead campaign",
+            )
         subject = "Following up regarding your profile"
         bot.set_email_sequence(subject, request.message)
 
@@ -2520,15 +2561,28 @@ async def send_chat_reply(
             days_of_the_week=[0, 1, 2, 3, 4, 5, 6],
         )
         bot.update_campaign_settings(follow_up_percentage=50)
-        bot.add_leads(
+        # A Quick Chat is a recruiter deliberately writing to ONE person, not a
+        # cold blast — so bypass Smartlead's block/bounce lists, which
+        # otherwise silently drop the lead and "complete" an empty campaign.
+        added = bot.add_leads(
             [
                 {
                     "first_name": cand["first_name"],
                     "last_name": cand["last_name"],
                     "email": cand["email"],
                 }
-            ]
+            ],
+            settings={
+                "ignore_duplicate_leads_in_other_campaign": True,
+                "ignore_community_bounce_list": True,
+                "ignore_global_block_list": True,
+            },
         )
+        if not added:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Smartlead refused lead {cand.get('email')} (blocked/unsubscribed/invalid) — check the Smartlead block list",
+            )
         bot.start_campaign()
 
         # Record in DB
@@ -2730,18 +2784,28 @@ def sync_responses(
                     if norm_li in hr_campaign_cache[hr_camp_int]:
                         activity = hr_campaign_cache[hr_camp_int][norm_li]
 
-                # Fallback to single fetch if not in cache or no campaign_id
-                if not activity:
+                # Fallback to single fetch if not in cache or no campaign_id.
+                # Also fall back when the batch stats carry no signal at all —
+                # the conversation-list response only previews messages, so an
+                # all-zero stats dict must not suppress the real chatroom fetch.
+                if not activity or (
+                    not activity.get("is_replied") and not activity.get("sent_count")
+                ):
                     print(f"DEBUG: Starting HeyReach single sync for {linkedin}")
                     import time
 
                     time.sleep(0.5)  # small sleep just for single fetches
-                    activity = hr_bot.get_lead_activity(
+                    single_activity = hr_bot.get_lead_activity(
                         linkedin,
                         campaign_id=int(hr_campaign_id) if hr_campaign_id else None,
-                        conversation_id=li_conv_id,
+                        conversation_id=li_conv_id
+                        or (activity or {}).get("conversation_id"),
                         account_id=int(li_acc_id) if li_acc_id else None,
                     )
+                    # Keep the batch stats (which may still carry recovered
+                    # conversation/account ids) if the single fetch failed.
+                    if single_activity:
+                        activity = single_activity
 
                     # Update IDs if recovered
                     if activity and (activity.get("conversation_id") != li_conv_id or str(activity.get("account_id")) != str(li_acc_id)):
@@ -2779,6 +2843,12 @@ def sync_responses(
 
         if has_update:
             updates.append(update_data)
+            # A reply may carry the candidate's mobile number — capture it for
+            # phoneless candidates and enroll them in call cadences.
+            reply_for_capture = update_data.get("response_text") or update_data.get("li_response_text")
+            if reply_for_capture:
+                from backend.services.phone_capture import capture_phone_from_reply
+                capture_phone_from_reply(c_id, reply_for_capture)
 
     # 3. Update Database
     updated_count = 0
@@ -3077,6 +3147,14 @@ async def smartlead_webhook(payload: Dict):
         except Exception:
             pass
 
+        # A reply may carry the candidate's mobile number — capture it for
+        # phoneless candidates and enroll them in call cadences.
+        try:
+            from backend.services.phone_capture import capture_phone_from_reply
+            capture_phone_from_reply(candidate_id, reply_text)
+        except Exception:
+            pass
+
         logger.info("[SmartleadWebhook] reply stored for candidate %s (%d rows)",
                     candidate_id, updated)
         return {"status": "ok", "candidate_id": candidate_id, "updated": updated}
@@ -3179,12 +3257,19 @@ async def heyreach_webhook(request: Dict):
                 # Extract Identifiers from webhook for future direct sync optimization
                 conv_id = request.get("conversation_id") or request.get("conversationId")
                 acc_id = request.get("accountId") or request.get("linkedInAccountId")
+                camp_id = (
+                    request.get("campaign_id")
+                    or request.get("campaignId")
+                    or (request.get("campaign") or {}).get("id")
+                )
 
                 # Invalidate in-memory chat cache immediately so UI refresh shows the reply NOW.
                 with _li_chat_lock:
                     if candidate_id in _li_chat_cache:
                         _li_chat_cache[candidate_id]["ts"] = 0
                         print(f"DEBUG: Webhook invalidated LI chat cache for cand {candidate_id} due to event: {event}")
+
+                is_reply_event = new_status == "replied"
 
                 if new_status:
                     # Update candidate_outreach
@@ -3196,9 +3281,14 @@ async def heyreach_webhook(request: Dict):
                     ]
                     params = [new_status]
 
-                    if new_response:
-                        fields.append("li_response_text = %s")
-                        params.append(new_response)
+                    if is_reply_event:
+                        # Guarded like the Smartlead webhook: never let a
+                        # malformed/empty payload blank a stored reply.
+                        fields.append(
+                            "li_response_text = COALESCE(NULLIF(%s, ''), li_response_text)"
+                        )
+                        params.append(new_response or "")
+                        fields.append("li_response_received_at = NOW()")
 
                     if conv_id:
                         fields.append("li_conversation_id = %s")
@@ -3213,6 +3303,25 @@ async def heyreach_webhook(request: Dict):
 
                     cur.execute(update_sql, tuple(params))
                     conn.commit()
+
+        # The webhook payload is only a trigger — HeyReach documents that it
+        # carries just the latest message. Re-fetch the full thread from
+        # GetChatroom in the background so cache/DB hold the source of truth.
+        if is_reply_event and profile_url:
+            try:
+                threading.Thread(
+                    target=_refresh_li_cache_task,
+                    args=(
+                        candidate_id,
+                        profile_url,
+                        int(camp_id) if camp_id else None,
+                        str(conv_id) if conv_id else None,
+                        int(acc_id) if acc_id else None,
+                    ),
+                    daemon=True,
+                ).start()
+            except Exception as t_err:
+                print(f"WARNING: Webhook thread spawn failed: {t_err}")
 
         return {"status": "success"}
     except Exception as e:

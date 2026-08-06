@@ -656,12 +656,17 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
                                 """,
                                 (candidate_id,),
                             )
+                        # A candidate who never had a number was never in any
+                        # call list — enroll them in the linked list of each
+                        # role they belong to (self-guards on status/phone/
+                        # duplicates), same as the Clay enrichment path.
+                        from backend.services.phone_capture import add_to_role_call_lists
+                        add_to_role_call_lists(cur, candidate_id)
                     conn.commit()
-            if cleared_wrong_number:
-                from backend.api.routes.calls import invalidate_calls_cache
-                invalidate_calls_cache()
+            from backend.api.routes.calls import invalidate_calls_cache
+            invalidate_calls_cache()
         except Exception as e:
-            print(f"WARNING: wrong-number reset failed for candidate {candidate_id}: {e}")
+            print(f"WARNING: phone-update side effects failed for candidate {candidate_id}: {e}")
 
     return {"success": True, "data": data}
 
