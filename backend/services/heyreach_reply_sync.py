@@ -68,6 +68,7 @@ def poll_once() -> int:
         replied.append(
             {
                 "norm": norm,
+                "profile_url": profile_url,
                 "text": (conv.get("lastMessageText") or "").strip(),
                 "at": conv.get("lastMessageAt"),
                 "conversation_id": conv.get("id"),
@@ -153,7 +154,7 @@ def poll_once() -> int:
                                 """,
                                 (_json.dumps([echo]), candidate_id),
                             )
-                        updated_candidates.append((candidate_id, reply["text"], echo))
+                        updated_candidates.append((candidate_id, reply, echo))
         conn.commit()
 
     if not updated_candidates:
@@ -203,10 +204,38 @@ def poll_once() -> int:
     try:
         from backend.services.phone_capture import capture_phone_from_reply
 
-        for candidate_id, text, _e in updated_candidates:
-            capture_phone_from_reply(candidate_id, text)
+        for candidate_id, reply, _e in updated_candidates:
+            capture_phone_from_reply(candidate_id, reply["text"])
     except Exception:
         logger.exception("Reply poller: phone capture failed")
+
+    # The conversation LISTING only carries the LAST message — a burst of
+    # replies between poll cycles surfaces just its final message. Refetch the
+    # full chatroom for each replied conversation, now and again after
+    # HeyReach's chatroom endpoint has had time to catch up with its own
+    # listing, so every message in the burst lands without anyone clicking.
+    try:
+        from backend.api.routes.outreach import _refresh_li_cache_task
+
+        seen_convs = set()
+        for candidate_id, reply, _e in updated_candidates:
+            conv_id = reply.get("conversation_id")
+            if not conv_id or conv_id in seen_convs:
+                continue
+            seen_convs.add(conv_id)
+            args = (
+                candidate_id,
+                reply.get("profile_url") or "",
+                None,
+                str(conv_id),
+                int(reply["account_id"]) if reply.get("account_id") else None,
+            )
+            threading.Thread(target=_refresh_li_cache_task, args=args, daemon=True).start()
+            timer = threading.Timer(600, _refresh_li_cache_task, args=args)
+            timer.daemon = True
+            timer.start()
+    except Exception:
+        logger.exception("Reply poller: chatroom refetch scheduling failed")
 
     logger.info(
         "HeyReach reply poller: promoted replies for %d candidate rows (%d conversations)",

@@ -3381,6 +3381,46 @@ async def heyreach_webhook(request: Dict):
                     cur.execute(update_sql, tuple(params))
                     conn.commit()
 
+        # HeyReach fires EVERY_MESSAGE_REPLY_RECEIVED once PER MESSAGE, and
+        # its chatroom endpoint can lag its own events by a long time — echo
+        # this message into the thread so a burst of replies shows every
+        # message immediately, not just whichever one a later fetch sees.
+        if is_reply_event and new_response:
+            try:
+                echo = {
+                    "id": f"local-webhook-{candidate_id}-{int(time.time() * 1000)}",
+                    "type": "REPLY",
+                    "direction": "inbound",
+                    "email_body": new_response,
+                    "time": datetime.now(tz_module.utc).isoformat(),
+                    "sender_name": "Candidate",
+                    "local_echo": True,
+                }
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn_echo:
+                    if conn_echo:
+                        with conn_echo.cursor() as cur_echo:
+                            cur_echo.execute(
+                                """
+                                UPDATE candidate_outreach
+                                SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                                    li_chat_history_updated_at = NOW()
+                                WHERE candidate_id = %s
+                                """,
+                                (json.dumps([echo]), candidate_id),
+                            )
+                        conn_echo.commit()
+                with _li_chat_lock:
+                    entry = _li_chat_cache.get(candidate_id)
+                    if entry is not None:
+                        messages = entry.setdefault("messages", [])
+                        if not any(
+                            str(m.get("email_body") or "").strip() == new_response.strip()
+                            for m in messages
+                        ):
+                            messages.append(echo)
+            except Exception as echo_err:
+                print(f"WARNING: Webhook reply echo failed: {echo_err}")
+
         # The webhook payload is only a trigger — HeyReach documents that it
         # carries just the latest message. Re-fetch the full thread from
         # GetChatroom in the background so cache/DB hold the source of truth.
