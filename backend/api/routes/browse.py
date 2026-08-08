@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, HTTPException, Depends
+from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks
 from typing import Optional, List, Any, Dict
 from pydantic import BaseModel
 from backend.pipeline.query import (
@@ -1665,6 +1665,7 @@ async def browse_metadata(
 @router.post("/candidates/bulk-status")
 async def bulk_update_status(
     update: BulkStatusUpdate,
+    background_tasks: BackgroundTasks,
     current_user: schemas.User = Depends(deps.get_current_user),
 ):
     """Set the same status on many candidates in one round trip.
@@ -1676,6 +1677,13 @@ async def bulk_update_status(
 
     Also note "Add to Shortlist" is not a separate feature — 'Shortlisted' is a
     value in RECRUITMENT_STAGES, so it is this endpoint with a fixed status.
+
+    Mass-shortlisting carries the SAME side effects as the single-candidate
+    role shortlist (outreach.py shortlist endpoints): per-role
+    candidate_outreach rows so the Smartlead/HeyReach dispatchers enroll the
+    candidates, call-list sync, and Clay contact enrichment for candidates
+    missing email/phone — a mass update must not silently strand candidates
+    outside the sequences.
     """
     started = time.monotonic()
 
@@ -1742,6 +1750,86 @@ async def bulk_update_status(
                     "UPDATE candidates SET status = %s WHERE id = ANY(%s::int[])",
                     (status, allowed),
                 )
+
+            enrich_targets = []
+            if allowed and status == "Shortlisted":
+                # Mirror the role-shortlist flow (outreach.py): queue email +
+                # LinkedIn enrollment per role, sync call lists, and note who
+                # needs Clay enrichment. Function-level imports — browse and
+                # outreach import each other's helpers.
+                cur.execute(
+                    """
+                    SELECT c.id, c.first_name, c.last_name, c.name, c.email,
+                           COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), '')),
+                           c.linkedin
+                    FROM candidates c WHERE c.id = ANY(%s::int[])
+                    """,
+                    (allowed,),
+                )
+                contact = {
+                    r[0]: {
+                        "id": r[0], "first_name": r[1], "last_name": r[2],
+                        "name": r[3], "email": r[4], "phone": r[5], "linkedin": r[6],
+                    }
+                    for r in cur.fetchall()
+                }
+
+                cur.execute(
+                    "SELECT role_id, candidate_id FROM recruitment_role_candidates WHERE candidate_id = ANY(%s::int[])",
+                    (allowed,),
+                )
+                role_members: Dict[int, list] = {}
+                for role_id, c_id in cur.fetchall():
+                    role_members.setdefault(int(role_id), []).append(int(c_id))
+
+                from backend.api.routes.outreach import _candidate_role_queue_state
+                from backend.services.auto_call_list import sync_shortlisted_to_call_list
+
+                active_states = {"queued", "scheduled", "started", "in_campaign", "completed"}
+                globally_active = set()
+                for role_id, member_ids in role_members.items():
+                    cur.execute(
+                        """
+                        SELECT candidate_id, status, li_status FROM candidate_outreach
+                        WHERE recruitment_role_id = %s AND candidate_id = ANY(%s::int[])
+                        """,
+                        (role_id, member_ids),
+                    )
+                    active_ids = {
+                        int(r[0]) for r in cur.fetchall()
+                        if (r[1] in active_states or r[2] in active_states)
+                    }
+                    globally_active |= active_ids
+                    for c_id in member_ids:
+                        if c_id in active_ids or c_id not in contact:
+                            continue
+                        queue_state = _candidate_role_queue_state(contact[c_id])
+                        cur.execute(
+                            """
+                            INSERT INTO candidate_outreach
+                                (candidate_id, recruitment_role_id, status, li_status, li_scheduled_for, created_at, updated_at)
+                            VALUES (%s, %s, %s, %s,
+                                    CASE WHEN %s='scheduled' THEN NOW() ELSE NULL END, NOW(), NOW())
+                            ON CONFLICT (candidate_id, recruitment_role_id) DO UPDATE
+                            SET status = CASE WHEN candidate_outreach.email_enrolled_at IS NULL
+                                              THEN EXCLUDED.status ELSE candidate_outreach.status END,
+                                li_status = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                                THEN EXCLUDED.li_status ELSE candidate_outreach.li_status END,
+                                li_scheduled_for = CASE WHEN candidate_outreach.li_enrolled_at IS NULL
+                                                        AND EXCLUDED.li_status='scheduled' THEN NOW()
+                                                        ELSE candidate_outreach.li_scheduled_for END,
+                                updated_at=NOW()
+                            """,
+                            (c_id, role_id, queue_state["email_status"],
+                             queue_state["linkedin_status"], queue_state["linkedin_status"]),
+                        )
+                    sync_shortlisted_to_call_list(cur, role_id, member_ids)
+
+                enrich_targets = [
+                    c for cid, c in contact.items()
+                    if cid not in globally_active
+                    and _candidate_role_queue_state(c)["needs_enrichment"]
+                ]
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -1821,6 +1909,27 @@ async def bulk_update_status(
         invalidate_calls_cache()
     except Exception:
         pass
+
+    if status == "Shortlisted":
+        # Push the freshly queued rows to the campaign dispatchers now rather
+        # than on their next poll, and enrich contacts that lack email/phone —
+        # the Clay callback fills candidates.email/mobile_phone and re-syncs
+        # call lists when a number arrives.
+        try:
+            from backend.api.routes.outreach import _dispatch_role_outreach_now
+            background_tasks.add_task(_dispatch_role_outreach_now)
+        except Exception:
+            logger.exception("Bulk shortlist: could not queue outreach dispatch")
+        if enrich_targets:
+            try:
+                from backend.services.clay import trigger_clay
+                for c in enrich_targets:
+                    first_name = c["first_name"] or (c["name"] or "Candidate").split()[0]
+                    last_name = c["last_name"] or " ".join((c["name"] or "").split()[1:])
+                    background_tasks.add_task(trigger_clay, first_name, last_name, c["linkedin"])
+                logger.info("Bulk shortlist: queued Clay enrichment for %d candidates", len(enrich_targets))
+            except Exception:
+                logger.exception("Bulk shortlist: could not queue Clay enrichment")
 
     logger.info(
         "Bulk status: %s -> %d updated, %d skipped, %d call tasks closed in %.2fs",

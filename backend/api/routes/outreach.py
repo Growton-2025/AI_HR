@@ -1080,6 +1080,8 @@ async def shortlist_selected_for_role(
                 for row in cur.fetchall()
             ]
             valid_ids = [candidate["id"] for candidate in candidates]
+            # Bound here, not inside the branch: read unconditionally below.
+            active_outreach_ids = set()
 
             if valid_ids:
                 cur.execute(
