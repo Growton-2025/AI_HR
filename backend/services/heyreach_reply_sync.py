@@ -74,6 +74,11 @@ def poll_once() -> int:
                 "conversation_id": conv.get("id"),
                 "account_id": conv.get("linkedInAccountId")
                 or (conv.get("linkedInAccount") or {}).get("id"),
+                # Despite the docs calling it a preview, the listing's
+                # messages[] carries the full thread — and FRESHER than the
+                # chatroom endpoint, which can lag by hours. This is the only
+                # reliable source for every message of a reply burst.
+                "thread": bot.format_chat_messages(conv.get("messages") or []),
             }
         )
     if not replied:
@@ -126,58 +131,54 @@ def poll_once() -> int:
                         ),
                     )
                     if cur.rowcount:
-                        # HeyReach's chatroom endpoint can lag its own listing
-                        # by many minutes — echo the reply into the persisted
-                        # thread AND the live memory cache so the conversation
-                        # modal shows it NOW. The fetch merge in
-                        # _sync_li_messages dedupes it (by body) once the
-                        # chatroom catches up.
-                        echo = None
-                        if reply["text"]:
-                            echo = {
-                                "id": f"local-reply-{candidate_id}-{reply['at']}",
-                                "type": "REPLY",
-                                "direction": "inbound",
-                                "email_body": reply["text"],
-                                "time": reply["at"],
-                                "sender_name": "Candidate",
-                                "local_echo": True,
-                            }
+                        # Persist the listing's full fresh thread — never
+                        # shrink an existing one (concurrent writers).
+                        if reply["thread"]:
                             import json as _json
 
                             cur.execute(
                                 """
                                 UPDATE candidate_outreach
-                                SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                                SET li_chat_history_cache = CASE
+                                        WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
+                                        THEN %s::jsonb ELSE li_chat_history_cache END,
                                     li_chat_history_updated_at = NOW()
                                 WHERE candidate_id = %s
                                 """,
-                                (_json.dumps([echo]), candidate_id),
+                                (len(reply["thread"]), _json.dumps(reply["thread"]), candidate_id),
                             )
-                        updated_candidates.append((candidate_id, reply, echo))
+                        updated_candidates.append((candidate_id, reply, None))
         conn.commit()
 
     if not updated_candidates:
         return 0
 
-    # Freshness: append the reply echo into this process's live thread cache
-    # (the merge in _sync_li_messages preserves it across provider refetches)
-    # and mark entries stale so open modals refetch on their next auto-poll.
+    # Freshness: replace this process's live thread cache with the listing's
+    # full fresh thread (carrying forward local echoes it doesn't contain
+    # yet), so an open modal shows every message on its next auto-poll.
     try:
         from backend.api.routes.outreach import _li_chat_cache, _li_chat_lock
 
         with _li_chat_lock:
-            for candidate_id, _text, echo in updated_candidates:
+            for candidate_id, reply, _e in updated_candidates:
+                thread = reply.get("thread") or []
                 entry = _li_chat_cache.get(candidate_id)
-                if entry is None:
+                if entry is None or not thread:
+                    if entry is not None:
+                        entry["ts"] = 0
                     continue
-                messages = entry.setdefault("messages", [])
-                if echo and not any(
-                    str(m.get("email_body") or "").strip() == str(echo["email_body"]).strip()
-                    for m in messages
-                ):
-                    messages.append(echo)
-                entry["ts"] = 0
+                previous_messages = entry.get("messages", [])
+                if len(previous_messages) > len(thread):
+                    entry["ts"] = 0
+                    continue
+                thread_bodies = {str(m.get("email_body") or "").strip() for m in thread}
+                echoes = [
+                    m for m in previous_messages
+                    if m.get("local_echo")
+                    and str(m.get("email_body") or "").strip() not in thread_bodies
+                ]
+                entry["messages"] = thread + echoes
+                entry["ts"] = time.monotonic()
     except Exception:
         pass
     try:

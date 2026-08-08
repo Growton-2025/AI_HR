@@ -673,72 +673,7 @@ class HeyReachBot:
                 print(
                     f"DEBUG: First message sender object: {raw_messages[0].get('sender')}"
                 )
-            # Map to consistent format
-            formatted = []
-            print(f"DEBUG: Processing {len(raw_messages)} messages for chatroom.")
-            for m in raw_messages:
-                # Log the raw text of the newest messages to diagnose missing replies
-                raw_body = str(
-                    m.get("body") or m.get("text") or m.get("messageText") or ""
-                )
-                if len(raw_messages) > 0 and raw_messages.index(m) < 5:
-                    print(
-                        f"DEBUG: Msg Sample - Sender: {m.get('sender')} | SenderType: {m.get('senderType')} | Body: {raw_body[:30]}"
-                    )
-                # Direction comes solely from `sender`: the literal "ME" means
-                # we sent it; any other value (the lead's name, or null) is an
-                # inbound reply from the candidate.
-                sender_val = m.get("sender")
-                is_incoming = not self._is_outbound_sender(sender_val)
-
-                # Sender name is display-only. The live API returns the
-                # literal "CORRESPONDENT" for the lead, not their name.
-                if isinstance(sender_val, dict):
-                    s_name = sender_val.get("name") or ""
-                elif isinstance(sender_val, str) and not self._is_outbound_sender(
-                    sender_val
-                ):
-                    s_name = sender_val if sender_val.upper() != "CORRESPONDENT" else ""
-                else:
-                    s_name = ""
-
-                # Content extraction
-                text_content = (
-                    m.get("body")
-                    or m.get("text")
-                    or m.get("message")
-                    or m.get("content")
-                    or m.get("messageText")
-                    or ""
-                )
-
-                # Time parsing
-                msg_time = m.get("createdAt") or m.get("time") or m.get("updatedAt")
-
-                formatted.append(
-                    {
-                        "id": str(m.get("id") or hash(text_content)),
-                        "type": "REPLY" if is_incoming else "SENT",
-                        "time": msg_time,
-                        "email_body": text_content,
-                        "sender_name": (s_name or "Candidate") if is_incoming else "You",
-                        "direction": "inbound" if is_incoming else "outbound",
-                    }
-                )
-
-            # Robust chronological sort (oldest first)
-            def get_timestamp(msg):
-                t = msg.get("time")
-                if not t:
-                    return 0
-                try:
-                    from dateutil.parser import parse
-
-                    return parse(t).timestamp()
-                except:
-                    return 0
-
-            formatted.sort(key=get_timestamp)
+            formatted = self.format_chat_messages(raw_messages)
             return {
                 "messages": formatted,
                 "conversation_id": final_conv_id,
@@ -748,6 +683,60 @@ class HeyReachBot:
         except Exception as e:
             print(f"❌ Error fetching LI chat history: {e}")
             return {"messages": [], "conversation_id": None, "account_id": None}
+
+    def format_chat_messages(self, raw_messages: List[Dict]) -> List[Dict]:
+        """
+        Map HeyReach message objects to the app's thread format, sorted oldest
+        first. Direction comes solely from `sender`: the literal "ME" means we
+        sent it; anything else (live API: "CORRESPONDENT") is the lead.
+        """
+        formatted = []
+        for m in raw_messages or []:
+            sender_val = m.get("sender")
+            is_incoming = not self._is_outbound_sender(sender_val)
+
+            # Sender name is display-only.
+            if isinstance(sender_val, dict):
+                s_name = sender_val.get("name") or ""
+            elif isinstance(sender_val, str) and is_incoming:
+                s_name = sender_val if sender_val.upper() != "CORRESPONDENT" else ""
+            else:
+                s_name = ""
+
+            text_content = (
+                m.get("body")
+                or m.get("text")
+                or m.get("message")
+                or m.get("content")
+                or m.get("messageText")
+                or ""
+            )
+            msg_time = m.get("createdAt") or m.get("time") or m.get("updatedAt")
+
+            formatted.append(
+                {
+                    "id": str(m.get("id") or hash(text_content)),
+                    "type": "REPLY" if is_incoming else "SENT",
+                    "time": msg_time,
+                    "email_body": text_content,
+                    "sender_name": (s_name or "Candidate") if is_incoming else "You",
+                    "direction": "inbound" if is_incoming else "outbound",
+                }
+            )
+
+        def get_timestamp(msg):
+            t = msg.get("time")
+            if not t:
+                return 0
+            try:
+                from dateutil.parser import parse
+
+                return parse(t).timestamp()
+            except Exception:
+                return 0
+
+        formatted.sort(key=get_timestamp)
+        return formatted
 
     def send_li_message(
         self,

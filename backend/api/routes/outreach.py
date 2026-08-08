@@ -153,6 +153,17 @@ def _sync_li_messages(
             if old_messages:
                 print(f"DEBUG: Preserving {len(old_messages)} existing messages for cand {candidate_id} after empty/failed sync.")
                 final_messages = old_messages
+        # The chatroom endpoint can lag the reply poller's listing-based
+        # thread by HOURS — a shorter chatroom fetch must never replace a
+        # longer thread we already hold (memory or DB blob writes below).
+        if final_messages and candidate_id in _li_chat_cache:
+            existing = _li_chat_cache[candidate_id].get("messages", [])
+            if len(existing) > len(final_messages):
+                print(
+                    f"DEBUG: Keeping {len(existing)}-msg thread for cand {candidate_id}; "
+                    f"fetch returned only {len(final_messages)} (chatroom lag)."
+                )
+                final_messages = existing
 
         previous_li_entry = _li_chat_cache.get(candidate_id) or {}
         new_li_entry = {
@@ -198,7 +209,9 @@ def _sync_li_messages(
                         cur.execute(
                             """
                             UPDATE candidate_outreach
-                            SET li_chat_history_cache = %s,
+                            SET li_chat_history_cache = CASE
+                                    WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
+                                    THEN %s::jsonb ELSE li_chat_history_cache END,
                                 li_chat_history_updated_at = %s,
                                 -- Only ever promote; never clear a stored reply
                                 -- from a fetch that happens to come back empty.
@@ -210,7 +223,7 @@ def _sync_li_messages(
                             WHERE candidate_id = %s
                         """,
                             (
-                                json.dumps(final_messages), datetime.now(tz_module.utc),
+                                len(final_messages), json.dumps(final_messages), datetime.now(tz_module.utc),
                                 has_reply,
                                 has_reply, reply_text or None,
                                 has_reply, reply_at,
