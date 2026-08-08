@@ -899,6 +899,21 @@ function Roles() {
     // HeyReach/Smartlead calls on every open role page. If auto-refresh is
     // wanted, port TalentPool's visibility-gated, backed-off loop instead.)
 
+    // Silent auto-refresh of the open role grid. This does NOT call any
+    // outreach provider — the backend's reply poller does that once,
+    // server-side; this merely refetches the role detail payload (served from
+    // the backend's 30s cache) so promoted replies/statuses appear in the
+    // list without anyone pressing Sync. fetchRoleDetails updates viewingRole
+    // in place with no loading flags, so the grid never flickers.
+    useEffect(() => {
+        if (!viewingRole?.name) return undefined
+        const intervalId = setInterval(() => {
+            if (document.visibilityState !== 'visible') return
+            void fetchRoleDetails(viewingRole.name)
+        }, 15000)
+        return () => clearInterval(intervalId)
+    }, [viewingRole?.name, fetchRoleDetails])
+
     // Fetch outreach status when viewing role
     useEffect(() => {
         if (viewingRole?.id) {

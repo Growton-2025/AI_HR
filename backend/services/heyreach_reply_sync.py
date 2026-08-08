@@ -139,6 +139,13 @@ def poll_once() -> int:
         query.refresh_profiles_in_cache([cid for cid, _ in updated_candidates])
     except Exception:
         pass
+    try:
+        from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
+
+        for candidate_id, _ in updated_candidates:
+            invalidate_role_detail_cache_for_candidate(candidate_id)
+    except Exception:
+        pass
 
     # A reply may carry the candidate's number.
     try:
