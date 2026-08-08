@@ -2826,13 +2826,17 @@ export const useAppStore = create(persist((set, get) => ({
     //
     // "Add to Shortlist" is this with status 'Shortlisted': shortlisting is a
     // status value, not separate membership.
-    bulkUpdateCandidateStatus: async (candidateIds, newStatus) => {
+    bulkUpdateCandidateStatus: async (candidateIds, newStatus, context = {}) => {
         const ids = [...new Set((candidateIds || []).map(Number).filter(Boolean))]
         if (!ids.length) return { success: true, updated: 0, skipped: 0 }
         try {
             const res = await axios.post(`${API_BASE}/candidates/bulk-status`, {
                 candidate_ids: ids,
                 status: newStatus,
+                // Shortlist campaign context: role view -> that role's
+                // campaigns; Talent Pool -> the picked HeyReach campaign.
+                role_id: context.role_id ?? null,
+                hr_campaign_id: context.hr_campaign_id ?? null,
             })
             // Patch only what the server actually changed — a mixed-ownership
             // selection can legitimately skip some ids, and showing those as

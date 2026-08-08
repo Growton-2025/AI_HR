@@ -158,6 +158,13 @@ class StatusUpdate(BaseModel):
 class BulkStatusUpdate(BaseModel):
     candidate_ids: List[int]
     status: str
+    # Shortlist context: enroll into the campaign the selection was made from.
+    # role_id — selection made inside a role view: enroll ONLY into that
+    # role's campaigns/call list (not every role the candidate is on).
+    # hr_campaign_id — Talent Pool selection with a HeyReach campaign picked:
+    # push role-less candidates straight into that campaign.
+    role_id: Optional[int] = None
+    hr_campaign_id: Optional[int] = None
 
 
 # One request cannot rewrite an unbounded number of rows. Matches the page cap
@@ -1662,6 +1669,73 @@ async def browse_metadata(
     finally:
         return_db_connection(conn)
 
+def _bulk_push_selected_to_heyreach(candidates: list, hr_campaign_id: int) -> None:
+    """
+    Background task: push Talent-Pool-selected candidates into the HeyReach
+    campaign picked in the UI, recording a role-less candidate_outreach row —
+    the bulk equivalent of the single-candidate shortlistAndOutreach flow.
+    """
+    import os
+    from backend.integrations.heyreach import HeyReachBot
+
+    sender_account_id = int(os.getenv("HEYREACH_DEFAULT_SENDER_ACCOUNT_ID", "113572"))
+    bot = HeyReachBot()
+    pushed = 0
+    conn = get_db_connection()
+    try:
+        for cand in candidates:
+            try:
+                first_name = cand["first_name"] or (cand["name"] or "Candidate").split()[0]
+                last_name = cand["last_name"] or " ".join((cand["name"] or "").split()[1:])
+                result = bot.push_lead(
+                    campaign_id=int(hr_campaign_id),
+                    account_id=sender_account_id,
+                    first_name=first_name,
+                    last_name=last_name,
+                    profile_url=cand["linkedin"],
+                )
+                if not result:
+                    continue
+                pushed += 1
+                if conn:
+                    with conn.cursor() as cur:
+                        # UNIQUE(candidate_id, recruitment_role_id) does not
+                        # bind for NULL role ids — check-then-write like the
+                        # single-candidate path to avoid duplicate rows.
+                        cur.execute(
+                            "SELECT 1 FROM candidate_outreach WHERE candidate_id = %s AND recruitment_role_id IS NULL",
+                            (cand["id"],),
+                        )
+                        if cur.fetchone():
+                            cur.execute(
+                                """
+                                UPDATE candidate_outreach
+                                SET heyreach_campaign_id = %s, li_status = 'in_campaign', updated_at = NOW()
+                                WHERE candidate_id = %s AND recruitment_role_id IS NULL
+                                """,
+                                (hr_campaign_id, cand["id"]),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO candidate_outreach
+                                    (candidate_id, recruitment_role_id, heyreach_campaign_id, li_status, created_at, updated_at)
+                                VALUES (%s, NULL, %s, 'in_campaign', NOW(), NOW())
+                                """,
+                                (cand["id"], hr_campaign_id),
+                            )
+                    conn.commit()
+            except Exception:
+                logger.exception("Bulk HeyReach push failed for candidate %s", cand.get("id"))
+    finally:
+        if conn:
+            return_db_connection(conn)
+    logger.info(
+        "Bulk shortlist: pushed %d/%d candidates to HeyReach campaign %s",
+        pushed, len(candidates), hr_campaign_id,
+    )
+
+
 @router.post("/candidates/bulk-status")
 async def bulk_update_status(
     update: BulkStatusUpdate,
@@ -1752,6 +1826,7 @@ async def bulk_update_status(
                 )
 
             enrich_targets = []
+            heyreach_push_targets = []
             if allowed and status == "Shortlisted":
                 # Mirror the role-shortlist flow (outreach.py): queue email +
                 # LinkedIn enrollment per role, sync call lists, and note who
@@ -1774,10 +1849,21 @@ async def bulk_update_status(
                     for r in cur.fetchall()
                 }
 
-                cur.execute(
-                    "SELECT role_id, candidate_id FROM recruitment_role_candidates WHERE candidate_id = ANY(%s::int[])",
-                    (allowed,),
-                )
+                if update.role_id:
+                    # Selection made inside a role view — enroll only into
+                    # THAT role's campaigns, not every role the candidate is on.
+                    cur.execute(
+                        """
+                        SELECT role_id, candidate_id FROM recruitment_role_candidates
+                        WHERE candidate_id = ANY(%s::int[]) AND role_id = %s
+                        """,
+                        (allowed, update.role_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT role_id, candidate_id FROM recruitment_role_candidates WHERE candidate_id = ANY(%s::int[])",
+                        (allowed,),
+                    )
                 role_members: Dict[int, list] = {}
                 for role_id, c_id in cur.fetchall():
                     role_members.setdefault(int(role_id), []).append(int(c_id))
@@ -1830,6 +1916,27 @@ async def bulk_update_status(
                     if cid not in globally_active
                     and _candidate_role_queue_state(c)["needs_enrichment"]
                 ]
+
+                if update.hr_campaign_id:
+                    # Talent Pool selection with a HeyReach campaign picked:
+                    # push every selected candidate with a LinkedIn profile who
+                    # isn't already in any LinkedIn sequence into that campaign.
+                    cur.execute(
+                        """
+                        SELECT c.id FROM candidates c
+                        WHERE c.id = ANY(%s::int[])
+                          AND NULLIF(TRIM(c.linkedin), '') IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM candidate_outreach co
+                              WHERE co.candidate_id = c.id
+                                AND (co.heyreach_campaign_id IS NOT NULL
+                                     OR co.li_status IN ('queued','scheduled','started','in_campaign','completed','replied'))
+                          )
+                        """,
+                        (allowed,),
+                    )
+                    pushable = {int(r[0]) for r in cur.fetchall()}
+                    heyreach_push_targets = [contact[cid] for cid in pushable if cid in contact]
         conn.commit()
     except HTTPException:
         conn.rollback()
@@ -1920,6 +2027,10 @@ async def bulk_update_status(
             background_tasks.add_task(_dispatch_role_outreach_now)
         except Exception:
             logger.exception("Bulk shortlist: could not queue outreach dispatch")
+        if heyreach_push_targets and update.hr_campaign_id:
+            background_tasks.add_task(
+                _bulk_push_selected_to_heyreach, heyreach_push_targets, int(update.hr_campaign_id)
+            )
         if enrich_targets:
             try:
                 from backend.services.clay import trigger_clay

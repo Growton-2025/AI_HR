@@ -2536,6 +2536,7 @@ function Roles() {
                         {(selectedIds.size > 0 || allFilteredSelected) && (
                             <BulkStatusActions
                                 candidateIds={Array.from(selectedIds)}
+                                roleId={viewingRole?.id}
                                 onApplied={async () => {
                                     setSelectedIds(new Set())
                                     setAllFilteredSelected(false)

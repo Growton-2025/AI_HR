@@ -27,10 +27,14 @@ const TERMINAL_STATUSES_UI = new Set([
  * that selection logic has been the source of real bugs. Each page passes the
  * ids it means.
  */
-export default function BulkStatusActions({ candidateIds, onApplied }) {
+export default function BulkStatusActions({ candidateIds, onApplied, roleId }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const bulkUpdateCandidateStatus = useAppStore(state => state.bulkUpdateCandidateStatus);
+  // Talent Pool's campaign picker lives in the store; when the selection is
+  // made there (no roleId), bulk-shortlisting pushes into that campaign —
+  // same context the single-candidate shortlist uses.
+  const heyreachCampaignId = useAppStore(state => state.heyreachCampaignId);
 
   const ids = candidateIds || [];
   if (!ids.length) return null;
@@ -48,7 +52,12 @@ export default function BulkStatusActions({ candidateIds, onApplied }) {
     setMenuOpen(false);
     setBusy(true);
     try {
-      const res = await bulkUpdateCandidateStatus(ids, status);
+      // Shortlist context: the role being viewed wins; otherwise the Talent
+      // Pool's picked HeyReach campaign (may be empty — backend handles null).
+      const context = roleId
+        ? { role_id: roleId }
+        : { hr_campaign_id: parseInt(heyreachCampaignId, 10) || null };
+      const res = await bulkUpdateCandidateStatus(ids, status, context);
       if (!res.success) {
         toast.error(res.error || 'Could not update statuses');
         return;
