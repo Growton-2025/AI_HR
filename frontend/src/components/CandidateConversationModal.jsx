@@ -89,19 +89,32 @@ export default function CandidateConversationModal({
       return { success: false }
     }
     const result = await fetchChatHistory(roleId, candidate.id, targetPlatform, force)
-    setThreads(previous => ({
-      ...previous,
-      [targetPlatform]: result.success
-        ? { messages: result.messages || [], loaded: true, error: '', syncing: Boolean(result.syncing) }
-        : {
-            messages: [], loaded: true, syncing: false,
-            // Coerce: some failures return a structured payload, and this value
-            // is rendered directly.
-            error: typeof result.error === 'string' && result.error
-              ? result.error
-              : 'Failed to load conversation',
-          },
-    }))
+    setThreads(previous => {
+      // A just-sent message takes the provider a while to ingest — a refetch
+      // that replaces the array wholesale made the sent bubble VANISH for
+      // minutes. Carry optimistic messages forward until the fetched thread
+      // actually contains them (matched by body).
+      const fetched = result.messages || []
+      const prevMessages = previous[targetPlatform]?.messages || []
+      const stillPending = prevMessages.filter(message =>
+        message._pending && !fetched.some(f =>
+          String(f.email_body || '').trim() === String(message.email_body || '').trim()
+        )
+      )
+      return {
+        ...previous,
+        [targetPlatform]: result.success
+          ? { messages: [...fetched, ...stillPending], loaded: true, error: '', syncing: Boolean(result.syncing) }
+          : {
+              messages: prevMessages, loaded: true, syncing: false,
+              // Coerce: some failures return a structured payload, and this value
+              // is rendered directly.
+              error: typeof result.error === 'string' && result.error
+                ? result.error
+                : 'Failed to load conversation',
+            },
+      }
+    })
     return result
   }, [candidate.id, fetchChatHistory, roleId])
 
@@ -157,7 +170,9 @@ export default function CandidateConversationModal({
     const intervalId = setInterval(() => {
       if (document.visibilityState !== 'visible') return
       const thread = threadsRef.current[platform]
-      if (thread?.loaded && !thread.error && !thread.syncing) void loadThread(platform)
+      // Errored threads keep polling too — a transient timeout must
+      // self-heal, not freeze the modal until Manual Sync.
+      if (thread?.loaded && !thread.syncing) void loadThread(platform)
     }, 15000)
     return () => clearInterval(intervalId)
   }, [platform, loadThread])
@@ -200,6 +215,18 @@ export default function CandidateConversationModal({
     setSending(true)
     const result = await sendChatReply(roleId, candidate.id, text, platform)
     if (result.success) {
+      // Delivered to the provider; the bubble stays optimistic (merged into
+      // refetches) until the provider's thread includes it, but stop saying
+      // "Sending…" — it's sent.
+      setThreads(previous => ({
+        ...previous,
+        [platform]: {
+          ...previous[platform],
+          messages: (previous[platform]?.messages || []).map(message =>
+            message === optimistic ? { ...message, _delivered: true } : message
+          ),
+        },
+      }))
       window.setTimeout(() => void loadThread(platform, true), 1500)
     } else {
       setThreads(previous => ({
@@ -274,7 +301,7 @@ export default function CandidateConversationModal({
               <strong>Loading latest messages…</strong>
               <span>This usually takes a few seconds</span>
             </div>
-          ) : activeThread.error ? (
+          ) : activeThread.error && messages.length === 0 ? (
             <div className="candidate-conversation-empty">
               <MessageSquare size={32} />
               <strong>Conversation unavailable</strong>
@@ -296,7 +323,7 @@ export default function CandidateConversationModal({
                     {messageTime(message) ? ` · ${messageTime(message)}` : ''}
                   </div>
                   <div className="candidate-message-body">{messageBody(message)}</div>
-                  {message._pending && <small>Sending…</small>}
+                  {message._pending && !message._delivered && <small>Sending…</small>}
                 </div>
               )
             })

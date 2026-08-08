@@ -122,6 +122,21 @@ def _sync_li_messages(
                 raw_body = msg.get("email_body", "")
                 if raw_body:
                     msg["email_body"] = _clean_email_body(raw_body)
+
+        # Carry forward locally-echoed sent messages the provider hasn't
+        # ingested yet — a fresh fetch must not make a just-sent message
+        # vanish. Once the provider's copy contains the text, the echo drops.
+        if messages:
+            with _li_chat_lock:
+                previous_messages = (_li_chat_cache.get(candidate_id) or {}).get("messages", [])
+            fetched_bodies = {str(m.get("email_body") or "").strip() for m in messages}
+            surviving_echoes = [
+                m for m in previous_messages
+                if m.get("local_echo")
+                and str(m.get("email_body") or "").strip() not in fetched_bodies
+            ]
+            if surviving_echoes:
+                messages = messages + surviving_echoes
     except Exception as e:
         print(f"WARNING: HeyReach sync failed for cand {candidate_id}: {e}")
 
@@ -210,6 +225,51 @@ def _sync_li_messages(
 
     print(f"DEBUG: LI cache refreshed for cand {candidate_id}: {len(final_messages or [])} msgs")
     return final_messages or []
+
+def _echo_sent_li_message(candidate_id: int, text: str) -> None:
+    """
+    A message sent FROM the app must appear in the app immediately — HeyReach's
+    chatroom can lag many minutes behind a successful send. Echo the sent
+    message into the memory cache AND the persisted thread blob; the fetch
+    merge in _sync_li_messages keeps it until HeyReach's copy contains it.
+    """
+    echo = {
+        "id": f"local-{int(time.time() * 1000)}",
+        "type": "SENT",
+        "direction": "outbound",
+        "email_body": text,
+        "time": datetime.now(tz_module.utc).isoformat(),
+        "sender_name": "You",
+        "local_echo": True,
+    }
+    with _li_chat_lock:
+        entry = _li_chat_cache.get(candidate_id)
+        if entry is None:
+            entry = {"messages": [], "ts": time.monotonic(), "refreshing": False}
+            _li_chat_cache[candidate_id] = entry
+        entry.setdefault("messages", []).append(echo)
+        # Keep serving the echoed thread rather than invalidating into a
+        # provider refetch that doesn't contain the message yet.
+        entry["ts"] = time.monotonic()
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE candidate_outreach
+                    SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                        li_chat_history_updated_at = NOW(),
+                        updated_at = NOW()
+                    WHERE candidate_id = %s
+                    """,
+                    (json.dumps([echo]), candidate_id),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"WARNING: could not persist sent-message echo for cand {candidate_id}: {e}")
+
 
 def _refresh_li_cache_task(
     candidate_id: int,
@@ -2436,11 +2496,10 @@ async def send_linkedin_chat_reply(
             except:
                 pass
 
-            with _li_chat_lock:
-                if candidate_id in _li_chat_cache:
-                    _li_chat_cache[candidate_id]["ts"] = (
-                        0  # Invalidate cache so next fetch is fresh
-                    )
+            # Echo the sent message into the served thread immediately —
+            # invalidating into a provider refetch made it vanish for however
+            # long HeyReach takes to ingest its own send.
+            _echo_sent_li_message(candidate_id, request.message)
             return {"success": True}
         else:
             raise HTTPException(
