@@ -911,7 +911,16 @@ function Roles() {
             if (document.visibilityState !== 'visible') return
             void fetchRoleDetails(viewingRole.name)
         }, 15000)
-        return () => clearInterval(intervalId)
+        // Refresh immediately when the tab becomes visible again — polling
+        // pauses while hidden, and returning users should not see stale rows.
+        const onVisible = () => {
+            if (document.visibilityState === 'visible') void fetchRoleDetails(viewingRole.name)
+        }
+        document.addEventListener('visibilitychange', onVisible)
+        return () => {
+            clearInterval(intervalId)
+            document.removeEventListener('visibilitychange', onVisible)
+        }
     }, [viewingRole?.name, fetchRoleDetails])
 
     // Fetch outreach status when viewing role

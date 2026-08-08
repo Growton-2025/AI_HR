@@ -174,7 +174,17 @@ export default function CandidateConversationModal({
       // self-heal, not freeze the modal until Manual Sync.
       if (thread?.loaded && !thread.syncing) void loadThread(platform)
     }, 15000)
-    return () => clearInterval(intervalId)
+    // Polling pauses while the tab is hidden — refresh the instant it
+    // becomes visible again, or the user stares at stale messages for up
+    // to a full poll interval after switching back.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadThread(platform)
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [platform, loadThread])
 
   // Calls sits alongside the message threads: a recruiter opening a candidate's
