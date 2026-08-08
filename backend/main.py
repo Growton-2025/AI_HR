@@ -133,6 +133,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"ROLE OUTREACH DISPATCHERS FAILED TO START: {e}")
 
+    # LinkedIn replies must reach the lists WITHOUT anyone opening a modal or
+    # pressing Sync — one workspace-wide watermark poll per cycle. The webhook
+    # (HEYREACH_WEBHOOK_URL) remains the real-time path in hosted envs.
+    try:
+        from backend.services import heyreach_reply_sync
+        heyreach_reply_sync.start_poller()
+    except Exception as e:
+        print(f"HEYREACH REPLY POLLER FAILED TO START: {e}")
+
     # Register the HeyReach reply webhook (EVERY_MESSAGE_REPLY_RECEIVED) so
     # candidate replies land in near real-time instead of waiting for a manual
     # sync. Requires the backend to be publicly reachable; set e.g.

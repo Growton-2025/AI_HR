@@ -67,11 +67,14 @@ class HeyReachBot:
         filters: Optional[Dict] = None,
         limit: int = 100,
         max_items: Optional[int] = None,
+        since: Optional[str] = None,
     ) -> List[Dict]:
         """
         Page through the cursor-based GetConversationsV3 endpoint and return
-        the collected conversation items. Errors are logged and whatever was
-        collected so far is returned.
+        the collected conversation items. `since` (UTC ISO-8601) restricts to
+        conversations whose lastMessageAt is on/after that instant — the
+        watermark mechanism for incremental reply polling. Errors are logged
+        and whatever was collected so far is returned.
         """
         url = "https://api.heyreach.io/api/public/inbox/GetConversationsV3"
         items: List[Dict] = []
@@ -83,6 +86,8 @@ class HeyReachBot:
                     "cursor": cursor,
                     "filters": filters or {},
                 }
+                if since:
+                    payload["from"] = since
                 res = self._session.post(
                     url, headers=self._api_headers(), json=payload, timeout=12
                 )
