@@ -130,11 +130,16 @@ def _sync_li_messages(
             with _li_chat_lock:
                 previous_messages = (_li_chat_cache.get(candidate_id) or {}).get("messages", [])
             fetched_bodies = {str(m.get("email_body") or "").strip() for m in messages}
-            surviving_echoes = [
-                m for m in previous_messages
-                if m.get("local_echo")
-                and str(m.get("email_body") or "").strip() not in fetched_bodies
-            ]
+            surviving_echoes = []
+            seen_echo_bodies = set()
+            for m in previous_messages:
+                if not m.get("local_echo"):
+                    continue
+                body = str(m.get("email_body") or "").strip()
+                if body in fetched_bodies or body in seen_echo_bodies:
+                    continue
+                seen_echo_bodies.add(body)
+                surviving_echoes.append(m)
             if surviving_echoes:
                 messages = messages + surviving_echoes
     except Exception as e:

@@ -84,47 +84,99 @@ def poll_once() -> int:
             return 0
         with conn.cursor() as cur:
             for reply in replied:
+                # candidates.normalized_linkedin exists in TWO formats in this
+                # DB: the pipeline's bare slug ('john-doe-123') and HeyReach's
+                # path ('/in/john-doe-123'). Match both, with a URL fallback —
+                # matching only one format silently skipped real candidates.
+                slug = reply["norm"].split("/in/")[-1].strip("/")
                 cur.execute(
-                    "SELECT id FROM candidates WHERE normalized_linkedin = %s AND COALESCE(is_archived, FALSE) = FALSE",
-                    (reply["norm"],),
+                    """
+                    SELECT id FROM candidates
+                    WHERE (normalized_linkedin = %s OR normalized_linkedin = %s
+                           OR linkedin ILIKE %s)
+                      AND COALESCE(is_archived, FALSE) = FALSE
+                    """,
+                    (reply["norm"], slug, f"%/in/{slug}%"),
                 )
                 rows = cur.fetchall()
                 if not rows:
                     continue
                 for (candidate_id,) in rows:
+                    # Promote only replies NEWER than what's stored — the
+                    # 30-min overlap window would otherwise re-promote (and
+                    # re-echo) the same reply every cycle.
                     cur.execute(
                         """
                         UPDATE candidate_outreach
                         SET li_status = 'replied',
                             li_response_text = COALESCE(NULLIF(%s, ''), li_response_text),
-                            li_response_received_at = COALESCE(%s::timestamptz, li_response_received_at, NOW()),
+                            li_response_received_at = COALESCE(%s::timestamptz, NOW()),
                             li_conversation_id = COALESCE(%s, li_conversation_id),
                             li_account_id = COALESCE(%s, li_account_id),
                             updated_at = NOW()
                         WHERE candidate_id = %s
+                          AND (li_response_received_at IS NULL
+                               OR li_response_received_at < COALESCE(%s::timestamptz, NOW()))
                         """,
                         (
                             reply["text"], reply["at"], reply["conversation_id"],
                             str(reply["account_id"]) if reply["account_id"] else None,
-                            candidate_id,
+                            candidate_id, reply["at"],
                         ),
                     )
                     if cur.rowcount:
-                        updated_candidates.append((candidate_id, reply["text"]))
+                        # HeyReach's chatroom endpoint can lag its own listing
+                        # by many minutes — echo the reply into the persisted
+                        # thread AND the live memory cache so the conversation
+                        # modal shows it NOW. The fetch merge in
+                        # _sync_li_messages dedupes it (by body) once the
+                        # chatroom catches up.
+                        echo = None
+                        if reply["text"]:
+                            echo = {
+                                "id": f"local-reply-{candidate_id}-{reply['at']}",
+                                "type": "REPLY",
+                                "direction": "inbound",
+                                "email_body": reply["text"],
+                                "time": reply["at"],
+                                "sender_name": "Candidate",
+                                "local_echo": True,
+                            }
+                            import json as _json
+
+                            cur.execute(
+                                """
+                                UPDATE candidate_outreach
+                                SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                                    li_chat_history_updated_at = NOW()
+                                WHERE candidate_id = %s
+                                """,
+                                (_json.dumps([echo]), candidate_id),
+                            )
+                        updated_candidates.append((candidate_id, reply["text"], echo))
         conn.commit()
 
     if not updated_candidates:
         return 0
 
-    # Freshness: drop cached threads so open modals show the reply on their
-    # next auto-poll, and refresh the list-serving caches.
+    # Freshness: append the reply echo into this process's live thread cache
+    # (the merge in _sync_li_messages preserves it across provider refetches)
+    # and mark entries stale so open modals refetch on their next auto-poll.
     try:
         from backend.api.routes.outreach import _li_chat_cache, _li_chat_lock
 
         with _li_chat_lock:
-            for candidate_id, _ in updated_candidates:
-                if candidate_id in _li_chat_cache:
-                    _li_chat_cache[candidate_id]["ts"] = 0
+            for candidate_id, _text, echo in updated_candidates:
+                entry = _li_chat_cache.get(candidate_id)
+                if entry is None:
+                    continue
+                messages = entry.setdefault("messages", [])
+                if echo and not any(
+                    str(m.get("email_body") or "").strip() == str(echo["email_body"]).strip()
+                    for m in messages
+                ):
+                    messages.append(echo)
+                entry["ts"] = 0
     except Exception:
         pass
     try:
@@ -136,13 +188,13 @@ def poll_once() -> int:
     try:
         from backend.pipeline import query
 
-        query.refresh_profiles_in_cache([cid for cid, _ in updated_candidates])
+        query.refresh_profiles_in_cache([cid for cid, _t, _e in updated_candidates])
     except Exception:
         pass
     try:
         from backend.api.routes.roles import invalidate_role_detail_cache_for_candidate
 
-        for candidate_id, _ in updated_candidates:
+        for candidate_id, _t, _e in updated_candidates:
             invalidate_role_detail_cache_for_candidate(candidate_id)
     except Exception:
         pass
@@ -151,7 +203,7 @@ def poll_once() -> int:
     try:
         from backend.services.phone_capture import capture_phone_from_reply
 
-        for candidate_id, text in updated_candidates:
+        for candidate_id, text, _e in updated_candidates:
             capture_phone_from_reply(candidate_id, text)
     except Exception:
         logger.exception("Reply poller: phone capture failed")
