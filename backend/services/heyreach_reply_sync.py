@@ -245,9 +245,18 @@ def poll_once() -> int:
 
 
 def _loop():
+    cycle = 0
     while True:
+        cycle += 1
         try:
-            poll_once()
+            promoted = poll_once()
+            # Heartbeat every ~15 min even when idle — silence in the log must
+            # mean "thread dead", never "nothing found".
+            if promoted or cycle % 5 == 1:
+                logger.info(
+                    "HeyReach reply poller heartbeat: cycle %d, promoted %d, watermark %s",
+                    cycle, promoted, _watermark,
+                )
         except Exception:
             logger.exception("HeyReach reply poller cycle failed")
         time.sleep(POLL_SECONDS)
