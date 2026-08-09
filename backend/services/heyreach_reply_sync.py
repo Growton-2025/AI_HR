@@ -22,8 +22,10 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-# Poll cadence; 0 disables the poller entirely.
-POLL_SECONDS = int(os.getenv("HEYREACH_REPLY_POLL_SECONDS", "180"))
+# Poll cadence; 0 disables the poller entirely. One listing call per cycle
+# (~1 req/min against HeyReach's 300/min org budget) — the app's detection
+# delay is then bounded by HeyReach's own LinkedIn ingestion, not by us.
+POLL_SECONDS = int(os.getenv("HEYREACH_REPLY_POLL_SECONDS", "60"))
 # Re-read this much history behind the watermark: HeyReach backdates messages
 # to their LinkedIn time when its scraper ingests them late, so a message can
 # APPEAR with a lastMessageAt minutes in the past.
@@ -238,7 +240,7 @@ def _loop():
             promoted = poll_once()
             # Heartbeat every ~15 min even when idle — silence in the log must
             # mean "thread dead", never "nothing found".
-            if promoted or cycle % 5 == 1:
+            if promoted or cycle % 15 == 1:
                 logger.info(
                     "HeyReach reply poller heartbeat: cycle %d, promoted %d, watermark %s",
                     cycle, promoted, _watermark,
