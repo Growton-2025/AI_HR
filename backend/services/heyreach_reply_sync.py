@@ -56,19 +56,22 @@ def poll_once() -> int:
     if not items:
         return 0
 
-    replied = []
+    # EVERY conversation with new activity gets its thread persisted — not
+    # just lead-last ones. A conversation where WE spoke last (Unibox sends,
+    # our follow-ups) must stay current too, so the app opens with everything
+    # already loaded instead of waiting on per-modal fetches.
+    activity = []
     for conv in items:
-        last_sender = conv.get("lastMessageSender")
-        if not last_sender or bot._is_outbound_sender(last_sender):
-            continue
         profile_url = (conv.get("correspondentProfile") or {}).get("profileUrl")
         norm = HeyReachBot._normalize_linkedin_url(profile_url)
         if not norm:
             continue
-        replied.append(
+        last_sender = conv.get("lastMessageSender")
+        activity.append(
             {
                 "norm": norm,
                 "profile_url": profile_url,
+                "is_reply": bool(last_sender) and not bot._is_outbound_sender(last_sender),
                 "text": (conv.get("lastMessageText") or "").strip(),
                 "at": conv.get("lastMessageAt"),
                 "conversation_id": conv.get("id"),
@@ -81,20 +84,23 @@ def poll_once() -> int:
                 "thread": bot.format_chat_messages(conv.get("messages") or []),
             }
         )
-    if not replied:
+    if not activity:
         return 0
 
+    import json as _json
+
     updated_candidates = []
+    thread_updates = []
     with get_db_connection_context(validate=False, register_pgvector=False) as conn:
         if not conn:
             return 0
         with conn.cursor() as cur:
-            for reply in replied:
+            for item in activity:
                 # candidates.normalized_linkedin exists in TWO formats in this
                 # DB: the pipeline's bare slug ('john-doe-123') and HeyReach's
                 # path ('/in/john-doe-123'). Match both, with a URL fallback —
                 # matching only one format silently skipped real candidates.
-                slug = reply["norm"].split("/in/")[-1].strip("/")
+                slug = item["norm"].split("/in/")[-1].strip("/")
                 cur.execute(
                     """
                     SELECT id FROM candidates
@@ -102,70 +108,77 @@ def poll_once() -> int:
                            OR linkedin ILIKE %s)
                       AND COALESCE(is_archived, FALSE) = FALSE
                     """,
-                    (reply["norm"], slug, f"%/in/{slug}%"),
+                    (item["norm"], slug, f"%/in/{slug}%"),
                 )
                 rows = cur.fetchall()
                 if not rows:
                     continue
                 for (candidate_id,) in rows:
+                    # Persist the listing's full fresh thread for ANY new
+                    # activity — never shrink an existing one.
+                    if item["thread"]:
+                        cur.execute(
+                            """
+                            UPDATE candidate_outreach
+                            SET li_chat_history_cache = CASE
+                                    WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
+                                    THEN %s::jsonb ELSE li_chat_history_cache END,
+                                li_chat_history_updated_at = NOW(),
+                                li_conversation_id = COALESCE(%s, li_conversation_id),
+                                li_account_id = COALESCE(%s, li_account_id)
+                            WHERE candidate_id = %s
+                            """,
+                            (
+                                len(item["thread"]), _json.dumps(item["thread"]),
+                                item["conversation_id"],
+                                str(item["account_id"]) if item["account_id"] else None,
+                                candidate_id,
+                            ),
+                        )
+                        if cur.rowcount:
+                            thread_updates.append((candidate_id, item["thread"]))
+
+                    if not item["is_reply"]:
+                        continue
                     # Promote only replies NEWER than what's stored — the
-                    # 30-min overlap window would otherwise re-promote (and
-                    # re-echo) the same reply every cycle.
+                    # 30-min overlap window would otherwise re-promote the
+                    # same reply every cycle.
                     cur.execute(
                         """
                         UPDATE candidate_outreach
                         SET li_status = 'replied',
                             li_response_text = COALESCE(NULLIF(%s, ''), li_response_text),
                             li_response_received_at = COALESCE(%s::timestamptz, NOW()),
-                            li_conversation_id = COALESCE(%s, li_conversation_id),
-                            li_account_id = COALESCE(%s, li_account_id),
                             updated_at = NOW()
                         WHERE candidate_id = %s
                           AND (li_response_received_at IS NULL
                                OR li_response_received_at < COALESCE(%s::timestamptz, NOW()))
                         """,
-                        (
-                            reply["text"], reply["at"], reply["conversation_id"],
-                            str(reply["account_id"]) if reply["account_id"] else None,
-                            candidate_id, reply["at"],
-                        ),
+                        (item["text"], item["at"], candidate_id, item["at"]),
                     )
                     if cur.rowcount:
-                        # Persist the listing's full fresh thread — never
-                        # shrink an existing one (concurrent writers).
-                        if reply["thread"]:
-                            import json as _json
-
-                            cur.execute(
-                                """
-                                UPDATE candidate_outreach
-                                SET li_chat_history_cache = CASE
-                                        WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
-                                        THEN %s::jsonb ELSE li_chat_history_cache END,
-                                    li_chat_history_updated_at = NOW()
-                                WHERE candidate_id = %s
-                                """,
-                                (len(reply["thread"]), _json.dumps(reply["thread"]), candidate_id),
-                            )
-                        updated_candidates.append((candidate_id, reply, None))
+                        updated_candidates.append((candidate_id, item, None))
         conn.commit()
 
-    if not updated_candidates:
+    if not updated_candidates and not thread_updates:
         return 0
 
     # Freshness: replace this process's live thread cache with the listing's
     # full fresh thread (carrying forward local echoes it doesn't contain
-    # yet), so an open modal shows every message on its next auto-poll.
+    # yet), so an open modal shows every message on its next auto-poll and a
+    # freshly opened one is served instantly from cache.
     try:
         from backend.api.routes.outreach import _li_chat_cache, _li_chat_lock
 
         with _li_chat_lock:
-            for candidate_id, reply, _e in updated_candidates:
-                thread = reply.get("thread") or []
+            for candidate_id, thread in thread_updates:
                 entry = _li_chat_cache.get(candidate_id)
-                if entry is None or not thread:
-                    if entry is not None:
-                        entry["ts"] = 0
+                if entry is None:
+                    _li_chat_cache[candidate_id] = {
+                        "messages": thread,
+                        "ts": time.monotonic(),
+                        "refreshing": False,
+                    }
                     continue
                 previous_messages = entry.get("messages", [])
                 if len(previous_messages) > len(thread):
@@ -210,37 +223,9 @@ def poll_once() -> int:
     except Exception:
         logger.exception("Reply poller: phone capture failed")
 
-    # The conversation LISTING only carries the LAST message — a burst of
-    # replies between poll cycles surfaces just its final message. Refetch the
-    # full chatroom for each replied conversation, now and again after
-    # HeyReach's chatroom endpoint has had time to catch up with its own
-    # listing, so every message in the burst lands without anyone clicking.
-    try:
-        from backend.api.routes.outreach import _refresh_li_cache_task
-
-        seen_convs = set()
-        for candidate_id, reply, _e in updated_candidates:
-            conv_id = reply.get("conversation_id")
-            if not conv_id or conv_id in seen_convs:
-                continue
-            seen_convs.add(conv_id)
-            args = (
-                candidate_id,
-                reply.get("profile_url") or "",
-                None,
-                str(conv_id),
-                int(reply["account_id"]) if reply.get("account_id") else None,
-            )
-            threading.Thread(target=_refresh_li_cache_task, args=args, daemon=True).start()
-            timer = threading.Timer(600, _refresh_li_cache_task, args=args)
-            timer.daemon = True
-            timer.start()
-    except Exception:
-        logger.exception("Reply poller: chatroom refetch scheduling failed")
-
     logger.info(
-        "HeyReach reply poller: promoted replies for %d candidate rows (%d conversations)",
-        len(updated_candidates), len(replied),
+        "HeyReach reply poller: %d replies promoted, %d threads refreshed (%d active conversations)",
+        len(updated_candidates), len(thread_updates), len(activity),
     )
     return len(updated_candidates)
 
