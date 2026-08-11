@@ -1836,7 +1836,7 @@ async def bulk_update_status(
                     """
                     SELECT c.id, c.first_name, c.last_name, c.name, c.email,
                            COALESCE(NULLIF(TRIM(c.mobile_phone), ''), NULLIF(TRIM(c.phone), '')),
-                           c.linkedin
+                           c.linkedin, c.normalized_linkedin
                     FROM candidates c WHERE c.id = ANY(%s::int[])
                     """,
                     (allowed,),
@@ -1845,9 +1845,46 @@ async def bulk_update_status(
                     r[0]: {
                         "id": r[0], "first_name": r[1], "last_name": r[2],
                         "name": r[3], "email": r[4], "phone": r[5], "linkedin": r[6],
+                        "norm": r[7],
                     }
                     for r in cur.fetchall()
                 }
+
+                # DB contact reuse FIRST — exactly what the manual "Fetch
+                # Contact" button does. Most bulk-shortlisted candidates
+                # already have email/phone on another record sharing the same
+                # LinkedIn (master library / duplicates); copy it instantly so
+                # enrollment sees real contact info, and reserve Clay for the
+                # genuinely unknown.
+                missing = {
+                    cid: c for cid, c in contact.items()
+                    if (not c["email"] or not c["phone"]) and c.get("norm")
+                }
+                if missing:
+                    from backend.services.candidate_pool import (
+                        fetch_best_contacts_for_normalized_lis,
+                    )
+
+                    best = fetch_best_contacts_for_normalized_lis(
+                        cur, [c["norm"] for c in missing.values()]
+                    )
+                    for cid, c in missing.items():
+                        db_email, db_phone = best.get(c["norm"], (None, None))
+                        new_email = c["email"] or db_email
+                        new_phone = c["phone"] or db_phone
+                        if new_email == c["email"] and new_phone == c["phone"]:
+                            continue
+                        cur.execute(
+                            """
+                            UPDATE candidates
+                            SET email = COALESCE(NULLIF(TRIM(email), ''), %s),
+                                mobile_phone = COALESCE(NULLIF(TRIM(mobile_phone), ''), %s),
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (db_email, db_phone, cid),
+                        )
+                        c["email"], c["phone"] = new_email, new_phone
 
                 if update.role_id:
                     # Selection made inside a role view — enroll only into

@@ -1143,7 +1143,7 @@ async def shortlist_selected_for_role(
                 """
                 SELECT id, name, first_name, last_name, email,
                        COALESCE(NULLIF(TRIM(mobile_phone), ''), NULLIF(TRIM(phone), ''), ''),
-                       linkedin
+                       linkedin, normalized_linkedin
                 FROM candidates
                 WHERE id = ANY(%s) AND COALESCE(is_archived, FALSE)=FALSE
                 """,
@@ -1154,9 +1154,43 @@ async def shortlist_selected_for_role(
                     "id": row[0], "name": row[1] or "", "first_name": row[2] or "",
                     "last_name": row[3] or "", "email": (row[4] or "").strip(),
                     "phone": row[5] or "", "linkedin": row[6] or "",
+                    "norm": row[7] or "",
                 }
                 for row in cur.fetchall()
             ]
+
+            # DB contact reuse first (what "Fetch Contact" does manually):
+            # copy email/phone from records sharing the same LinkedIn so
+            # enrollment sees real contact info; Clay handles only the rest.
+            reuse_targets = [
+                c for c in candidates
+                if (not c["email"] or not c["phone"]) and c["norm"]
+            ]
+            if reuse_targets:
+                from backend.services.candidate_pool import (
+                    fetch_best_contacts_for_normalized_lis,
+                )
+
+                best = fetch_best_contacts_for_normalized_lis(
+                    cur, [c["norm"] for c in reuse_targets]
+                )
+                for c in reuse_targets:
+                    db_email, db_phone = best.get(c["norm"], (None, None))
+                    new_email = c["email"] or (db_email or "")
+                    new_phone = c["phone"] or (db_phone or "")
+                    if new_email == c["email"] and new_phone == c["phone"]:
+                        continue
+                    cur.execute(
+                        """
+                        UPDATE candidates
+                        SET email = COALESCE(NULLIF(TRIM(email), ''), %s),
+                            mobile_phone = COALESCE(NULLIF(TRIM(mobile_phone), ''), %s),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (db_email, db_phone, c["id"]),
+                    )
+                    c["email"], c["phone"] = new_email, new_phone
             valid_ids = [candidate["id"] for candidate in candidates]
             # Bound here, not inside the branch: read unconditionally below.
             active_outreach_ids = set()
