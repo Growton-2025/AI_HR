@@ -53,6 +53,7 @@ def sync_shortlisted_to_call_list(cur, role_id: int, candidate_ids: list[int]):
                 SELECT 1 FROM calls existing
                 WHERE existing.candidate_id = c_id AND existing.list_id = %s
             )
+            ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
             """,
             (linked_call_list_id, FIRST_ATTEMPT_TITLE, enriched_candidate_ids, linked_call_list_id)
         )

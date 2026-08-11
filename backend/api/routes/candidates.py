@@ -653,6 +653,7 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
                                         AND p.list_id = c.list_id
                                         AND p.status = 'pending'
                                   )
+                                ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                                 """,
                                 (candidate_id,),
                             )

@@ -158,6 +158,7 @@ def add_to_role_call_lists(cur, candidate_id: int, restart_cadence: bool = False
                     AND p.list_id = r.linked_call_list_id
                     AND p.status = 'pending'
               )
+            ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
             """,
             (FIRST_ATTEMPT_TITLE, candidate_id),
         )

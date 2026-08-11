@@ -863,6 +863,8 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'plivo_endpoints' AND column_name = 'env_key')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'inbound_calls' AND column_name = 'resolution')
+                        AND EXISTS (SELECT 1 FROM pg_indexes
+                                    WHERE indexname = 'uidx_calls_one_pending_per_list')
                         AND NOT EXISTS (SELECT 1 FROM pg_constraint
                                         WHERE conname = 'unique_candidate_list')
                 """)
@@ -947,6 +949,30 @@ def ensure_calls_schema_ready(force: bool = False):
             # Manual "Stop cadence" toggle — same candidate-level scope as
             # mobile_phone_wrong, gates the next-attempt insert the same way.
             cur.execute("ALTER TABLE candidates ADD COLUMN IF NOT EXISTS cadence_paused BOOLEAN DEFAULT FALSE;")
+            # ONE pending task per candidate per list, enforced by the DB.
+            # Re-saving an outcome (double-click, review-modal auto-save,
+            # concurrent workers) used to re-run the cadence advance and spawn
+            # duplicate pending rows that then multiplied down the ladder.
+            # Dedupe once, then the unique index makes every insert path
+            # race-safe via ON CONFLICT DO NOTHING.
+            cur.execute(
+                "SELECT 1 FROM pg_indexes WHERE indexname = 'uidx_calls_one_pending_per_list'"
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    DELETE FROM calls a USING calls b
+                    WHERE a.status = 'pending' AND b.status = 'pending'
+                      AND a.candidate_id = b.candidate_id AND a.list_id = b.list_id
+                      AND a.id > b.id
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX uidx_calls_one_pending_per_list
+                    ON calls (candidate_id, list_id) WHERE status = 'pending'
+                    """
+                )
             cur.execute(f"""
                 DO $$
                 BEGIN
@@ -1286,6 +1312,7 @@ def add_candidates_to_list(
                       WHERE existing.candidate_id = c_id AND existing.list_id = %s
                         AND existing.status = 'pending'
                   )
+                ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                 RETURNING id
             )
             SELECT
@@ -1618,6 +1645,7 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                                     GREATEST(%s::date + %s * INTERVAL '1 day', {SQL_IST_TODAY})::date,
                                     %s
                                 )
+                                ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                                 """,
                                 (candidate_id, list_id, anchor, delay_days, next_title)
                             )
@@ -1632,6 +1660,7 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                     """
                     INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
                     VALUES (%s, %s, 'pending', %s, %s, %s)
+                    ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                     """,
                     (candidate_id, list_id, request.due_date, request.due_time, FOLLOWUP_TASK_TITLE),
                 )
@@ -1831,9 +1860,18 @@ def _ensure_open_call_task(cur, candidate_id: int, owner: str) -> Optional[int]:
         """
         INSERT INTO calls (candidate_id, list_id, status, task_title, due_date)
         VALUES (%s, %s, 'pending', %s, CURRENT_DATE)
+        ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
         RETURNING id
         """,
         (candidate_id, list_id, "Follow up on missed callback"),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    # A pending task already exists for this candidate in the list — reuse it.
+    cur.execute(
+        "SELECT id FROM calls WHERE candidate_id = %s AND list_id = %s AND status = 'pending' LIMIT 1",
+        (candidate_id, list_id),
     )
     return cur.fetchone()[0]
 
@@ -2027,11 +2065,21 @@ def create_callback_task(
                     """
                     INSERT INTO calls (candidate_id, list_id, status, task_title, due_date)
                     VALUES (%s, %s, 'pending', %s, CURRENT_DATE)
+                    ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                     RETURNING id
                     """,
                     (candidate_id, list_id, "Inbound callback"),
                 )
-                call_id = cur.fetchone()[0]
+                row = cur.fetchone()
+                if row:
+                    call_id = row[0]
+                else:
+                    # Pending task already exists — reuse it for the callback.
+                    cur.execute(
+                        "SELECT id FROM calls WHERE candidate_id = %s AND list_id = %s AND status = 'pending' LIMIT 1",
+                        (candidate_id, list_id),
+                    )
+                    call_id = cur.fetchone()[0]
 
             call = fetch_call_by_id(cur, call_id, owner)
         conn.commit()
