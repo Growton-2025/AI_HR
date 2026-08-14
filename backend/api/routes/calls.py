@@ -2286,77 +2286,14 @@ def get_call_stats(
     validate_slicer_params(range_, date_from, date_to, outcome_group)
     owner = get_call_list_owner(current_user)
     outcome_set = OUTCOME_GROUPS.get(outcome_group) if outcome_group else None
-    # Stats are cached per owner + slicer params (invalidation always clears
-    # the whole dict, so the composite key needs no targeted eviction).
-    stats_key = f"{owner}|{range_ or ''}|{date_from or ''}|{date_to or ''}|{outcome_group or ''}"
 
-    # ── INSTANT STATS CACHE ──
-    # Stale-while-revalidate (see get_calls): serve any populated cache
-    # immediately and rewarm in the background when past the fresh window.
-    now = time.time()
-    if (
-        stats_key in _stats_cache
-        and (now - _stats_cache_ts.get(stats_key, 0) < _STATS_TTL)
-    ):
-        if not calls_cache_is_fresh():
-            refresh_call_caches_async()
-        return _stats_cache[stats_key]
-
-    stats_cache_stale = False
-    with _calls_lock:
-        if _calls_cache is not None and _call_lists_cache is not None:
-            stats_cache_stale = not calls_cache_is_fresh()
-            today = ist_today()
-            bounds = resolve_range_bounds(range_, date_from, date_to, today)
-            due_today = 0
-            upcoming = 0
-            completed = 0
-
-            for call in _calls_cache:
-                if call.get("created_by") != owner:
-                    continue
-                status = call.get("status")
-                if status == "completed":
-                    # Completed counts slice on completion date AND outcome.
-                    if call_matches_slicer(call, bounds, outcome_set, use_completed_at=True):
-                        completed += 1
-                    continue
-                # Only pending calls are bucketed into due_today / upcoming.
-                # This MUST match the SQL path below (status = 'pending')
-                # otherwise the counts flicker whenever the stats request
-                # switches between the in-memory cache and the DB fallback.
-                if status != "pending":
-                    continue
-                due_date = call.get("due_date")
-                if not due_date:
-                    continue
-                # Pending rows have no outcome yet, so the outcome filter is
-                # NOT applied here (it would always zero these buckets) —
-                # only the date range slices pending calls.
-                if not call_matches_slicer(call, bounds, None, use_completed_at=False):
-                    continue
-                if due_date <= today:
-                    due_today += 1
-                else:
-                    upcoming += 1
-
-            active_lists = sum(1 for item in _call_lists_cache if item.get("created_by") == owner)
-            stats = {
-                "due_today": due_today,
-                "upcoming": upcoming,
-                "completed": completed,
-                "active_lists": active_lists,
-                "inbound_pending": inbound_pending_count(),
-            }
-            if len(_stats_cache) > 64:
-                _stats_cache.clear()
-                _stats_cache_ts.clear()
-            _stats_cache[stats_key] = stats
-            _stats_cache_ts[stats_key] = now
-            if stats_cache_stale:
-                refresh_call_caches_async()
-            return stats
-
+    # Counts ALWAYS come from the database. They were previously computed
+    # from each worker's private in-memory cache (stale-while-revalidate,
+    # then cached again for 30s per worker) — with multiple workers and
+    # background writers (reply poller, cadence, phone capture) mutating the
+    # DB directly, every refresh could land on a different worker with a
+    # different-vintage snapshot, so the header counts flickered on every
+    # reload. One aggregate query per stats poll is cheap; consistency isn't.
     conn = get_calls_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -2406,19 +2343,13 @@ def get_call_stats(
             CROSS JOIN list_counts
         """, query_params)
         row = cur.fetchone()
-        stats = {
+        return {
             "due_today": row[0] or 0,
             "upcoming": row[1] or 0,
             "completed": row[2] or 0,
             "active_lists": row[3] or 0,
             "inbound_pending": inbound_pending_count(),
         }
-        if len(_stats_cache) > 64:
-            _stats_cache.clear()
-            _stats_cache_ts.clear()
-        _stats_cache[stats_key] = stats
-        _stats_cache_ts[stats_key] = now
-        return stats
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
