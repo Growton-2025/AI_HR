@@ -1492,7 +1492,10 @@ def get_calls(
         if status == "completed":
             query += " ORDER BY c.completed_at DESC NULLS LAST"
         else:
-            query += " ORDER BY c.due_date ASC NULLS FIRST, c.due_time ASC NULLS FIRST, c.created_at DESC NULLS LAST"
+            # Oldest-created first within a due date: candidates not yet
+            # attempted sit on top; tasks (re)scheduled moments ago sink to
+            # the bottom instead of jumping above untouched candidates.
+            query += " ORDER BY c.due_date ASC NULLS FIRST, c.due_time ASC NULLS FIRST, c.created_at ASC NULLS LAST"
 
         cur.execute(query, params)
         rows = cur.fetchall()
@@ -1633,16 +1636,19 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                             # "Day 1" call logged the next morning produced a
                             # "Day 2" task dated two days out.
                             #
-                            # GREATEST(..., today) so catching up on an overdue
-                            # task never creates one already in the past — it
-                            # lands today instead.
+                            # GREATEST(..., tomorrow): catching up on an
+                            # overdue task must not schedule the next attempt
+                            # in the past — and never for TODAY either. The
+                            # recruiter just dialed this candidate; floored to
+                            # today, the next attempt reappeared in Due Today
+                            # seconds after logging the outcome.
                             anchor = current_due_date or ist_today()
                             cur.execute(
                                 f"""
                                 INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
                                 VALUES (
                                     %s, %s, 'pending',
-                                    GREATEST(%s::date + %s * INTERVAL '1 day', {SQL_IST_TODAY})::date,
+                                    GREATEST(%s::date + %s * INTERVAL '1 day', {SQL_IST_TODAY} + INTERVAL '1 day')::date,
                                     %s
                                 )
                                 ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
@@ -1817,6 +1823,14 @@ def _ensure_open_call_task(cur, candidate_id: int, owner: str) -> Optional[int]:
     none open — an existing cadence task is left alone so this never duplicates
     scheduled work.
     """
+    # A terminal candidate must NOT be resurrected: "Connected - Not
+    # Interested" logged seconds before this ran used to race it and leave a
+    # fresh follow-up task chasing someone who just declined.
+    cur.execute("SELECT COALESCE(status, '') FROM candidates WHERE id = %s", (candidate_id,))
+    status_row = cur.fetchone()
+    if status_row and status_row[0].strip().lower() in TERMINAL_CANDIDATE_STATUSES:
+        return None
+
     cur.execute(
         """
         SELECT c.id FROM calls c
