@@ -16,6 +16,7 @@ from backend.db.connection import (
 from backend.integrations.smartlead import SmartleadBot, CampaignNotFoundError
 from backend.integrations.heyreach import HeyReachBot
 from backend.services.linkedin_normalize import normalize_linkedin
+from backend.services.outreach_counts import reply_count_sql
 from backend.services.role_campaigns import (
     campaign_payload,
     fetch_role_campaign,
@@ -1753,7 +1754,11 @@ async def get_outreach_status(
                             ELSE 0
                         END AS li_cached_message_count,
                         response_read_at,
-                        li_response_read_at
+                        li_response_read_at,
+                        {reply_count_sql("email_chat_history_cache", "response_text")}
+                            AS email_reply_count,
+                        {reply_count_sql("li_chat_history_cache", "li_response_text")}
+                            AS li_reply_count
                     FROM candidate_outreach
                     WHERE {role_where}
                 """,
@@ -1770,6 +1775,8 @@ async def get_outreach_status(
                         int(row[9] or 0) + (1 if row[8] else 0),
                         int(row[13] or 0),
                     )
+                    email_reply_count = int(row[16] or 0)
+                    li_reply_count = int(row[17] or 0)
                     # Unread = a response exists and was never read, or a newer
                     # response arrived after the last read.
                     email_unread = (bool(row[4]) or bool(row[5])) and (
@@ -1794,6 +1801,11 @@ async def get_outreach_status(
                         "email_message_count": email_message_count,
                         "li_message_count": li_message_count,
                         "message_count": email_message_count + li_message_count,
+                        # Replies = what the candidate actually wrote back. The
+                        # conversation badge shows this, not the thread size.
+                        "email_reply_count": email_reply_count,
+                        "li_reply_count": li_reply_count,
+                        "reply_count": email_reply_count + li_reply_count,
                         "response_read_at": row[14],
                         "li_response_read_at": row[15],
                         "has_unread_response": email_unread or li_unread,

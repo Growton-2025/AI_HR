@@ -12,6 +12,7 @@ from backend.services.role_activation import (
     fetch_role_activation,
     retry_role_activation,
 )
+from backend.services.outreach_counts import reply_count_sql
 import logging
 import time
 
@@ -598,6 +599,15 @@ async def get_role(
                 params = [current_user.id, role_name]
                 role_order = "r.created_at DESC"
 
+            # Replies = inbound messages only, so the conversation badge counts
+            # what the candidate wrote back rather than what we sent.
+            email_reply_count_sql = reply_count_sql(
+                "co.email_chat_history_cache", "co.response_text"
+            )
+            li_reply_count_sql = reply_count_sql(
+                "co.li_chat_history_cache", "co.li_response_text"
+            )
+
             cur.execute(
                 f"""
                 WITH selected_role AS (
@@ -637,7 +647,11 @@ async def get_role(
                        COALESCE(role_outreach.email_message_count, 0),
                        COALESCE(role_outreach.li_message_count, 0),
                        COALESCE(role_outreach.message_count, 0),
-                       rc.created_at
+                       rc.created_at,
+                       COALESCE(role_outreach.email_reply_count, 0),
+                       COALESCE(role_outreach.li_reply_count, 0),
+                       COALESCE(role_outreach.email_reply_count, 0)
+                           + COALESCE(role_outreach.li_reply_count, 0)
                 FROM selected_role sr
                 LEFT JOIN users u ON u.id = sr.user_id
                 LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
@@ -695,7 +709,9 @@ async def get_role(
                                 THEN jsonb_array_length(co.li_chat_history_cache)
                                 ELSE 0
                             END
-                        ) AS message_count
+                        ) AS message_count,
+                        {email_reply_count_sql} AS email_reply_count,
+                        {li_reply_count_sql} AS li_reply_count
                     FROM candidate_outreach co
                     WHERE co.candidate_id = c.id
                       AND co.recruitment_role_id = sr.id
@@ -774,6 +790,9 @@ async def get_role(
                     "email_message_count": int(row[35] or 0),
                     "li_message_count": int(row[36] or 0),
                     "message_count": int(row[37] or 0),
+                    "email_reply_count": int(row[39] or 0),
+                    "li_reply_count": int(row[40] or 0),
+                    "reply_count": int(row[41] or 0),
                     "outreach_counts_loaded": True,
                     "notes": row[25] or "",
                     "status": row[19] or candidate.get("status") or "To be started",

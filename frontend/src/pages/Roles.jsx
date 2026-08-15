@@ -61,18 +61,20 @@ function addedTooltip(isoString) {
     return `Added on ${day} at ${time} IST`
 }
 
+// The conversation badge counts REPLIES — messages the candidate wrote back —
+// the way every chat app does it. A campaign message we sent must never light
+// the badge up; no reply yet means no number at all.
+function pickReplyCount(source = {}) {
+    if (source.reply_count != null) return Number(source.reply_count) || 0
+    const li = source.li_reply_count
+    const email = source.email_reply_count
+    if (li != null || email != null) return (Number(li) || 0) + (Number(email) || 0)
+    return null
+}
+
 function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
     const countsReady = options.countsReady !== false
     const candidateCountsReady = countsReady || candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true
-    const rawMessageCount = candidateCountsReady ? (
-        outreach.message_count
-        ?? outreach.total_message_count
-        ?? outreach.li_message_count
-        ?? outreach.email_message_count
-        ?? candidate.message_count
-        ?? ((Number(candidate.message_sent_count || 0) || 0) + (Number(candidate.li_sent_count || 0) || 0))
-    ) : null
-    const messageCount = rawMessageCount == null ? null : (Number(rawMessageCount) || 0)
     const responseText = (
         outreach.li_response_text
         || outreach.response_text
@@ -84,11 +86,19 @@ function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) 
     const responseChannel = outreach.li_response_text || candidate.li_response_text
         ? 'LinkedIn'
         : (outreach.response_text || candidate.response_text || candidate.response ? 'Email' : '')
+    // Older payloads (or a backend that hasn't caught up) carry no reply
+    // counts; a stored response text still means at least one reply.
+    const resolvedReplyCount = candidateCountsReady
+        ? (pickReplyCount(outreach) ?? pickReplyCount(candidate) ?? (String(responseText || '').trim() ? 1 : 0))
+        : null
     return {
         responseText,
         responseChannel,
-        messageCount,
-        hasResponse: Boolean(String(responseText || '').trim()) || Number(messageCount || 0) > 0 || Boolean(outreach.li_conversation_id),
+        replyCount: resolvedReplyCount,
+        // "Responded" means the candidate wrote back — not that a thread
+        // exists. Sending a campaign message opens a conversation and bumps
+        // the message count, so neither of those can stand in for a reply.
+        hasResponse: Number(resolvedReplyCount || 0) > 0 || Boolean(String(responseText || '').trim()),
         hasUnread: Boolean(outreach.has_unread_response),
     }
 }
@@ -2346,10 +2356,15 @@ function Roles() {
                                                         }}>
                                                             <span>
                                                                 <MessageSquare size={13} /> Open conversation
-                                                                {responseState.messageCount == null ? (
+                                                                {responseState.replyCount == null ? (
                                                                     <b className="is-loading">…</b>
-                                                                ) : responseState.messageCount > 0 ? (
-                                                                    <b className={responseState.hasUnread ? 'is-unread' : ''}>{responseState.messageCount}</b>
+                                                                ) : responseState.replyCount > 0 ? (
+                                                                    <b
+                                                                        className={responseState.hasUnread ? 'is-unread' : ''}
+                                                                        title={`${responseState.replyCount} ${responseState.replyCount === 1 ? 'reply' : 'replies'} from this candidate`}
+                                                                    >
+                                                                        {responseState.replyCount}
+                                                                    </b>
                                                                 ) : null}
                                                             </span>
                                                             <small title={responseState.responseText}>{responseState.responseText || 'No response yet'}</small>
