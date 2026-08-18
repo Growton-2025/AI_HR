@@ -1,5 +1,7 @@
 import os
+import hashlib
 import logging
+import re
 import requests
 import threading
 import time
@@ -144,6 +146,31 @@ def _env_key() -> str:
         return "local"
     host = explicit.split("://")[-1].split("/")[0].strip().lower()
     return host or "local"
+
+
+# Plivo rejects an endpoint alias that is longer than 50 characters or carries
+# anything outside letters, digits, hyphen and underscore. _env_key() is a
+# hostname on hosted deployments — 69 characters with three dots — so an alias
+# built straight from it was refused by the API on every single call, and no
+# recruiter on the hosted backend could ever be given a line. Keep the readable
+# head of the host for the console, and a hash tail so two deployments that
+# share a prefix can never collide on one endpoint.
+_ALIAS_MAX = 50
+# How deep to page when hunting for an endpoint to adopt. Bounded so a huge
+# account cannot turn one login into an unbounded crawl of the Plivo API.
+_ADOPT_SCAN_LIMIT = 400
+
+
+def _env_alias_slug() -> str:
+    env_key = _env_key()
+    head = re.sub(r"[^a-z0-9-]+", "-", env_key.lower()).strip("-")[:20].strip("-")
+    digest = hashlib.sha256(env_key.encode("utf-8")).hexdigest()[:8]
+    return f"{head}_{digest}" if head else digest
+
+
+def endpoint_alias_for_user(user_id: int) -> str:
+    """The alias this user's endpoint carries in Plivo, for this environment."""
+    return f"recruiter_{user_id}_{_env_alias_slug()}"[:_ALIAS_MAX]
 
 
 # Arbitrary but fixed: the advisory-lock id every worker agrees on before
@@ -885,6 +912,25 @@ async def _rebind_if_stale(user_id: int, row: dict) -> dict:
     return row
 
 
+async def _delete_endpoint_quietly(endpoint_id, user_id: int) -> None:
+    """Undo a creation whose registry row could not be written.
+
+    Best effort: if the delete also fails the endpoint is orphaned, which is
+    what adoption exists to clean up on the next login.
+    """
+    if not endpoint_id or not (PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN):
+        return
+    try:
+        client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
+        await asyncio.to_thread(client.endpoints.delete, endpoint_id=str(endpoint_id))
+        logger.info("Rolled back unpersisted Plivo endpoint %s for user %s", endpoint_id, user_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not roll back unpersisted Plivo endpoint %s for user %s: %s",
+            endpoint_id, user_id, exc,
+        )
+
+
 async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
     """Reclaim an endpoint that exists in Plivo but not in our registry.
 
@@ -899,20 +945,38 @@ async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
     if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
         return None
 
-    # Environment-scoped. A bare "recruiter_<id>" alias made a second
-    # environment adopt the FIRST environment's live endpoint and reset its
-    # password — which silently locked the original out of SIP registration, so
-    # its softphone could not register, outbound reported "Not Reachable" and
-    # every inbound call went straight to voicemail with nothing to ring.
-    alias = f"recruiter_{user_id}_{_env_key()}"
+    # Environment-scoped, and it must stay that way. A bare "recruiter_<id>"
+    # alias made a second environment adopt the FIRST environment's live
+    # endpoint and reset its password — which silently locked the original out
+    # of SIP registration, so its softphone could not register, outbound
+    # reported "Not Reachable" and every inbound call went straight to
+    # voicemail with nothing to ring. Never match the unscoped legacy form.
+    #
+    # The pre-slug alias is accepted too, so a laptop that provisioned as
+    # "recruiter_4_local" reclaims that endpoint instead of minting a second.
+    # On hosted deployments the pre-slug form was too long for Plivo to ever
+    # create, so there is nothing of that shape to find.
+    aliases = {endpoint_alias_for_user(user_id), f"recruiter_{user_id}_{_env_key()}"}
     try:
         client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
-        listing = await asyncio.to_thread(client.endpoints.list, limit=20)
-        match = next(
-            (e for e in (getattr(listing, "objects", None) or listing or [])
-             if str(getattr(e, "alias", "") or "") == alias),
-            None,
-        )
+
+        def _find_by_alias():
+            # Paginate: the account holds hundreds of endpoints, and a listing
+            # capped at the first 20 found nothing, so adoption silently never
+            # fired and every failed persist orphaned another endpoint.
+            offset = 0
+            while offset < _ADOPT_SCAN_LIMIT:
+                page = client.endpoints.list(limit=20, offset=offset)
+                items = list(getattr(page, "objects", None) or page or [])
+                if not items:
+                    return None
+                for item in items:
+                    if str(getattr(item, "alias", "") or "") in aliases:
+                        return item
+                offset += 20
+            return None
+
+        match = await asyncio.to_thread(_find_by_alias)
         if not match:
             return None
 
@@ -1029,7 +1093,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
                 client.endpoints.create,
                 username=username,
                 password=password,
-                alias=f"recruiter_{user_id}_{_env_key()}",
+                alias=endpoint_alias_for_user(user_id),
                 app_id=app_id,
             )
             endpoint_id = getattr(resp, "endpoint_id", None) or getattr(resp, "id", None)
@@ -1042,30 +1106,20 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
             logger.error("Failed to create Plivo endpoint for user %s: %s", user_id, exc)
             return None
 
-        def _write():
-            conn = get_db_connection(validate=False, register_pgvector=False)
-            if not conn:
-                return False
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO plivo_endpoints (user_id, endpoint_id, username, password, app_id)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (user_id) DO NOTHING
-                        """,
-                        (user_id, str(endpoint_id) if endpoint_id else None, username, password, app_id),
-                    )
-                conn.commit()
-                return True
-            except Exception as exc:
-                conn.rollback()
-                logger.error("Failed to persist Plivo endpoint for user %s: %s", user_id, exc)
-                return False
-            finally:
-                return_db_connection(conn)
-
-        if not await asyncio.to_thread(_write):
+        # One writer for both the create and adopt paths. The inline INSERT this
+        # replaces named ON CONFLICT (user_id) — a constraint the table does not
+        # have, since endpoints are unique per (user_id, env_key) — so it raised
+        # on every call and no endpoint created here was ever stored. It also
+        # left env_key at its 'legacy' default, which the reader below and
+        # mark_endpoint_registered would never match again.
+        stored = await asyncio.to_thread(
+            _persist_endpoint_row, user_id, endpoint_id, username, password, app_id,
+        )
+        if not stored:
+            # An endpoint we cannot store is unreachable and permanent: nothing
+            # points at it, and the next login mints another. Hand it back to
+            # Plivo rather than leaving it in the account forever.
+            await _delete_endpoint_quietly(endpoint_id, user_id)
             return None
         logger.info("Provisioned Plivo endpoint %s for user %s", username, user_id)
         return {"username": username, "password": password,
@@ -1165,11 +1219,23 @@ def get_registered_endpoint_usernames(within_seconds: int = 900) -> list:
                   AND last_registered_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
                   AND (in_call_since IS NULL
                        OR in_call_since < CURRENT_TIMESTAMP - (%s * INTERVAL '1 second'))
+                  -- This deployment only. The registry is shared with every
+                  -- developer laptop, and those endpoints belong to a different
+                  -- Plivo Application: ringing one cannot connect, and it burns
+                  -- the <Dial timeout> before the caller reaches voicemail.
+                  AND env_key = %s
                 ORDER BY last_registered_at DESC
                 """,
-                (within_seconds, BUSY_STALE_SECONDS),
+                (within_seconds, BUSY_STALE_SECONDS, _env_key()),
             )
-            return [r[0] for r in cur.fetchall()]
+            usernames = [r[0] for r in cur.fetchall()]
+            # An inbound call that rings nobody is otherwise indistinguishable
+            # from one that rang everybody and was ignored.
+            logger.info(
+                "Inbound ring list for env %s: %d endpoint(s) %s",
+                _env_key(), len(usernames), usernames,
+            )
+            return usernames
     except Exception as exc:
         logger.warning("Could not list registered endpoints: %s", exc)
         return []
