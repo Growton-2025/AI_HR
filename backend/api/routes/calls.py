@@ -2867,14 +2867,33 @@ async def sync_call_recording(
         record_url = await asyncio.to_thread(plivo_service.lookup_recording_url, call_uuid)
         if record_url:
             plivo_service.recordings[call_uuid] = record_url
+            # Store it before doing anything slow, so the player stops waiting
+            # on work it never needed.
+            await asyncio.to_thread(
+                plivo_service.persist_recording_url, call_uuid, record_url
+            )
+            invalidate_calls_cache()
             logger.info(f"Recovered recording for UUID {call_uuid} via Plivo REST lookup")
 
     if record_url:
+        # Queue the transcription rather than awaiting it. The review modal
+        # polls this endpoint every 5s while the browser abandons each request
+        # after 15s, so awaiting the full pipeline held a worker for minutes
+        # and stacked overlapping paid transcriptions of the same audio. The
+        # claim is taken in the database because the in-process guard cannot
+        # see a run started by a sibling gunicorn worker.
+        #
         # Pass the recruiter-timed duration (already on this row) so a long
-        # call routed through this manual-sync fallback also skips
-        # gpt-4o-transcribe's silent-truncation risk on longer audio, same as
-        # the webhook path does.
-        await plivo_service.process_call_insights(call_uuid, record_url, duration_seconds=call.get("duration"))
+        # call routed through this fallback also skips gpt-4o-transcribe's
+        # silent-truncation risk on longer audio, same as the webhook path.
+        if await asyncio.to_thread(plivo_service.claim_insights_run, call_uuid):
+            asyncio.create_task(
+                plivo_service.process_call_insights(
+                    call_uuid, record_url, duration_seconds=call.get("duration")
+                )
+            )
+        else:
+            logger.info(f"Insights already running for {call_uuid}; not starting another")
 
         conn = get_calls_db_connection()
         if conn:
@@ -2882,8 +2901,8 @@ async def sync_call_recording(
             updated_call = fetch_call_by_id(cur, call_id, owner)
             cur.close()
             return_db_connection(conn)
-            invalidate_calls_cache()
             return updated_call
+        return call
 
     raise HTTPException(
          status_code=404,

@@ -243,6 +243,22 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
         duration_seconds = _extract_duration_seconds(form_data)
         logger.info(f"Provider recording duration for {call_uuid}: {duration_seconds}s")
         if _recording_callback_is_final(form_data):
+            # Put the URL on the row NOW, before any of the slow work. The
+            # player is gated on calls.recording_url, and that used to be
+            # written only once transcription and summarising had finished — so
+            # the recruiter watched "Polling for recording stream from
+            # Plivo..." for up to three minutes while we had been holding the
+            # link since the call ended. It has to be the row rather than the
+            # in-memory map, too: that map is per gunicorn worker, and the
+            # recruiter's next poll may be served by a different one.
+            #
+            # Only on the FINAL callback: the interim one points at a partial
+            # file, and offering that as "the recording" would hand the
+            # recruiter a truncated call.
+            await asyncio.to_thread(
+                plivo_service.persist_recording_url, call_uuid, recording_url
+            )
+            calls_module.invalidate_calls_cache()
             background_tasks.add_task(
                 plivo_service.process_call_insights,
                 call_uuid,

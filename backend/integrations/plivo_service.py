@@ -2,6 +2,7 @@ import os
 import hashlib
 import logging
 import re
+from collections import Counter
 import requests
 import threading
 import time
@@ -123,6 +124,101 @@ def lookup_recording_url(call_uuid: str):
 def download_plivo_recording(record_url: str, timeout: int = 30):
     auth = (PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN) if PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN else None
     return requests.get(record_url, timeout=timeout, auth=auth)
+
+
+def persist_recording_url(call_uuid: str, record_url: str) -> bool:
+    """Store the recording on the call row as soon as its URL is known.
+
+    Plivo hands us the URL in the recording callback, but it used to be written
+    only at the END of process_call_insights — in the same UPDATE as the
+    transcript and summary. So the player the recruiter is waiting on was gated
+    behind a download, a transcription and two LLM passes: measured at 8s for a
+    25-second call and over three minutes for a twenty-minute one, for a URL we
+    had held since the moment the call ended.
+
+    The row is the shared source of truth; the in-memory `recordings` map is
+    per gunicorn worker, so a poll served by a sibling worker cannot see it.
+    """
+    if not call_uuid or not record_url:
+        return False
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE calls
+                   SET recording_url = %s, updated_at = NOW()
+                 WHERE (plivo_call_uuid = %s OR plivo_transaction_id = %s)
+                   AND COALESCE(recording_url, '') <> %s
+                """,
+                (record_url, call_uuid, call_uuid, record_url),
+            )
+            updated = cur.rowcount or 0
+        conn.commit()
+        if updated:
+            logger.info("Stored recording_url for %s on %d call row(s)", call_uuid, updated)
+        return updated > 0
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Could not store recording_url for %s: %s", call_uuid, exc)
+        return False
+    finally:
+        return_db_connection(conn)
+
+
+# How long a claimed insights run is assumed to still be running. Long enough
+# to cover transcription of a long call, short enough that a worker killed
+# mid-run does not block a retry for the rest of the day.
+INSIGHTS_CLAIM_STALE_SECONDS = 15 * 60
+
+
+def claim_insights_run(call_uuid: str) -> bool:
+    """Take the right to transcribe this call, across workers. True if we won.
+
+    The review modal polls every 5s while the client gives up on each request
+    after 15s, so a single long call could stack half a dozen overlapping
+    transcription runs — each one a paid OpenAI request for the same audio,
+    all competing for the same worker pool. The in-process guard could not see
+    any of them because it lives in a different process.
+    """
+    if not call_uuid:
+        return False
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        # No database means no transcript could be stored even if we ran, and
+        # the poll repeats every few seconds — granting the claim here would
+        # start a fresh transcription on every one of them.
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE calls
+                   SET recording_synced_at = NOW()
+                 WHERE (plivo_call_uuid = %s OR plivo_transaction_id = %s)
+                   AND (recording_synced_at IS NULL
+                        OR recording_synced_at < NOW() - (%s * INTERVAL '1 second'))
+                """,
+                (call_uuid, call_uuid, INSIGHTS_CLAIM_STALE_SECONDS),
+            )
+            won = (cur.rowcount or 0) > 0
+        conn.commit()
+        return won
+    except Exception as exc:
+        conn.rollback()
+        logger.warning("Could not claim insights run for %s: %s", call_uuid, exc)
+        # An unexpected query failure is rare and usually transient, so fall
+        # back to the old behaviour — a possible duplicate run — rather than
+        # dropping the transcript entirely.
+        return True
+    finally:
+        return_db_connection(conn)
 
 
 _PLIVO_STATE_FILE = os.path.join(
@@ -1311,6 +1407,69 @@ def detect_likely_voicemail(transcript_text: Optional[str], duration_seconds: Op
 GPT4O_TRANSCRIBE_SAFE_MAX_SECONDS = 480  # 8 minutes
 
 
+# ── Keeping the transcript honest ────────────────────────────────────────────
+# What the microphone captured is the record. An LLM may re-emit it with
+# speaker labels, but it may not add to it: asked to "analyze a VoIP call" with
+# four words of audio, gpt-4o-mini writes the recruiting conversation it
+# expects to see, and that lands on a real candidate's file as fact.
+
+# Below this many words there is nothing to interpret, so we never ask.
+MIN_WORDS_FOR_ANALYSIS = 12
+# How far the labelled rewrite may drift from the words actually spoken.
+TRANSCRIPT_MIN_RETENTION = 0.7
+TRANSCRIPT_MAX_EXPANSION = 1.3
+
+_SPEAKER_LABEL_RE = re.compile(r"^\s*[A-Za-z][A-Za-z .'-]{0,24}:\s*", re.MULTILINE)
+_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _transcript_words(text: str) -> list:
+    """Spoken words only — speaker labels are ours, not the candidate's."""
+    return _WORD_RE.findall(_SPEAKER_LABEL_RE.sub("", text or "").lower())
+
+
+def transcript_is_faithful(raw_text: str, labelled_text: str) -> bool:
+    """Does the speaker-labelled rewrite still say what the recording said?
+
+    Guards both failure modes: dropping the second half of a long call, and
+    inventing a conversation over near-silence. The comparison is on words
+    rather than characters so the "Recruiter:" / "Lead:" prefixes the rewrite
+    adds do not read as new content.
+    """
+    raw_words = _transcript_words(raw_text)
+    labelled_words = _transcript_words(labelled_text)
+    if not raw_words or not labelled_words:
+        return False
+    if len(labelled_words) > len(raw_words) * TRANSCRIPT_MAX_EXPANSION:
+        return False          # invented material
+    if len(labelled_words) < len(raw_words) * TRANSCRIPT_MIN_RETENTION:
+        return False          # abridged away
+    # Length alone is not enough: the words themselves have to be the spoken
+    # ones, not a same-length paraphrase.
+    raw_counts = Counter(raw_words)
+    labelled_counts = Counter(labelled_words)
+    kept = sum(min(count, labelled_counts[word]) for word, count in raw_counts.items())
+    return kept >= len(raw_words) * TRANSCRIPT_MIN_RETENTION
+
+
+def too_little_speech_to_analyse(raw_text: str) -> bool:
+    return len(_transcript_words(raw_text)) < MIN_WORDS_FOR_ANALYSIS
+
+
+def no_conversation_summary(duration_seconds) -> str:
+    """Said plainly, so the recruiter knows the call yielded nothing.
+
+    Deliberately avoids the "not enough information" phrasings the UI treats as
+    a placeholder to keep polling for — this is a final answer, not a retry.
+    """
+    if duration_seconds:
+        return (
+            f"No conversation was captured. The {int(duration_seconds)}-second "
+            "recording contains almost no speech."
+        )
+    return "No conversation was captured. The recording contains almost no speech."
+
+
 async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0, duration_seconds: int = None):
     try:
         existing_insights = call_insights.get(call_uuid)
@@ -1392,13 +1551,48 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
 
         raw_text = transcript.text
         os.remove(temp_audio_path)
-        
-        logger.info("Generating insights...")
-        prompt = f"""
+
+        # Nothing was said, so there is nothing to analyse. Asking anyway is
+        # how a 9-second "Thank you very much." became a five-turn discussion
+        # of the candidate's open-source contributions, complete with a quote.
+        if too_little_speech_to_analyse(raw_text):
+            logger.info(
+                f"Call {call_uuid} has {len(_transcript_words(raw_text))} spoken word(s) — "
+                "storing the transcription as-is without asking for insights."
+            )
+            result_json = {
+                "transcript": raw_text,
+                "summary": no_conversation_summary(duration_seconds),
+                "insights": [],
+                "sentiment": None,
+                "sentiment_reason": None,
+            }
+        else:
+            logger.info("Generating insights...")
+            result_json = await _generate_call_insights(client, raw_text)
+
+        call_insights[call_uuid] = result_json
+        await _store_call_insights(
+            call_uuid, record_url, raw_text, result_json, duration_seconds,
+        )
+        return
+    except Exception as e:
+        logger.error(f"Error processing call insights for {call_uuid}: {e}")
+        call_insights[call_uuid] = {"error": str(e)}
+
+
+async def _generate_call_insights(client, raw_text: str) -> dict:
+    prompt = f"""
         You are an expert AI recruiting assistant analyzing a VoIP call.
         Transcript:
         {raw_text}
-        
+
+        Use ONLY what appears in the transcript above. Do not add, infer or
+        imagine anything that was not said. The "transcript" you return must be
+        the same words, split by speaker — never a longer or richer version of
+        the conversation. If the transcript is too sparse to work with, return
+        it unchanged and say so in the summary.
+
         Also analyze the Lead's overall sentiment toward the opportunity discussed
         (not the recruiter's tone) — Positive (engaged/interested), Neutral
         (noncommittal/mixed), or Negative (uninterested/pushback/hostile) — with a
@@ -1416,73 +1610,101 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         }}
         """
         
-        completion = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        clean = completion.choices[0].message.content.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[1]
-            clean = clean.rsplit("```", 1)[0]
-        clean = clean.strip()
-        
-        try:
-            result_json = json.loads(clean)
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r"\{.*\}", clean, re.DOTALL)
-            result_json = json.loads(match.group(0)) if match else {}
+    completion = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    clean = completion.choices[0].message.content.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[1]
+        clean = clean.rsplit("```", 1)[0]
+    clean = clean.strip()
 
-        call_insights[call_uuid] = result_json
-        logger.info(f"Successfully generated direct audio insights for {call_uuid}")
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        return json.loads(match.group(0)) if match else {}
 
-        sentiment_raw = str(result_json.get("sentiment") or "").strip().capitalize()
-        sentiment = sentiment_raw if sentiment_raw in ("Positive", "Neutral", "Negative") else None
-        sentiment_reason = (result_json.get("sentiment_reason") or "").strip() or None
 
-        # Sync back to local SQL database
-        try:
-            from backend.api.routes.calls import get_calls_db_connection, return_db_connection, invalidate_calls_cache
-            conn = get_calls_db_connection()
-            if conn:
-                cur = conn.cursor()
-                t_items = result_json.get("transcript")
-                t_str = ""
-                if isinstance(t_items, list):
-                    t_str = "\n".join([f"{m.get('speaker', 'Unknown')}: {m.get('text', '')}" for m in t_items if isinstance(m, dict)])
-                elif isinstance(t_items, str):
-                    t_str = t_items
-                else:
-                    t_str = str(t_items) if t_items else raw_text
+async def _store_call_insights(call_uuid, record_url, raw_text, result_json, duration_seconds):
+    logger.info(f"Successfully generated direct audio insights for {call_uuid}")
 
-                # The speaker-labelled version comes from gpt-4o-mini RE-EMITTING
-                # the conversation, and on long calls it abridges heavily (23-min
-                # calls came back as ~1.2k-char digests full of "..." elisions).
-                # Labels are a nicety; the words are the record. If the rewrite
-                # lost a meaningful share of the ASR text, store the ASR text.
-                if raw_text and len(t_str) < 0.7 * len(raw_text):
-                    logger.warning(
-                        f"LLM transcript rewrite for {call_uuid} is {len(t_str)} chars vs "
-                        f"{len(raw_text)} raw — storing the raw transcription instead."
-                    )
-                    t_str = raw_text
+    sentiment_raw = str(result_json.get("sentiment") or "").strip().capitalize()
+    sentiment = sentiment_raw if sentiment_raw in ("Positive", "Neutral", "Negative") else None
+    sentiment_reason = (result_json.get("sentiment_reason") or "").strip() or None
 
-                likely_voicemail = detect_likely_voicemail(t_str, duration_seconds)
+    # Sync back to local SQL database
+    try:
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection, invalidate_calls_cache
+        conn = get_calls_db_connection()
+        if conn:
+            cur = conn.cursor()
+            t_items = result_json.get("transcript")
+            t_str = ""
+            if isinstance(t_items, list):
+                t_str = "\n".join([f"{m.get('speaker', 'Unknown')}: {m.get('text', '')}" for m in t_items if isinstance(m, dict)])
+            elif isinstance(t_items, str):
+                t_str = t_items
+            else:
+                t_str = str(t_items) if t_items else raw_text
 
-                # Authoritative provider duration wins when present; COALESCE
-                # keeps any existing value (e.g. the client-side timer) when the
-                # webhook didn't carry a usable duration.
-                # Concurrent syncs (review-modal poll + background poll + the
-                # provider's final callback) can race for the same call, and an
-                # early run may have transcribed a not-yet-final recording.
-                # Words are never lost by keeping the longer transcript.
+            # The speaker-labelled version comes from gpt-4o-mini RE-EMITTING
+            # the conversation, and it can depart from the audio in BOTH
+            # directions. On long calls it abridges (23-min calls came back
+            # as ~1.2k-char digests full of "..." elisions). On short ones
+            # it invents: a 9-second recording whose only words were "Thank
+            # you very much." was stored as a five-turn discussion of the
+            # candidate's open-source contributions, and the summary quoted
+            # a sentence nobody said. The old check only caught shrinkage,
+            # so a rewrite twenty times longer than the audio sailed past.
+            #
+            # Labels are a nicety; the words are the record.
+            if not transcript_is_faithful(raw_text, t_str):
+                logger.warning(
+                    f"LLM transcript rewrite for {call_uuid} does not match the "
+                    f"audio ({len(t_str)} chars vs {len(raw_text)} raw) — storing "
+                    "the raw transcription instead."
+                )
+                t_str = raw_text
+
+            likely_voicemail = detect_likely_voicemail(t_str, duration_seconds)
+
+            # Authoritative provider duration wins when present; COALESCE
+            # keeps any existing value (e.g. the client-side timer) when the
+            # webhook didn't carry a usable duration.
+            #
+            # The transcript is written outright rather than "longest wins".
+            # That rule existed so an early run over a not-yet-final recording
+            # could not truncate a complete one — but it also made a fabricated
+            # transcript permanent, since an invented conversation is always
+            # longer than the handful of words actually spoken, and no correct
+            # re-run could ever replace it. Only the final callback starts a
+            # run now, and claim_insights_run stops concurrent ones racing, so
+            # the newest result is the trustworthy one.
+            cur.execute("""
+                UPDATE calls
+                SET
+                    recording_url = %s,
+                    transcript = %s,
+                    summary = %s,
+                    sentiment = %s,
+                    sentiment_reason = %s,
+                    duration = COALESCE(%s, duration),
+                    likely_voicemail = %s,
+                    status = 'completed',
+                    updated_at = NOW()
+                WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
+            """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail, call_uuid, call_uuid))
+            conn.commit()
+
+            if cur.rowcount == 0:
+                logger.info("No matching UUID found in DB, falling back to updating latest call task record")
                 cur.execute("""
                     UPDATE calls
                     SET
                         recording_url = %s,
-                        transcript = CASE
-                            WHEN LENGTH(%s) > LENGTH(COALESCE(transcript, '')) THEN %s
-                            ELSE transcript END,
+                        transcript = %s,
                         summary = %s,
                         sentiment = %s,
                         sentiment_reason = %s,
@@ -1490,42 +1712,19 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                         likely_voicemail = %s,
                         status = 'completed',
                         updated_at = NOW()
-                    WHERE plivo_call_uuid = %s OR plivo_transaction_id = %s
-                """, (record_url, t_str, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail, call_uuid, call_uuid))
+                    WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
+                """, (record_url, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail))
                 conn.commit()
-
-                if cur.rowcount == 0:
-                    logger.info("No matching UUID found in DB, falling back to updating latest call task record")
-                    cur.execute("""
-                        UPDATE calls
-                        SET
-                            recording_url = %s,
-                            transcript = CASE
-                                WHEN LENGTH(%s) > LENGTH(COALESCE(transcript, '')) THEN %s
-                                ELSE transcript END,
-                            summary = %s,
-                            sentiment = %s,
-                            sentiment_reason = %s,
-                            duration = COALESCE(%s, duration),
-                            likely_voicemail = %s,
-                            status = 'completed',
-                            updated_at = NOW()
-                        WHERE id = (SELECT id FROM calls ORDER BY updated_at DESC LIMIT 1)
-                    """, (record_url, t_str, t_str, result_json.get("summary"), sentiment, sentiment_reason, duration_seconds, likely_voicemail))
-                    conn.commit()
-                cur.close()
-                return_db_connection(conn)
-                # Refresh the in-memory caches so the newly stored duration,
-                # transcript and summary surface immediately in the calls list
-                # and stats instead of lagging behind by a cache cycle.
-                try:
-                    invalidate_calls_cache()
-                except Exception as cache_err:
-                    logger.warning(f"Cache invalidation after Plivo sync failed: {cache_err}")
-                logger.info(f"Database synced for Plivo insights: {call_uuid}")
-        except Exception as db_err:
-            logger.error(f"DB update failed for Plivo insights: {db_err}")
-        
-    except Exception as e:
-        logger.error(f"Error processing insights for {call_uuid}: {e}")
-        call_insights[call_uuid] = {"error": str(e)}
+            cur.close()
+            return_db_connection(conn)
+            # Refresh the in-memory caches so the newly stored duration,
+            # transcript and summary surface immediately in the calls list
+            # and stats instead of lagging behind by a cache cycle.
+            try:
+                invalidate_calls_cache()
+            except Exception as cache_err:
+                logger.warning(f"Cache invalidation after Plivo sync failed: {cache_err}")
+            logger.info(f"Database synced for Plivo insights: {call_uuid}")
+    except Exception as db_err:
+        logger.error(f"DB update failed for Plivo insights: {db_err}")
+    

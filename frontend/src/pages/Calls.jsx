@@ -2358,7 +2358,11 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
            }
          } catch(e) {}
       };
-      t = setInterval(fetchReviewData, 5000);
+      // The recording lands within a second or two of hangup (the webhook
+      // stores its URL straight onto the row now), so check briskly until the
+      // player can appear. Transcription genuinely takes a while after that,
+      // and polling hard for it only adds load.
+      t = setInterval(fetchReviewData, reviewCallData?.recording_url ? 5000 : 1500);
       fetchReviewData(); // Run immediately on enter
     }
     return () => clearInterval(t);
@@ -2941,7 +2945,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                       </div>
                     ) : (
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px', background: '#eff6ff', borderRadius: '8px', color: '#1e40af', fontSize: '13px', marginBottom: '24px' }}>
-                        <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Polling for recording stream from Plivo...
+                        <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Waiting for the recording from Plivo…
                       </div>
                     )}
                     
