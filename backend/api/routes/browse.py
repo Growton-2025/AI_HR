@@ -2007,31 +2007,17 @@ async def bulk_update_status(
     if status.lower() in TERMINAL_CANDIDATE_STATUSES:
         try:
             from backend.api.routes.calls import (
-                get_call_list_owner, get_calls_db_connection,
+                close_pending_calls_for_candidates, get_calls_db_connection,
                 return_db_connection as return_calls_conn,
             )
 
-            owner = get_call_list_owner(current_user)
-            closed_outcome = f"Closed - {status}"
             calls_conn = get_calls_db_connection()
             if calls_conn:
                 try:
                     cur = calls_conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE calls
-                           SET status = 'completed', outcome = %s,
-                               completed_at = NOW(), updated_at = NOW()
-                         WHERE candidate_id = ANY(%s::int[])
-                           AND status = 'pending'
-                           AND list_id IN (
-                               SELECT id FROM call_lists
-                                WHERE LOWER(COALESCE(created_by, '')) = %s
-                           )
-                        """,
-                        (closed_outcome, allowed, owner),
+                    closed_calls = close_pending_calls_for_candidates(
+                        cur, allowed, status
                     )
-                    closed_calls = cur.rowcount or 0
                     calls_conn.commit()
                     cur.close()
                 finally:
@@ -2132,30 +2118,19 @@ async def update_status(
     if status_normalized in TERMINAL_CANDIDATE_STATUSES:
         try:
             from backend.api.routes.calls import (
-                get_call_list_owner, get_calls_db_connection, return_db_connection,
-                invalidate_calls_cache,
+                close_pending_calls_for_candidates, get_calls_db_connection,
+                return_db_connection, invalidate_calls_cache,
             )
 
-            owner = get_call_list_owner(current_user)
-            # Synthetic, self-explanatory label — distinct from the real
-            # "Connected - Not Interested" call outcome, since this path isn't
-            # tied to an actual outcome the recruiter selected for a call.
-            closed_outcome = f"Closed - {(update.status or '').strip()}"
             conn = get_calls_db_connection()
             if conn:
                 cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE calls
-                    SET status = 'completed', outcome = %s, completed_at = NOW(), updated_at = NOW()
-                    WHERE candidate_id = %s
-                      AND status = 'pending'
-                      AND list_id IN (
-                          SELECT id FROM call_lists
-                          WHERE LOWER(COALESCE(created_by, '')) = %s
-                      )
-                    """,
-                    (closed_outcome, candidate_id, owner),
+                # The helper stamps a synthetic "Closed - <status>" outcome,
+                # distinct from the real "Connected - Not Interested" call
+                # outcome: this path isn't tied to an outcome the recruiter
+                # selected for a call.
+                close_pending_calls_for_candidates(
+                    cur, [candidate_id], update.status
                 )
                 conn.commit()
                 cur.close()

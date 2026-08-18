@@ -77,6 +77,82 @@ TERMINAL_CANDIDATE_STATUSES = {
     "rejected",
 }
 
+
+def is_terminal_candidate_status(status: Optional[str]) -> bool:
+    """Does this candidate status mean "stop calling them"?"""
+    return (status or "").strip().lower() in TERMINAL_CANDIDATE_STATUSES
+
+
+def terminal_candidate_status_sql(column: str) -> str:
+    """The same rule as SQL, for queries that must not resurface the candidate.
+
+    The values come from the module constant above and never from a request,
+    so they are quoted inline — callers can drop the predicate into queries
+    that already juggle a dozen positional parameters without threading more
+    through.
+    """
+    quoted = ", ".join(
+        "'" + status.replace("'", "''") + "'"
+        for status in sorted(TERMINAL_CANDIDATE_STATUSES)
+    )
+    return f"LOWER(TRIM(COALESCE({column}, ''))) IN ({quoted})"
+
+
+def close_pending_calls_for_candidates(cur, candidate_ids, status: str) -> int:
+    """Resolve every still-pending call task for candidates who are done.
+
+    Deliberately NOT scoped to the lists of whoever changed the status. The
+    status lives on the candidate, so "remove from the future cadence" means
+    every list they sit in; an owner-scoped sweep left the candidate being
+    dialled from a list somebody else had created.
+
+    Rows are completed, never deleted, so each attempt stays visible in the
+    completed log as the calling framework requires.
+    """
+    ids = sorted({int(cid) for cid in (candidate_ids or [])})
+    if not ids:
+        return 0
+    cur.execute(
+        """
+        UPDATE calls
+           SET status = 'completed',
+               outcome = %s,
+               completed_at = NOW(),
+               updated_at = NOW()
+         WHERE candidate_id = ANY(%s::int[])
+           AND status = 'pending'
+        """,
+        (f"Closed - {(status or '').strip()}", ids),
+    )
+    return cur.rowcount or 0
+
+
+def sweep_terminal_candidate_call_tasks(conn) -> int:
+    """Close pending tasks for candidates who ALREADY hold a terminal status.
+
+    Covers rows minted before the cadence learned to check candidate status,
+    and any that a failed write path leaves behind. Each row is stamped with
+    the status that retired it, matching close_pending_calls_for_candidates.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE calls c
+               SET status = 'completed',
+                   outcome = 'Closed - ' || TRIM(cand.status),
+                   completed_at = NOW(),
+                   updated_at = NOW()
+              FROM candidates cand
+             WHERE cand.id = c.candidate_id
+               AND c.status = 'pending'
+               AND {terminal_candidate_status_sql('cand.status')}
+            """
+        )
+        closed = cur.rowcount or 0
+    if closed:
+        conn.commit()
+    return closed
+
 # ── Slicer (date-range / outcome) filters for the Calls workspace ────────────
 # "Wrong Number" belongs to no group on purpose: those rows only show under
 # All Outcomes.
@@ -462,6 +538,34 @@ def bulk_load_call_lists_cache(shared_conn=None):
                 _do_load(conn)
 
 
+_terminal_sweep_done = False
+
+
+def _sweep_terminal_call_tasks_once() -> None:
+    """Retire leftover pending tasks once per process, before the cache warms.
+
+    Rows minted before the cadence learned to check candidate status are still
+    sitting in recruiters' queues; this clears them at startup so the warmed
+    cache is already correct. Guarded by a flag because warm_call_caches also
+    runs on every background rewarm, and this is a write.
+    """
+    global _terminal_sweep_done
+    if _terminal_sweep_done:
+        return
+    _terminal_sweep_done = True
+    try:
+        with get_db_connection_context(validate=True, register_pgvector=False) as conn:
+            if not conn:
+                return
+            closed = sweep_terminal_candidate_call_tasks(conn)
+        if closed:
+            print(f"DEBUG: Retired {closed} pending call task(s) for terminal-status candidates.")
+    except Exception as exc:
+        # Never block cache warming (and with it every calls request) on a
+        # best-effort cleanup.
+        print(f"WARNING: terminal-status call sweep failed: {exc}")
+
+
 def warm_call_caches(shared_conn=None):
     global _calls_cache, _call_lists_cache, _stats_cache, _stats_cache_ts
 
@@ -491,6 +595,7 @@ def warm_call_caches(shared_conn=None):
         return False  # signal: all good
 
     ensure_calls_schema_ready()
+    _sweep_terminal_call_tasks_once()
     rerun_needed = False
     if shared_conn:
         rerun_needed = _warm_from_connection(shared_conn) or False
@@ -1277,8 +1382,9 @@ def add_candidates_to_list(
         # Ownership check + duplicate count + insert in ONE round trip — each
         # statement costs ~0.6s against the remote DB. CTEs read a consistent
         # snapshot, so `duplicates` counts rows as they were BEFORE the insert.
+        terminal_status_sql = terminal_candidate_status_sql("cand.status")
         cur.execute(
-            """
+            f"""
             WITH target_list AS (
                 SELECT id FROM call_lists
                 WHERE id = %s
@@ -1299,6 +1405,18 @@ def add_candidates_to_list(
                     WHERE cand.id = c_id
                       AND COALESCE(NULLIF(TRIM(cand.mobile_phone), ''),
                                    NULLIF(TRIM(cand.phone), '')) IS NOT NULL
+                      -- Adding a candidate who is already retired ("For
+                      -- Future", "Shared with customer", …) would put them
+                      -- straight back into a calling queue.
+                      AND NOT {terminal_status_sql}
+                )
+            ),
+            retired_ids AS (
+                SELECT c_id
+                FROM UNNEST(%s::int[]) AS c_id
+                WHERE EXISTS (
+                    SELECT 1 FROM candidates cand
+                    WHERE cand.id = c_id AND {terminal_status_sql}
                 )
             ),
             inserted AS (
@@ -1320,11 +1438,13 @@ def add_candidates_to_list(
                 (SELECT dup_count FROM duplicates) AS duplicate_count,
                 (SELECT COUNT(*) FROM inserted) AS inserted_count,
                 (SELECT COUNT(DISTINCT c_id) FROM UNNEST(%s::int[]) AS c_id) AS requested_count,
-                (SELECT COUNT(DISTINCT c_id) FROM callable_ids) AS callable_count
+                (SELECT COUNT(DISTINCT c_id) FROM callable_ids) AS callable_count,
+                (SELECT COUNT(DISTINCT c_id) FROM retired_ids) AS retired_count
             """,
             (
                 request.list_id, owner,
                 request.list_id, request.candidate_ids,
+                request.candidate_ids,
                 request.candidate_ids,
                 request.list_id, FIRST_ATTEMPT_TITLE, request.list_id,
                 request.candidate_ids,
@@ -1336,6 +1456,7 @@ def add_candidates_to_list(
             inserted_count,
             requested_count,
             callable_count,
+            retired_count,
         ) = cur.fetchone()
 
         if not list_found:
@@ -1352,11 +1473,27 @@ def add_candidates_to_list(
                 detail = f"{duplicate_count} of {requested_count} selected candidates are already in this call list"
             raise HTTPException(status_code=400, detail=detail)
 
+        # A candidate whose status already retired them ("For Future", "Shared
+        # with customer", …) must not be dialled again, so adding them to a
+        # list is refused rather than silently queuing the calls back up.
+        retired_count = retired_count or 0
+        if not inserted_count and retired_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This candidate's status has removed them from calling"
+                    if retired_count == 1
+                    else f"{retired_count} selected candidates have a status that removes them from calling"
+                ),
+            )
+
         # Candidates with no phone number are silently unusable in a call list —
         # they render as "N/A" rows the recruiter can never dial. Skip them at
         # insert time and report how many, so the count is explainable rather
         # than the list quietly coming up short.
-        skipped_no_phone = max(0, (requested_count or 0) - (callable_count or 0))
+        skipped_no_phone = max(
+            0, (requested_count or 0) - (callable_count or 0) - retired_count
+        )
         if not inserted_count and skipped_no_phone:
             raise HTTPException(
                 status_code=400,
@@ -1421,6 +1558,15 @@ def get_calls(
         if _calls_cache is not None:
             cache_stale = not calls_cache_is_fresh()
             data = [c for c in _calls_cache if c.get("created_by") == owner]
+            # A terminal candidate never appears in the ACTIVE queue, even if a
+            # pending row outlived the sweep that should have closed it.
+            # Completed rows are untouched — the framework wants the attempt
+            # retained in the log.
+            data = [
+                c for c in data
+                if c.get("status") != "pending"
+                or not is_terminal_candidate_status(c.get("candidate_status"))
+            ]
             if status:
                 data = [c for c in data if c.get("status") == status]
             if list_id:
@@ -1465,7 +1611,13 @@ def get_calls(
         refresh_call_caches_async()
         
         cur = conn.cursor()
-        query = f"{CALLS_SELECT_QUERY} WHERE LOWER(COALESCE(cl.created_by, '')) = %s"
+        # Mirrors the in-memory filter above: pending rows for a terminal
+        # candidate are never part of the active queue.
+        query = (
+            f"{CALLS_SELECT_QUERY} WHERE LOWER(COALESCE(cl.created_by, '')) = %s"
+            f" AND (c.status <> 'pending'"
+            f"      OR NOT {terminal_candidate_status_sql('cand.status')})"
+        )
         params: list[Any] = [owner]
 
         if status:
@@ -1613,18 +1765,26 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                         # scheduling until cleared (phone update, or "Continue").
                         # A missing number stops it too: the next attempt would
                         # just be another undiallable "N/A" row in Due Today.
+                        #
+                        # A terminal candidate status ends it outright. Without
+                        # this the ladder walked on forever: a candidate marked
+                        # "Shared with customer" or "For Future" had their next
+                        # attempt minted every time a recruiter logged the
+                        # current one, so they never left the calling loop no
+                        # matter how often the pending rows were swept.
                         cur.execute(
-                            """
+                            f"""
                             SELECT COALESCE(mobile_phone_wrong, FALSE),
                                    COALESCE(cadence_paused, FALSE),
                                    COALESCE(NULLIF(TRIM(mobile_phone), ''),
-                                            NULLIF(TRIM(phone), '')) IS NULL AS no_phone
+                                            NULLIF(TRIM(phone), '')) IS NULL AS no_phone,
+                                   {terminal_candidate_status_sql('status')} AS terminal_status
                             FROM candidates WHERE id = %s
                             """,
                             (candidate_id,),
                         )
                         phone_row = cur.fetchone()
-                        blocked = bool(phone_row) and any(phone_row[:3])
+                        blocked = bool(phone_row) and any(phone_row[:4])
                         if not blocked:
                             delay_days, next_title = step
                             # Anchor the ladder on THIS task's due date, not on
@@ -1662,15 +1822,23 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                 # intact as history instead of being overwritten when the
                 # follow-up call happens (initiate_call reuses plivo_transaction_id
                 # for the SAME row, which previously clobbered the prior recording).
+                # A terminal status still wins: it is the one thing that takes
+                # the candidate out of every future call, agreed slot or not.
                 cur.execute(
-                    """
-                    INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
-                    VALUES (%s, %s, 'pending', %s, %s, %s)
-                    ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
-                    """,
-                    (candidate_id, list_id, request.due_date, request.due_time, FOLLOWUP_TASK_TITLE),
+                    f"SELECT {terminal_candidate_status_sql('status')} FROM candidates WHERE id = %s",
+                    (candidate_id,),
                 )
-                scheduled_next_title = FOLLOWUP_TASK_TITLE
+                terminal_row = cur.fetchone()
+                if not (terminal_row and terminal_row[0]):
+                    cur.execute(
+                        """
+                        INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
+                        VALUES (%s, %s, 'pending', %s, %s, %s)
+                        ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
+                        """,
+                        (candidate_id, list_id, request.due_date, request.due_time, FOLLOWUP_TASK_TITLE),
+                    )
+                    scheduled_next_title = FOLLOWUP_TASK_TITLE
             elif current_outcome == WRONG_NUMBER_OUTCOME:
                 # Tag the number on the candidate so every list sees it; the
                 # cadence pauses until an alternate number is saved.
@@ -1691,18 +1859,8 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                     "UPDATE candidates SET status = %s, updated_at = NOW() WHERE id = %s",
                     (NOT_INTERESTED_CANDIDATE_STATUS, candidate_id),
                 )
-                cur.execute(
-                    """
-                    UPDATE calls
-                    SET status = 'completed', outcome = %s, completed_at = NOW(), updated_at = NOW()
-                    WHERE candidate_id = %s
-                      AND status = 'pending'
-                      AND list_id IN (
-                          SELECT id FROM call_lists
-                          WHERE LOWER(COALESCE(created_by, '')) = %s
-                      )
-                    """,
-                    (NOT_INTERESTED_OUTCOME, candidate_id, owner),
+                close_pending_calls_for_candidates(
+                    cur, [candidate_id], NOT_INTERESTED_CANDIDATE_STATUS
                 )
                 not_interested_removed = True
             # Connected - Interested ends the cadence: the call completes and
@@ -2324,10 +2482,18 @@ def get_call_stats(
             ),
             call_counts AS (
                 SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= {SQL_IST_TODAY}{due_sql}) AS due_today,
-                    COUNT(*) FILTER (WHERE status = 'pending' AND due_date > {SQL_IST_TODAY}{due_sql}) AS upcoming,
+                    COUNT(*) FILTER (WHERE status = 'pending' AND NOT terminal_candidate AND due_date <= {SQL_IST_TODAY}{due_sql}) AS due_today,
+                    COUNT(*) FILTER (WHERE status = 'pending' AND NOT terminal_candidate AND due_date > {SQL_IST_TODAY}{due_sql}) AS upcoming,
                     COUNT(*) FILTER (WHERE status = 'completed'{comp_sql}{outcome_sql}) AS completed
-                FROM calls
+                FROM (
+                    -- The pending buckets must count exactly what the list
+                    -- shows, so they exclude terminal candidates the same way
+                    -- get_calls does; completed keeps every historical row.
+                    SELECT calls.*,
+                           {terminal_candidate_status_sql('cand.status')} AS terminal_candidate
+                    FROM calls
+                    JOIN candidates cand ON cand.id = calls.candidate_id
+                ) AS calls
                 WHERE list_id IN (SELECT id FROM owned_lists)
             ),
             list_counts AS (

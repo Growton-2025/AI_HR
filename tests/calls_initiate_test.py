@@ -166,8 +166,9 @@ def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
 
 def test_add_candidates_duplicate_returns_400_without_wrapping(monkeypatch):
     # Single combined statement returns
-    # (list_found, duplicate_count, inserted_count, requested_count, callable_count)
-    cursor = _FakeCursor(fetchone_results=[(1, 1, 0, 1, 1)])
+    # (list_found, duplicate_count, inserted_count, requested_count,
+    #  callable_count, retired_count)
+    cursor = _FakeCursor(fetchone_results=[(1, 1, 0, 1, 1, 0)])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
@@ -187,7 +188,7 @@ def test_add_candidates_duplicate_returns_400_without_wrapping(monkeypatch):
 
 
 def test_add_candidates_success_invalidates_cache(monkeypatch):
-    cursor = _FakeCursor(fetchone_results=[(1, 0, 2, 2, 2)])
+    cursor = _FakeCursor(fetchone_results=[(1, 0, 2, 2, 2, 0)])
     conn = _FakeConnection(cursor)
     invalidated = []
 
@@ -211,7 +212,7 @@ def test_add_candidates_skips_contactless_and_reports_count(monkeypatch):
     inserted, and the caller must be told how many were left out so the shorter
     list is explainable rather than looking like data loss."""
     # 5 requested, only 3 have a number, so 3 inserted and 2 reported as skipped.
-    cursor = _FakeCursor(fetchone_results=[(1, 0, 3, 5, 3)])
+    cursor = _FakeCursor(fetchone_results=[(1, 0, 3, 5, 3, 0)])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
@@ -231,7 +232,7 @@ def test_add_candidates_skips_contactless_and_reports_count(monkeypatch):
 def test_add_candidates_all_contactless_returns_400(monkeypatch):
     """Nothing insertable and nothing duplicated — the recruiter needs the real
     reason (no numbers), not a silent success reporting zero added."""
-    cursor = _FakeCursor(fetchone_results=[(1, 0, 0, 2, 0)])
+    cursor = _FakeCursor(fetchone_results=[(1, 0, 0, 2, 0, 0)])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
@@ -523,7 +524,7 @@ def test_calls_mutation_routes_return_contracts_and_invalidate(monkeypatch):
 
 
 def test_add_candidates_partial_duplicates_report_counts(monkeypatch):
-    cursor = _FakeCursor(fetchone_results=[(1, 1, 0, 2, 2)])
+    cursor = _FakeCursor(fetchone_results=[(1, 1, 0, 2, 2, 0)])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
@@ -542,7 +543,7 @@ def test_add_candidates_partial_duplicates_report_counts(monkeypatch):
 
 
 def test_add_candidates_all_duplicates_report_clear_message(monkeypatch):
-    cursor = _FakeCursor(fetchone_results=[(1, 2, 0, 2, 2)])
+    cursor = _FakeCursor(fetchone_results=[(1, 2, 0, 2, 2, 0)])
     conn = _FakeConnection(cursor)
 
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
