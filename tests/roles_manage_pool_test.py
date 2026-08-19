@@ -102,7 +102,8 @@ def test_generic_status_update_invalidates_role_and_count_caches(monkeypatch):
         "PROFILES_BY_ID",
         {101: {"owner_user_id": 7, "status": "To be started"}},
     )
-    monkeypatch.setattr(browse, "update_candidate_status", lambda candidate_id, status: True)
+    # Signature gained changed_by/source when status changes started being logged.
+    monkeypatch.setattr(browse, "update_candidate_status", lambda candidate_id, status, **kwargs: True)
     monkeypatch.setattr(
         candidates,
         "invalidate_candidate_count_caches",

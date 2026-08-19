@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  CalendarClock, ClipboardList, ExternalLink, PhoneCall, PhoneIncoming,
+  Ban, CalendarClock, ClipboardList, ExternalLink, PhoneCall, PhoneIncoming,
   PhoneMissed, PhoneOff, RefreshCw, UserX, Voicemail,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
@@ -49,7 +49,31 @@ const DEFAULT_ACTIVITY_OUTCOME_META = { tone: 'neutral', icon: PhoneIncoming };
 const OUTCOME_PILL_BASE = { bg: '#f8fafc', border: '#e2e8f0', textColor: '#334155' };
 const OUTCOME_PILL_ICON_COLOR = { accent: 'var(--accent-primary)', neutral: '#64748b' };
 
+// A task retired by a status change — never dialled. The backend writes
+// "Closed - <status>" as a synthetic outcome so the record stays in the log,
+// but shown in the same pill as a real outcome it reads as another call: one
+// call to a candidate in two roles appeared as two completed entries.
+const RETIRED_OUTCOME_PREFIX = 'Closed - ';
+const isRetiredTask = (outcome) => String(outcome || '').startsWith(RETIRED_OUTCOME_PREFIX);
+const retiredReason = (outcome) => String(outcome || '').slice(RETIRED_OUTCOME_PREFIX.length);
+
 const OutcomeBadge = ({ outcome, fallbackLabel = 'No Outcome', size = 11 }) => {
+  if (isRetiredTask(outcome)) {
+    return (
+      <span
+        title={`Not a call. This task was removed from calling when the candidate was marked "${retiredReason(outcome)}".`}
+        style={{
+          display: 'inline-flex', alignItems: 'center', gap: '5px',
+          padding: '2px 10px', borderRadius: '999px',
+          background: '#fff', color: '#64748b', border: '1px dashed #cbd5e1',
+          fontSize: size, fontWeight: 600, whiteSpace: 'nowrap', fontStyle: 'italic',
+        }}
+      >
+        <Ban size={size} color="#94a3b8" />
+        Not called — {retiredReason(outcome)}
+      </span>
+    );
+  }
   const meta = ACTIVITY_OUTCOME_META[outcome] || DEFAULT_ACTIVITY_OUTCOME_META;
   const Icon = meta.icon;
   const iconColor = OUTCOME_PILL_ICON_COLOR[meta.tone];

@@ -53,11 +53,29 @@ def sync_shortlisted_to_call_list(cur, role_id: int, candidate_ids: list[int]):
                 SELECT 1 FROM calls existing
                 WHERE existing.candidate_id = c_id AND existing.list_id = %s
             )
+            -- …and not already being called from a DIFFERENT list. A candidate
+            -- shortlisted for two roles used to get a parallel "Call 1 - Day 1"
+            -- in each list: dialled twice for two jobs, and on retirement a
+            -- completed entry appeared in every list, reading as several calls
+            -- when only one was made.
+            AND NOT EXISTS (
+                SELECT 1 FROM calls other
+                WHERE other.candidate_id = c_id
+                  AND other.list_id <> %s
+                  AND other.status IN ('pending', 'in_progress')
+            )
             ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
+            RETURNING candidate_id
             """,
-            (linked_call_list_id, FIRST_ATTEMPT_TITLE, enriched_candidate_ids, linked_call_list_id)
+            (linked_call_list_id, FIRST_ATTEMPT_TITLE, enriched_candidate_ids,
+             linked_call_list_id, linked_call_list_id)
         )
-        logger.info(f"Auto-synced {len(enriched_candidate_ids)} candidates to call list {linked_call_list_id} for role {role_id}.")
+        added = cur.rowcount or 0
+        skipped = len(enriched_candidate_ids) - added
+        logger.info(
+            f"Auto-synced {added} candidates to call list {linked_call_list_id} for role {role_id}"
+            + (f"; skipped {skipped} already in a list" if skipped > 0 else "")
+        )
         
     except Exception as e:
         logger.error(f"Failed to auto-sync candidates to call list for role {role_id}: {e}")

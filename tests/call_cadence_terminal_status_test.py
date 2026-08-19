@@ -285,7 +285,8 @@ def test_completed_tasks_stay_in_the_log(monkeypatch):
 # ── 4. and cannot be added back to a list ───────────────────────────────────
 
 def _add_candidates(monkeypatch, counts, candidate_ids=(101,)):
-    """counts = (list_found, duplicates, inserted, requested, callable, retired)"""
+    """counts = (list_found, duplicates, inserted, requested, callable,
+                 retired, open_elsewhere)"""
     cursor = _ScriptedCursor({"WITH target_list AS": counts})
     connection = _Connection(cursor)
     monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda *a, **k: None)
@@ -301,7 +302,7 @@ def test_adding_a_retired_candidate_to_a_list_is_refused(monkeypatch):
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as excinfo:
-        _add_candidates(monkeypatch, (1, 0, 0, 1, 0, 1))
+        _add_candidates(monkeypatch, (1, 0, 0, 1, 0, 1, 0))
 
     assert excinfo.value.status_code == 400
     assert "removed them from calling" in excinfo.value.detail
@@ -311,14 +312,14 @@ def test_retired_candidates_are_reported_separately_from_phoneless_ones(monkeypa
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as excinfo:
-        _add_candidates(monkeypatch, (1, 0, 0, 2, 0, 0), candidate_ids=(101, 102))
+        _add_candidates(monkeypatch, (1, 0, 0, 2, 0, 0, 0), candidate_ids=(101, 102))
 
     # Nobody was retired here, so the reason must still be the phone one.
     assert "phone number" in excinfo.value.detail
 
 
 def test_the_insert_filters_on_status_not_just_on_having_a_phone(monkeypatch):
-    _, cursor = _add_candidates(monkeypatch, (1, 0, 1, 1, 1, 0))
+    _, cursor = _add_candidates(monkeypatch, (1, 0, 1, 1, 1, 0, 0))
     sql, _ = cursor.executed[0]
 
     assert "mobile_phone" in sql            # pre-existing filter intact

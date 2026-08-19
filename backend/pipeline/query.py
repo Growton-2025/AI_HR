@@ -7666,14 +7666,34 @@ async def get_semantic_scores(query_text: str) -> Dict[int, float]:
         logger.error(f"Semantic scoring failed: {e}", exc_info=True)
         return {}
 
-def update_candidate_status(candidate_id: int, status: str) -> bool:
-    """Updates the status of a candidate in the database and the in-memory cache."""
+def update_candidate_status(
+    candidate_id: int, status: str, changed_by: str = None, source: str = None
+) -> bool:
+    """Updates the status of a candidate in the database and the in-memory cache.
+
+    Records the change in candidate_status_history. Without that record there
+    is no way to answer "who moved this candidate, and from what?" — a question
+    that came up on every candidate whose recorded reason no longer matched
+    their status.
+    """
+    from backend.services.candidate_status_log import (
+        SOURCE_STATUS_DROPDOWN, record_status_change,
+    )
+
     conn = get_db_connection()
     if not conn:
         return False
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT status FROM candidates WHERE id = %s", (candidate_id,))
+            previous_row = cur.fetchone()
+            previous_status = previous_row[0] if previous_row else None
             cur.execute("UPDATE candidates SET status = %s WHERE id = %s", (status, candidate_id))
+            if previous_status != status:
+                record_status_change(
+                    cur, candidate_id, previous_status, status,
+                    changed_by, source or SOURCE_STATUS_DROPDOWN,
+                )
             conn.commit()
             
             # Update cache if present

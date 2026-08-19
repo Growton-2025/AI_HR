@@ -1397,6 +1397,22 @@ def add_candidates_to_list(
                   AND candidate_id = ANY(%s::int[])
                   AND status = 'pending'
             ),
+            -- Already being called from a DIFFERENT list. The per-list
+            -- uniqueness index does not see across lists, so a candidate who
+            -- is a fit for two roles got a parallel "Call 1 - Day 1" in each:
+            -- two recruiters could dial the same person for two jobs, and
+            -- retiring them left a completed entry in every list, which reads
+            -- as several calls when only one was made.
+            open_elsewhere_ids AS (
+                SELECT c_id
+                FROM UNNEST(%s::int[]) AS c_id
+                WHERE EXISTS (
+                    SELECT 1 FROM calls other
+                    WHERE other.candidate_id = c_id
+                      AND other.list_id <> %s
+                      AND other.status IN ('pending', 'in_progress')
+                )
+            ),
             callable_ids AS (
                 SELECT c_id
                 FROM UNNEST(%s::int[]) AS c_id
@@ -1410,6 +1426,7 @@ def add_candidates_to_list(
                       -- straight back into a calling queue.
                       AND NOT {terminal_status_sql}
                 )
+                AND c_id NOT IN (SELECT c_id FROM open_elsewhere_ids)
             ),
             retired_ids AS (
                 SELECT c_id
@@ -1439,11 +1456,13 @@ def add_candidates_to_list(
                 (SELECT COUNT(*) FROM inserted) AS inserted_count,
                 (SELECT COUNT(DISTINCT c_id) FROM UNNEST(%s::int[]) AS c_id) AS requested_count,
                 (SELECT COUNT(DISTINCT c_id) FROM callable_ids) AS callable_count,
-                (SELECT COUNT(DISTINCT c_id) FROM retired_ids) AS retired_count
+                (SELECT COUNT(DISTINCT c_id) FROM retired_ids) AS retired_count,
+                (SELECT COUNT(DISTINCT c_id) FROM open_elsewhere_ids) AS open_elsewhere_count
             """,
             (
                 request.list_id, owner,
                 request.list_id, request.candidate_ids,
+                request.candidate_ids, request.list_id,
                 request.candidate_ids,
                 request.candidate_ids,
                 request.list_id, FIRST_ATTEMPT_TITLE, request.list_id,
@@ -1457,6 +1476,7 @@ def add_candidates_to_list(
             requested_count,
             callable_count,
             retired_count,
+            open_elsewhere_count,
         ) = cur.fetchone()
 
         if not list_found:
@@ -1487,12 +1507,28 @@ def add_candidates_to_list(
                 ),
             )
 
+        # Being called from another list already. One person, one live calling
+        # thread — otherwise two roles dial them independently, and retiring
+        # them leaves a completed entry in each list that reads as extra calls.
+        open_elsewhere_count = open_elsewhere_count or 0
+        if not inserted_count and open_elsewhere_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This candidate is already in another call list"
+                    if open_elsewhere_count == 1
+                    else f"{open_elsewhere_count} selected candidates are already in another call list"
+                ),
+            )
+
         # Candidates with no phone number are silently unusable in a call list —
         # they render as "N/A" rows the recruiter can never dial. Skip them at
         # insert time and report how many, so the count is explainable rather
         # than the list quietly coming up short.
         skipped_no_phone = max(
-            0, (requested_count or 0) - (callable_count or 0) - retired_count
+            0,
+            (requested_count or 0) - (callable_count or 0)
+            - retired_count - open_elsewhere_count,
         )
         if not inserted_count and skipped_no_phone:
             raise HTTPException(
@@ -1855,10 +1891,37 @@ def update_call(call_id: int, request: CallUpdate, current_user: schemas.User = 
                 # completed too, so they stop appearing in the active calling
                 # loop but keep a visible record in Completed instead of just
                 # vanishing.
+                # Only when the recruiter has not already recorded a reason of
+                # their own. Shreya Shroff was marked "High CTC" and then, 51
+                # seconds later, logging this outcome overwrote it with "Not
+                # Interested" — the cadence result is the same either way, but
+                # the reason she recorded was lost, and the same thing had
+                # happened to four other candidates who were marked Duplicate
+                # or For Future. A hand-set terminal status is a decision, not
+                # a placeholder.
                 cur.execute(
-                    "UPDATE candidates SET status = %s, updated_at = NOW() WHERE id = %s",
+                    f"""
+                    UPDATE candidates
+                       SET status = %s, updated_at = NOW()
+                     WHERE id = %s
+                       AND NOT {terminal_candidate_status_sql('status')}
+                    """,
                     (NOT_INTERESTED_CANDIDATE_STATUS, candidate_id),
                 )
+                if cur.rowcount == 0:
+                    logger.info(
+                        "Candidate %s already holds a terminal status — keeping it "
+                        "rather than overwriting with %s",
+                        candidate_id, NOT_INTERESTED_CANDIDATE_STATUS,
+                    )
+                else:
+                    from backend.services.candidate_status_log import (
+                        SOURCE_CALL_OUTCOME, record_status_change,
+                    )
+                    record_status_change(
+                        cur, candidate_id, None, NOT_INTERESTED_CANDIDATE_STATUS,
+                        owner, SOURCE_CALL_OUTCOME,
+                    )
                 close_pending_calls_for_candidates(
                     cur, [candidate_id], NOT_INTERESTED_CANDIDATE_STATUS
                 )
@@ -2484,7 +2547,14 @@ def get_call_stats(
                 SELECT
                     COUNT(*) FILTER (WHERE status = 'pending' AND NOT terminal_candidate AND due_date <= {SQL_IST_TODAY}{due_sql}) AS due_today,
                     COUNT(*) FILTER (WHERE status = 'pending' AND NOT terminal_candidate AND due_date > {SQL_IST_TODAY}{due_sql}) AS upcoming,
-                    COUNT(*) FILTER (WHERE status = 'completed'{comp_sql}{outcome_sql}) AS completed
+                    -- "Completed" means calls that happened. A task retired by
+                    -- a status change was never dialled, so counting it made
+                    -- one call to Shreya Shroff read as two.
+                    COUNT(*) FILTER (
+                        WHERE status = 'completed'
+                          AND COALESCE(outcome, '') NOT LIKE 'Closed - %%'
+                          {comp_sql}{outcome_sql}
+                    ) AS completed
                 FROM (
                     -- The pending buckets must count exactly what the list
                     -- shows, so they exclude terminal candidates the same way

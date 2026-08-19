@@ -1820,6 +1820,16 @@ async def bulk_update_status(
             allowed = [r[0] for r in cur.fetchall()]
 
             if allowed:
+                from backend.services.candidate_status_log import (
+                    SOURCE_BULK_STATUS, record_status_changes,
+                )
+
+                # Logged before the UPDATE, so the previous values are still there.
+                record_status_changes(
+                    cur, allowed, status,
+                    (current_user.email or current_user.username or ""),
+                    SOURCE_BULK_STATUS,
+                )
                 cur.execute(
                     "UPDATE candidates SET status = %s WHERE id = ANY(%s::int[])",
                     (status, allowed),
@@ -2087,7 +2097,11 @@ async def update_status(
 ):
     started = time.monotonic()
     _authorize_candidate_update(candidate_id, current_user, allow_role_access=True)
-    success = update_candidate_status(candidate_id, update.status)
+    success = update_candidate_status(
+        candidate_id,
+        update.status,
+        changed_by=(current_user.email or current_user.username or ""),
+    )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update candidate status")
     from backend.api.routes.candidates import invalidate_candidate_count_caches
