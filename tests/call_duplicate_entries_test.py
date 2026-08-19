@@ -148,6 +148,62 @@ def test_retired_tasks_are_left_out_of_the_completed_count():
     assert "NOT LIKE 'Closed - %%'" in source
 
 
+def _completed_via_cache(monkeypatch, rows):
+    monkeypatch.setattr(calls_route, "ensure_calls_schema_ready", lambda *a, **k: None)
+    monkeypatch.setattr(calls_route, "refresh_call_caches_async", lambda: None)
+    monkeypatch.setattr(calls_route, "_calls_cache", rows, raising=False)
+    monkeypatch.setattr(calls_route, "_cache_warmed_at", float("inf"), raising=False)
+    return calls_route.get_calls(
+        status="completed", list_id=None, due_filter=None, range_=None,
+        date_from=None, date_to=None, outcome_group=None, current_user=USER,
+    )
+
+
+def _completed_row(**overrides):
+    row = {
+        "id": 1, "candidate_id": 13624, "created_by": "rec@example.com",
+        "status": "completed", "candidate_status": "High CTC",
+        "outcome": "Connected - Not Interested", "duration": 227,
+        "due_date": None, "created_at": None, "completed_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_the_retired_task_is_not_listed_as_a_call(monkeypatch):
+    # Exactly Shreya's two rows: one dialled from EMEA, one retired in Hevo.
+    rows = _completed_via_cache(monkeypatch, [
+        _completed_row(id=961, outcome="Connected - Not Interested", duration=227),
+        _completed_row(id=923, outcome="Closed - High CTC", duration=0),
+    ])
+
+    assert [r["id"] for r in rows] == [961]
+
+
+def test_a_real_outcome_that_merely_starts_with_closed_is_not_hidden(monkeypatch):
+    # The prefix has to be the synthetic one, not any outcome mentioning it.
+    rows = _completed_via_cache(monkeypatch, [
+        _completed_row(id=1, outcome="Connected - Not Interested"),
+        _completed_row(id=2, outcome="Not Connected"),
+        _completed_row(id=3, outcome="Unreachable"),
+    ])
+
+    assert [r["id"] for r in rows] == [1, 2, 3]
+
+
+def test_the_record_is_retained_on_the_candidate():
+    import inspect
+    from backend.api.routes import candidates as candidates_route
+
+    source = inspect.getsource(candidates_route.get_candidate_activity)
+
+    # The framework asks for the task to be retained in the log. It is — the
+    # candidate's Activity History shows every completed row, including the
+    # retired one, which is why hiding it from the call list is safe.
+    assert "c.status = 'completed'" in source
+    assert "Closed" not in source
+
+
 def test_the_badge_says_it_was_never_called():
     assert "Not called — " in CALLS_JSX
     assert "RETIRED_OUTCOME_PREFIX = 'Closed - '" in CALLS_JSX

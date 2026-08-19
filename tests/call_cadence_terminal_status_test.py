@@ -272,14 +272,28 @@ def test_pending_task_for_a_retired_candidate_is_hidden(monkeypatch):
     assert [c["id"] for c in fetch("pending")] == [3]
 
 
-def test_completed_tasks_stay_in_the_log(monkeypatch):
+def test_a_real_completed_call_stays_in_the_log(monkeypatch):
+    fetch = _cached_calls(monkeypatch, [
+        _call_row(id=1, status="completed", outcome="Connected - Not Interested",
+                  candidate_status="For Future"),
+    ])
+
+    # Retiring a candidate must never hide the calls that were actually made.
+    assert [c["id"] for c in fetch("completed")] == [1]
+
+
+def test_the_retired_task_itself_is_not_listed_as_a_call(monkeypatch):
+    # This reverses an earlier reading of the framework. "Retain the record in
+    # the completed log" is satisfied by the candidate's Activity History,
+    # which still shows the row; listing it among the calls made one call to a
+    # candidate who sat in two lists read as two, which is what a recruiter
+    # reported.
     fetch = _cached_calls(monkeypatch, [
         _call_row(id=1, status="completed", outcome="Closed - For Future",
                   candidate_status="For Future"),
     ])
 
-    # The framework asks for the record to be retained, shown as completed.
-    assert [c["id"] for c in fetch("completed")] == [1]
+    assert fetch("completed") == []
 
 
 # ── 4. and cannot be added back to a list ───────────────────────────────────

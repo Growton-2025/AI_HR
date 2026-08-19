@@ -83,6 +83,17 @@ def is_terminal_candidate_status(status: Optional[str]) -> bool:
     return (status or "").strip().lower() in TERMINAL_CANDIDATE_STATUSES
 
 
+# The synthetic outcome written when a status change retires a still-pending
+# task. It marks a row that was never dialled, which is why it is kept out of
+# the call log and its counts — the candidate's Activity History still shows
+# it, so the record is retained as the calling framework requires.
+RETIRED_OUTCOME_PREFIX = "Closed - "
+
+
+def is_retired_call_task(outcome: Optional[str]) -> bool:
+    return str(outcome or "").startswith(RETIRED_OUTCOME_PREFIX)
+
+
 def terminal_candidate_status_sql(column: str) -> str:
     """The same rule as SQL, for queries that must not resurface the candidate.
 
@@ -1603,6 +1614,12 @@ def get_calls(
                 if c.get("status") != "pending"
                 or not is_terminal_candidate_status(c.get("candidate_status"))
             ]
+            # A task retired by a status change was never dialled, so it does
+            # not belong in a list of calls: one call to a candidate who sat in
+            # two lists showed up as two Completed entries. The row is kept —
+            # the candidate's Activity History still shows it, labelled "Not
+            # called" — it just stops padding the call log.
+            data = [c for c in data if not is_retired_call_task(c.get("outcome"))]
             if status:
                 data = [c for c in data if c.get("status") == status]
             if list_id:
@@ -1653,6 +1670,7 @@ def get_calls(
             f"{CALLS_SELECT_QUERY} WHERE LOWER(COALESCE(cl.created_by, '')) = %s"
             f" AND (c.status <> 'pending'"
             f"      OR NOT {terminal_candidate_status_sql('cand.status')})"
+            f" AND COALESCE(c.outcome, '') NOT LIKE '{RETIRED_OUTCOME_PREFIX}%%'"
         )
         params: list[Any] = [owner]
 
