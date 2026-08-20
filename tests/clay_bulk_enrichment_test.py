@@ -207,11 +207,36 @@ ROLES_JSX = (
 ).read_text()
 
 
-def test_a_still_running_lookup_is_never_reported_as_broken():
+FRONTEND_SRC = (
+    __import__("pathlib").Path(__file__).resolve().parent.parent / "frontend" / "src"
+)
+
+# Phrasings that accuse the pipeline of being broken. A lookup still in flight
+# is progress; only a lookup that cannot deliver is a fault, and that is
+# reported by the server as a 503, not guessed at by a timer in the browser.
+BROKEN_PIPELINE_CLAIMS = (
+    "has not reached Hayasa",
+    "Check the Clay callback step",
+    "Clay finished, but",
+)
+
+
+def test_no_screen_tells_the_recruiter_a_running_lookup_has_failed():
+    # Scans the whole frontend, not just the file that had the bug, so the
+    # wording cannot reappear on another screen.
+    offenders = []
+    for path in FRONTEND_SRC.rglob("*.jsx"):
+        text = path.read_text()
+        for claim in BROKEN_PIPELINE_CLAIMS:
+            if claim in text:
+                offenders.append(f"{path.name}: {claim}")
+
+    assert offenders == []
+
+
+def test_a_still_running_lookup_is_reported_as_still_running():
     # Clay took over eight minutes in a live batch, while the UI gave up at 40
     # seconds and told the recruiter the callback was broken.
-    assert "has not reached Hayasa" not in ROLES_JSX
-    assert "Check the Clay callback step" not in ROLES_JSX
     assert "Still enriching" in ROLES_JSX
     assert "the row updates on its own" in ROLES_JSX
 
