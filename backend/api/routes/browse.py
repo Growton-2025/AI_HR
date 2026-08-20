@@ -1958,10 +1958,18 @@ async def bulk_update_status(
                         )
                     sync_shortlisted_to_call_list(cur, role_id, member_ids)
 
+                # Whether someone is mid-sequence has nothing to do with
+                # whether we know their phone number. `globally_active` is the
+                # right guard for ENROLMENT — never re-enroll a candidate whose
+                # campaign is already running — but applying it here meant the
+                # bulk shortlist enrolled a candidate and, by that very act,
+                # disqualified them from ever being enriched in bulk again.
+                # In one role that left 46 of 46 phoneless shortlisted
+                # candidates unreachable by Clay: the button ran, the toast
+                # said it had queued, and not a single row was sent.
                 enrich_targets = [
                     c for cid, c in contact.items()
-                    if cid not in globally_active
-                    and _candidate_role_queue_state(c)["needs_enrichment"]
+                    if _candidate_role_queue_state(c)["needs_enrichment"]
                 ]
 
                 if update.hr_campaign_id:
@@ -2066,12 +2074,20 @@ async def bulk_update_status(
             )
         if enrich_targets:
             try:
-                from backend.services.clay import trigger_clay
-                for c in enrich_targets:
-                    first_name = c["first_name"] or (c["name"] or "Candidate").split()[0]
-                    last_name = c["last_name"] or " ".join((c["name"] or "").split()[1:])
-                    background_tasks.add_task(trigger_clay, first_name, last_name, c["linkedin"])
-                logger.info("Bulk shortlist: queued Clay enrichment for %d candidates", len(enrich_targets))
+                from backend.services.clay import trigger_clay_bulk
+
+                rows = [
+                    (
+                        c["first_name"] or (c["name"] or "Candidate").split()[0],
+                        c["last_name"] or " ".join((c["name"] or "").split()[1:]),
+                        c["linkedin"],
+                    )
+                    for c in enrich_targets
+                ]
+                # One task for the whole selection: background tasks run in
+                # sequence, and each trigger is a blocking round trip.
+                background_tasks.add_task(trigger_clay_bulk, rows)
+                logger.info("Bulk shortlist: queued Clay enrichment for %d candidates", len(rows))
             except Exception:
                 logger.exception("Bulk shortlist: could not queue Clay enrichment")
 

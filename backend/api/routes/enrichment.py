@@ -405,6 +405,25 @@ async def enrich_candidate(
                 first_name = parts[0]
                 last_name = parts[1] if len(parts) > 1 else ""
 
+            # The one failure worth interrupting the recruiter for: without a
+            # public callback URL Clay would run, bill, and post the answer
+            # nowhere. Everything else — including a lookup that simply takes
+            # minutes — is progress, not an error.
+            from backend.services.clay import _callback_base
+
+            if not _callback_base():
+                logger.error(
+                    "Refusing to enrich candidate %s: no public callback URL configured",
+                    candidate_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Contact enrichment is not configured on this server: no public "
+                        "callback URL is set, so Clay has nowhere to return results."
+                    ),
+                )
+
             logger.info("Calling Clay for candidate %s", candidate_id)
             background_tasks.add_task(trigger_clay, first_name, last_name, linkedin_url)
             return {
@@ -417,6 +436,16 @@ async def enrich_candidate(
 async def receive_results(request: Request):
     """Clay callback — fan out contact updates by normalized LinkedIn."""
     data = await request.json()
+
+    # Field NAMES only, never the values — enough to spot Clay returning a
+    # number under a key we do not read (which looks identical to Clay finding
+    # nothing), without writing anybody's phone number into the logs.
+    if isinstance(data, dict):
+        logger.info(
+            "Clay callback fields: %s | non-empty: %s",
+            sorted(data.keys()),
+            sorted(k for k, v in data.items() if clean_val(v)),
+        )
 
     first = clean_val(data.get("first_name")) or "N/A"
     last = clean_val(data.get("last_name")) or "N/A"

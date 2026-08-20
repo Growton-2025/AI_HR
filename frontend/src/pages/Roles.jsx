@@ -72,6 +72,13 @@ function pickReplyCount(source = {}) {
     return null
 }
 
+// Watching a Clay lookup: quick checks while there is a chance of an instant
+// hit from the contact library, then a slower cadence for the waterfall
+// itself. ~4 minutes in total, against the 40 seconds that used to expire
+// mid-job and report it as a broken callback.
+const CLAY_POLL_ATTEMPTS = 60
+const clayPollDelayMs = (attempt) => (attempt < 10 ? 2000 : 5000)
+
 function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
     const countsReady = options.countsReady !== false
     const candidateCountsReady = countsReady || candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true
@@ -1108,9 +1115,13 @@ function Roles() {
                 return
             }
 
-            toast.info(`Refreshing ${candidate.name || 'candidate'} from Clay…`)
-            for (let attempt = 0; attempt < 20; attempt += 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000))
+            toast.info(`Looking up ${candidate.name || 'candidate'} in Clay…`)
+            // Clay's waterfall is measured in minutes, not seconds — a live
+            // batch took over eight. Watch for a few minutes, checking often
+            // at first and then backing off, instead of the old 40-second
+            // window that expired while the job was still perfectly healthy.
+            for (let attempt = 0; attempt < CLAY_POLL_ATTEMPTS; attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, clayPollDelayMs(attempt)))
                 const contacts = await axios.get(
                     `${API_BASE}/roles/${encodeURIComponent(viewingRole.name)}/contacts?cb=${Date.now()}`,
                     { headers: { 'Cache-Control': 'no-cache' } }
@@ -1125,7 +1136,12 @@ function Roles() {
                 }
             }
 
-            toast.warning('Clay finished, but its result has not reached Hayasa yet. Check the Clay callback step.')
+            // Still running is not a failure. The result lands on its own when
+            // Clay calls back — this used to claim the callback was broken.
+            toast.info(
+                `Still enriching ${candidate.name || 'candidate'}. Clay can take a few minutes — `
+                + 'the row updates on its own, no need to wait here.'
+            )
         } catch (error) {
             toast.error(error.response?.data?.detail || `Failed to refresh ${candidate.name || 'candidate'}`)
         } finally {
