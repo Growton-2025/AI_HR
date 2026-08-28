@@ -41,25 +41,51 @@ nohup $PYTHON_EXEC -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --re
 BACKEND_PID=$!
 echo "Backend starting with PID $BACKEND_PID. Waiting for it to be ready..."
 
-# Wait for backend health check
-for i in {1..30}; do
-    if curl -s http://127.0.0.1:8000/api/health | grep -q "ok"; then
-        echo "Backend is ready!"
+# Wait for backend health check.
+# -m 2 is load-bearing: uvicorn binds the socket before the lifespan startup
+# finishes, so during a cold start the connection is accepted-but-never-answered
+# and a timeout-less curl blocks forever — the loop never advances and the
+# frontend below never launches.
+# The budget is minutes, not seconds: a cold start warms the calls cache and (with
+# ENABLE_STARTUP_CACHE_WARMUP=true) the full profile cache against the remote DB,
+# which takes ~10 minutes. A 30s budget just meant the script declared success
+# while the backend was still starting, and every early request 500'd.
+BACKEND_WAIT_SECONDS=${BACKEND_WAIT_SECONDS:-900}
+BACKEND_READY=0
+SECONDS_WAITED=0
+while [ "$SECONDS_WAITED" -lt "$BACKEND_WAIT_SECONDS" ]; do
+    if curl -s -m 2 http://127.0.0.1:8000/api/health 2>/dev/null | grep -q "ok"; then
+        BACKEND_READY=1
+        echo "Backend is ready after ${SECONDS_WAITED}s."
         break
     fi
-    echo "Still waiting for backend... ($i/30)"
-    sleep 1
+    # One line per 15s rather than per attempt, so a 10-minute warm stays readable.
+    if [ $((SECONDS_WAITED % 15)) -eq 0 ]; then
+        echo "Still waiting for backend... (${SECONDS_WAITED}s/${BACKEND_WAIT_SECONDS}s)"
+    fi
+    sleep 3
+    SECONDS_WAITED=$((SECONDS_WAITED + 3))
 done
+
+if [ "$BACKEND_READY" -ne 1 ]; then
+    echo "WARNING: backend did not answer /api/health within ${BACKEND_WAIT_SECONDS}s."
+    echo "         Starting the frontend anyway; API calls will 500 until it finishes."
+    echo "         Check /tmp/ai_hr_backend.log."
+fi
 
 # 2. Start Frontend in background
 echo "Starting Frontend (Port 3000)..."
 cd frontend
-nohup npm run dev -- --port 3000 --host 127.0.0.1 > /tmp/ai_hr_frontend.log 2>&1 &
+nohup npm run dev -- --port 3000 --host 127.0.0.1 --strictPort > /tmp/ai_hr_frontend.log 2>&1 &
 FRONTEND_PID=$!
 cd ..
 echo "Frontend running with PID $FRONTEND_PID. Logs in /tmp/ai_hr_frontend.log."
 
-echo "Services started successfully!"
+if [ "$BACKEND_READY" -eq 1 ]; then
+    echo "Services started successfully!"
+else
+    echo "Frontend started; backend still warming up."
+fi
 echo "Backend: http://127.0.0.1:8000/docs"
 echo "Frontend: http://127.0.0.1:3000/"
 echo "To stop services, run: kill $BACKEND_PID $FRONTEND_PID"
