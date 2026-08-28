@@ -343,7 +343,16 @@ def _ai_credits_summary_from_details(details: Any) -> Dict[str, Any]:
 # would only truncate it to max_value_len and double its token cost. The
 # _pack_json carrier key is an internal transport, never model-facing.
 _FULL_ROW_CONTEXT_SKIP_KEYS = frozenset(
-    {"candidate.resume_text", "candidate.resume_full_text", "resume._pack_json"}
+    {
+        "candidate.resume_text",
+        "candidate.resume_full_text",
+        "resume._pack_json",
+        "calls._pack_json",
+        # Transcripts reach the model in full (bounded) through the context pack's
+        # call_history section; the row dump would only show a 1200-char stub of one.
+        "calls.transcripts",
+        "calls.last_transcript",
+    }
 )
 
 
@@ -352,19 +361,21 @@ def _format_full_row_context(context: Dict[str, str], *, max_fields: int = 650, 
         key, _ = item
         if key.startswith("candidate."):
             return (0, key)
-        if key.startswith("role."):
+        if key.startswith("calls."):
             return (1, key)
-        if key.startswith("resume."):
+        if key.startswith("role."):
             return (2, key)
-        if key.startswith("extra."):
+        if key.startswith("resume."):
             return (3, key)
-        if key.startswith("raw."):
+        if key.startswith("extra."):
             return (4, key)
-        if key.startswith("ai."):
+        if key.startswith("raw."):
             return (5, key)
-        if key.startswith("row."):
+        if key.startswith("ai."):
             return (6, key)
-        return (7, key)
+        if key.startswith("row."):
+            return (7, key)
+        return (8, key)
 
     payload: Dict[str, str] = {}
     for key, raw_value in sorted((context or {}).items(), key=priority):
@@ -799,10 +810,34 @@ def _hydrate_resume_text(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str
     return profile
 
 
+def _hydrate_call_history(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Attach the candidate's call history at run time.
+
+    Transcripts are far too large for the warm profile cache, so they are loaded only
+    when a Smart Column is about to run on this row — the same deal resume text gets.
+    Re-fetched on every run because a call that happened since the last run is exactly
+    the evidence the column is being asked about.
+    """
+    if not profile:
+        return profile
+    # Shallow copy: the source dict is usually the entry in the shared warm cache, and
+    # writing ~18KB of transcript per candidate back into it would grow that cache
+    # without bound. Only a top-level key is added, so sharing the nested values is safe.
+    hydrated = dict(profile)
+    try:
+        from backend.services.candidate_interactions import fetch_candidate_calls
+
+        hydrated["calls"] = fetch_candidate_calls(int(profile.get("id")))
+    except Exception:
+        logger.exception("Failed to hydrate call history for candidate %s", profile.get("id"))
+        hydrated["calls"] = []
+    return hydrated
+
+
 def _fetch_profile(candidate_id: int) -> Optional[Dict[str, Any]]:
     profile = query.PROFILES_BY_ID.get(candidate_id)
     if profile and profile.get("roles"):
-        return _hydrate_resume_text(profile)
+        return _hydrate_call_history(_hydrate_resume_text(profile))
 
     # Newly ingested/uploaded rows may not be present in the worker-local cache yet.
     # Refreshing the single profile uses backend.pipeline.query's full candidate +
@@ -811,16 +846,16 @@ def _fetch_profile(candidate_id: int) -> Optional[Dict[str, Any]]:
         query.refresh_profiles_in_cache([candidate_id])
         refreshed = query.PROFILES_BY_ID.get(candidate_id)
         if refreshed:
-            return _hydrate_resume_text(refreshed)
+            return _hydrate_call_history(_hydrate_resume_text(refreshed))
     except Exception:
         logger.exception("Failed to refresh AI-column profile cache for candidate %s", candidate_id)
 
     if profile:
-        return _hydrate_resume_text(profile)
+        return _hydrate_call_history(_hydrate_resume_text(profile))
 
     from backend.api.routes.enrichment import _fetch_profile_from_db
 
-    return _hydrate_resume_text(_fetch_profile_from_db(candidate_id))
+    return _hydrate_call_history(_hydrate_resume_text(_fetch_profile_from_db(candidate_id)))
 
 
 def _ai_context_values_from_definitions(definitions: List[Dict[str, Any]], candidate_id: int) -> Dict[str, str]:
@@ -1329,7 +1364,16 @@ def _run_ai_task(
         "RESUME RULE: when the candidate context pack contains a 'resume' section, treat it as "
         "first-party candidate-supplied evidence (skills, achievements, projects, wording). "
         "If the resume conflicts with LinkedIn/enrichment data on employment dates or tenure, "
-        "prefer the enrichment data and the pre-computed career facts."
+        "prefer the enrichment data and the pre-computed career facts. "
+        "INTERACTION RULE: the context pack's 'call_history' section (call transcripts, AI call "
+        "summaries, sentiment, outcomes and the recruiter's per-call notes) and "
+        "candidate.recruiter_notes are our own first-hand record of talking to this candidate. "
+        "For anything the candidate stated directly — notice period, current or expected "
+        "compensation, willingness to relocate, reason for leaving, interest level, objections, "
+        "availability, commitments made — these outrank the scraped profile and enrichment data. "
+        "Quote or paraphrase only what the transcript actually contains. "
+        "When call_history is empty, say so; never infer that a call happened or invent what was "
+        "said on it, and never fall back to the profile to answer a question about a call."
     )
     content_first_system_prompt = (
         f"{system_prompt} "

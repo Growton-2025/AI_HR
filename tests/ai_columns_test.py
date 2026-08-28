@@ -259,7 +259,12 @@ def test_fetch_profile_refreshes_stale_cache_without_roles(monkeypatch):
     monkeypatch.setattr(ai_columns.query, "PROFILES_BY_ID", profiles_by_id)
     monkeypatch.setattr(ai_columns.query, "refresh_profiles_in_cache", fake_refresh)
 
-    assert ai_columns._fetch_profile(123) is refreshed_profile
+    # Content, not identity: hydration returns a shallow copy so call transcripts
+    # never get written back into the shared warm cache.
+    fetched = ai_columns._fetch_profile(123)
+    assert fetched["name"] == "Fresh Candidate"
+    assert fetched["roles"] == refreshed_profile["roles"]
+    assert stale_profile.get("calls") is None
 
 
 def test_ai_column_migration_resets_legacy_raw_fields():
@@ -2622,3 +2627,125 @@ def test_delete_ai_column_archives_and_cancels_when_found(monkeypatch):
     assert "SELECT id FROM ai_column_definitions" in sqls[0]
     assert "UPDATE ai_column_runs" in sqls[1] and "status = 'canceled'" in sqls[1]
     assert "UPDATE ai_column_definitions" in sqls[2] and "is_archived = TRUE" in sqls[2]
+
+
+# ---------------------------------------------------------------------------
+# Smart Columns over first-party interaction data (notes + call transcripts).
+
+
+def _profile_with_calls():
+    return {
+        "id": 4242,
+        "name": "Nethranand P S",
+        "notes": "Open to relocating to Bengaluru. Prefers SaaS.",
+        "status": "Contacted",
+        "roles": [{"title": "Account Executive", "company": "Acme"}],
+        "calls": [
+            {
+                "id": 3,
+                "direction": "outbound",
+                "date": "2026-08-20T10:00:00",
+                "status": "Completed",
+                "outcome": "Connected - Interested",
+                "notes": "Wants a remote role.",
+                "duration_seconds": 420,
+                "sentiment": "Positive",
+                "sentiment_reason": "Engaged throughout",
+                "summary": "Discussed the AE role; candidate is interested.",
+                "transcript": "Recruiter: What is your notice period?\nNethranand P S: Sixty days.",
+            },
+            {
+                "id": 1,
+                "direction": "inbound",
+                "date": "2026-08-12T09:00:00",
+                "status": "Completed",
+                "outcome": "called_back",
+                "notes": "",
+                "duration_seconds": 60,
+                "sentiment": "",
+                "sentiment_reason": "",
+                "summary": "",
+                "transcript": "Nethranand P S: Calling back about the role.",
+            },
+        ],
+    }
+
+
+def test_call_history_and_notes_reach_the_smart_column_context():
+    context = build_candidate_context(_profile_with_calls())
+
+    assert context["candidate.notes"] == "Open to relocating to Bengaluru. Prefers SaaS."
+    assert context["calls.count"] == "2"
+    assert context["calls.last_outcome"] == "Connected - Interested"
+    assert context["calls.last_sentiment"] == "Positive"
+    assert context["calls.last_notes"] == "Wants a remote role."
+    assert "Sixty days" in context["calls.last_transcript"]
+    # Every call's transcript, each labelled so the model can attribute a quote.
+    assert "Sixty days" in context["calls.transcripts"]
+    assert "Calling back about the role" in context["calls.transcripts"]
+    assert "Call 1" in context["calls.transcripts"]
+
+
+def test_call_history_pack_section_carries_transcripts_and_notes():
+    pack = build_candidate_context_pack(build_candidate_context(_profile_with_calls()))
+
+    assert pack["candidate"]["recruiter_notes"] == "Open to relocating to Bengaluru. Prefers SaaS."
+    history = pack["call_history"]
+    assert history["count"] == 2
+    first = history["calls"][0]
+    assert first["direction"] == "outbound"
+    assert first["recruiter_notes"] == "Wants a remote role."
+    assert "Sixty days" in first["transcript"]
+    assert "first-party evidence" in history["note"]
+
+
+def test_candidate_without_calls_gets_an_explicit_empty_call_history():
+    """A missing call history must read as 'no calls', never as an absent section the
+    model can paper over with profile data."""
+    context = build_candidate_context({"id": 1, "name": "No Calls", "roles": []})
+
+    assert context["calls.count"] == "0"
+    assert context["calls.transcripts"] == ""
+    history = build_candidate_context_pack(context)["call_history"]
+    assert history["count"] == 0
+    assert history["calls"] == []
+    assert "No call history" in history["note"]
+
+
+def test_bulk_call_text_stays_out_of_the_truncated_row_dump():
+    """Transcripts are delivered whole through the context pack; the row dump would
+    only show a 1200-char stub of the most recent one."""
+    assert "calls.transcripts" in ai_columns._FULL_ROW_CONTEXT_SKIP_KEYS
+    assert "calls.last_transcript" in ai_columns._FULL_ROW_CONTEXT_SKIP_KEYS
+    assert "calls._pack_json" in ai_columns._FULL_ROW_CONTEXT_SKIP_KEYS
+
+    context = build_candidate_context(_profile_with_calls())
+    dumped = ai_columns._format_full_row_context(context)
+    assert "Sixty days" not in dumped
+    # Short interaction scalars still ride along in the dump.
+    assert "Connected - Interested" in dumped
+
+
+def test_interaction_fields_are_offered_in_the_field_catalog():
+    groups = {group["group"]: [item["key"] for item in group["items"]] for group in build_field_catalog([])}
+
+    assert "Interaction Fields" in groups
+    assert "candidate.notes" in groups["Interaction Fields"]
+    assert "calls.last_transcript" in groups["Interaction Fields"]
+    # One definition only — a duplicate under Default Fields would list notes twice.
+    assert "candidate.notes" not in groups.get("Default Fields", [])
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Summarise the most recent call with this candidate",
+        "What notice period did they give on the call?",
+        "Pull the salary expectation from the call transcript",
+        "What do the recruiter notes say about relocation?",
+    ],
+)
+def test_interaction_prompts_are_answered_from_the_row_not_the_web(prompt):
+    """'recent'/'latest' in a call prompt used to trip the freshness router and send a
+    web search after an answer that only exists in our own transcript."""
+    assert classify_ai_column_prompt(prompt)["data_source"] == "row"

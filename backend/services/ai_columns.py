@@ -37,7 +37,6 @@ DEFAULT_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
     {"key": "candidate.phone", "label": "candidate.phone", "group": "Default Fields", "path": ("phone",)},
     {"key": "candidate.mobile_phone", "label": "candidate.mobile_phone", "group": "Default Fields", "path": ("mobile_phone",)},
     {"key": "candidate.status", "label": "candidate.status", "group": "Default Fields", "path": ("status",)},
-    {"key": "candidate.notes", "label": "candidate.notes", "group": "Default Fields", "path": ("notes",)},
     {"key": "candidate.work_preference", "label": "candidate.work_preference", "group": "Default Fields", "path": ("work_preference",)},
     {"key": "candidate.extracted_industry", "label": "candidate.extracted_industry", "group": "Default Fields", "path": ("extracted_industry",)},
     {
@@ -114,6 +113,33 @@ RESUME_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
 
 AI_COLUMN_RESUME_CHAR_BUDGET = int(os.getenv("AI_COLUMN_RESUME_CHAR_BUDGET", "6000"))
 
+# Interaction tokens: what the recruiter and the candidate actually said/wrote, as
+# opposed to what the profile claims. Notes live on the candidate row; transcripts,
+# AI summaries, sentiment and per-call notes come from the call history hydrated by
+# the runner. Bulk text (transcripts) is delivered once through the context pack —
+# the same treatment resume text gets — so it cannot evict other fields from the
+# bounded row dump.
+INTERACTION_FIELD_DEFINITIONS: Sequence[Dict[str, Any]] = (
+    {"key": "candidate.notes", "label": "candidate.notes", "group": "Interaction Fields", "path": ("notes",)},
+    {"key": "calls.count", "label": "calls.count", "group": "Interaction Fields"},
+    {"key": "calls.last_date", "label": "calls.last_date", "group": "Interaction Fields"},
+    {"key": "calls.last_direction", "label": "calls.last_direction", "group": "Interaction Fields"},
+    {"key": "calls.last_status", "label": "calls.last_status", "group": "Interaction Fields"},
+    {"key": "calls.last_outcome", "label": "calls.last_outcome", "group": "Interaction Fields"},
+    {"key": "calls.last_duration_seconds", "label": "calls.last_duration_seconds", "group": "Interaction Fields"},
+    {"key": "calls.last_sentiment", "label": "calls.last_sentiment", "group": "Interaction Fields"},
+    {"key": "calls.last_summary", "label": "calls.last_summary", "group": "Interaction Fields"},
+    {"key": "calls.last_notes", "label": "calls.last_notes", "group": "Interaction Fields"},
+    {"key": "calls.last_transcript", "label": "calls.last_transcript", "group": "Interaction Fields"},
+    {"key": "calls.summaries", "label": "calls.summaries (all calls)", "group": "Interaction Fields"},
+    {"key": "calls.notes", "label": "calls.notes (all calls)", "group": "Interaction Fields"},
+    {"key": "calls.transcripts", "label": "calls.transcripts (all calls)", "group": "Interaction Fields"},
+)
+
+# Total transcript text across all calls in one row's context. Per-call truncation
+# lives in candidate_interactions; this is the whole-row ceiling.
+AI_COLUMN_CALLS_CHAR_BUDGET = int(os.getenv("AI_COLUMN_CALLS_CHAR_BUDGET", "18000"))
+
 TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
 URL_PATTERN = re.compile(r"https?://[^\s<>)\"']+", re.IGNORECASE)
 
@@ -156,6 +182,34 @@ WEB_FRESHNESS_TERMS = (
     "acquisition",
     "posted content",
     "posted on linkedin",
+)
+
+
+# Prompts about our own record of the candidate — call transcripts, recruiter notes,
+# what was said or promised. The answer is in the row and nowhere on the web, so these
+# outrank the freshness/public-evidence routing below.
+FIRST_PARTY_INTERACTION_TERMS = (
+    "transcript",
+    "call notes",
+    "call summary",
+    "call summaries",
+    "on the call",
+    "during the call",
+    "phone call",
+    "screening call",
+    "last call",
+    "recent call",
+    "call history",
+    "spoke to",
+    "spoke with",
+    "said on",
+    "recruiter notes",
+    "candidate notes",
+    "our notes",
+    "the notes",
+    "call sentiment",
+    "call outcome",
+    "notice period",
 )
 
 
@@ -479,6 +533,93 @@ def _get_nested_value(obj: Any, path: Sequence[Any]) -> Any:
     return cur
 
 
+def _call_entry_lines(call: Dict[str, Any], *, index: int) -> str:
+    """One call rendered as a labelled block, so the model can attribute a quote."""
+    header = " · ".join(
+        part
+        for part in (
+            f"Call {index}",
+            (call.get("direction") or "").title(),
+            call.get("date") or "",
+            call.get("outcome") or call.get("status") or "",
+        )
+        if part
+    )
+    return header
+
+
+def _apply_call_context(ctx: Dict[str, str], profile: Dict[str, Any]) -> None:
+    """Expose the candidate's call history (transcripts, summaries, notes) as calls.* tokens.
+
+    The runner hydrates profile["calls"]; when it is absent (cold cache, callers that
+    never hydrate) every token resolves to empty, exactly like a candidate with no calls,
+    so prompts that reference them degrade instead of erroring.
+    """
+    calls = profile.get("calls")
+    calls = [call for call in calls if isinstance(call, dict)] if isinstance(calls, list) else []
+
+    ctx["calls.count"] = str(len(calls))
+    latest = calls[0] if calls else {}
+    ctx["calls.last_date"] = stringify_context_value(latest.get("date"))
+    ctx["calls.last_direction"] = stringify_context_value(latest.get("direction"))
+    ctx["calls.last_status"] = stringify_context_value(latest.get("status"))
+    ctx["calls.last_outcome"] = stringify_context_value(latest.get("outcome"))
+    ctx["calls.last_duration_seconds"] = stringify_context_value(latest.get("duration_seconds"))
+    ctx["calls.last_sentiment"] = stringify_context_value(latest.get("sentiment"))
+    ctx["calls.last_summary"] = stringify_context_value(latest.get("summary"))
+    ctx["calls.last_notes"] = stringify_context_value(latest.get("notes"))
+    ctx["calls.last_transcript"] = stringify_context_value(latest.get("transcript"))
+
+    summaries: List[str] = []
+    notes: List[str] = []
+    transcripts: List[str] = []
+    transcript_budget = AI_COLUMN_CALLS_CHAR_BUDGET
+    pack_calls: List[Dict[str, Any]] = []
+    for index, call in enumerate(calls, start=1):
+        header = _call_entry_lines(call, index=index)
+        if call.get("summary"):
+            summaries.append(f"{header}: {call['summary']}")
+        if call.get("notes"):
+            notes.append(f"{header}: {call['notes']}")
+
+        transcript = str(call.get("transcript") or "")
+        if transcript and transcript_budget > 0:
+            if len(transcript) > transcript_budget:
+                transcript = transcript[:transcript_budget].rstrip() + " …[truncated]"
+            transcript_budget -= len(transcript)
+            transcripts.append(f"{header}\n{transcript}")
+        else:
+            transcript = ""
+
+        pack_calls.append(
+            {
+                "index": index,
+                "direction": call.get("direction") or "",
+                "date": call.get("date") or "",
+                "status": call.get("status") or "",
+                "outcome": call.get("outcome") or "",
+                "duration_seconds": call.get("duration_seconds") or 0,
+                "sentiment": call.get("sentiment") or "",
+                "sentiment_reason": call.get("sentiment_reason") or "",
+                "summary": call.get("summary") or "",
+                "recruiter_notes": call.get("notes") or "",
+                "transcript": transcript,
+            }
+        )
+
+    ctx["calls.summaries"] = "\n\n".join(summaries)
+    ctx["calls.notes"] = "\n\n".join(notes)
+    ctx["calls.transcripts"] = "\n\n".join(transcripts)
+
+    # Structured payload for build_candidate_context_pack, which only receives this
+    # flat dict. Excluded from the row dump by key name.
+    ctx["calls._pack_json"] = (
+        json.dumps({"count": len(calls), "calls": pack_calls}, ensure_ascii=False, default=str)
+        if calls
+        else ""
+    )
+
+
 def build_candidate_context(
     profile: Dict[str, Any],
     ai_values: Optional[Dict[str, Any]] = None,
@@ -535,6 +676,10 @@ def build_candidate_context(
             ensure_ascii=False,
             default=str,
         )
+    for item in INTERACTION_FIELD_DEFINITIONS:
+        if item.get("path"):
+            ctx[item["key"]] = stringify_context_value(_get_nested_value(profile, item["path"]))
+    _apply_call_context(ctx, profile)
     for imported in flatten_raw_fields(profile.get("raw_fields")):
         raw_value = _get_nested_value(profile.get("raw_fields") or {}, imported["path"][1:])
         ctx[imported["key"]] = stringify_context_value(raw_value)
@@ -561,7 +706,7 @@ def build_candidate_context(
 # is delivered once via the context pack (bounded), and letting the walker
 # expand resume_parsed.roles[N].* would evict real fields at the max_fields cap.
 _PROFILE_CONTEXT_SKIP_KEYS = frozenset(
-    {"resume", "resume_text", "resume_full_text", "resume_summary", "resume_parsed"}
+    {"resume", "resume_text", "resume_full_text", "resume_summary", "resume_parsed", "calls"}
 )
 
 
@@ -692,6 +837,13 @@ def classify_ai_column_prompt(prompt_template: str) -> Dict[str, str]:
     prompt = (prompt_template or "").strip()
     lower = prompt.lower()
     urls = extract_urls(prompt)
+
+    if _text_has_any(lower, FIRST_PARTY_INTERACTION_TERMS):
+        return {
+            "data_source": "row",
+            "web_required_reason": "",
+            "routing_mode": "content",
+        }
 
     linkedin_activity = (
         "linkedin" in lower
@@ -1747,6 +1899,8 @@ def build_candidate_context_pack(context: Dict[str, str], facts: Optional[Dict[s
             "about": stringify_context_value(context.get("candidate.about")),
             "email": stringify_context_value(context.get("candidate.email")),
             "phone": stringify_context_value(context.get("candidate.mobile_phone") or context.get("candidate.phone")),
+            "status": stringify_context_value(context.get("candidate.status")),
+            "recruiter_notes": stringify_context_value(context.get("candidate.notes")),
         },
         "imported_extra_fields": _flat_context_section(context, "extra"),
         "current_role": work_roles[0] if work_roles else {},
@@ -1769,7 +1923,29 @@ def build_candidate_context_pack(context: Dict[str, str], facts: Optional[Dict[s
             "sources": enrichment.get("sources", {}) if isinstance(enrichment, dict) else _flat_context_section(context, "row.raw_fields.enrichment.sources"),
         },
         "resume": _resume_pack_section(context),
+        "call_history": _calls_pack_section(context),
     }
+
+
+def _calls_pack_section(context: Dict[str, str]) -> Dict[str, Any]:
+    """The only place full call transcripts reach the model.
+
+    Calls are first-party evidence of what the candidate actually said — they outrank
+    the scraped profile on anything the candidate stated directly (notice period,
+    compensation, willingness to relocate) and are the only source for interest,
+    objections and commitments.
+    """
+    payload = _context_json_value(context, "calls._pack_json", {}) or {}
+    if not payload or not payload.get("calls"):
+        return {"count": 0, "calls": [], "note": "No call history recorded for this candidate."}
+    payload["note"] = (
+        "Recruiter call history, newest first. Transcripts and recruiter notes are "
+        "first-party evidence of what the candidate said on the phone. Prefer them over "
+        "the scraped profile for anything the candidate stated directly (notice period, "
+        "compensation, relocation, interest). Never infer a call happened, or what was "
+        "said on it, when this section is empty."
+    )
+    return payload
 
 
 def _resume_pack_section(context: Dict[str, str]) -> Dict[str, Any]:
@@ -2590,6 +2766,13 @@ def build_field_catalog(
             "group": field["group"],
             "token": f"{{{field['key']}}}",
         }
+    for field in INTERACTION_FIELD_DEFINITIONS:
+        grouped[field["group"]][field["key"]] = {
+            "key": field["key"],
+            "label": field["label"],
+            "group": field["group"],
+            "token": f"{{{field['key']}}}",
+        }
     for profile in profiles:
         for imported in flatten_raw_fields(profile.get("raw_fields")):
             grouped["Imported Fields"][imported["key"]] = {
@@ -2623,6 +2806,7 @@ def build_field_catalog(
             }
     ordered_groups = [
         "Default Fields",
+        "Interaction Fields",
         "Resume Fields",
         "Role Fields",
         "Role Context",
