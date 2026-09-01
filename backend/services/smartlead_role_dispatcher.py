@@ -121,7 +121,11 @@ def dispatch_due_email(limit: int = 20) -> int:
                         UPDATE candidate_outreach
                         SET campaign_id=%s, campaign_name=%s, status='in_campaign',
                             initial_message=%s, initial_message_at=COALESCE(initial_message_at,NOW()),
-                            email_enrolled_at=NOW(), updated_at=NOW()
+                            email_enrolled_at=NOW(),
+                            -- The reply poller ranks by conversation activity; without a
+                            -- send stamp a freshly enrolled lead looks stale and falls out
+                            -- of the priority tier into the slow round-robin sweep.
+                            last_message_sent_at=NOW(), updated_at=NOW()
                         WHERE candidate_id=%s AND recruitment_role_id=%s AND email_enrolled_at IS NULL
                         """,
                         (str(campaign_id), campaign_name, initial_message, candidate_id, role_id),

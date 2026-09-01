@@ -85,6 +85,56 @@ async def warm_backend_caches():
     await warm_calls_backend()
     await warm_profiles_backend()
 
+def _register_smartlead_webhooks(public_url: str) -> None:
+    """Point every live campaign's EMAIL_REPLY event at our webhook.
+
+    Blocking (requests + DB), so callers run it off the event loop. Campaign ids
+    stored in candidate_outreach can be stale — Smartlead answers "Campaign not
+    found" for several of them — so a failure on one campaign must never stop
+    the rest from registering.
+    """
+    from backend.db.connection import get_db_connection_context
+    from backend.integrations.smartlead import SmartleadBot
+
+    api_key = os.getenv("SMARTLEAD_API_KEY")
+    if not api_key:
+        print("Smartlead webhook registration skipped: SMARTLEAD_API_KEY is not set")
+        return
+
+    campaign_ids = []
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT campaign_id
+                    FROM candidate_outreach
+                    WHERE campaign_id IS NOT NULL
+                      AND updated_at > NOW() - INTERVAL '90 days'
+                    """
+                )
+                campaign_ids = [row[0] for row in cur.fetchall() if row[0]]
+    except Exception as e:
+        print(f"Smartlead webhook registration could not list campaigns: {e}")
+        return
+
+    if not campaign_ids:
+        print("Smartlead webhook registration skipped: no recent campaigns")
+        return
+
+    bot = SmartleadBot(api_key=api_key)
+    registered = 0
+    for campaign_id in campaign_ids:
+        try:
+            if bot.ensure_reply_webhook(campaign_id, public_url):
+                registered += 1
+        except Exception as e:
+            print(f"Smartlead webhook registration failed for campaign {campaign_id}: {e}")
+    print(f"Smartlead reply webhook registered on {registered}/{len(campaign_ids)} campaign(s)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Backend is starting up...")
@@ -142,6 +192,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"HEYREACH REPLY POLLER FAILED TO START: {e}")
 
+    # Email replies had no background path at all: no webhook was ever
+    # registered with Smartlead (the live campaign's only EMAIL_REPLY
+    # subscriber points at Clay), so a reply reached the lists only when a
+    # recruiter pressed "Sync Responses".
+    try:
+        from backend.services import smartlead_reply_sync
+        smartlead_reply_sync.start_poller()
+    except Exception as e:
+        print(f"SMARTLEAD REPLY POLLER FAILED TO START: {e}")
+
     # Register the HeyReach reply webhook (EVERY_MESSAGE_REPLY_RECEIVED) so
     # candidate replies land in near real-time instead of waiting for a manual
     # sync. Requires the backend to be publicly reachable; set e.g.
@@ -156,6 +216,22 @@ async def lifespan(app: FastAPI):
             )
         except Exception as e:
             print(f"HEYREACH WEBHOOK REGISTRATION FAILED (non-fatal): {e}")
+
+    # Register the Smartlead reply webhook (EMAIL_REPLY) on every campaign this
+    # workspace is actually running, so email replies land in real time instead
+    # of waiting for the poller or a manual sync. Requires the backend to be
+    # publicly reachable; set e.g.
+    # SMARTLEAD_WEBHOOK_URL=https://<host>/api/outreach/smartlead/webhook
+    #
+    # Unlike HeyReach, Smartlead webhooks are per campaign, so this registers
+    # one per active campaign id found in candidate_outreach. Existing hooks
+    # belonging to other integrations are left untouched.
+    smartlead_webhook_url = os.getenv("SMARTLEAD_WEBHOOK_URL")
+    if smartlead_webhook_url:
+        try:
+            await asyncio.to_thread(_register_smartlead_webhooks, smartlead_webhook_url)
+        except Exception as e:
+            print(f"SMARTLEAD WEBHOOK REGISTRATION FAILED (non-fatal): {e}")
 
     # Warm calls cache AFTER migrations so the DB pool is fully available.
     # This is awaited directly (takes ~2-3s) so it is ready before the first request.

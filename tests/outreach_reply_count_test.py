@@ -265,3 +265,117 @@ def test_responded_tab_does_not_treat_an_open_thread_as_a_response():
     # Both of these are true the moment WE send, never mind the candidate.
     assert "li_conversation_id" not in has_response
     assert "messageCount" not in has_response
+
+
+# ---------------------------------------------------------------------------
+# Smartlead replies must reach the lists without a manual sync.
+
+
+def test_smartlead_bot_exposes_reply_webhook_registration():
+    """The endpoint existed but nothing ever registered it, so it was never called."""
+    from backend.integrations.smartlead import SmartleadBot
+
+    bot = SmartleadBot(api_key="test-key")
+    assert hasattr(bot, "ensure_reply_webhook")
+    assert bot.REPLY_WEBHOOK_EVENT == "EMAIL_REPLY"
+
+
+def test_reply_webhook_is_per_campaign_not_global():
+    """Verified against the live API: /api/v1/webhook/create 404s; webhooks live
+    under /api/v1/campaigns/{id}/webhooks."""
+    from backend.integrations.smartlead import SmartleadBot
+
+    calls = {}
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return []
+
+    def fake_get(url, **kwargs):
+        calls["get"] = url
+        return _Response()
+
+    def fake_post(url, json=None, **kwargs):
+        calls["post"] = url
+        calls["payload"] = json
+        return _Response()
+
+    import backend.integrations.smartlead as smartlead_module
+
+    original_get, original_post = smartlead_module.requests.get, smartlead_module.requests.post
+    smartlead_module.requests.get = fake_get
+    smartlead_module.requests.post = fake_post
+    try:
+        bot = SmartleadBot(api_key="test-key")
+        assert bot.ensure_reply_webhook("2896985", "https://example.test/api/outreach/smartlead/webhook")
+    finally:
+        smartlead_module.requests.get = original_get
+        smartlead_module.requests.post = original_post
+
+    assert "/api/v1/campaigns/2896985/webhooks" in calls["get"]
+    assert "/api/v1/campaigns/2896985/webhooks" in calls["post"]
+    assert "webhook/create" not in calls["post"]
+    assert calls["payload"]["event_types"] == ["EMAIL_REPLY"]
+    # id None creates a new hook; other integrations on the campaign survive.
+    assert calls["payload"]["id"] is None
+
+
+def test_registration_leaves_other_integrations_alone():
+    """The live campaign already sends EMAIL_REPLY to Clay. Installing ours must
+    add a row, never overwrite theirs."""
+    from backend.integrations.smartlead import SmartleadBot
+
+    clay_hook = {
+        "id": 418156,
+        "name": "Account Executive - Nidhi",
+        "webhook_url": "https://api.clay.com/v3/sources/webhook/pull-in-data",
+        "event_types": ["EMAIL_REPLY"],
+    }
+    posted = {}
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [clay_hook]
+
+    import backend.integrations.smartlead as smartlead_module
+
+    original_get, original_post = smartlead_module.requests.get, smartlead_module.requests.post
+    smartlead_module.requests.get = lambda url, **kw: _Response()
+    smartlead_module.requests.post = lambda url, json=None, **kw: (posted.update(json or {}), _Response())[1]
+    try:
+        SmartleadBot(api_key="k").ensure_reply_webhook("2896985", "https://example.test/hook")
+    finally:
+        smartlead_module.requests.get = original_get
+        smartlead_module.requests.post = original_post
+
+    # Not Clay's id — a new hook, so Clay keeps receiving replies.
+    assert posted["id"] is None
+    assert posted["webhook_url"] == "https://example.test/hook"
+
+
+def test_reply_poller_exists_and_is_configurable():
+    """HeyReach had a poller; email had nothing but the manual button."""
+    from backend.services import smartlead_reply_sync
+
+    assert hasattr(smartlead_reply_sync, "start_poller")
+    assert hasattr(smartlead_reply_sync, "poll_once")
+    assert smartlead_reply_sync.POLL_SECONDS > 0
+
+
+def test_webhook_echoes_reply_into_the_email_thread_cache():
+    """The badge counts inbound messages in email_chat_history_cache and only
+    falls back to a floor of 1 from response_text — without the echo a candidate
+    who replies five times still reads as '1'."""
+    import inspect
+    from backend.api.routes import outreach
+
+    source = inspect.getsource(outreach.smartlead_webhook)
+    assert "email_chat_history_cache" in source
+    assert "local-webhook-" in source
+    assert '"direction": "inbound"' in source

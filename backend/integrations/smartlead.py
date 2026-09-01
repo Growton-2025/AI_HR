@@ -329,6 +329,89 @@ class SmartleadBot:
             return [activity["reply_text"]]
         return []
 
+    # ------------------------------------------------------------------
+    # Reply webhooks
+    #
+    # Smartlead webhooks are PER CAMPAIGN, at /api/v1/campaigns/{id}/webhooks.
+    # There is no global /api/v1/webhook/create — that path 404s. Verified
+    # against the live account: GET on the per-campaign path returns the
+    # registered hooks, e.g.
+    #   [{"id":418156,"name":"...","webhook_url":"https://api.clay.com/...",
+    #     "event_types":["EMAIL_REPLY"],"categories":[]}]
+
+    REPLY_WEBHOOK_NAME = "hayasa-replies"
+    REPLY_WEBHOOK_EVENT = "EMAIL_REPLY"
+
+    def list_campaign_webhooks(self, campaign_id):
+        """Webhooks registered on one campaign. [] on any failure."""
+        url = f"{self.base_url}/api/v1/campaigns/{campaign_id}/webhooks?api_key={self.api_key}"
+        try:
+            response = requests.get(url, timeout=15)
+            if response.status_code != 200:
+                print(f"⚠️ Smartlead webhook list failed for campaign {campaign_id}: HTTP {response.status_code}")
+                return []
+            payload = response.json()
+            return payload if isinstance(payload, list) else []
+        except Exception as e:
+            print(f"⚠️ Smartlead webhook list failed for campaign {campaign_id}: {e}")
+            return []
+
+    def ensure_reply_webhook(self, campaign_id, public_url) -> bool:
+        """Idempotently point this campaign's EMAIL_REPLY event at `public_url`.
+
+        Counterpart to HeyReachBot.ensure_reply_webhook. Other subscribers are
+        left alone — a campaign can carry several webhooks (this account already
+        sends EMAIL_REPLY to Clay), and removing someone else's integration to
+        install ours would be a silent, damaging side effect. We only add or
+        update the row that is ours, matched by name or by URL.
+
+        Returns True if our webhook is registered afterwards.
+        """
+        if not campaign_id or not public_url:
+            return False
+
+        existing = self.list_campaign_webhooks(campaign_id)
+        ours = next(
+            (
+                hook for hook in existing
+                if hook.get("name") == self.REPLY_WEBHOOK_NAME
+                or hook.get("webhook_url") == public_url
+            ),
+            None,
+        )
+        if (
+            ours
+            and ours.get("webhook_url") == public_url
+            and self.REPLY_WEBHOOK_EVENT in (ours.get("event_types") or [])
+        ):
+            print(f"✅ Smartlead reply webhook already registered on campaign {campaign_id} (id={ours.get('id')})")
+            return True
+
+        # Same endpoint creates and updates: an id present updates that row, a
+        # null id creates a new one.
+        payload = {
+            "id": ours.get("id") if ours else None,
+            "name": self.REPLY_WEBHOOK_NAME,
+            "webhook_url": public_url,
+            "event_types": [self.REPLY_WEBHOOK_EVENT],
+            "categories": [],
+        }
+        url = f"{self.base_url}/api/v1/campaigns/{campaign_id}/webhooks?api_key={self.api_key}"
+        try:
+            response = requests.post(url, json=payload, timeout=15)
+            if response.status_code not in (200, 201):
+                print(
+                    f"⚠️ Smartlead webhook registration failed for campaign {campaign_id}: "
+                    f"HTTP {response.status_code} {response.text[:200]}"
+                )
+                return False
+            verb = "updated" if ours else "registered"
+            print(f"✅ Smartlead reply webhook {verb} on campaign {campaign_id} -> {public_url}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Smartlead webhook registration failed for campaign {campaign_id}: {e}")
+            return False
+
     def start_campaign(self):
         """Step 6: Activate the campaign"""
         if not self.campaign_id: return

@@ -290,6 +290,63 @@ def _echo_sent_li_message(candidate_id: int, text: str) -> None:
         print(f"WARNING: could not persist sent-message echo for cand {candidate_id}: {e}")
 
 
+def _register_campaign_reply_webhook(bot, campaign_id) -> None:
+    """Point a freshly created campaign's EMAIL_REPLY event at our webhook."""
+    public_url = os.getenv("SMARTLEAD_WEBHOOK_URL")
+    if not public_url or not campaign_id:
+        return
+    try:
+        bot.ensure_reply_webhook(campaign_id, public_url)
+    except Exception:
+        logger.exception("Could not register Smartlead webhook on campaign %s", campaign_id)
+
+
+def _record_outbound_email(candidate_id: int, campaign_id: str, message: str) -> None:
+    """Persist a recruiter-sent email: activity stamp + thread echo.
+
+    Mirrors _echo_sent_li_message for LinkedIn. Two jobs:
+      * last_message_sent_at — the reply poller ranks by real conversation
+        activity, so without this a just-mailed candidate is indistinguishable
+        from one last touched weeks ago.
+      * the thread cache — so the sent message appears in the conversation
+        immediately instead of only after the next Smartlead fetch.
+    """
+    echo = {
+        "id": f"local-sent-{candidate_id}-{int(time.time() * 1000)}",
+        "type": "SENT",
+        "direction": "outbound",
+        "email_body": message,
+        "time": datetime.now(tz_module.utc).isoformat(),
+        "sender_name": "Recruiter",
+        "local_echo": True,
+    }
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE candidate_outreach
+                       SET last_message_sent_at = NOW(),
+                           email_chat_history_cache =
+                               COALESCE(email_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                           email_chat_history_updated_at = NOW(),
+                           updated_at = NOW()
+                     WHERE candidate_id = %s
+                       AND (campaign_id = %s OR %s IS NULL)
+                    """,
+                    (json.dumps([echo]), candidate_id, campaign_id, campaign_id),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to record outbound email for candidate %s", candidate_id)
+
+    with _email_chat_lock:
+        if candidate_id in _email_chat_cache:
+            _email_chat_cache[candidate_id]["ts"] = 0
+
+
 def _refresh_li_cache_task(
     candidate_id: int,
     profile_url: str,
@@ -913,8 +970,9 @@ async def send_role_email_to_shortlisted(
                         """
                         INSERT INTO candidate_outreach
                             (candidate_id, recruitment_role_id, campaign_id, campaign_name,
-                             status, initial_message, initial_message_at, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, 'in_campaign', %s, NOW(), NOW(), NOW())
+                             status, initial_message, initial_message_at,
+                             last_message_sent_at, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, 'in_campaign', %s, NOW(), NOW(), NOW(), NOW())
                         ON CONFLICT (candidate_id, recruitment_role_id)
                         DO UPDATE SET campaign_id = EXCLUDED.campaign_id,
                                       campaign_name = EXCLUDED.campaign_name,
@@ -1377,6 +1435,11 @@ async def trigger_outreach(
         days_of_the_week=[0, 1, 2, 3, 4, 5, 6],
     )
     bot.update_campaign_settings(follow_up_percentage=50)
+    # Smartlead webhooks are PER CAMPAIGN and a newly created campaign has
+    # none (verified against a fresh Quick Chat campaign: []), so registering
+    # only at startup leaves every campaign created later with no real-time
+    # path — its replies wait for the poller instead.
+    _register_campaign_reply_webhook(bot, campaign_id)
 
     # 5. Add leads
     leads = [
@@ -1575,6 +1638,11 @@ Recruitment Team""",
                     days_of_the_week=[0, 1, 2, 3, 4, 5, 6],
                 )
                 bot.update_campaign_settings(follow_up_percentage=50)
+                # Smartlead webhooks are PER CAMPAIGN and a newly created campaign has
+                # none (verified against a fresh Quick Chat campaign: []), so registering
+                # only at startup leaves every campaign created later with no real-time
+                # path — its replies wait for the poller instead.
+                _register_campaign_reply_webhook(bot, campaign_id)
                 bot.add_leads(
                     [{"first_name": first_name, "last_name": last_name, "email": email}]
                 )
@@ -2631,6 +2699,14 @@ async def send_chat_reply(
                         reply_email_body=latest_msg.get("email_body"),
                     )
                     if res:
+                        # Record the send. This branch used to return straight
+                        # away, so a reply written from the conversation modal
+                        # left NO trace in the database: the thread cache never
+                        # showed it, and last_message_sent_at stayed null, which
+                        # made a freshly-mailed candidate look stale to the reply
+                        # poller and dropped them out of its priority tier — the
+                        # message then took ~27 minutes to sync instead of ~3.
+                        _record_outbound_email(candidate_id, campaign_id, request.message)
                         return {"success": True}
 
         # Fallback: Campaign doesn't exist OR it exists but has no history yet. Trigger a new one.
@@ -2686,6 +2762,11 @@ async def send_chat_reply(
             days_of_the_week=[0, 1, 2, 3, 4, 5, 6],
         )
         bot.update_campaign_settings(follow_up_percentage=50)
+        # Smartlead webhooks are PER CAMPAIGN and a newly created campaign has
+        # none (verified against a fresh Quick Chat campaign: []), so registering
+        # only at startup leaves every campaign created later with no real-time
+        # path — its replies wait for the poller instead.
+        _register_campaign_reply_webhook(bot, campaign_id)
         # A Quick Chat is a recruiter deliberately writing to ONE person, not a
         # cold blast — so bypass Smartlead's block/bounce lists, which
         # otherwise silently drop the lead and "complete" an empty campaign.
@@ -2730,6 +2811,7 @@ async def send_chat_reply(
                                 status = 'in_campaign',
                                 initial_message = %s,
                                 initial_message_at = NOW(),
+                                last_message_sent_at = NOW(),
                                 updated_at = NOW()
                             WHERE candidate_id = %s AND {role_where}
                         """,
@@ -3201,10 +3283,12 @@ async def smartlead_webhook(payload: Dict):
     "Sync Responses", so a replied-to candidate can read as "No response yet"
     indefinitely.
 
-    Register with:
-        POST https://server.smartlead.ai/api/v1/webhook/create?api_key=...
-    selecting the EMAIL_REPLY event and pointing at
-        {public_url}/api/outreach/smartlead/webhook
+    Registered by SmartleadBot.ensure_reply_webhook at startup when
+    SMARTLEAD_WEBHOOK_URL is set. Webhooks are PER CAMPAIGN, at
+        POST /api/v1/campaigns/{campaign_id}/webhooks
+    with the EMAIL_REPLY event. (An earlier version of this docstring named a
+    global /api/v1/webhook/create endpoint; that path does not exist and 404s,
+    so anyone following it registered nothing.)
 
     Smartlead retries 5xx at 1min / 5min / 30min and treats 4xx as permanent, so
     this returns 200 for anything it cannot act on — an unmatched lead is not a
@@ -3270,6 +3354,42 @@ async def smartlead_webhook(payload: Dict):
                 )
                 updated = cur.rowcount
             conn.commit()
+
+        # Echo the message into the stored thread, exactly as the HeyReach
+        # webhook does for LinkedIn. The conversation badge counts inbound
+        # messages in email_chat_history_cache and only falls back to a floor of
+        # 1 when response_text is set (see outreach_counts.reply_count_sql), so
+        # without this echo a candidate who replies five times still shows "1"
+        # until someone opens the thread and forces a fetch.
+        if reply_text:
+            try:
+                echo = {
+                    "id": f"local-webhook-{candidate_id}-{int(time.time() * 1000)}",
+                    "type": "REPLY",
+                    "direction": "inbound",
+                    "email_body": reply_text,
+                    "time": datetime.now(tz_module.utc).isoformat(),
+                    "sender_name": "Candidate",
+                    "local_echo": True,
+                }
+                with get_db_connection_context(validate=False, register_pgvector=False) as conn_echo:
+                    if conn_echo:
+                        with conn_echo.cursor() as cur_echo:
+                            cur_echo.execute(
+                                """
+                                UPDATE candidate_outreach
+                                SET email_chat_history_cache =
+                                        COALESCE(email_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                                    email_chat_history_updated_at = NOW()
+                                WHERE candidate_id = %s
+                                """,
+                                (json.dumps([echo]), candidate_id),
+                            )
+                        conn_echo.commit()
+            except Exception:
+                # The reply is already stored in response_text; a failed echo
+                # costs an accurate badge, not the reply itself.
+                logger.exception("[SmartleadWebhook] chat echo failed for candidate %s", candidate_id)
 
         # Drop the cached thread so the conversation modal shows the reply now
         # rather than after the 300s TTL.
