@@ -41,6 +41,20 @@ nohup $PYTHON_EXEC -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --re
 BACKEND_PID=$!
 echo "Backend starting with PID $BACKEND_PID. Waiting for it to be ready..."
 
+# 2. Start the frontend NOW, not after the backend is ready.
+#
+# Vite serves its own bundle and needs the backend only when a request is
+# proxied, so gating it on the health check just meant :3000 refused connections
+# for the entire cold start — several minutes of the app looking dead when it
+# could have been showing the login page.
+echo "Starting Frontend (Port 3000)..."
+cd frontend
+nohup npm run dev -- --port 3000 --host 127.0.0.1 --strictPort > /tmp/ai_hr_frontend.log 2>&1 &
+FRONTEND_PID=$!
+cd ..
+echo "Frontend running with PID $FRONTEND_PID. Logs in /tmp/ai_hr_frontend.log."
+echo "Frontend: http://127.0.0.1:3000/  (sign-in works once the backend is ready, below)"
+
 # Wait for backend health check.
 # -m 2 is load-bearing: uvicorn binds the socket before the lifespan startup
 # finishes, so during a cold start the connection is accepted-but-never-answered
@@ -48,8 +62,10 @@ echo "Backend starting with PID $BACKEND_PID. Waiting for it to be ready..."
 # frontend below never launches.
 # The budget is minutes, not seconds: a cold start warms the calls cache and (with
 # ENABLE_STARTUP_CACHE_WARMUP=true) the full profile cache against the remote DB,
-# which takes ~10 minutes. A 30s budget just meant the script declared success
-# while the backend was still starting, and every early request 500'd.
+# which takes ~4-11 minutes depending on DB contention. A 30s budget just meant
+# the script declared success while the backend was still starting, and every
+# early request 500'd. The frontend is already serving by this point, so this
+# wait now only gates the "you can sign in" message.
 BACKEND_WAIT_SECONDS=${BACKEND_WAIT_SECONDS:-900}
 BACKEND_READY=0
 SECONDS_WAITED=0
@@ -69,22 +85,14 @@ done
 
 if [ "$BACKEND_READY" -ne 1 ]; then
     echo "WARNING: backend did not answer /api/health within ${BACKEND_WAIT_SECONDS}s."
-    echo "         Starting the frontend anyway; API calls will 500 until it finishes."
+    echo "         The frontend is up, but API calls will 500 until it finishes."
     echo "         Check /tmp/ai_hr_backend.log."
 fi
 
-# 2. Start Frontend in background
-echo "Starting Frontend (Port 3000)..."
-cd frontend
-nohup npm run dev -- --port 3000 --host 127.0.0.1 --strictPort > /tmp/ai_hr_frontend.log 2>&1 &
-FRONTEND_PID=$!
-cd ..
-echo "Frontend running with PID $FRONTEND_PID. Logs in /tmp/ai_hr_frontend.log."
-
 if [ "$BACKEND_READY" -eq 1 ]; then
-    echo "Services started successfully!"
+    echo "Services started successfully! You can sign in now."
 else
-    echo "Frontend started; backend still warming up."
+    echo "Frontend is up; backend still warming — sign-in will 500 until it answers."
 fi
 echo "Backend: http://127.0.0.1:8000/docs"
 echo "Frontend: http://127.0.0.1:3000/"
