@@ -5,16 +5,17 @@ import { API_BASE } from '../store/useAppStore';
 import { useVoIP } from '../context/VoIPContext';
 
 /**
- * Quiet notice that a candidate is calling in.
+ * Alert that a candidate is calling in.
  *
- * Deliberately NOT a modal and deliberately silent: a candidate can call back
- * at any moment, and the recruiter is usually mid-task (typing a filter, in a
- * drawer). This never plays a sound, never takes focus, never changes route —
- * it just offers the call. Rendered from the app shell so it follows the
- * recruiter across every page.
+ * Still NOT a modal and it never changes route — the recruiter is usually
+ * mid-task (typing a filter, in a drawer) and must not lose their place. But it
+ * is no longer silent: VoIPContext rings, raises an OS notification and flashes
+ * the tab title alongside this, because a quiet bottom-right toast was missed
+ * whenever the recruiter was looking at another tab. Rendered from the app shell
+ * so it follows the recruiter across every page.
  */
 export default function IncomingCallBanner() {
-  const { incomingCall, acceptIncomingCall, dismissIncomingCall } = useVoIP();
+  const { incomingCall, acceptIncomingCall, dismissIncomingCall, setInboundCallerLabel } = useVoIP();
   const [caller, setCaller] = useState(null);
 
   useEffect(() => {
@@ -44,7 +45,11 @@ export default function IncomingCallBanner() {
           const at = new Date(/Z$|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : `${raw}Z`);
           return !Number.isNaN(at.getTime()) && Date.now() - at.getTime() < 120000;
         });
-        setCaller(byNumber || recent || null);
+        const resolved = byNumber || recent || null;
+        setCaller(resolved);
+        // The alert already fired with the raw number; name the person now that
+        // we know who it is.
+        if (resolved?.candidate_name) setInboundCallerLabel?.(resolved.candidate_name);
       })
       .catch(() => { /* the banner is still useful without the name */ });
     return () => { cancelled = true; };
@@ -59,28 +64,29 @@ export default function IncomingCallBanner() {
 
   return (
     <div
-      role="status"
-      aria-live="polite"
+      // assertive: this interrupts, unlike the polite status it used to be.
+      role="alert"
+      aria-live="assertive"
       style={{
         position: 'fixed', right: 24, bottom: 24, zIndex: 12000,
-        background: '#0f172a', color: '#fff', borderRadius: 14, padding: '14px 18px',
-        display: 'flex', alignItems: 'center', gap: 16, minWidth: 340,
-        boxShadow: '0 20px 40px rgba(15,23,42,0.35)',
-        border: '1px solid rgba(255,255,255,0.12)',
-        animation: 'slideUp 0.25s ease-out',
+        background: '#0f172a', color: '#fff', borderRadius: 16, padding: '18px 22px',
+        display: 'flex', alignItems: 'center', gap: 18, minWidth: 420,
+        boxShadow: '0 24px 56px rgba(15,23,42,0.45), 0 0 0 3px rgba(249,115,22,0.35)',
+        border: '1px solid rgba(255,255,255,0.16)',
+        animation: 'slideUp 0.25s ease-out, incomingCallPulse 1.6s ease-in-out infinite',
       }}
     >
       <div style={{
-        width: 38, height: 38, borderRadius: '50%', background: 'var(--accent-primary, #f97316)',
+        width: 46, height: 46, borderRadius: '50%', background: 'var(--accent-primary, #f97316)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
       }}>
-        <Phone size={18} />
+        <Phone size={22} />
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, color: '#fbbf24' }}>
           INCOMING CALL
         </div>
-        <div style={{ fontSize: 14, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        <div style={{ fontSize: 17, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
           {name}
         </div>
         <div style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -94,7 +100,7 @@ export default function IncomingCallBanner() {
         title="Answer"
         style={{
           background: '#16a34a', color: '#fff', border: 'none', borderRadius: 10,
-          padding: '9px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+          padding: '12px 20px', fontSize: 15, fontWeight: 700, cursor: 'pointer',
           display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'inherit',
         }}
       >

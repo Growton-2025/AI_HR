@@ -3080,3 +3080,26 @@ input:checked + .slider:before {
 .hy-tooltip-left::before {
   left: 18px;
 }
+
+/* Incoming-call banner: a soft glow pulse so a ringing call is unmistakable
+   against the page behind it. Paired with the ringtone, OS notification and
+   flashing tab title raised from VoIPContext. */
+@keyframes incomingCallPulse {
+  0%, 100% {
+    box-shadow: 0 24px 56px rgba(15, 23, 42, 0.45), 0 0 0 3px rgba(249, 115, 22, 0.35);
+  }
+
+  50% {
+    box-shadow: 0 24px 56px rgba(15, 23, 42, 0.45), 0 0 0 9px rgba(249, 115, 22, 0.12);
+  }
+}
+
+/* Respect a reduced-motion preference: the ring and notification still fire,
+   so nothing is lost by holding the banner still. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes incomingCallPulse {
+    0%, 100% {
+      box-shadow: 0 24px 56px rgba(15, 23, 42, 0.45), 0 0 0 3px rgba(249, 115, 22, 0.35);
+    }
+  }
+}

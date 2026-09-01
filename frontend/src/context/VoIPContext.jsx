@@ -186,21 +186,177 @@ const stopAudioElement = (audio) => {
   }
 };
 
+// Our own sinks. Never eligible for the ringtone sweep below: killing these is
+// what silenced answered inbound calls.
+const OWN_AUDIO_ELEMENT_IDS = new Set(['plivo-remote-audio', 'plivo-local-audio']);
+
+const isRingtoneAudioElement = (audio) => {
+  const idClass = `${audio.id || ''} ${audio.className || ''}`.toLowerCase();
+  const src = String(audio.src || '').toLowerCase();
+  return (
+    idClass.includes('ringtone') ||
+    /\bring\b/.test(idClass) ||
+    src.includes('ringtone') ||
+    /\bring\b/.test(src)
+  );
+};
+
+// Silence the SDK's own ring WITHOUT touching call media.
+//
+// This used to match any <audio> whose id merely contained "plivo" and then run
+// the full stopAudioElement() on it — which calls track.stop() on the srcObject,
+// permanently ending those MediaStreamTracks. Since it ran on every
+// onIncomingCall, before the recruiter had answered, it destroyed the SDK's
+// remote-audio sink; answering then produced a connected call with no audio.
+// Pause only, ringtone elements only, and never our own sinks.
+const stopPlivoRingtoneAudio = () => {
+  if (typeof document === 'undefined') return;
+  document.querySelectorAll('audio').forEach(audio => {
+    if (OWN_AUDIO_ELEMENT_IDS.has(audio.id)) return;
+    if (!isRingtoneAudioElement(audio)) return;
+    try {
+      audio.pause?.();
+      audio.currentTime = 0;
+    } catch (_) {
+      // Best-effort: a ringtone we cannot pause is a nuisance, not a failure.
+    }
+  });
+};
+
+// The SDK may have left its remote-audio element paused (or never started it
+// because the tab was in the background when the stream arrived). Answering is a
+// user gesture, so this is the one moment we are allowed to force playback.
+const resumePlivoManagedAudio = () => {
+  if (typeof document === 'undefined') return;
+  document.querySelectorAll('audio').forEach(audio => {
+    if (isRingtoneAudioElement(audio)) return;
+    if (audio.id && OWN_AUDIO_ELEMENT_IDS.has(audio.id) && !audio.srcObject) return;
+    if (!audio.paused) return;
+    if (audio.muted) return;
+    try {
+      audio.play?.()?.catch?.(() => {});
+    } catch (_) {
+      // Autoplay policy can still refuse; the call itself is unaffected.
+    }
+  });
+};
+
+// Full teardown — used when the provider unmounts or a call ends, where ending
+// the tracks is the point.
 const stopPlivoManagedAudio = () => {
   if (typeof document === 'undefined') return;
   document.querySelectorAll('audio').forEach(audio => {
     const idClass = `${audio.id || ''} ${audio.className || ''}`.toLowerCase();
     const src = String(audio.src || '').toLowerCase();
-    const isPlivoOrRingtone =
-      idClass.includes('plivo') ||
-      idClass.includes('ringtone') ||
-      /\bring\b/.test(idClass) ||
-      src.includes('plivo') ||
-      src.includes('ringtone');
-    if (isPlivoOrRingtone) {
+    if (idClass.includes('plivo') || src.includes('plivo') || isRingtoneAudioElement(audio)) {
       stopAudioElement(audio);
     }
   });
+};
+
+// ---------------------------------------------------------------------------
+// Inbound alerting.
+//
+// An inbound call forks to every registered recruiter at once, so this rings
+// every browser it reaches. That is deliberate: a silent banner meant callbacks
+// were missed whenever the recruiter was on another tab, which is most of the
+// time. Three channels, because no single one survives a backgrounded tab:
+// a ringtone (audible while the tab is alive), an OS notification (the only
+// thing that crosses to another application), and a flashing tab title (the
+// cheapest signal when the recruiter is elsewhere in the browser).
+
+// One AudioContext for the life of the page. Browsers start it suspended until
+// the user has interacted; unlockAudioContext() below resumes it on the first
+// gesture so the ring is not swallowed the first time it matters.
+let sharedAudioContext = null;
+
+const getAudioContext = () => {
+  const AudioCtx = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+  if (!AudioCtx) return null;
+  if (!sharedAudioContext || sharedAudioContext.state === 'closed') {
+    try {
+      sharedAudioContext = new AudioCtx();
+    } catch (_) {
+      return null;
+    }
+  }
+  if (sharedAudioContext.state === 'suspended') {
+    sharedAudioContext.resume().catch(() => {});
+  }
+  return sharedAudioContext;
+};
+
+const unlockAudioContext = () => { getAudioContext(); };
+
+// Standard double-pulse ring: two 400ms bursts 200ms apart, then a 2s gap.
+// Synthesised rather than shipped as an asset so it needs no network fetch and
+// cannot be blocked by a missing/blocked file at the moment a call arrives.
+const RING_CADENCE_MS = 3000;
+
+const createRingtone = () => {
+  const ctx = getAudioContext();
+  if (!ctx) return null;
+  try {
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(ctx.destination);
+    // Two detuned oscillators give the warble of a real ring rather than a beep.
+    const oscA = ctx.createOscillator();
+    oscA.type = 'sine';
+    oscA.frequency.value = 440;
+    oscA.connect(gain);
+    const oscB = ctx.createOscillator();
+    oscB.type = 'sine';
+    oscB.frequency.value = 480;
+    oscB.connect(gain);
+    oscA.start();
+    oscB.start();
+
+    const burst = (startAt) => {
+      gain.gain.setValueAtTime(0, startAt);
+      gain.gain.linearRampToValueAtTime(0.09, startAt + 0.03);
+      gain.gain.setValueAtTime(0.09, startAt + 0.37);
+      gain.gain.linearRampToValueAtTime(0, startAt + 0.4);
+    };
+    const cadence = () => {
+      const t = ctx.currentTime;
+      gain.gain.cancelScheduledValues(t);
+      burst(t);
+      burst(t + 0.6);
+    };
+    cadence();
+    const intervalId = window.setInterval(cadence, RING_CADENCE_MS);
+    return { ctx, gain, oscA, oscB, intervalId };
+  } catch (_) {
+    return null;
+  }
+};
+
+const destroyRingtone = (ring) => {
+  if (!ring) return;
+  try {
+    window.clearInterval(ring.intervalId);
+    ring.gain.gain.cancelScheduledValues(ring.ctx.currentTime);
+    ring.gain.gain.setValueAtTime(0, ring.ctx.currentTime);
+    ring.oscA.stop();
+    ring.oscB.stop();
+    // The context is shared and deliberately NOT closed here — closing it would
+    // force the next call to build a suspended one that needs a fresh gesture.
+  } catch (_) {
+    // Best-effort teardown.
+  }
+};
+
+const notificationsSupported = () => typeof window !== 'undefined' && 'Notification' in window;
+
+const requestNotificationPermission = () => {
+  if (!notificationsSupported()) return;
+  if (window.Notification.permission !== 'default') return;
+  try {
+    window.Notification.requestPermission?.().catch?.(() => {});
+  } catch (_) {
+    // Older browsers use the callback form; not worth a shim.
+  }
 };
 
 export function useVoIP() {
@@ -256,6 +412,119 @@ export function VoIPProvider({ children }) {
   // which feels like a dead line. Play a soft synthetic ring immediately and
   // stop it as soon as the SDK reports remote ringing or any terminal event.
   const dialToneRef = useRef(null);
+
+  // Inbound alerting state: ringtone handle, OS notification handle, and the
+  // title-flash interval. Refs, not state — these must be tearable-down from
+  // event handlers that do not re-render.
+  const inboundRingRef = useRef(null);
+  const inboundNotificationRef = useRef(null);
+  const titleFlashRef = useRef(null);
+  // The alert fires the instant the SDK reports a call, when all we have is a
+  // number; the banner resolves the candidate name a moment later over HTTP.
+  // Held in a ref so the running title-flash picks up the better label without
+  // being restarted.
+  const inboundCallerLabelRef = useRef('');
+
+  const stopInboundAlert = () => {
+    destroyRingtone(inboundRingRef.current);
+    inboundRingRef.current = null;
+
+    try {
+      inboundNotificationRef.current?.close?.();
+    } catch (_) {
+      // The notification may already have been dismissed by the OS.
+    }
+    inboundNotificationRef.current = null;
+
+    const flash = titleFlashRef.current;
+    if (flash) {
+      window.clearInterval(flash.intervalId);
+      document.title = flash.originalTitle;
+      titleFlashRef.current = null;
+    }
+    inboundCallerLabelRef.current = '';
+  };
+
+  const startInboundAlert = ({ from, name } = {}) => {
+    // Never stack two alerts; a re-fired event must not leave an orphan ring.
+    stopInboundAlert();
+
+    inboundRingRef.current = createRingtone();
+
+    const caller = name || from || 'Unknown caller';
+    inboundCallerLabelRef.current = caller;
+
+    if (notificationsSupported() && window.Notification.permission === 'granted') {
+      try {
+        // tag: a re-delivered event replaces the existing notification instead
+        // of stacking a second one for the same call.
+        const notification = new window.Notification('Incoming call', {
+          body: caller,
+          tag: 'hayasa-inbound-call',
+          renotify: true,
+          requireInteraction: true,
+          icon: '/hayasa-favicon.svg',
+        });
+        notification.onclick = () => {
+          try {
+            window.focus();
+            notification.close();
+          } catch (_) { /* focus can be refused; the banner is still there */ }
+        };
+        inboundNotificationRef.current = notification;
+      } catch (_) {
+        // Notification constructors throw on some platforms (e.g. Android
+        // Chrome requires a service worker). The ring and title still fire.
+      }
+    }
+
+    // Tab title flash: the only signal visible when the recruiter is on another
+    // tab in the same window and has notifications turned off.
+    if (typeof document !== 'undefined') {
+      const originalTitle = document.title;
+      let on = false;
+      const intervalId = window.setInterval(() => {
+        on = !on;
+        document.title = on
+          ? `📞 Incoming call — ${inboundCallerLabelRef.current || caller}`
+          : originalTitle;
+      }, 900);
+      titleFlashRef.current = { intervalId, originalTitle };
+    }
+  };
+
+  // Called by the banner once it has matched the number to a candidate, so the
+  // notification and tab title name the person rather than the phone number.
+  const setInboundCallerLabel = (label) => {
+    const next = String(label || '').trim();
+    if (!next || next === inboundCallerLabelRef.current) return;
+    // Only relabel an alert that is actually running.
+    if (!titleFlashRef.current && !inboundNotificationRef.current) return;
+    inboundCallerLabelRef.current = next;
+
+    const previous = inboundNotificationRef.current;
+    if (!previous) return;
+    try {
+      previous.close?.();
+      // Same tag, so the OS replaces the old one instead of stacking a second.
+      const notification = new window.Notification('Incoming call', {
+        body: next,
+        tag: 'hayasa-inbound-call',
+        renotify: false,
+        requireInteraction: true,
+        icon: '/hayasa-favicon.svg',
+      });
+      notification.onclick = () => {
+        try {
+          window.focus();
+          notification.close();
+        } catch (_) { /* focus can be refused; the banner is still there */ }
+      };
+      inboundNotificationRef.current = notification;
+    } catch (_) {
+      inboundNotificationRef.current = null;
+    }
+  };
 
   const stopDialTone = () => {
     const tone = dialToneRef.current;
@@ -360,6 +629,7 @@ export function VoIPProvider({ children }) {
       // instead of stalling for that whole window.
       initInFlightRef.current = false;
       queuedForceInitRef.current = false;
+      stopInboundAlert();
       hangupSoftphoneCall();
       stopCallAudio();
       try {
@@ -385,6 +655,25 @@ export function VoIPProvider({ children }) {
     // the softphone stuck in 'connecting' until the modal's 12s rescue retry.
     return () => { initDoneRef.current = false; };
   }, []);
+
+  // Browsers start an AudioContext suspended and refuse Notification permission
+  // outside a user gesture. Piggyback on the recruiter's first click/keypress —
+  // by the time a candidate calls back, both are ready.
+  useEffect(() => {
+    const onFirstGesture = () => {
+      unlockAudioContext();
+      requestNotificationPermission();
+    };
+    window.addEventListener('pointerdown', onFirstGesture, { once: true });
+    window.addEventListener('keydown', onFirstGesture, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', onFirstGesture);
+      window.removeEventListener('keydown', onFirstGesture);
+    };
+  }, []);
+
+  // A ring or a flashing title that outlives its call is worse than no alert.
+  useEffect(() => stopInboundAlert, []);
 
   useEffect(() => {
     activeCallRef.current = activeCall;
@@ -713,9 +1002,10 @@ export function VoIPProvider({ children }) {
       sdk.client.on('onIncomingCall', (callUUID, extraHeaders, callInfo) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         try {
+          // Our synthetic ring replaces the SDK's, so the two never overlap.
           sdk.client.setRingTone?.(false);
         } catch (_) { /* older SDK builds may not expose it */ }
-        stopPlivoManagedAudio();
+        stopPlivoRingtoneAudio();
         // The SDK's argument shape varies by version and call type, so pull the
         // caller id out of whichever slot carries it and treat it as optional —
         // the banner resolves the name from the backend, which has already
@@ -755,12 +1045,18 @@ export function VoIPProvider({ children }) {
         }
 
         setIncomingCall({ callUUID: uuid, from, at: Date.now() });
+        // Ring, notify and flash the title. This fires for every recruiter the
+        // call forks to, on whatever page they are on and whether or not the tab
+        // is focused — a silent banner meant callbacks were missed whenever the
+        // recruiter was looking at another tab.
+        startInboundAlert({ from });
       });
 
       sdk.client.on('onIncomingCallCanceled', (canceledUUID) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         // Another recruiter answered first, or the caller hung up.
-        stopPlivoManagedAudio();
+        stopPlivoRingtoneAudio();
+        stopInboundAlert();
         // Only clear the banner if this cancel is for the call it is showing —
         // a concurrent caller we suppressed above also cancels, and must not
         // take down a banner the recruiter can still answer. When the SDK gives
@@ -774,6 +1070,7 @@ export function VoIPProvider({ children }) {
       sdk.client.on('onCallTerminated', (reason) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         stopDialTone();
+        stopInboundAlert();
         setIncomingCall(null);
         setVoipCallEvent(buildVoipCallEvent('terminated', reason, activeCallRef.current?.number));
         setVoipStatus('registered');
@@ -783,6 +1080,7 @@ export function VoIPProvider({ children }) {
       sdk.client.on('onCallFailed', (reason) => {
         if (softphoneGenerationRef.current !== instanceId) return;
         stopDialTone();
+        stopInboundAlert();
         console.warn('[VoIP] Call failed', reason);
         setVoipCallEvent(buildVoipCallEvent('failed', reason, activeCallRef.current?.number));
         setVoipStatus('registered');
@@ -953,9 +1251,14 @@ export function VoIPProvider({ children }) {
     const pending = incomingCall;
     if (!pending?.callUUID) return { success: false };
     try {
+      stopInboundAlert();
       await ensureMicrophonePermission();
       // 'ignore' so a second inbound never rings over a live conversation.
       softphoneRef.current?.client?.answer(pending.callUUID, 'ignore');
+      // Answering is a user gesture — the one moment autoplay policy lets us
+      // force the remote stream to play if the SDK left its element paused.
+      resumePlivoManagedAudio();
+      window.setTimeout(resumePlivoManagedAudio, 600);
       setIncomingCall(null);
       setVoipStatus('connected');
       setActiveCall({ state: 'connected', number: pending.from || '', direction: 'inbound' });
@@ -978,6 +1281,7 @@ export function VoIPProvider({ children }) {
 
   const dismissIncomingCall = () => {
     const pending = incomingCall;
+    stopInboundAlert();
     setIncomingCall(null);
     if (!pending?.callUUID) return;
     try {
@@ -1029,6 +1333,7 @@ export function VoIPProvider({ children }) {
         incomingCall,
         acceptIncomingCall,
         dismissIncomingCall,
+        setInboundCallerLabel,
         voipDegraded,
         connectedInbound,
         clearConnectedInbound,
