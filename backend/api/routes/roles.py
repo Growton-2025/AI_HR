@@ -13,6 +13,22 @@ from backend.services.role_activation import (
     retry_role_activation,
 )
 from backend.services.outreach_counts import reply_count_sql
+
+
+def _col(row, index):
+    """Positional column read that tolerates a row narrower than expected."""
+    try:
+        return row[index]
+    except (IndexError, TypeError):
+        return None
+
+
+def _iso_at(value):
+    """ISO-format a timestamp column that may be absent or already a string."""
+    if not value:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
 import logging
 import time
 
@@ -651,7 +667,9 @@ async def get_role(
                        COALESCE(role_outreach.email_reply_count, 0),
                        COALESCE(role_outreach.li_reply_count, 0),
                        COALESCE(role_outreach.email_reply_count, 0)
-                           + COALESCE(role_outreach.li_reply_count, 0)
+                           + COALESCE(role_outreach.li_reply_count, 0),
+                       role_outreach.response_received_at,
+                       role_outreach.li_response_received_at
                 FROM selected_role sr
                 LEFT JOIN users u ON u.id = sr.user_id
                 LEFT JOIN recruitment_role_candidates rc ON rc.role_id = sr.id
@@ -669,6 +687,8 @@ async def get_role(
                     SELECT
                         co.response_text,
                         co.li_response_text,
+                        co.response_received_at,
+                        co.li_response_received_at,
                         co.status,
                         co.message_sent_count,
                         co.li_status,
@@ -793,6 +813,11 @@ async def get_role(
                     "email_reply_count": int(row[39] or 0),
                     "li_reply_count": int(row[40] or 0),
                     "reply_count": int(row[41] or 0),
+                    # Which reply is NEWER decides what the list shows and how it
+                    # is labelled; without these the UI always preferred LinkedIn
+                    # and tagged an email reply "LINKEDIN".
+                    "response_received_at": _iso_at(_col(row, 42)),
+                    "li_response_received_at": _iso_at(_col(row, 43)),
                     "outreach_counts_loaded": True,
                     "notes": row[25] or "",
                     "status": row[19] or candidate.get("status") or "To be started",

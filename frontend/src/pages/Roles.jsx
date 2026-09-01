@@ -82,17 +82,34 @@ const clayPollDelayMs = (attempt) => (attempt < 10 ? 2000 : 5000)
 function candidateResponseSnapshot(candidate = {}, outreach = {}, options = {}) {
     const countsReady = options.countsReady !== false
     const candidateCountsReady = countsReady || candidate.outreach_counts_loaded === true || candidate.outreach_counts_included === true
-    const responseText = (
-        outreach.li_response_text
-        || outreach.response_text
-        || candidate.li_response_text
-        || candidate.response_text
-        || candidate.response
-        || ''
-    )
-    const responseChannel = outreach.li_response_text || candidate.li_response_text
-        ? 'LinkedIn'
-        : (outreach.response_text || candidate.response_text || candidate.response ? 'Email' : '')
+    // Show the MOST RECENT reply, and label it with the channel it actually
+    // arrived on. This used to prefer LinkedIn unconditionally and derive the
+    // label from a different expression than the text: a candidate contacted on
+    // both channels was shown their old LinkedIn message, and an email reply
+    // could appear tagged "LINKEDIN" because li_response_text existed somewhere.
+    const emailReply = (outreach.response_text || candidate.response_text || candidate.response || '').trim()
+    const linkedinReply = (outreach.li_response_text || candidate.li_response_text || '').trim()
+    const emailAt = outreach.response_received_at || candidate.response_received_at || ''
+    const linkedinAt = outreach.li_response_received_at || candidate.li_response_received_at || ''
+
+    let responseText = ''
+    let responseChannel = ''
+    if (emailReply && linkedinReply) {
+        // Both channels answered — the newer message is the one that matters.
+        // With no timestamps (older payloads) fall back to the previous
+        // LinkedIn-first behaviour rather than guessing.
+        const emailIsNewer = emailAt && linkedinAt
+            ? new Date(emailAt).getTime() > new Date(linkedinAt).getTime()
+            : false
+        responseText = emailIsNewer ? emailReply : linkedinReply
+        responseChannel = emailIsNewer ? 'Email' : 'LinkedIn'
+    } else if (linkedinReply) {
+        responseText = linkedinReply
+        responseChannel = 'LinkedIn'
+    } else if (emailReply) {
+        responseText = emailReply
+        responseChannel = 'Email'
+    }
     // Older payloads (or a backend that hasn't caught up) carry no reply
     // counts; a stored response text still means at least one reply.
     const resolvedReplyCount = candidateCountsReady
@@ -681,6 +698,9 @@ function Roles() {
     const [emailSetupLoading, setEmailSetupLoading] = useState(false)
     const [emailSetupModalOpen, setEmailSetupModalOpen] = useState(false)
     const [isSyncing, setIsSyncing] = useState(false)
+    // Roles this tab has already auto-synced, so reopening a role in the same
+    // session does not re-run the sweep on every click.
+    const autoSyncedRolesRef = useRef(new Set())
     const [isDeactivating, setIsDeactivating] = useState(false)
     const [isRefreshing, setIsRefreshing] = useState(false)
     const [refreshingProfileIds, setRefreshingProfileIds] = useState({})
@@ -1206,6 +1226,39 @@ function Roles() {
             setIsSyncing(false)
         }
     }
+
+    // Catch up on replies the moment a role is opened.
+    //
+    // The background poller keeps the lists honest while the server is running,
+    // but a recruiter opening the app in the morning wants what arrived
+    // overnight to be there already — pressing "Sync Responses" to discover
+    // yesterday's replies is how messages got missed. This runs once per role
+    // per tab, in the background, and stays silent: no spinner on the button, no
+    // "no new responses" toast. Only a real result is announced.
+    useEffect(() => {
+        const roleId = viewingRole?.id
+        if (!roleId) return
+        if (autoSyncedRolesRef.current.has(roleId)) return
+        autoSyncedRolesRef.current.add(roleId)
+
+        let cancelled = false
+        ;(async () => {
+            try {
+                const res = await syncOutreachResponses(roleId)
+                if (cancelled || !res?.success) return
+                const updated = Number(res.data?.updated_count || 0)
+                if (updated > 0) {
+                    toast.success(`${updated} new ${updated === 1 ? 'response' : 'responses'} synced`)
+                    await fetchOutreachStatus(roleId)
+                }
+            } catch (_) {
+                // Silent: the manual button and the server-side poller both
+                // remain as fallbacks, and a failed background catch-up must
+                // never interrupt the recruiter.
+            }
+        })()
+        return () => { cancelled = true }
+    }, [viewingRole?.id, syncOutreachResponses, fetchOutreachStatus])
 
     const handleCopy = (text) => {
         if (!text) return
