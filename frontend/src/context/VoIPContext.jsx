@@ -293,6 +293,16 @@ const unlockAudioContext = () => { getAudioContext(); };
 // cannot be blocked by a missing/blocked file at the moment a call arrives.
 const RING_CADENCE_MS = 3000;
 
+// Credential fetch attempts before giving up and showing the "calling line is
+// not set up" banner. Six with exponential backoff covers a backend that is
+// still warming its caches, which can take minutes on a cold start.
+const CREDENTIALS_ATTEMPTS = 6;
+// While the softphone is in an error state, keep trying quietly in the
+// background. Without this a failure was permanent for the session on every
+// page except Calls (which had a single one-shot retry), so a recruiter who
+// opened the app too early never received a callback and had no idea why.
+const ERROR_RECOVERY_MS = 30000;
+
 const createRingtone = () => {
   const ctx = getAudioContext();
   if (!ctx) return null;
@@ -683,6 +693,26 @@ export function VoIPProvider({ children }) {
     incomingCallRef.current = incomingCall;
   }, [incomingCall]);
 
+  // Recover from a failed softphone init on any page.
+  //
+  // The registration heartbeat below only runs once already registered, and the
+  // only automatic retry lived in Calls.jsx as a one-shot — so a softphone that
+  // failed to start (typically because the page was opened while the backend was
+  // still warming) stayed dead for the whole session unless the recruiter noticed
+  // the banner and pressed Retry. Meanwhile every candidate callback rang nobody.
+  useEffect(() => {
+    if (voipStatus !== 'error') return undefined;
+    const id = window.setInterval(() => {
+      // Quiet: no toast, no spinner. The banner stays until this succeeds, and
+      // disappears by itself when it does.
+      void initSoftphone({ force: true });
+    }, ERROR_RECOVERY_MS);
+    return () => window.clearInterval(id);
+    // initSoftphone is stable enough for this purpose and intentionally omitted:
+    // including it would tear down and rebuild the timer on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voipStatus]);
+
   // Keep the endpoint's registration fresh. The inbound webhook only rings
   // endpoints seen registering in the last 15 minutes, but the SDK fires
   // onLogin exactly once and a SIP session stays up for hours — so a recruiter
@@ -833,7 +863,7 @@ export function VoIPProvider({ children }) {
       // times instead of giving up: the softphone used to be rescued only by a
       // retry living in Calls.jsx, which is why incoming calls appeared on that
       // page and nowhere else.
-      for (let attempt = 0; attempt < 4 && !credentialsOk; attempt += 1) {
+      for (let attempt = 0; attempt < CREDENTIALS_ATTEMPTS && !credentialsOk; attempt += 1) {
         try {
           const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`);
           res = credentialsResponse.data || {};
@@ -841,14 +871,22 @@ export function VoIPProvider({ children }) {
         } catch (error) {
           lastStatus = error?.response?.status || 0;
           res = error?.response?.data || {};
-          // Retry when the response is unreadable (status 0) as well as on
-          // 401/403. The bearer token is restored asynchronously on a cold
-          // load, and that race can surface either as a 401 or as an error
-          // with no response at all — breaking out on the latter left the
-          // softphone permanently unregistered after a single 72ms attempt,
-          // which sends every inbound call to voicemail.
-          if (lastStatus && lastStatus !== 401 && lastStatus !== 403) break;
-          await new Promise(resolve => window.setTimeout(resolve, 400 * (attempt + 1)));
+          // Retry anything that is not a settled client-side rejection.
+          //
+          // This used to break out on any status other than 401/403, which made
+          // a WARMING BACKEND fatal: the dev proxy (and a cold hosted worker)
+          // answers 500 while uvicorn has bound the socket but not finished
+          // startup, so the loop exited on the first attempt in milliseconds and
+          // the recruiter got "Unable to prepare Plivo softphone" for the rest of
+          // the session. Status 0 (no response at all) is the same story.
+          // A 404/422 is a real misconfiguration and still stops immediately.
+          const worthRetrying = !lastStatus || lastStatus >= 500 || lastStatus === 401
+            || lastStatus === 403 || lastStatus === 408 || lastStatus === 429;
+          if (!worthRetrying) break;
+          // Backoff sized for a cold backend rather than a token race:
+          // 0.5s, 1s, 2s, 4s, 8s, 8s… ≈ 24s of cover.
+          const delay = Math.min(500 * 2 ** attempt, 8000);
+          await new Promise(resolve => window.setTimeout(resolve, delay));
         }
       }
       reportTiming('credentials_fetch', performance.now() - credentialsStart);
