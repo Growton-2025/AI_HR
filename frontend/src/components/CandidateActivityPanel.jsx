@@ -106,6 +106,8 @@ const PossibleVoicemailBadge = ({ size = 11 }) => (
 
 function CandidateActivityPanel({ candidateId, candidateName }) {
   const fetchCandidateActivity = useAppStore(state => state.fetchCandidateActivity);
+  const syncCallRecording = useAppStore(state => state.syncCallRecording);
+  const [syncingCallId, setSyncingCallId] = useState(null);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -135,6 +137,18 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
     setLoading(false);
     setRefreshing(false);
   }, [candidateId, fetchCandidateActivity]);
+
+  const handleSyncRecording = useCallback(async (callId) => {
+    setSyncingCallId(callId);
+    try {
+      // syncCallRecording already clears this candidate's activity cache on
+      // success, so the reload below picks up the new recording URL.
+      await syncCallRecording(callId);
+      await loadActivity({ force: true });
+    } finally {
+      setSyncingCallId(null);
+    }
+  }, [syncCallRecording, loadActivity]);
 
   useEffect(() => {
     setItems([]);
@@ -235,7 +249,27 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
                 <div style={{ marginBottom: '14px', padding: '14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
                   <audio controls src={item.recording_url} style={{ width: '100%' }} />
                 </div>
-              ) : null}
+              ) : (
+                // Plivo can take minutes to publish a recording. The Calls
+                // workspace used to offer this per call in its inline row; that
+                // row is gone, so the retry lives here or nowhere.
+                <div style={{ marginBottom: '14px', padding: '14px', borderRadius: '14px', background: '#f8fafc', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '13px', color: '#64748b' }}>Recording not available for this call yet.</span>
+                  <button
+                    onClick={() => handleSyncRecording(item.id)}
+                    disabled={syncingCallId === item.id}
+                    style={{
+                      padding: '8px 12px', borderRadius: '10px', border: '1px solid rgba(203,213,225,0.9)',
+                      background: '#fff', color: '#334155', fontSize: '12px', fontWeight: 700,
+                      cursor: syncingCallId === item.id ? 'wait' : 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: '6px', fontFamily: 'inherit',
+                    }}
+                  >
+                    <RefreshCw size={14} className={syncingCallId === item.id ? 'animate-spin' : ''} />
+                    {syncingCallId === item.id ? 'Syncing…' : 'Sync Recording'}
+                  </button>
+                </div>
+              )}
 
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 16px', marginBottom: '14px', fontSize: '13px', color: '#475569' }}>
                 <div><strong>From:</strong> {item.from_number || 'N/A'}</div>

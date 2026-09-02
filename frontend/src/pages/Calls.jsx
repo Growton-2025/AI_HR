@@ -7,6 +7,7 @@ import CandidateActivityPanel, { OutcomeBadge, PossibleVoicemailBadge, formatDat
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
+import CandidateConversationModal from '../components/CandidateConversationModal';
 import { SelectFilter } from '../components/FilterComponents';
 import {
   RANGE_OPTIONS, RANGE_DROPDOWN_OPTIONS, OUTCOME_GROUP_OPTIONS,
@@ -842,7 +843,8 @@ export default function Calls() {
   const [pendingInboundId, setPendingInboundId] = useState(null);
   const [inboundRefreshKey, setInboundRefreshKey] = useState(0);
   const [inboundHistoryCandidate, setInboundHistoryCandidate] = useState(null);
-  const [expandedCallId, setExpandedCallId] = useState(null);
+  // The call row whose candidate is open in the insights popup.
+  const [insightsCall, setInsightsCall] = useState(null);
   const [syncingCallId, setSyncingCallId] = useState(null);
   const [deletingCallIds, setDeletingCallIds] = useState(() => new Set());
   const [deletingListIds, setDeletingListIds] = useState(() => new Set());
@@ -1629,7 +1631,6 @@ export default function Calls() {
                   {!showCallsLoading && (filteredCalls || []).map(call => {
                     const isDeletingCall = deletingCallIds.has(call.id);
                     const isTogglingCadence = togglingCadenceIds.has(call.candidate_id);
-                    const isExpanded = expandedCallId === call.id;
                     // Completed calls stay dialable: recruiters need to call a
                     // candidate back after a finished attempt (a callback, a
                     // follow-up, or simply reaching someone who did not pick up
@@ -1725,14 +1726,14 @@ export default function Calls() {
                             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                               {call.status === 'completed' && (
                                 <button
-                                  onClick={() => setExpandedCallId(isExpanded ? null : call.id)}
+                                  onClick={() => setInsightsCall(call)}
                                   style={{
                                     padding: '7px 12px', borderRadius: '10px', fontSize: '12px', fontWeight: 700,
                                     background: '#fff', color: '#334155', border: '1px solid rgba(203,213,225,0.9)', cursor: 'pointer',
                                     display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap'
                                   }}
                                 >
-                                  {isExpanded ? 'Hide Details' : 'View Insights'}
+                                  View Insights
                                 </button>
                               )}
                               <button
@@ -1771,116 +1772,6 @@ export default function Calls() {
                             </div>
                           </td>
                         </tr>
-                        {isExpanded && (
-                          <tr>
-                            <td colSpan={CALLS_TABLE_COL_COUNT} style={{ padding: 0, borderBottom: '1px solid #f1f5f9' }}>
-                              <div className="calls-expanded-details" style={{
-                                padding: '20px', background: '#f8fafc', margin: '0 16px 16px',
-                                borderRadius: '16px', border: '1.5px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '20px'
-                              }}>
-                                <div style={{ background: '#fff', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center', marginBottom: '12px' }}>
-                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Call Recording</h4>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                                      {call.recording_url && (
-                                        <a
-                                          href={call.recording_url}
-                                          target="_blank"
-                                          rel="noreferrer"
-                                          style={{ fontSize: '12px', fontWeight: 700, color: 'var(--accent-primary)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
-                                        >
-                                          <ExternalLink size={14} />
-                                          Open Recording
-                                        </a>
-                                      )}
-                                      {!call.recording_url && (
-                                        <button
-                                          onClick={() => handleSyncRecording(call.id)}
-                                          disabled={syncingCallId === call.id}
-                                          style={{
-                                            padding: '8px 12px',
-                                            borderRadius: '10px',
-                                            border: '1px solid rgba(203,213,225,0.9)',
-                                            background: '#fff',
-                                            color: '#334155',
-                                            fontSize: '12px',
-                                            fontWeight: 700,
-                                            cursor: syncingCallId === call.id ? 'wait' : 'pointer',
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: '6px'
-                                          }}
-                                        >
-                                          <RefreshCw size={14} style={{ animation: syncingCallId === call.id ? 'spin 1s linear infinite' : 'none' }} />
-                                          {syncingCallId === call.id ? 'Syncing...' : 'Sync Recording'}
-                                        </button>
-                                      )}
-                                    </div>
-                                  </div>
-                                  {call.recording_url ? (
-                                    <audio controls src={call.recording_url} style={{ width: '100%' }} />
-                                  ) : (
-                                    <div style={{ color: '#64748b', fontSize: '13px' }}>
-                                      Recording not available for this call yet.
-                                    </div>
-                                  )}
-                                  {(call.recording_source || call.recording_synced_at) && (
-                                    <div style={{ marginTop: '10px', fontSize: '12px', color: '#94a3b8' }}>
-                                      {call.recording_source ? `Source: ${call.recording_source}` : ''}
-                                      {call.recording_source && call.recording_synced_at ? ' • ' : ''}
-                                      {call.recording_synced_at ? `Synced ${formatDateTime(call.recording_synced_at)}` : ''}
-                                    </div>
-                                  )}
-                                </div>
-
-                                {call.notes && (
-                                  <div style={{ background: '#f8fafc', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Recruiter Notes</h4>
-                                    <div style={{ fontSize: '13px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
-                                      {call.notes}
-                                    </div>
-                                  </div>
-                                )}
-
-                                <div className="calls-insights-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-                                  <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '12px' }}>
-                                      <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', margin: 0 }}>AI Summary</h4>
-                                      <SentimentBadge sentiment={call.sentiment} reason={call.sentiment_reason} />
-                                    </div>
-                                    <div style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
-                                      {call.summary || (call.recording_url ? 'Processing summary...' : 'No summary available.')}
-                                    </div>
-                                    {call.sentiment_reason && (
-                                      <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px dashed #e2e8f0', fontSize: '12px', color: '#94a3b8', fontStyle: 'italic' }}>
-                                        “{call.sentiment_reason}”
-                                      </div>
-                                    )}
-                                  </div>
-                                  <div style={{ background: '#fff', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-                                    <h4 style={{ fontSize: '12px', fontWeight: 800, color: '#64748b', textTransform: 'uppercase', marginBottom: '12px', letterSpacing: '0.05em' }}>Full Transcript</h4>
-                                    <div style={{
-                                      fontSize: '13px', color: '#64748b', lineHeight: '1.6', height: '200px', overflowY: 'auto',
-                                      paddingRight: '12px'
-                                    }}>
-                                      {call.transcript ? (
-                                        <TranscriptView
-                                          transcript={call.transcript}
-                                          candidateName={call.candidate_name}
-                                          recruiterName={recruiterDisplayName(call)}
-                                        />
-                                      ) : (
-                                        <div style={{ whiteSpace: 'pre-wrap' }}>
-                                          {call.recording_url ? 'Transcribing call...' : 'No transcript available.'}
-                                        </div>
-                                      )}
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
                       </React.Fragment>
                     );
                   })}
@@ -1897,6 +1788,27 @@ export default function Calls() {
           </div>
         )}
       </div>
+
+      {insightsCall && (
+        <CandidateConversationModal
+          candidate={{
+            id: insightsCall.candidate_id,
+            name: insightsCall.candidate_name,
+            first_name: (insightsCall.candidate_name || '').split(' ')[0],
+            status: statusOverrides[insightsCall.candidate_id] ?? insightsCall.candidate_status,
+            linkedin: insightsCall.candidate_linkedin,
+          }}
+          // Resolved server-side from the candidate's most recent outreach row;
+          // null when they belong to no role, where the modal says so rather than
+          // firing a request that would 422.
+          roleId={insightsCall.candidate_role_id || null}
+          initialPlatform="calls"
+          onClose={() => setInsightsCall(null)}
+          updateStatus={updateCandidateStatus}
+          onStatusChanged={(candidateId, status) =>
+            setStatusOverrides(previous => ({ ...previous, [candidateId]: status }))}
+        />
+      )}
 
       {callingCandidate && (
         <CallingModal

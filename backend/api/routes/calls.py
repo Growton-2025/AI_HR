@@ -346,11 +346,32 @@ CALLS_SELECT_QUERY = """
         c.sentiment,
         c.sentiment_reason,
         COALESCE(c.likely_voicemail, FALSE),
-        COALESCE(cand.cadence_paused, FALSE)
+        COALESCE(cand.cadence_paused, FALSE),
+        cand_role.recruitment_role_id
     FROM calls c
     JOIN call_lists cl ON c.list_id = cl.id
     JOIN candidates cand ON c.candidate_id = cand.id
+    -- The calls domain has no role of its own (call_lists carries none), but the
+    -- conversation modal's email/LinkedIn threads are stored per role. Resolve the
+    -- candidate's most recently touched role so opening a call row can show those
+    -- threads instead of "open this candidate from a role".
+    LEFT JOIN LATERAL (
+        SELECT co.recruitment_role_id
+        FROM candidate_outreach co
+        WHERE co.candidate_id = c.candidate_id
+          AND co.recruitment_role_id IS NOT NULL
+        ORDER BY co.updated_at DESC NULLS LAST
+        LIMIT 1
+    ) cand_role ON TRUE
 """
+
+
+def _row_col(row, index):
+    """Positional column read that tolerates a row narrower than expected."""
+    try:
+        return row[index]
+    except (IndexError, TypeError):
+        return None
 
 
 def call_row_to_dict(row) -> dict:
@@ -391,6 +412,10 @@ def call_row_to_dict(row) -> dict:
         "sentiment_reason": row[32],
         "likely_voicemail": bool(row[33]),
         "cadence_paused": bool(row[34]),
+        # Appended last, and read defensively: this module maps query results
+        # positionally, so any caller holding a row from a narrower SELECT should
+        # simply lack the field rather than raise IndexError.
+        "candidate_role_id": _row_col(row, 35),
     }
 
 
@@ -924,6 +949,11 @@ class CallResponse(BaseModel):
     candidate_notes: Optional[str] = None
     candidate_status: Optional[str] = None
     candidate_linkedin: Optional[str] = None
+    # The candidate's most recent role, resolved in CALLS_SELECT_QUERY. Declared
+    # here because the route sets response_model=List[CallResponse] and FastAPI
+    # drops any field the model does not declare — the column reached the dict
+    # and was then silently filtered out of the JSON.
+    candidate_role_id: Optional[int] = None
     sentiment: Optional[str] = None
     sentiment_reason: Optional[str] = None
     likely_voicemail: Optional[bool] = False

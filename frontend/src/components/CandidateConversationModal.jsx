@@ -63,9 +63,14 @@ export default function CandidateConversationModal({
   onClose,
   updateStatus,
   onStatusChanged,
+  // Which tab to open on. The Calls workspace opens this modal from a call row,
+  // where the calls timeline is what the recruiter asked to see; without this the
+  // modal would land on email/LinkedIn and bury the reason it was opened.
+  initialPlatform,
 }) {
-  const defaultPlatform = candidate?.li_response_text || candidate?.li_status === 'replied' ? 'linkedin' : 'email'
-  const [platform, setPlatform] = useState(defaultPlatform)
+  const derivedPlatform = candidate?.li_response_text || candidate?.li_status === 'replied' ? 'linkedin' : 'email'
+  const openingPlatform = initialPlatform || derivedPlatform
+  const [platform, setPlatform] = useState(openingPlatform)
   const [threads, setThreads] = useState({ email: EMPTY_THREAD, linkedin: EMPTY_THREAD })
   const [replyText, setReplyText] = useState('')
   const [sending, setSending] = useState(false)
@@ -119,12 +124,16 @@ export default function CandidateConversationModal({
   }, [candidate.id, fetchChatHistory, roleId])
 
   useEffect(() => {
-    setPlatform(defaultPlatform)
+    setPlatform(openingPlatform)
     setThreads({ email: EMPTY_THREAD, linkedin: EMPTY_THREAD })
     setReplyText('')
-    void loadThread(defaultPlatform)
-    void loadThread(defaultPlatform === 'email' ? 'linkedin' : 'email')
-  }, [candidate.id, defaultPlatform, loadThread])
+    // Only email and linkedin are message threads. 'calls' is a valid opening
+    // tab but has no thread to fetch — its timeline loads inside
+    // CandidateActivityPanel — so prefetch the two real threads regardless of
+    // which tab is showing, derived one first so the likelier tab fills sooner.
+    void loadThread(derivedPlatform)
+    void loadThread(derivedPlatform === 'email' ? 'linkedin' : 'email')
+  }, [candidate.id, openingPlatform, derivedPlatform, loadThread])
 
   const activeThread = threads[platform] || EMPTY_THREAD
   const messages = activeThread.messages || []
