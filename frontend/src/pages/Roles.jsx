@@ -141,6 +141,11 @@ function Roles() {
         // Global Outreach Cache
         outreachStatusCache,
         fetchOutreachStatus,
+        // Selected from the store below but never destructured here, so every
+        // reference to it threw ReferenceError: the manual "Sync Responses"
+        // button failed on click, and the auto-sync effect — which names it in a
+        // dependency array evaluated on every render — took the whole page down.
+        syncOutreachResponses,
         removeCandidateFromRole,
         invalidateTalentPoolCaches,
         rolesLastFetchedAt,
