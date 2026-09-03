@@ -3181,6 +3181,26 @@ export const useAppStore = create(persist((set, get) => ({
         return request
     },
 
+    // Recordings Plivo still holds that the app can no longer show, because the
+    // call row that linked them to this candidate was deleted. Deliberately not
+    // cached: it is an explicit "go and look" action, and a stale empty result
+    // would be indistinguishable from nothing to recover.
+    fetchRecoverableRecordings: async (candidateId, days = 30) => {
+        try {
+            const res = await axios.get(
+                `${API_BASE}/calls/candidates/${candidateId}/recoverable-recordings`,
+                { params: { days }, timeout: CALL_REQUEST_TIMEOUT_MS },
+            )
+            return { success: true, recordings: res.data?.recordings || [] }
+        } catch (error) {
+            const detail = error?.response?.data?.detail
+            return {
+                success: false,
+                error: typeof detail === 'string' ? detail : 'Could not search for recordings',
+            }
+        }
+    },
+
     fetchCandidateActivity: async (candidateId, options = {}) => {
         const force = typeof options === 'boolean' ? options : options.force === true
         const maxAgeMs = 15 * 1000
