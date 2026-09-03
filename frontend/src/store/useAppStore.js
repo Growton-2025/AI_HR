@@ -3181,17 +3181,34 @@ export const useAppStore = create(persist((set, get) => ({
         return request
     },
 
-    // Recordings Plivo still holds that the app can no longer show, because the
-    // call row that linked them to this candidate was deleted. Deliberately not
-    // cached: it is an explicit "go and look" action, and a stale empty result
-    // would be indistinguishable from nothing to recover.
-    fetchRecoverableRecordings: async (candidateId, days = 30) => {
+    // Rebuild call rows for recordings Plivo still holds but this timeline can
+    // no longer show, because the row that linked them to the candidate was
+    // deleted. Deliberately not cached: it is an explicit "go and look" action,
+    // and a stale empty result would be indistinguishable from nothing to
+    // recover. Idempotent server-side, so a second click restores nothing new.
+    recoverRecordings: async (candidateId, days = 30) => {
         try {
-            const res = await axios.get(
-                `${API_BASE}/calls/candidates/${candidateId}/recoverable-recordings`,
+            const res = await axios.post(
+                `${API_BASE}/calls/candidates/${candidateId}/recover-recordings`,
+                null,
                 { params: { days }, timeout: CALL_REQUEST_TIMEOUT_MS },
             )
-            return { success: true, recordings: res.data?.recordings || [] }
+            // Restored rows are real calls now, so the cached timeline is stale.
+            set(state => {
+                const activityCache = { ...state.candidateActivityCache }
+                const activityFetchedAt = { ...state.candidateActivityFetchedAt }
+                delete activityCache[candidateId]
+                delete activityFetchedAt[candidateId]
+                return {
+                    candidateActivityCache: activityCache,
+                    candidateActivityFetchedAt: activityFetchedAt,
+                }
+            })
+            return {
+                success: true,
+                recovered: res.data?.recovered || 0,
+                recordings: res.data?.recordings || [],
+            }
         } catch (error) {
             const detail = error?.response?.data?.detail
             return {

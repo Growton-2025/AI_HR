@@ -107,10 +107,14 @@ const PossibleVoicemailBadge = ({ size = 11 }) => (
 function CandidateActivityPanel({ candidateId, candidateName }) {
   const fetchCandidateActivity = useAppStore(state => state.fetchCandidateActivity);
   const syncCallRecording = useAppStore(state => state.syncCallRecording);
-  const fetchRecoverableRecordings = useAppStore(state => state.fetchRecoverableRecordings);
-  // Recordings Plivo still has but this timeline cannot show, because the call
-  // row that linked them to the candidate was deleted. null = not searched yet.
+  const recoverRecordings = useAppStore(state => state.recoverRecordings);
+  // Outcome of the last "Find missing" run: recordings Plivo still had but this
+  // timeline could not show, because the call row that linked them to the
+  // candidate was deleted. null = not searched yet.
   const [recoverable, setRecoverable] = useState(null);
+  // A failed search must never render as "nothing to recover" — that reads as
+  // proof the audio is gone when in fact we never managed to ask Plivo.
+  const [recoverError, setRecoverError] = useState('');
   const [searchingRecoverable, setSearchingRecoverable] = useState(false);
   const [syncingCallId, setSyncingCallId] = useState(null);
   const [items, setItems] = useState([]);
@@ -157,13 +161,30 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
 
   const handleFindMissing = useCallback(async () => {
     setSearchingRecoverable(true);
+    setRecoverError('');
     try {
-      const res = await fetchRecoverableRecordings(candidateId);
-      setRecoverable(res.success ? res.recordings : []);
+      const res = await recoverRecordings(candidateId);
+      if (!res.success) {
+        setRecoverable(null);
+        setRecoverError(res.error || 'Could not search for recordings');
+        return;
+      }
+      setRecoverable(res.recordings);
+      // Recovered rows are ordinary calls now, so the point of the box above is
+      // only to say what happened — the audio itself belongs in the timeline.
+      if (res.recovered) {
+        await loadActivity({ force: true });
+      }
     } finally {
       setSearchingRecoverable(false);
     }
-  }, [candidateId, fetchRecoverableRecordings]);
+  }, [candidateId, recoverRecordings, loadActivity]);
+
+  // A different candidate's panel must not inherit the previous one's result.
+  useEffect(() => {
+    setRecoverable(null);
+    setRecoverError('');
+  }, [candidateId]);
 
   useEffect(() => {
     setItems([]);
@@ -228,35 +249,32 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
         </button>
       </div>
 
+      {recoverError && (
+        <div style={{ margin: '0 24px', marginTop: '16px', padding: '16px', borderRadius: '14px',
+                      background: '#fef2f2', border: '1px solid #fecaca' }}>
+          <div style={{ fontSize: '13px', fontWeight: 700, color: '#b91c1c' }}>
+            Could not check Plivo: {recoverError}
+          </div>
+          <div style={{ fontSize: '12px', color: '#7f1d1d', marginTop: 6 }}>
+            This does not mean the audio is gone — the search itself failed. Try again.
+          </div>
+        </div>
+      )}
+
       {recoverable !== null && (
         <div style={{ margin: '0 24px', marginTop: '16px', padding: '16px', borderRadius: '14px',
                       background: recoverable.length ? '#fff7ed' : '#f8fafc',
                       border: `1px solid ${recoverable.length ? '#fed7aa' : '#e2e8f0'}` }}>
-          <div style={{ fontSize: '12px', fontWeight: 800, color: '#9a3412', marginBottom: recoverable.length ? 10 : 0 }}>
-            {recoverable.length
-              ? `${recoverable.length} recording${recoverable.length === 1 ? '' : 's'} found in Plivo but missing from this timeline`
-              : null}
-          </div>
-          {recoverable.length === 0 && (
+          {recoverable.length ? (
+            <div style={{ fontSize: '13px', fontWeight: 700, color: '#9a3412' }}>
+              Recovered {recoverable.length} recording{recoverable.length === 1 ? '' : 's'} from
+              Plivo — {recoverable.length === 1 ? 'it is' : 'they are'} back in the timeline below.
+            </div>
+          ) : (
             <div style={{ fontSize: '13px', color: '#64748b' }}>
               No orphaned recordings — everything Plivo has for this candidate is already shown above.
             </div>
           )}
-          {recoverable.map(rec => (
-            <div key={rec.recording_id} style={{ marginBottom: '12px' }}>
-              <div style={{ fontSize: '12px', color: '#7c2d12', fontWeight: 700, marginBottom: 6 }}>
-                {formatDateTime(rec.recorded_at)} · {Math.floor((rec.duration_seconds || 0) / 60)}m
-                {String((rec.duration_seconds || 0) % 60).padStart(2, '0')}s
-              </div>
-              {/* Plivo requires auth on the media URL, so an inline <audio> tag
-                  cannot play it — hand over the link instead of a dead player. */}
-              <a href={rec.recording_url} target="_blank" rel="noreferrer"
-                 style={{ fontSize: '13px', fontWeight: 700, color: 'var(--accent-primary, #f97316)',
-                          textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                <ExternalLink size={13} /> Open recording in Plivo
-              </a>
-            </div>
-          ))}
         </div>
       )}
 

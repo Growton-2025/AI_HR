@@ -2748,24 +2748,17 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
             return_db_connection(conn)
 
 
-@router.get("/candidates/{candidate_id}/recoverable-recordings")
-def recoverable_recordings(
-    candidate_id: int,
-    days: int = 45,
-    current_user: schemas.User = Depends(deps.get_current_user),
-):
-    """Recordings Plivo still holds for this candidate that the app cannot show.
+def _orphaned_plivo_recordings(candidate_id: int, days: int = 30):
+    """Recordings Plivo still holds that no live call row points at.
 
-    A deleted call row severs the only link between a candidate and their audio,
-    even though Plivo keeps the file. Recovering one used to mean hand-querying
-    the Plivo API, which is only possible if someone knows to ask.
-
-    Two Plivo API traps this works around, both of which silently return nothing
-    rather than erroring:
+    Two Plivo API traps, both of which silently return nothing rather than
+    erroring, and both of which cost real time to find:
       * /Call/ ignores unfiltered history — it needs an explicit window of at
         most one month, formatted 'YYYY-MM-DD HH:MM:SS'. Any other format 400s.
       * /Recording/?call_uuid=... returns [] even when the recording exists.
         Listing by add_time and matching on to_number is what actually works.
+
+    Returns (candidate_name, phone_tail, [recording dicts]).
     """
     import requests as _requests
 
@@ -2788,7 +2781,6 @@ def recoverable_recordings(
             if not row:
                 raise HTTPException(status_code=404, detail="Candidate not found")
             name, phone = row[0], digits_only(row[1] or "")
-            # Recordings already attached to a live call row are not "recoverable".
             cur.execute(
                 "SELECT recording_url FROM calls "
                 "WHERE candidate_id = %s AND recording_url IS NOT NULL",
@@ -2799,12 +2791,12 @@ def recoverable_recordings(
         return_db_connection(conn)
 
     if not phone:
-        return {"candidate_id": candidate_id, "name": name, "recordings": []}
+        return name, "", []
 
     tail = phone[-10:]
     window_days = max(1, min(days, 30))
-    end = datetime.utcnow()
-    start = end - timedelta(days=window_days)
+    end_at = datetime.utcnow()
+    start_at = end_at - timedelta(days=window_days)
     fmt = "%Y-%m-%d %H:%M:%S"
 
     found, offset = [], 0
@@ -2814,8 +2806,8 @@ def recoverable_recordings(
                 f"https://api.plivo.com/v1/Account/{auth_id}/Recording/",
                 auth=(auth_id, auth_token),
                 params={
-                    "add_time__gte": start.strftime(fmt),
-                    "add_time__lte": end.strftime(fmt),
+                    "add_time__gte": start_at.strftime(fmt),
+                    "add_time__lte": end_at.strftime(fmt),
                     "limit": 20,
                     "offset": offset,
                 },
@@ -2840,17 +2832,99 @@ def recoverable_recordings(
                     "recording_url": url,
                 })
             offset += 20
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Plivo recording lookup failed for candidate %s", candidate_id)
         raise HTTPException(status_code=502, detail=f"Plivo lookup failed: {exc}")
 
     found.sort(key=lambda item: str(item.get("recorded_at")), reverse=True)
-    return {
-        "candidate_id": candidate_id,
-        "name": name,
-        "searched_days": window_days,
-        "recordings": found,
-    }
+    return name, tail, found
+
+
+@router.post("/candidates/{candidate_id}/recover-recordings")
+def recover_recordings(
+    candidate_id: int,
+    days: int = 30,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Rebuild call rows for recordings Plivo kept after their row was deleted.
+
+    Showing orphaned audio in a separate "missing" box told a recruiter their
+    history was broken without repairing it. Restoring the row instead puts the
+    call back in the timeline next to every other call, where it belongs, and it
+    stays there.
+
+    Idempotent: _orphaned_plivo_recordings excludes any recording already
+    attached to a live row, so running twice recovers nothing the second time.
+    """
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+    _name, _tail, orphans = _orphaned_plivo_recordings(candidate_id, days)
+    if not orphans:
+        return {"recovered": 0, "recordings": []}
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            # Put the call back where this candidate's other calls live; fall
+            # back to the recruiter's most recent list when they have none left.
+            cur.execute(
+                """
+                SELECT c.list_id FROM calls c
+                JOIN call_lists cl ON cl.id = c.list_id
+                WHERE c.candidate_id = %s AND LOWER(COALESCE(cl.created_by, '')) = %s
+                ORDER BY c.created_at DESC LIMIT 1
+                """,
+                (candidate_id, owner),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    "SELECT id FROM call_lists WHERE LOWER(COALESCE(created_by, '')) = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (owner,),
+                )
+                row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=409, detail="No call list available to restore into")
+            list_id = row[0]
+
+            restored = []
+            for rec in orphans:
+                cur.execute(
+                    """
+                    INSERT INTO calls
+                        (candidate_id, list_id, status, outcome, duration,
+                         recording_url, recording_source, recording_synced_at,
+                         plivo_call_uuid, completed_at, created_at, updated_at)
+                    VALUES (%s, %s, 'completed', %s, %s, %s, 'plivo_recovery', NOW(),
+                            %s, %s::timestamptz, NOW(), NOW())
+                    RETURNING id
+                    """,
+                    (
+                        candidate_id, list_id, "Recovered recording",
+                        rec["duration_seconds"], rec["recording_url"],
+                        rec["call_uuid"], rec["recorded_at"],
+                    ),
+                )
+                restored.append({**rec, "call_id": cur.fetchone()[0]})
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        logger.exception("Failed to restore recordings for candidate %s", candidate_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        return_db_connection(conn)
+
+    refresh_call_caches_async()
+    logger.info("Restored %d recording(s) for candidate %s", len(restored), candidate_id)
+    return {"recovered": len(restored), "recordings": restored}
 
 
 @router.delete("/lists/{list_id}")
