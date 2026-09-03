@@ -2756,7 +2756,12 @@ def _orphaned_plivo_recordings(candidate_id: int, days: int = 30):
       * /Call/ ignores unfiltered history — it needs an explicit window of at
         most one month, formatted 'YYYY-MM-DD HH:MM:SS'. Any other format 400s.
       * /Recording/?call_uuid=... returns [] even when the recording exists.
-        Listing by add_time and matching on to_number is what actually works.
+        Listing by add_time and matching on the phone number is what works.
+
+    The candidate's number sits on opposite sides of the call depending on who
+    dialled: to_number when we rang them, from_number when they rang us. Matching
+    to_number alone hid every inbound recording — 26 of the 45 orphans in the
+    account at the time this was fixed — so both sides are checked.
 
     Returns (candidate_name, phone_tail, [recording dicts]).
     """
@@ -2794,6 +2799,15 @@ def _orphaned_plivo_recordings(candidate_id: int, days: int = 30):
         return name, "", []
 
     tail = phone[-10:]
+    # A candidate row carrying our own Plivo line would otherwise match the
+    # far end of every call in the account and "recover" the whole log.
+    if tail and tail == digits_only(os.getenv("PLIVO_NUMBER") or "")[-10:]:
+        logger.warning(
+            "Candidate %s stores the account's own Plivo number; skipping lookup",
+            candidate_id,
+        )
+        return name, tail, []
+
     window_days = max(1, min(days, 30))
     end_at = datetime.utcnow()
     start_at = end_at - timedelta(days=window_days)
@@ -2819,7 +2833,9 @@ def _orphaned_plivo_recordings(candidate_id: int, days: int = 30):
             if not objects:
                 break
             for item in objects:
-                if digits_only(str(item.get("to_number") or ""))[-10:] != tail:
+                to_tail = digits_only(str(item.get("to_number") or ""))[-10:]
+                from_tail = digits_only(str(item.get("from_number") or ""))[-10:]
+                if tail not in (to_tail, from_tail):
                     continue
                 url = item.get("recording_url")
                 if not url or url in known:
@@ -2896,11 +2912,19 @@ def recover_recordings(
             for rec in orphans:
                 cur.execute(
                     """
+                    -- recording_synced_at is left NULL on purpose. Despite the
+                    -- name it is not a record of when we fetched the audio: it
+                    -- is the cross-worker lock claim_insights_run() takes
+                    -- before transcribing. Stamping it NOW() here handed the
+                    -- new row a transcription claim nobody was using, so the
+                    -- first "sync recording" on a recovered call answered
+                    -- "insights already running" and did nothing for the 15
+                    -- minutes it took the claim to go stale.
                     INSERT INTO calls
                         (candidate_id, list_id, status, outcome, duration,
-                         recording_url, recording_source, recording_synced_at,
+                         recording_url, recording_source,
                          plivo_call_uuid, completed_at, created_at, updated_at)
-                    VALUES (%s, %s, 'completed', %s, %s, %s, 'plivo_recovery', NOW(),
+                    VALUES (%s, %s, 'completed', %s, %s, %s, 'plivo_recovery',
                             %s, %s::timestamptz, NOW(), NOW())
                     RETURNING id
                     """,
