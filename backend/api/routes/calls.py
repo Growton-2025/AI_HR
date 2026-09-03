@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend.api import deps, schemas
 from backend.db.connection import get_db_connection, return_db_connection, get_db_connection_context
 from backend.services.call_artifacts import (
+    digits_only,
     extract_transcript_text,
     is_placeholder_summary,
     transcript_preview,
@@ -1005,6 +1006,8 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'calls' AND column_name = 'dial_token')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'plivo_app_state')
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'deleted_calls')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'plivo_endpoints' AND column_name = 'env_key')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
@@ -1152,6 +1155,35 @@ def ensure_calls_schema_ready(force: bool = False):
             # events living there would corrupt every one of those.
             # plivo_call_uuid is UNIQUE because Plivo retries webhooks and may
             # deliver the same callback more than once — it is the idempotency key.
+            # Nothing that has already happened should be destroyable by a
+            # single click. A recruiter removing a candidate from a call list
+            # used to hard-DELETE the row, taking the completed calls, their
+            # recording URLs and transcripts with it — recoverable only by
+            # hand-searching Plivo, and only if someone noticed. Deletes now copy
+            # the row here first, with who did it and when.
+            #
+            # An archive rather than a deleted_at flag on `calls`: the live table
+            # is read from sixteen places across two modules and guarded by a
+            # partial unique index on pending rows, so a soft-delete column would
+            # have to be threaded through every one of them, and a single missed
+            # filter silently resurrects a deleted call.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deleted_calls (
+                    archive_id SERIAL PRIMARY KEY,
+                    deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    deleted_by VARCHAR(255),
+                    delete_reason VARCHAR(64),
+                    call_row JSONB NOT NULL
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ix_deleted_calls_candidate "
+                "ON deleted_calls (((call_row->>'candidate_id')::int));"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS ix_deleted_calls_at ON deleted_calls (deleted_at DESC);"
+            )
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS inbound_calls (
                     id SERIAL PRIMARY KEY,
@@ -2643,6 +2675,25 @@ def get_call_stats(
         return_db_connection(conn)
 
 
+def _archive_calls(cur, where_sql: str, params: tuple, deleted_by: str, reason: str) -> int:
+    """Copy call rows into deleted_calls before they are removed.
+
+    Stores the whole row as JSON so the archive keeps working when `calls` gains
+    columns, and so a restore never has to guess at a column list. Returns the
+    number archived.
+    """
+    cur.execute(
+        f"""
+        INSERT INTO deleted_calls (deleted_by, delete_reason, call_row)
+        SELECT %s, %s, to_jsonb(c) FROM calls c WHERE {where_sql}
+        """,
+        (deleted_by, reason, *params),
+    )
+    # rowcount is informational here, and not every cursor implementation the
+    # callers pass in exposes it — the archive itself is what matters.
+    return getattr(cur, "rowcount", 0) or 0
+
+
 @router.delete("/{call_id}")
 def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_current_user)):
     ensure_calls_schema_ready()
@@ -2654,6 +2705,12 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
     cur = None
     try:
         cur = conn.cursor()
+        scope_sql = """c.id = %s
+              AND c.list_id IN (
+                  SELECT id FROM call_lists
+                  WHERE LOWER(COALESCE(created_by, '')) = %s
+              )"""
+        _archive_calls(cur, scope_sql, (call_id, owner), current_user.email or owner, "call_removed")
         cur.execute(
             """
             DELETE FROM calls
@@ -2691,6 +2748,111 @@ def delete_call(call_id: int, current_user: schemas.User = Depends(deps.get_curr
             return_db_connection(conn)
 
 
+@router.get("/candidates/{candidate_id}/recoverable-recordings")
+def recoverable_recordings(
+    candidate_id: int,
+    days: int = 45,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Recordings Plivo still holds for this candidate that the app cannot show.
+
+    A deleted call row severs the only link between a candidate and their audio,
+    even though Plivo keeps the file. Recovering one used to mean hand-querying
+    the Plivo API, which is only possible if someone knows to ask.
+
+    Two Plivo API traps this works around, both of which silently return nothing
+    rather than erroring:
+      * /Call/ ignores unfiltered history — it needs an explicit window of at
+        most one month, formatted 'YYYY-MM-DD HH:MM:SS'. Any other format 400s.
+      * /Recording/?call_uuid=... returns [] even when the recording exists.
+        Listing by add_time and matching on to_number is what actually works.
+    """
+    import requests as _requests
+
+    auth_id = os.getenv("PLIVO_AUTH_ID")
+    auth_token = os.getenv("PLIVO_AUTH_TOKEN")
+    if not auth_id or not auth_token:
+        raise HTTPException(status_code=503, detail="Plivo is not configured")
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, COALESCE(NULLIF(TRIM(mobile_phone), ''), phone) "
+                "FROM candidates WHERE id = %s",
+                (candidate_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Candidate not found")
+            name, phone = row[0], digits_only(row[1] or "")
+            # Recordings already attached to a live call row are not "recoverable".
+            cur.execute(
+                "SELECT recording_url FROM calls "
+                "WHERE candidate_id = %s AND recording_url IS NOT NULL",
+                (candidate_id,),
+            )
+            known = {r[0] for r in cur.fetchall() if r[0]}
+    finally:
+        return_db_connection(conn)
+
+    if not phone:
+        return {"candidate_id": candidate_id, "name": name, "recordings": []}
+
+    tail = phone[-10:]
+    window_days = max(1, min(days, 30))
+    end = datetime.utcnow()
+    start = end - timedelta(days=window_days)
+    fmt = "%Y-%m-%d %H:%M:%S"
+
+    found, offset = [], 0
+    try:
+        while offset < 500:
+            response = _requests.get(
+                f"https://api.plivo.com/v1/Account/{auth_id}/Recording/",
+                auth=(auth_id, auth_token),
+                params={
+                    "add_time__gte": start.strftime(fmt),
+                    "add_time__lte": end.strftime(fmt),
+                    "limit": 20,
+                    "offset": offset,
+                },
+                timeout=25,
+            )
+            if response.status_code != 200:
+                break
+            objects = response.json().get("objects", [])
+            if not objects:
+                break
+            for item in objects:
+                if digits_only(str(item.get("to_number") or ""))[-10:] != tail:
+                    continue
+                url = item.get("recording_url")
+                if not url or url in known:
+                    continue
+                found.append({
+                    "recording_id": item.get("recording_id"),
+                    "call_uuid": item.get("call_uuid"),
+                    "recorded_at": item.get("add_time"),
+                    "duration_seconds": int(float(item.get("recording_duration_ms") or 0) / 1000),
+                    "recording_url": url,
+                })
+            offset += 20
+    except Exception as exc:
+        logger.exception("Plivo recording lookup failed for candidate %s", candidate_id)
+        raise HTTPException(status_code=502, detail=f"Plivo lookup failed: {exc}")
+
+    found.sort(key=lambda item: str(item.get("recorded_at")), reverse=True)
+    return {
+        "candidate_id": candidate_id,
+        "name": name,
+        "searched_days": window_days,
+        "recordings": found,
+    }
+
+
 @router.delete("/lists/{list_id}")
 def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get_current_user)):
     ensure_calls_schema_ready()
@@ -2713,6 +2875,20 @@ def delete_call_list(list_id: int, current_user: schemas.User = Depends(deps.get
             (list_id, owner),
         )
         deleted_call_count = cur.fetchone()[0] or 0
+
+        # calls.list_id is ON DELETE CASCADE, so dropping a list silently takes
+        # every call in it — recordings and transcripts included. Archive them
+        # first; the cascade cannot be intercepted afterwards.
+        _archive_calls(
+            cur,
+            """c.list_id = %s
+              AND c.list_id IN (
+                  SELECT id FROM call_lists WHERE LOWER(COALESCE(created_by, '')) = %s
+              )""",
+            (list_id, owner),
+            current_user.email or owner,
+            "list_deleted",
+        )
 
         cur.execute(
             """

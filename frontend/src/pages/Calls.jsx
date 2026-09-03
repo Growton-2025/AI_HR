@@ -1065,7 +1065,11 @@ export default function Calls() {
 
   const handleDeleteCall = async (callId) => {
     if (deletingCallIds.has(callId)) return;
-    if (!window.confirm('Remove this candidate from the call list?')) return;
+    const call = (calls || []).find(c => c.id === callId);
+    const completedNote = call?.status === 'completed'
+      ? '\n\nThis call is COMPLETED — removing it also removes its recording and transcript from the candidate\u2019s history.'
+      : '';
+    if (!window.confirm(`Remove this call from the list?${completedNote}`)) return;
     setDeletingCallIds(prev => new Set(prev).add(callId));
     try {
       const res = await deleteCall(callId);
