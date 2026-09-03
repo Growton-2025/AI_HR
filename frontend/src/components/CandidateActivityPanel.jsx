@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Ban, CalendarClock, ClipboardList, ExternalLink, PhoneCall, PhoneIncoming,
-  PhoneMissed, PhoneOff, RefreshCw, Search, UserX, Voicemail,
+  Ban, CalendarClock, ChevronDown, ChevronUp, ClipboardList, ExternalLink,
+  PhoneCall, PhoneIncoming, PhoneMissed, PhoneOff, RefreshCw, Search, UserX,
+  Voicemail,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
+import { TranscriptView } from './TranscriptView';
 
 /**
  * The candidate's call log: every completed call with its recording, duration,
@@ -46,6 +48,12 @@ const ACTIVITY_OUTCOME_META = {
   'Unreachable': { tone: 'neutral', icon: PhoneOff },
 };
 const DEFAULT_ACTIVITY_OUTCOME_META = { tone: 'neutral', icon: PhoneIncoming };
+const TRANSCRIPT_TOGGLE_STYLE = {
+  marginTop: 10, padding: '4px 0', border: 'none', background: 'none',
+  color: 'var(--accent-primary, #f97316)', fontSize: 12, fontWeight: 700,
+  fontFamily: 'inherit', cursor: 'pointer', display: 'inline-flex',
+  alignItems: 'center', gap: 5,
+};
 const OUTCOME_PILL_BASE = { bg: '#f8fafc', border: '#e2e8f0', textColor: '#334155' };
 const OUTCOME_PILL_ICON_COLOR = { accent: 'var(--accent-primary)', neutral: '#64748b' };
 
@@ -116,6 +124,8 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
   // proof the audio is gone when in fact we never managed to ask Plivo.
   const [recoverError, setRecoverError] = useState('');
   const [searchingRecoverable, setSearchingRecoverable] = useState(false);
+  // Which calls have their full transcript open, keyed by call id.
+  const [expandedTranscripts, setExpandedTranscripts] = useState({});
   const [syncingCallId, setSyncingCallId] = useState(null);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -180,10 +190,15 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
     }
   }, [candidateId, recoverRecordings, loadActivity]);
 
+  const toggleTranscript = useCallback((callId) => {
+    setExpandedTranscripts(prev => ({ ...prev, [callId]: !prev[callId] }));
+  }, []);
+
   // A different candidate's panel must not inherit the previous one's result.
   useEffect(() => {
     setRecoverable(null);
     setRecoverError('');
+    setExpandedTranscripts({});
   }, [candidateId]);
 
   useEffect(() => {
@@ -370,10 +385,38 @@ function CandidateActivityPanel({ candidateId, candidateName }) {
                 </div>
               )}
 
-              {item.transcript_preview && (
-                <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
-                  {item.transcript_preview}
-                </div>
+              {(item.transcript || item.transcript_preview) && (
+                expandedTranscripts[item.id] ? (
+                  <div>
+                    <TranscriptView
+                      transcript={item.transcript}
+                      candidateName={candidateName}
+                      fallback={item.transcript_preview}
+                    />
+                    <button
+                      onClick={() => toggleTranscript(item.id)}
+                      style={TRANSCRIPT_TOGGLE_STYLE}
+                    >
+                      <ChevronUp size={13} /> Hide transcript
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ fontSize: '13px', color: '#64748b', lineHeight: 1.6 }}>
+                      {item.transcript_preview}
+                    </div>
+                    {/* Only offer the toggle when there is more to see — on a
+                        short call the preview already is the whole transcript. */}
+                    {item.transcript && item.transcript !== item.transcript_preview && (
+                      <button
+                        onClick={() => toggleTranscript(item.id)}
+                        style={TRANSCRIPT_TOGGLE_STYLE}
+                      >
+                        <ChevronDown size={13} /> Read full transcript
+                      </button>
+                    )}
+                  </div>
+                )
               )}
 
               {item.source_url && (

@@ -17,7 +17,7 @@ from backend.api import schemas, deps
 from backend.db.connection import (
     get_db_connection_context,
 )
-from backend.services.call_artifacts import transcript_preview
+from backend.services.call_artifacts import extract_transcript_text, transcript_preview
 from backend.services.linkedin_normalize import normalize_linkedin
 from backend.pipeline.query import (
     process_query_main,
@@ -702,7 +702,8 @@ async def get_candidate_activity(
                         c.notes,
                         c.plivo_virtual_number,
                         cand.mobile_phone,
-                        COALESCE(c.likely_voicemail, FALSE)
+                        COALESCE(c.likely_voicemail, FALSE),
+                        cand.name
                     FROM calls c
                     JOIN call_lists cl ON c.list_id = cl.id
                     JOIN candidates cand ON c.candidate_id = cand.id
@@ -722,6 +723,11 @@ async def get_candidate_activity(
     items = []
     for row in rows:
         summary = (row[6] or row[8] or "").strip() or None
+        # The stored text labels the candidate "Lead:" — whisper's own wording.
+        # extract_transcript_text swaps that for the candidate's real name and
+        # normalises the recruiter side, which is what the Calls page has always
+        # rendered; sending the raw text here is why this panel read "Lead:".
+        transcript_full = extract_transcript_text(row[7], candidate_name=row[12])
         items.append(
             {
                 "id": row[0],
@@ -732,7 +738,11 @@ async def get_candidate_activity(
                 "duration_seconds": row[4] or 0,
                 "recording_url": row[5],
                 "summary": summary,
-                "transcript_preview": transcript_preview(row[7]),
+                # The preview stays for the collapsed row; the full text is what a
+                # recruiter needs to cross-check a detail without replaying the
+                # call, and a 220-character cut is 1.5% of a 15-minute one.
+                "transcript_preview": transcript_preview(transcript_full),
+                "transcript": transcript_full,
                 "notes": (row[8] or "").strip() or None,
                 "from_number": row[9],
                 "to_number": row[10],
