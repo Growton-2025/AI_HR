@@ -1419,7 +1419,13 @@ MIN_WORDS_FOR_ANALYSIS = 12
 TRANSCRIPT_MIN_RETENTION = 0.7
 TRANSCRIPT_MAX_EXPANSION = 1.3
 
-_SPEAKER_LABEL_RE = re.compile(r"^\s*[A-Za-z][A-Za-z .'-]{0,24}:\s*", re.MULTILINE)
+# Unicode-aware, and wide enough for a real name: the label is now the
+# candidate's own name, so an ASCII-only class left "Alice Rachael Mendonca:"
+# (with a cedilla) unstripped, counted the name as spoken words, and could fail
+# transcript_is_faithful — throwing away a correctly labelled transcript.
+_SPEAKER_LABEL_RE = re.compile(
+    r"^\s*[^\W\d_][^\n:]{0,40}:\s*", re.MULTILINE | re.UNICODE
+)
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
 
@@ -1468,6 +1474,180 @@ def no_conversation_summary(duration_seconds) -> str:
             "recording contains almost no speech."
         )
     return "No conversation was captured. The recording contains almost no speech."
+
+
+# --- Dual-channel (per-leg) transcription -----------------------------------
+#
+# Plivo records each leg of a call on its own channel: channel 0 is the
+# recruiter, channel 1 is the person they called. Downmixing that to mono threw
+# away the only reliable evidence of who spoke, and left an LLM to reconstruct
+# speaker turns from the words alone. It guessed, and it got it wrong in both
+# directions — whole calls came back with the candidate's answers attributed to
+# the recruiter.
+#
+# Transcribing each channel separately and interleaving by timestamp makes
+# attribution exact rather than inferred. Inbound voicemail captures are
+# genuinely mono (one caller, no second leg); those return None here and fall
+# back to the single-file path, which is correct — there is no second speaker
+# to find.
+
+CHANNEL_SPEAKERS = ("Recruiter", "Candidate")
+
+
+def _decode_channels(audio_path: str) -> Optional[list]:
+    """De-interleaved int16 PCM per channel at 16 kHz, or None if not stereo."""
+    try:
+        import av
+        import numpy as np
+    except ImportError:
+        logger.warning("PyAV/numpy unavailable — per-channel transcription disabled")
+        return None
+
+    try:
+        with av.open(audio_path) as container:
+            stream = container.streams.audio[0]
+            if (stream.codec_context.channels or 1) < 2:
+                return None
+            resampler = av.audio.resampler.AudioResampler(
+                format="s16", layout="stereo", rate=16000,
+            )
+            chunks = []
+            for frame in container.decode(stream):
+                for resampled in resampler.resample(frame):
+                    chunks.append(resampled.to_ndarray())
+        if not chunks:
+            return None
+        data = np.concatenate(chunks, axis=1)
+        # s16 stereo decodes to a single interleaved plane.
+        if data.shape[0] == 1:
+            data = data.reshape(-1, 2).T
+        if data.shape[0] < 2:
+            return None
+        return [data[0], data[1]]
+    except Exception as exc:
+        logger.warning("Could not split channels for %s: %s", audio_path, exc)
+        return None
+
+
+def _write_mono_audio(samples, path: str, rate: int = 16000) -> None:
+    """One call leg as a compact mono MP3.
+
+    Deliberately not WAV: a single leg of a 15-minute call is 28.7 MB of raw
+    PCM, and OpenAI rejects anything over 25 MB — the first run of this came
+    back "413: Maximum content size limit exceeded" and silently fell back to
+    the mono guesswork it was meant to replace. At 32 kbps the same leg is
+    3.6 MB, which keeps roughly a hundred minutes of call inside the limit.
+    """
+    import av
+    import numpy as np
+    from fractions import Fraction
+
+    with av.open(path, "w") as out:
+        stream = out.add_stream("mp3", rate=rate)
+        stream.bit_rate = 32000
+        block = 1152 * 16          # whole MP3 frames, so nothing is padded
+        pts = 0
+        for start in range(0, len(samples), block):
+            chunk = np.ascontiguousarray(samples[start:start + block]).reshape(1, -1)
+            frame = av.AudioFrame.from_ndarray(chunk, format="s16", layout="mono")
+            frame.rate = rate
+            frame.pts = pts
+            frame.time_base = Fraction(1, rate)
+            pts += chunk.shape[1]
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+
+
+async def _transcribe_per_channel(
+    client, audio_path: str, candidate_label: str,
+) -> Optional[str]:
+    """Speaker-labelled transcript built from the two call legs, or None."""
+    channels = await asyncio.to_thread(_decode_channels, audio_path)
+    if not channels:
+        return None
+
+    speakers = ("Recruiter", candidate_label)
+    segments = []
+    tmp_paths = []
+    try:
+        for index, samples in enumerate(channels):
+            path = f"{audio_path}.ch{index}.mp3"
+            tmp_paths.append(path)
+            await asyncio.to_thread(_write_mono_audio, samples, path)
+            with open(path, "rb") as handle:
+                # verbose_json is what carries the per-segment timing that the
+                # interleave below depends on; the default response has none.
+                result = await client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=handle,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            for seg in (getattr(result, "segments", None) or []):
+                text = (getattr(seg, "text", "") or "").strip()
+                if text:
+                    segments.append((float(getattr(seg, "start", 0.0)), index, text))
+    except Exception as exc:
+        logger.warning("Per-channel transcription failed for %s: %s", audio_path, exc)
+        return None
+    finally:
+        for path in tmp_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    if not segments:
+        return None
+
+    segments.sort(key=lambda item: item[0])
+    lines = []
+    for _start, index, text in segments:
+        speaker = speakers[index]
+        if lines and lines[-1][0] == speaker:
+            lines[-1][1] = f"{lines[-1][1]} {text}".strip()
+        else:
+            lines.append([speaker, text])
+    return "\n".join(f"{speaker}: {text}" for speaker, text in lines)
+
+
+def _candidate_name_for_call(call_uuid: str) -> Optional[str]:
+    """The candidate on the other end of this call, for speaker labelling.
+
+    Looked up here rather than passed in by each caller: insights are kicked off
+    from the Plivo webhook, the manual sync endpoint and the insights route, and
+    threading a name through all three would leave whichever one was missed
+    silently emitting the generic "Lead" label again.
+    """
+    if not call_uuid:
+        return None
+    from backend.db.connection import get_db_connection, return_db_connection
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cand.name
+                FROM calls c
+                JOIN candidates cand ON cand.id = c.candidate_id
+                WHERE c.plivo_call_uuid = %s OR c.plivo_transaction_id = %s
+                ORDER BY c.created_at DESC
+                LIMIT 1
+                """,
+                (call_uuid, call_uuid),
+            )
+            row = cur.fetchone()
+            return (row[0] or "").strip() or None if row else None
+    except Exception as exc:
+        logger.warning("Could not resolve candidate name for %s: %s", call_uuid, exc)
+        return None
+    finally:
+        return_db_connection(conn)
 
 
 async def process_call_insights(call_uuid: str, record_url: str, initial_delay_seconds: int = 0, duration_seconds: int = None):
@@ -1550,6 +1730,15 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                     )
 
         raw_text = transcript.text
+
+        # Who spoke is decided by the audio, not by a model reading the words.
+        candidate_name = await asyncio.to_thread(_candidate_name_for_call, call_uuid)
+        channel_transcript = await _transcribe_per_channel(
+            client, temp_audio_path, (candidate_name or "").strip() or "Candidate",
+        )
+        if channel_transcript:
+            logger.info("Speaker labels for %s taken from the two call legs", call_uuid)
+
         os.remove(temp_audio_path)
 
         # Nothing was said, so there is nothing to analyse. Asking anyway is
@@ -1561,7 +1750,7 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
                 "storing the transcription as-is without asking for insights."
             )
             result_json = {
-                "transcript": raw_text,
+                "transcript": channel_transcript or raw_text,
                 "summary": no_conversation_summary(duration_seconds),
                 "insights": [],
                 "sentiment": None,
@@ -1569,11 +1758,14 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
             }
         else:
             logger.info("Generating insights...")
-            result_json = await _generate_call_insights(client, raw_text)
+            result_json = await _generate_call_insights(
+                client, channel_transcript or raw_text, candidate_name=candidate_name,
+            )
 
         call_insights[call_uuid] = result_json
         await _store_call_insights(
             call_uuid, record_url, raw_text, result_json, duration_seconds,
+            channel_transcript=channel_transcript,
         )
         return
     except Exception as e:
@@ -1581,11 +1773,45 @@ async def process_call_insights(call_uuid: str, record_url: str, initial_delay_s
         call_insights[call_uuid] = {"error": str(e)}
 
 
-async def _generate_call_insights(client, raw_text: str) -> dict:
+async def _generate_call_insights(
+    client, raw_text: str, candidate_name: Optional[str] = None,
+) -> dict:
+    """Split the raw transcription by speaker and analyse it.
+
+    The model is told who the candidate is. Without that it could only emit the
+    generic "Lead" label, which every downstream surface then had to rewrite,
+    and it had nothing to anchor attribution on — so on a mono recording with no
+    diarization it guessed turn boundaries and put the candidate's words in the
+    recruiter's mouth. The names people use on the call ("hi Sanjay, this is
+    Jaya") are the strongest evidence available, and the model can only use them
+    if it knows which name belongs to whom.
+    """
+    speaker_label = (candidate_name or "").strip() or "Lead"
+    identity = (
+        f'The person the recruiter called is named "{speaker_label}".'
+        if candidate_name
+        else "The name of the person the recruiter called is not known."
+    )
+
     prompt = f"""
         You are an expert AI recruiting assistant analyzing a VoIP call.
+
+        {identity}
+        There are exactly two speakers: the recruiter, and {speaker_label}.
+
         Transcript:
         {raw_text}
+
+        Attributing turns correctly matters more than anything else here. Use
+        the evidence in the words themselves:
+          - The recruiter introduces themselves, explains why they are calling,
+            describes roles, and asks the questions.
+          - {speaker_label} answers about their own experience, notice period,
+            salary and availability.
+          - When someone is addressed by name, the NEXT speaker is usually the
+            person just addressed.
+        If a turn is genuinely ambiguous, keep it with the previous speaker
+        rather than inventing an alternation.
 
         Use ONLY what appears in the transcript above. Do not add, infer or
         imagine anything that was not said. The "transcript" you return must be
@@ -1593,16 +1819,17 @@ async def _generate_call_insights(client, raw_text: str) -> dict:
         the conversation. If the transcript is too sparse to work with, return
         it unchanged and say so in the summary.
 
-        Also analyze the Lead's overall sentiment toward the opportunity discussed
-        (not the recruiter's tone) — Positive (engaged/interested), Neutral
-        (noncommittal/mixed), or Negative (uninterested/pushback/hostile) — with a
-        one-sentence reason grounded in something they actually said.
+        Also analyze {speaker_label}'s overall sentiment toward the opportunity
+        discussed (not the recruiter's tone) — Positive (engaged/interested),
+        Neutral (noncommittal/mixed), or Negative (uninterested/pushback/hostile)
+        — with a one-sentence reason grounded in something they actually said.
 
         Write in plain professional text — no emoji, no markdown formatting.
 
-        Output JSON object:
+        Output JSON object. The "speaker" field must be exactly "Recruiter" or
+        "{speaker_label}" — no other value, and never a description or role:
         {{
-            "transcript": [{{"speaker": "Recruiter" or "Lead", "text": "What they said"}}],
+            "transcript": [{{"speaker": "Recruiter" or "{speaker_label}", "text": "What they said"}}],
             "summary": "...",
             "insights": ["..."],
             "sentiment": "Positive" or "Neutral" or "Negative",
@@ -1627,7 +1854,10 @@ async def _generate_call_insights(client, raw_text: str) -> dict:
         return json.loads(match.group(0)) if match else {}
 
 
-async def _store_call_insights(call_uuid, record_url, raw_text, result_json, duration_seconds):
+async def _store_call_insights(
+    call_uuid, record_url, raw_text, result_json, duration_seconds,
+    channel_transcript: Optional[str] = None,
+):
     logger.info(f"Successfully generated direct audio insights for {call_uuid}")
 
     sentiment_raw = str(result_json.get("sentiment") or "").strip().capitalize()
@@ -1642,7 +1872,11 @@ async def _store_call_insights(call_uuid, record_url, raw_text, result_json, dur
             cur = conn.cursor()
             t_items = result_json.get("transcript")
             t_str = ""
-            if isinstance(t_items, list):
+            if channel_transcript:
+                # Built from the separated call legs: the speakers are known,
+                # not inferred, so the model's own attribution is discarded.
+                t_str = channel_transcript
+            elif isinstance(t_items, list):
                 t_str = "\n".join([f"{m.get('speaker', 'Unknown')}: {m.get('text', '')}" for m in t_items if isinstance(m, dict)])
             elif isinstance(t_items, str):
                 t_str = t_items
@@ -1660,7 +1894,15 @@ async def _store_call_insights(call_uuid, record_url, raw_text, result_json, dur
             # so a rewrite twenty times longer than the audio sailed past.
             #
             # Labels are a nicety; the words are the record.
-            if not transcript_is_faithful(raw_text, t_str):
+            #
+            # The guard is about the LLM re-emitting the conversation. A
+            # per-channel transcript is not a rewrite — it is Whisper reading
+            # the same audio one leg at a time, and it legitimately differs in
+            # wording from the mono pass (each leg is clearer on its own, and
+            # cross-talk is heard once per channel). Judging it against the mono
+            # text would throw away the only exactly-attributed transcript we
+            # have, so it is exempt.
+            if not channel_transcript and not transcript_is_faithful(raw_text, t_str):
                 logger.warning(
                     f"LLM transcript rewrite for {call_uuid} does not match the "
                     f"audio ({len(t_str)} chars vs {len(raw_text)} raw) — storing "
