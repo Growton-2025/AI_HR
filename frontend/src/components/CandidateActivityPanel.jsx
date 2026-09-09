@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { TranscriptView } from './TranscriptView';
+import { formatIstDateTime } from '../utils/istTime';
 
 /**
  * The candidate's call log: every completed call with its recording, duration,
@@ -26,14 +27,7 @@ import { TranscriptView } from './TranscriptView';
 // reads as one professional surface instead of a wall of colored chips.
 const formatDateTime = (value) => {
   if (!value) return 'Unknown';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
-  });
+  return formatIstDateTime(value) || value;
 };
 
 const ACTIVITY_OUTCOME_META = {

@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import axios from 'axios';
 import { API_BASE, BACKEND_BASE, canonicalCallsQuery, useAppStore } from '../store/useAppStore';
+import { formatIstDate, formatIstDateTime } from '../utils/istTime';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/react/shallow';
 
@@ -525,10 +526,7 @@ function ConversationHistoryPanel({ candidateId, candidateName, platform }) {
             const senderName = isCandidate ? candidateName?.split(' ')?.[0] || 'Candidate' : 'You';
             const time = msg.time || msg.created_at || msg.timestamp;
             const body = msg.email_body || msg.message || msg.text || '';
-            const formattedTime = time ? new Date(time) : null;
-            const readableTime = formattedTime && !isNaN(formattedTime.getTime())
-              ? `${formattedTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} ${formattedTime.toLocaleDateString()}`
-              : time;
+            const readableTime = time ? (formatIstDateTime(time) || time) : '';
 
             return (
               <div key={`${platform}-message-${idx}`} style={{ display: 'flex', flexDirection: 'column', alignItems: isCandidate ? 'flex-start' : 'flex-end', animation: 'msgFadeIn 0.24s ease' }}>
@@ -1533,7 +1531,7 @@ export default function Calls() {
                             <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                               <Calendar size={11} />
                               {call.status === 'completed'
-                                ? (call.completed_at ? new Date(call.completed_at).toLocaleDateString() : 'Unknown')
+                                ? (call.completed_at ? formatIstDate(call.completed_at) : 'Unknown')
                                 : `${formatLocalDate(call.due_date)}${call.due_time ? ` ${formatDueTime(call.due_time)}` : ''}`
                               }
                             </div>

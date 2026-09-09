@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { useAppStore } from '../store/useAppStore'
 import StatusDropdown from './StatusDropdown'
 import CandidateActivityPanel from './CandidateActivityPanel'
+import { formatIstDateTime } from '../utils/istTime'
 
 const EMPTY_THREAD = { messages: [], loaded: false, error: '' }
 
@@ -47,8 +48,7 @@ function messageBody(message) {
 function messageTime(message) {
   const value = message?.time || message?.created_at || message?.timestamp
   if (!value) return ''
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString()
+  return formatIstDateTime(value) || String(value)
 }
 
 function isIncomingMessage(message) {

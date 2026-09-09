@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 import { X, Download, RefreshCcw, FileText, Mail, Phone, MapPin, Linkedin, Briefcase, GraduationCap, Award, Sparkles } from 'lucide-react';
 import { API_BASE } from '../store/useAppStore';
+import { formatIstDate } from '../utils/istTime';
 
 const SECTION_TITLE = {
   fontSize: 11, fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase',
@@ -274,7 +275,7 @@ export default function ResumeModal({ open, candidate, resume, onClose, onRepars
                 {parsed.full_name || candidate?.name || 'Resume'}
               </div>
               <div style={{ fontSize: 11.5, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {resume.filename}{resume.uploaded_at ? ` · uploaded ${new Date(resume.uploaded_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}` : ''}
+                {resume.filename}{resume.uploaded_at ? ` · uploaded ${formatIstDate(resume.uploaded_at)}` : ''}
               </div>
             </div>
           </div>

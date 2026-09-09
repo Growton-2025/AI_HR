@@ -25,6 +25,7 @@ import ResumeCell from '../components/ResumeCell';
 import ResumeModal from '../components/ResumeModal';
 import useResumes from '../hooks/useResumes';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { formatIstDateTime } from '../utils/istTime';
 
 export function parseStructuredValue(val) {
   if (val == null) return null;
@@ -1180,13 +1181,7 @@ function ConversationModal({ candidate, onClose }) {
 
   const formatTime = (timeStr) => {
     if (!timeStr) return '';
-    try {
-      const d = new Date(timeStr);
-      if (isNaN(d.getTime())) return timeStr;
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ' + d.toLocaleDateString([], { month: '2-digit', day: '2-digit' });
-    } catch {
-      return timeStr;
-    }
+    return formatIstDateTime(timeStr, { day: '2-digit', month: '2-digit' }) || timeStr;
   };
 
   return (
