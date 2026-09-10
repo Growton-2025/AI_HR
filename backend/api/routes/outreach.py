@@ -7,6 +7,7 @@ import time
 import asyncio
 from datetime import datetime, timedelta, timezone as tz_module
 from typing import List, Optional, Dict
+from dateutil import parser as _date_parser
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from backend.api import schemas, deps
@@ -124,29 +125,16 @@ def _sync_li_messages(
                 if raw_body:
                     msg["email_body"] = _clean_email_body(raw_body)
 
-        # HeyReach's own chatroom API can redeliver the same message; never
-        # cache/persist a run of identical adjacent messages.
         messages = _dedupe_consecutive_messages(messages)
 
-        # Carry forward locally-echoed sent messages the provider hasn't
-        # ingested yet — a fresh fetch must not make a just-sent message
-        # vanish. Once the provider's copy contains the text, the echo drops.
+        # The chatroom endpoint can lag the listing-based thread by hours and
+        # doesn't know about just-sent echoes: merge by content instead of
+        # preferring whichever list is longer (a longer list was how a stale,
+        # duplicate-laden thread kept overwriting a clean fetch).
         if messages:
             with _li_chat_lock:
-                previous_messages = (_li_chat_cache.get(candidate_id) or {}).get("messages", [])
-            fetched_bodies = {str(m.get("email_body") or "").strip() for m in messages}
-            surviving_echoes = []
-            seen_echo_bodies = set()
-            for m in previous_messages:
-                if not m.get("local_echo"):
-                    continue
-                body = str(m.get("email_body") or "").strip()
-                if body in fetched_bodies or body in seen_echo_bodies:
-                    continue
-                seen_echo_bodies.add(body)
-                surviving_echoes.append(m)
-            if surviving_echoes:
-                messages = messages + surviving_echoes
+                previous_messages = list((_li_chat_cache.get(candidate_id) or {}).get("messages", []))
+            messages = _merge_li_thread(previous_messages, messages)
     except Exception as e:
         print(f"WARNING: HeyReach sync failed for cand {candidate_id}: {e}")
 
@@ -157,24 +145,7 @@ def _sync_li_messages(
             old_messages = _li_chat_cache[candidate_id].get("messages", [])
             if old_messages:
                 print(f"DEBUG: Preserving {len(old_messages)} existing messages for cand {candidate_id} after empty/failed sync.")
-                final_messages = old_messages
-        # The chatroom endpoint can lag the reply poller's listing-based
-        # thread by HOURS — a shorter chatroom fetch must never replace a
-        # longer thread we already hold (memory or DB blob writes below).
-        if final_messages and candidate_id in _li_chat_cache:
-            existing = _li_chat_cache[candidate_id].get("messages", [])
-            if len(existing) > len(final_messages):
-                print(
-                    f"DEBUG: Keeping {len(existing)}-msg thread for cand {candidate_id}; "
-                    f"fetch returned only {len(final_messages)} (chatroom lag)."
-                )
-                final_messages = existing
-
-        # The two fallbacks above pull from in-memory state that predates
-        # this fix (a long-lived worker can still hold a pre-fix, duplicate-
-        # laden thread) — dedupe whichever list won before it's cached/persisted,
-        # not just the freshly-fetched branch.
-        final_messages = _dedupe_consecutive_messages(final_messages)
+                final_messages = _merge_li_thread(old_messages, [])
 
         previous_li_entry = _li_chat_cache.get(candidate_id) or {}
         new_li_entry = {
@@ -217,12 +188,23 @@ def _sync_li_messages(
                     if not conn:
                         raise RuntimeError("Database connection failed while persisting LinkedIn cache")
                     with conn.cursor() as cur:
+                        # Row lock: four workers plus the poller all write this
+                        # blob; merge against what's actually stored under the
+                        # lock so nobody's carried-forward messages are lost.
+                        cur.execute(
+                            "SELECT li_chat_history_cache FROM candidate_outreach WHERE candidate_id = %s FOR UPDATE",
+                            (candidate_id,),
+                        )
+                        persisted = final_messages
+                        for (db_blob,) in cur.fetchall():
+                            if isinstance(db_blob, str):
+                                db_blob = json.loads(db_blob)
+                            if db_blob:
+                                persisted = _merge_li_thread(db_blob, persisted)
                         cur.execute(
                             """
                             UPDATE candidate_outreach
-                            SET li_chat_history_cache = CASE
-                                    WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
-                                    THEN %s::jsonb ELSE li_chat_history_cache END,
+                            SET li_chat_history_cache = %s::jsonb,
                                 li_chat_history_updated_at = %s,
                                 -- Only ever promote; never clear a stored reply
                                 -- from a fetch that happens to come back empty.
@@ -234,7 +216,7 @@ def _sync_li_messages(
                             WHERE candidate_id = %s
                         """,
                             (
-                                len(final_messages), json.dumps(final_messages), datetime.now(tz_module.utc),
+                                json.dumps(persisted), datetime.now(tz_module.utc),
                                 has_reply,
                                 has_reply, reply_text or None,
                                 has_reply, reply_at,
@@ -242,6 +224,8 @@ def _sync_li_messages(
                             ),
                         )
                         conn.commit()
+                        final_messages = persisted
+                        _li_chat_cache[candidate_id]["messages"] = persisted
             except Exception as db_err:
                 print(f"WARNING: Failed to persist LI cache to DB: {db_err}")
 
@@ -262,21 +246,34 @@ def _echo_sent_li_message(candidate_id: int, text: str) -> None:
     message into the memory cache AND the persisted thread blob; the fetch
     merge in _sync_li_messages keeps it until HeyReach's copy contains it.
     """
+    now = datetime.now(tz_module.utc)
     echo = {
         "id": f"local-{int(time.time() * 1000)}",
         "type": "SENT",
         "direction": "outbound",
         "email_body": text,
-        "time": datetime.now(tz_module.utc).isoformat(),
+        "time": _utc_iso_z(now),
         "sender_name": "You",
         "local_echo": True,
     }
+    # A double-submit produces the same text twice within seconds; a genuine
+    # repeated "Thanks" minutes later is still a new message.
+    dedup_key = _msg_dedup_key(text)
+    recent_cutoff = (now - timedelta(minutes=2)).timestamp()
     with _li_chat_lock:
         entry = _li_chat_cache.get(candidate_id)
         if entry is None:
             entry = {"messages": [], "ts": time.monotonic(), "refreshing": False}
             _li_chat_cache[candidate_id] = entry
-        entry.setdefault("messages", []).append(echo)
+        messages = entry.setdefault("messages", [])
+        if not any(
+            _is_echo(m)
+            and str(m.get("direction") or "") == "outbound"
+            and _msg_dedup_key(str(m.get("email_body") or "")) == dedup_key
+            and _msg_time_key(m) > recent_cutoff
+            for m in messages
+        ):
+            messages.append(echo)
         # Keep serving the echoed thread rather than invalidating into a
         # provider refetch that doesn't contain the message yet.
         entry["ts"] = time.monotonic()
@@ -292,8 +289,16 @@ def _echo_sent_li_message(candidate_id: int, text: str) -> None:
                         li_chat_history_updated_at = NOW(),
                         updated_at = NOW()
                     WHERE candidate_id = %s
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(COALESCE(li_chat_history_cache, '[]'::jsonb)) e
+                        WHERE e->>'local_echo' = 'true'
+                          AND e->>'direction' = 'outbound'
+                          AND e->>'email_body' = %s
+                          AND (e->>'time')::timestamptz > NOW() - interval '2 minutes'
+                      )
                     """,
-                    (json.dumps([echo]), candidate_id),
+                    (json.dumps([echo]), candidate_id, text),
                 )
             conn.commit()
     except Exception as e:
@@ -2017,10 +2022,7 @@ async def get_linkedin_chat_history(
                                 final_msgs = [entry]
                             elif not any((m.get("email_body") or "").strip() == clean_init for m in final_msgs):
                                 final_msgs = [entry] + final_msgs
-                try:
-                    final_msgs.sort(key=lambda x: x.get("time", ""))
-                except:
-                    pass
+                final_msgs.sort(key=_msg_time_key)
                 return {"messages": final_msgs, "syncing": already_refreshing}
     try:
         t0 = time.time()
@@ -2221,7 +2223,7 @@ async def get_linkedin_chat_history(
                 li_entry["initial_at"] = initial_li_at
 
         current_messages = cached["messages"] if cached else []
-        final_msgs = _prepend_initial(current_messages)
+        final_msgs = sorted(_prepend_initial(current_messages), key=_msg_time_key)
 
         # ── OPTIMISTIC FALLBACK ──────────────────────────────────────────────
         # If the history is STILL empty, but we possess a reply in our DB,
@@ -2328,6 +2330,86 @@ def _dedupe_consecutive_messages(messages: List[Dict]) -> List[Dict]:
                 continue
         kept.append(m)
     return kept
+
+
+def _utc_iso_z(value) -> Optional[str]:
+    """Render a datetime/ISO string in HeyReach's own `...Z` UTC format.
+
+    Echo entries used to carry `datetime.now().isoformat()` ("+00:00"),
+    which sorts lexically AFTER every provider "…Z" timestamp regardless of
+    the actual time, so echoes drifted to the end of the thread.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        dt = value if isinstance(value, datetime) else _date_parser.parse(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz_module.utc)
+    dt = dt.astimezone(tz_module.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _msg_time_key(m: Dict) -> float:
+    t = (m or {}).get("time")
+    if not t:
+        return 0.0
+    try:
+        dt = _date_parser.parse(str(t))
+    except Exception:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz_module.utc)
+    return dt.timestamp()
+
+
+def _is_echo(m: Dict) -> bool:
+    return bool((m or {}).get("local_echo")) or str((m or {}).get("id") or "").startswith("local-")
+
+
+def _msg_key(m: Dict):
+    return (
+        str((m or {}).get("direction") or "").lower(),
+        _msg_dedup_key(str((m or {}).get("email_body") or "")),
+    )
+
+
+def _merge_li_thread(stored: List[Dict], fetched: List[Dict]) -> List[Dict]:
+    """Reconcile a stored thread with a fresh provider fetch.
+
+    `fetched` is the provider's truth and is kept verbatim (so a candidate
+    who genuinely says "hi" three times keeps all three). From `stored` we
+    carry forward only what the fetch lacks: real provider messages the
+    chatroom endpoint hasn't caught up on yet, and local echoes whose text
+    the provider still hasn't ingested. An echo whose text now exists as a
+    real message is dropped — the real entry replaces it. The result is
+    time-ordered, so a late echo never lands after a newer message.
+
+    With an empty `fetched` this degrades to a stored-only cleanup: reals
+    are all kept, echoes are dropped only when they duplicate a real or an
+    earlier echo.
+    """
+    merged: List[Dict] = list(fetched or [])
+    fetched_keys = {_msg_key(m) for m in merged}
+    carried_real_keys = set()
+    carried_echo_keys = set()
+    for m in stored or []:
+        key = _msg_key(m)
+        if not key[1]:
+            continue
+        if not _is_echo(m):
+            if key in fetched_keys:
+                continue
+            merged.append(m)
+            carried_real_keys.add(key)
+        else:
+            if key in fetched_keys or key in carried_real_keys or key in carried_echo_keys:
+                continue
+            merged.append(m)
+            carried_echo_keys.add(key)
+    merged.sort(key=_msg_time_key)
+    return _dedupe_consecutive_messages(merged)
 
 
 def _clean_email_body(body: str) -> str:
@@ -3459,7 +3541,7 @@ async def smartlead_webhook(payload: Dict):
 
 
 @router.post("/heyreach/webhook")
-async def heyreach_webhook(request: Dict):
+def heyreach_webhook(request: Dict):
     """
     Handle webhook events from HeyReach
     """
@@ -3472,6 +3554,19 @@ async def heyreach_webhook(request: Dict):
     profile_url = lead_data.get("profile_url") or lead_data.get("profileUrl")
 
     conv_id_early = request.get("conversation_id") or request.get("conversationId")
+
+    if "repl" in event.lower():
+        # Every delivery is logged so fan-out/retry duplicates are visible in
+        # the hosted log stream, and so the reply payload's field names can be
+        # confirmed against HeyReach's docs.
+        logger.info(
+            "HeyReach webhook %s corr=%s conv=%s payload=%s",
+            event,
+            request.get("correlation_id"),
+            conv_id_early,
+            json.dumps(request, default=str)[:2000],
+        )
+    reply_time_raw = request.get("timestamp")
 
     try:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
@@ -3530,6 +3625,12 @@ async def heyreach_webhook(request: Dict):
                         # Trust is_reply flag if it exists, otherwise assume the latest is the reply
                         if last_msg.get("is_reply", True):
                             new_response = last_msg.get("message", "")
+                            reply_time_raw = (
+                                last_msg.get("creation_time")
+                                or last_msg.get("createdAt")
+                                or last_msg.get("created_at")
+                                or reply_time_raw
+                            )
                     else:
                         new_response = request.get("messageText") or request.get("message")
 
@@ -3603,30 +3704,37 @@ async def heyreach_webhook(request: Dict):
         # message immediately, not just whichever one a later fetch sees.
         if is_reply_event and new_response:
             try:
+                # Stamp the echo with the message's own time (HeyReach sends
+                # it) so it sorts next to the provider copy instead of at
+                # "now", which could be hours later for a retried delivery.
                 echo = {
                     "id": f"local-webhook-{candidate_id}-{int(time.time() * 1000)}",
                     "type": "REPLY",
                     "direction": "inbound",
                     "email_body": new_response,
-                    "time": datetime.now(tz_module.utc).isoformat(),
+                    "time": _utc_iso_z(reply_time_raw) or _utc_iso_z(datetime.now(tz_module.utc)),
                     "sender_name": "Candidate",
                     "local_echo": True,
                 }
                 dedup_key = _msg_dedup_key(new_response)
+                already_present = False
                 with get_db_connection_context(validate=False, register_pgvector=False) as conn_echo:
                     if conn_echo:
                         with conn_echo.cursor() as cur_echo:
-                            # HeyReach can redeliver the same webhook event
-                            # (retries, at-least-once delivery); skip the
-                            # append if an inbound message with the same
-                            # normalized body is already in the thread so
-                            # retries don't duplicate the message.
+                            # HeyReach delivers the same event several times
+                            # (duplicate registrations, at-least-once retries),
+                            # often concurrently across workers. FOR UPDATE
+                            # serializes check-then-append on the row so only
+                            # one delivery appends the message.
                             cur_echo.execute(
-                                "SELECT li_chat_history_cache FROM candidate_outreach WHERE candidate_id = %s",
+                                "SELECT li_chat_history_cache FROM candidate_outreach WHERE candidate_id = %s FOR UPDATE",
                                 (candidate_id,),
                             )
-                            row_echo = cur_echo.fetchone()
-                            existing_msgs = (row_echo[0] if row_echo else None) or []
+                            existing_msgs = []
+                            for (blob,) in cur_echo.fetchall():
+                                if isinstance(blob, str):
+                                    blob = json.loads(blob)
+                                existing_msgs.extend(blob or [])
                             already_present = any(
                                 str(m.get("direction") or "") == "inbound"
                                 and _msg_dedup_key(str(m.get("email_body") or "")) == dedup_key

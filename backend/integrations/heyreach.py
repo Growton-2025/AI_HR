@@ -816,46 +816,122 @@ class HeyReachBot:
             print(f"❌ Failed to send LI message: {e}")
             return False
 
+    _WEBHOOKS_BASE = "https://api.heyreach.io/api/public/webhooks"
+    REPLY_WEBHOOK_EVENT = "EVERY_MESSAGE_REPLY_RECEIVED"
+
+    def list_webhooks(self) -> List[Dict]:
+        res = self._session.post(
+            f"{self._WEBHOOKS_BASE}/GetAllWebhooks",
+            headers=self._api_headers(),
+            json={"offset": 0, "limit": 100, "includeCustomHeaders": False},
+            timeout=10,
+        )
+        res.raise_for_status()
+        return res.json().get("items", []) or []
+
+    def delete_webhook(self, webhook_id: int) -> None:
+        # HeyReach refuses to delete an active hook ("must be deactivated
+        # before deleting").
+        self.set_webhook_active(webhook_id, False)
+        res = requests.delete(
+            f"{self._WEBHOOKS_BASE}/DeleteWebhook",
+            headers=self._api_headers(),
+            params={"webhookId": int(webhook_id)},
+            timeout=10,
+        )
+        res.raise_for_status()
+
+    def set_webhook_active(self, webhook_id: int, active: bool) -> None:
+        res = requests.patch(
+            f"{self._WEBHOOKS_BASE}/UpdateWebhook",
+            headers=self._api_headers(),
+            params={"webhookId": int(webhook_id)},
+            json={"isActive": bool(active)},
+            timeout=10,
+        )
+        res.raise_for_status()
+
     def ensure_reply_webhook(self, public_url: str) -> bool:
         """
         Idempotently register a webhook so HeyReach POSTs to `public_url` on
         EVERY reply (EVERY_MESSAGE_REPLY_RECEIVED covers messages and InMails;
         MESSAGE_REPLY_RECEIVED would fire only on the first reply per lead).
         Returns True if the webhook exists or was created.
-        """
-        event_type = "EVERY_MESSAGE_REPLY_RECEIVED"
-        base = "https://api.heyreach.io/api/public/webhooks"
-        try:
-            res = self._session.post(
-                f"{base}/GetAllWebhooks",
-                headers=self._api_headers(),
-                json={"offset": 0, "limit": 100, "includeCustomHeaders": False},
-                timeout=10,
-            )
-            res.raise_for_status()
-            for hook in res.json().get("items", []):
-                if (
-                    hook.get("webhookUrl") == public_url
-                    and hook.get("eventType") == event_type
-                    and hook.get("isActive", True)
-                ):
-                    print(f"✅ HeyReach reply webhook already registered (id={hook.get('id')})")
-                    return True
 
-            res = self._session.post(
-                f"{base}/CreateWebhook",
-                headers=self._api_headers(),
-                json={
-                    "webhookName": "ai-hr-replies",
-                    "webhookUrl": public_url,
-                    "eventType": event_type,
-                    "campaignIds": [],  # empty = listen across all campaigns
-                },
-                timeout=10,
-            )
-            res.raise_for_status()
-            print(f"✅ HeyReach reply webhook registered for {public_url}")
-            return True
+        Self-healing: if more than one active registration exists for this
+        URL+event, all but the oldest are deleted. Every gunicorn worker runs
+        this at startup, and a list-then-create race once left four identical
+        hooks — HeyReach then delivered every reply four times. A Postgres
+        advisory lock serializes the workers (and any laptop pointing at the
+        same database), and the create goes through a plain request rather
+        than the retrying session so a slow 5xx can't be replayed into
+        several hooks.
+        """
+        lock_key = "heyreach_reply_webhook"
+        conn_ctx = None
+        conn = None
+        try:
+            from backend.db.connection import get_db_connection_context
+
+            conn_ctx = get_db_connection_context(validate=False, register_pgvector=False)
+            conn = conn_ctx.__enter__()
+        except Exception as e:
+            print(f"⚠️ HeyReach webhook: no DB lock available ({e}); proceeding unlocked")
+            conn = None
+        locked = False
+        try:
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (lock_key,))
+                    locked = bool(cur.fetchone()[0])
+                if not locked:
+                    print("ℹ️ HeyReach reply webhook: another process is registering it")
+                    return True
+            return self._reconcile_reply_webhook(public_url)
         except Exception as e:
             print(f"⚠️ HeyReach webhook registration failed: {e}")
             return False
+        finally:
+            if conn and locked:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
+                except Exception:
+                    pass
+            if conn_ctx is not None:
+                try:
+                    conn_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+    def _reconcile_reply_webhook(self, public_url: str) -> bool:
+        event_type = self.REPLY_WEBHOOK_EVENT
+        ours = [
+            h for h in self.list_webhooks()
+            if h.get("webhookUrl") == public_url
+            and h.get("eventType") == event_type
+            and h.get("isActive", True)
+        ]
+        if ours:
+            ours.sort(key=lambda h: int(h.get("id") or 0))
+            keep = ours[0]
+            for extra in ours[1:]:
+                self.delete_webhook(extra["id"])
+                print(f"🧹 HeyReach: deleted duplicate reply webhook id={extra['id']}")
+            print(f"✅ HeyReach reply webhook already registered (id={keep.get('id')})")
+            return True
+
+        res = requests.post(
+            f"{self._WEBHOOKS_BASE}/CreateWebhook",
+            headers=self._api_headers(),
+            json={
+                "webhookName": "ai-hr-replies",
+                "webhookUrl": public_url,
+                "eventType": event_type,
+                "campaignIds": [],  # empty = listen across all campaigns
+            },
+            timeout=10,
+        )
+        res.raise_for_status()
+        print(f"✅ HeyReach reply webhook registered for {public_url}")
+        return True

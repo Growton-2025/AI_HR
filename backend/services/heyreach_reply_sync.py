@@ -46,7 +46,23 @@ def poll_once() -> int:
     from backend.db.connection import get_db_connection_context
     from backend.integrations.heyreach import HeyReachBot
 
-    from backend.api.routes.outreach import _dedupe_consecutive_messages
+    from backend.api.routes.outreach import (
+        _clean_email_body,
+        _dedupe_consecutive_messages,
+        _merge_li_thread,
+    )
+
+    def _clean_outbound(thread):
+        # Same normalization _sync_li_messages applies to OUR messages, so one
+        # outbound message can't carry two different dedup keys depending on
+        # which writer stored it.
+        for m in thread:
+            if str(m.get("direction") or "").lower() == "inbound":
+                continue
+            body = m.get("email_body") or ""
+            if body:
+                m["email_body"] = _clean_email_body(body)
+        return thread
 
     now = datetime.now(timezone.utc)
     since = _watermark or _utc_iso(now - timedelta(hours=24))
@@ -86,7 +102,7 @@ def poll_once() -> int:
                 # chatroom endpoint, which can lag by hours. This is the only
                 # reliable source for every message of a reply burst.
                 "thread": _dedupe_consecutive_messages(
-                    bot.format_chat_messages(conv.get("messages") or [])
+                    _clean_outbound(bot.format_chat_messages(conv.get("messages") or []))
                 ),
             }
         )
@@ -121,28 +137,41 @@ def poll_once() -> int:
                     continue
                 for (candidate_id,) in rows:
                     # Persist the listing's full fresh thread for ANY new
-                    # activity — never shrink an existing one.
+                    # activity, merged by content with what's stored (under a
+                    # row lock — several workers and syncs write this blob).
+                    # "Never shrink" used to live here; it is what kept
+                    # duplicate-laden threads from ever converging.
                     if item["thread"]:
+                        cur.execute(
+                            "SELECT li_chat_history_cache FROM candidate_outreach WHERE candidate_id = %s FOR UPDATE",
+                            (candidate_id,),
+                        )
+                        merged = item["thread"]
+                        for (db_blob,) in cur.fetchall():
+                            if isinstance(db_blob, str):
+                                db_blob = _json.loads(db_blob)
+                            if db_blob:
+                                merged = _merge_li_thread(db_blob, merged)
                         cur.execute(
                             """
                             UPDATE candidate_outreach
-                            SET li_chat_history_cache = CASE
-                                    WHEN COALESCE(jsonb_array_length(li_chat_history_cache), 0) <= %s
-                                    THEN %s::jsonb ELSE li_chat_history_cache END,
+                            SET li_chat_history_cache = %s::jsonb,
                                 li_chat_history_updated_at = NOW(),
                                 li_conversation_id = COALESCE(%s, li_conversation_id),
                                 li_account_id = COALESCE(%s, li_account_id)
                             WHERE candidate_id = %s
                             """,
                             (
-                                len(item["thread"]), _json.dumps(item["thread"]),
+                                _json.dumps(merged),
                                 item["conversation_id"],
                                 str(item["account_id"]) if item["account_id"] else None,
                                 candidate_id,
                             ),
                         )
                         if cur.rowcount:
-                            thread_updates.append((candidate_id, item["thread"]))
+                            thread_updates.append((candidate_id, merged))
+                        # Commit per candidate so the row lock is held briefly.
+                        conn.commit()
 
                     if not item["is_reply"]:
                         continue
@@ -186,17 +215,7 @@ def poll_once() -> int:
                         "refreshing": False,
                     }
                     continue
-                previous_messages = entry.get("messages", [])
-                if len(previous_messages) > len(thread):
-                    entry["ts"] = 0
-                    continue
-                thread_bodies = {str(m.get("email_body") or "").strip() for m in thread}
-                echoes = [
-                    m for m in previous_messages
-                    if m.get("local_echo")
-                    and str(m.get("email_body") or "").strip() not in thread_bodies
-                ]
-                entry["messages"] = thread + echoes
+                entry["messages"] = _merge_li_thread(entry.get("messages", []), thread)
                 entry["ts"] = time.monotonic()
     except Exception:
         pass
