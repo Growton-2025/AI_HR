@@ -3575,28 +3575,48 @@ async def heyreach_webhook(request: Dict):
                     "sender_name": "Candidate",
                     "local_echo": True,
                 }
+                dedup_key = _msg_dedup_key(new_response)
                 with get_db_connection_context(validate=False, register_pgvector=False) as conn_echo:
                     if conn_echo:
                         with conn_echo.cursor() as cur_echo:
+                            # HeyReach can redeliver the same webhook event
+                            # (retries, at-least-once delivery); skip the
+                            # append if an inbound message with the same
+                            # normalized body is already in the thread so
+                            # retries don't duplicate the message.
                             cur_echo.execute(
-                                """
-                                UPDATE candidate_outreach
-                                SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
-                                    li_chat_history_updated_at = NOW()
-                                WHERE candidate_id = %s
-                                """,
-                                (json.dumps([echo]), candidate_id),
+                                "SELECT li_chat_history_cache FROM candidate_outreach WHERE candidate_id = %s",
+                                (candidate_id,),
                             )
+                            row_echo = cur_echo.fetchone()
+                            existing_msgs = (row_echo[0] if row_echo else None) or []
+                            already_present = any(
+                                str(m.get("direction") or "") == "inbound"
+                                and _msg_dedup_key(str(m.get("email_body") or "")) == dedup_key
+                                for m in existing_msgs
+                            )
+                            if not already_present:
+                                cur_echo.execute(
+                                    """
+                                    UPDATE candidate_outreach
+                                    SET li_chat_history_cache = COALESCE(li_chat_history_cache, '[]'::jsonb) || %s::jsonb,
+                                        li_chat_history_updated_at = NOW()
+                                    WHERE candidate_id = %s
+                                    """,
+                                    (json.dumps([echo]), candidate_id),
+                                )
                         conn_echo.commit()
-                with _li_chat_lock:
-                    entry = _li_chat_cache.get(candidate_id)
-                    if entry is not None:
-                        messages = entry.setdefault("messages", [])
-                        if not any(
-                            str(m.get("email_body") or "").strip() == new_response.strip()
-                            for m in messages
-                        ):
-                            messages.append(echo)
+                if not already_present:
+                    with _li_chat_lock:
+                        entry = _li_chat_cache.get(candidate_id)
+                        if entry is not None:
+                            messages = entry.setdefault("messages", [])
+                            if not any(
+                                str(m.get("direction") or "") == "inbound"
+                                and _msg_dedup_key(str(m.get("email_body") or "")) == dedup_key
+                                for m in messages
+                            ):
+                                messages.append(echo)
             except Exception as echo_err:
                 print(f"WARNING: Webhook reply echo failed: {echo_err}")
 
