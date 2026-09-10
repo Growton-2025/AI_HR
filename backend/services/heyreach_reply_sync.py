@@ -46,6 +46,8 @@ def poll_once() -> int:
     from backend.db.connection import get_db_connection_context
     from backend.integrations.heyreach import HeyReachBot
 
+    from backend.api.routes.outreach import _dedupe_consecutive_messages
+
     now = datetime.now(timezone.utc)
     since = _watermark or _utc_iso(now - timedelta(hours=24))
 
@@ -83,7 +85,9 @@ def poll_once() -> int:
                 # messages[] carries the full thread — and FRESHER than the
                 # chatroom endpoint, which can lag by hours. This is the only
                 # reliable source for every message of a reply burst.
-                "thread": bot.format_chat_messages(conv.get("messages") or []),
+                "thread": _dedupe_consecutive_messages(
+                    bot.format_chat_messages(conv.get("messages") or [])
+                ),
             }
         )
     if not activity:

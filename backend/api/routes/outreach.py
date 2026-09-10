@@ -124,6 +124,10 @@ def _sync_li_messages(
                 if raw_body:
                     msg["email_body"] = _clean_email_body(raw_body)
 
+        # HeyReach's own chatroom API can redeliver the same message; never
+        # cache/persist a run of identical adjacent messages.
+        messages = _dedupe_consecutive_messages(messages)
+
         # Carry forward locally-echoed sent messages the provider hasn't
         # ingested yet — a fresh fetch must not make a just-sent message
         # vanish. Once the provider's copy contains the text, the echo drops.
@@ -2291,6 +2295,33 @@ def _msg_dedup_key(text: str) -> str:
     twice in the conversation view.
     """
     return re.sub(r"\s+", " ", _normalize_body_text(text or "") or "").strip().lower()
+
+
+def _dedupe_consecutive_messages(messages: List[Dict]) -> List[Dict]:
+    """Collapse adjacent messages with the same direction + normalized body.
+
+    HeyReach's own APIs (GetConversationsV3 listing, GetChatroom) can hand
+    back the same inbound message more than once — its LinkedIn ingestion
+    appears to redetect a message across polling cycles and store each
+    detection as a separate entry, which then gets persisted into
+    li_chat_history_cache verbatim by any full-thread refresh. Only ADJACENT
+    duplicates are collapsed so two genuinely separate sends of the same
+    text, with other messages in between, are left alone.
+    """
+    kept: List[Dict] = []
+    for m in messages or []:
+        direction = str(m.get("direction") or "")
+        key = _msg_dedup_key(str(m.get("email_body") or ""))
+        if kept:
+            prev = kept[-1]
+            if (
+                key
+                and direction == str(prev.get("direction") or "")
+                and key == _msg_dedup_key(str(prev.get("email_body") or ""))
+            ):
+                continue
+        kept.append(m)
+    return kept
 
 
 def _clean_email_body(body: str) -> str:
