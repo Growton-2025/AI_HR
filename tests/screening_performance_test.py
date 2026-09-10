@@ -2087,3 +2087,158 @@ def test_role_counts_join_active_candidates(monkeypatch):
     assert "LEFT JOIN candidates c ON c.id = rc.candidate_id" in sql
     assert "COALESCE(c.is_archived, FALSE) = FALSE" in sql
     assert tuple(params) == (7,)
+
+
+# ── schema evidence rows must be streamable ──────────────────────────────────
+#
+# attach_schema_evidence_to_profiles pulled every column of every candidate
+# table into the profiles that the screening WebSocket streams to the browser.
+# candidate_resumes.file_bytes (bytea → memoryview) is not JSON-serializable,
+# so the first list containing a candidate with an uploaded resume aborted the
+# whole run with "[ValueError(...), TypeError('vars() ...')]".
+
+from fastapi.encoders import jsonable_encoder  # noqa: E402
+from backend.api.routes import candidates as candidates_route  # noqa: E402
+import inspect  # noqa: E402
+
+
+class _EvidenceCursor:
+    def __init__(self, rows_by_table):
+        self.rows_by_table = rows_by_table
+        self.executed = []
+        self._table = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        self._table = next((t for t in self.rows_by_table if f'FROM "{t}"' in sql), None)
+        self._columns = re.findall(r'"([a-z_0-9]+)"', sql.split(" FROM ")[0])
+
+    @property
+    def description(self):
+        return [(c,) for c in self._columns]
+
+    def fetchall(self):
+        return [tuple(row.get(c) for c in self._columns) for row in self.rows_by_table.get(self._table, [])]
+
+
+def _resume_catalog():
+    return {
+        "tables": {
+            "candidate_resumes": {
+                "candidate_related": True,
+                "columns": [
+                    {"name": "candidate_id", "type": "integer"},
+                    {"name": "filename", "type": "text"},
+                    {"name": "file_bytes", "type": "bytea"},
+                    {"name": "extracted_text", "type": "text"},
+                    {"name": "checksum_sha256", "type": "text"},
+                ],
+            },
+            "candidate_outreach": {
+                "candidate_related": True,
+                "columns": [
+                    {"name": "candidate_id", "type": "integer"},
+                    {"name": "li_status", "type": "text"},
+                    {"name": "li_chat_history_cache", "type": "jsonb"},
+                    {"name": "embedding", "type": "USER-DEFINED"},
+                ],
+            },
+        }
+    }
+
+
+def test_schema_evidence_never_selects_binary_vector_or_cache_columns(monkeypatch):
+    cursor = _EvidenceCursor({
+        "candidate_resumes": [{"candidate_id": 1, "filename": "cv.pdf", "extracted_text": "x" * 10_000}],
+        "candidate_outreach": [{"candidate_id": 1, "li_status": "replied"}],
+    })
+    monkeypatch.setattr(query, "get_db_connection", lambda **kwargs: type("C", (), {"cursor": lambda self: cursor})())
+    monkeypatch.setattr(query, "return_db_connection", lambda c: None)
+
+    profiles = query.attach_schema_evidence_to_profiles([{"id": 1, "name": "A"}], _resume_catalog())
+
+    joined_sql = "\n".join(cursor.executed)
+    for forbidden in ("file_bytes", "checksum_sha256", "li_chat_history_cache", "embedding"):
+        assert forbidden not in joined_sql
+    rows = {r["table"]: r["row"] for r in profiles[0]["schema_evidence_rows"]}
+    assert rows["candidate_resumes"]["filename"] == "cv.pdf"
+    assert len(rows["candidate_resumes"]["extracted_text"]) == query._SCHEMA_EVIDENCE_MAX_TEXT
+    assert rows["candidate_outreach"] == {"candidate_id": 1, "li_status": "replied"}
+    jsonable_encoder(profiles[0])
+
+
+def test_schema_evidence_row_values_are_sanitized_even_if_a_buffer_slips_through(monkeypatch):
+    cursor = _EvidenceCursor({
+        "candidate_resumes": [{"candidate_id": 1, "filename": memoryview(b"%PDF"), "extracted_text": "ok"}],
+    })
+    monkeypatch.setattr(query, "get_db_connection", lambda **kwargs: type("C", (), {"cursor": lambda self: cursor})())
+    monkeypatch.setattr(query, "return_db_connection", lambda c: None)
+
+    profiles = query.attach_schema_evidence_to_profiles([{"id": 1}], _resume_catalog())
+
+    row = profiles[0]["schema_evidence_rows"][0]["row"]
+    assert "filename" not in row and row["extracted_text"] == "ok"
+    jsonable_encoder(profiles[0])
+
+
+def test_every_screening_event_is_json_serializable(monkeypatch):
+    profiles = [
+        {
+            "id": idx,
+            "name": f"Candidate {idx}",
+            "headline": "BDR",
+            "total_experience_years": idx,
+            "roles": [{"title": "BDR", "company": "Acme", "details": "Outbound", "duration_years": 2}],
+            "schema_evidence_rows": [
+                {"table": "candidate_resumes", "category": "candidate_fact", "row": {"filename": "cv.pdf"}}
+            ],
+        }
+        for idx in range(1, 4)
+    ]
+
+    class _FakeCriteriaResponse:
+        content = '{"min_function_years": [{"function": "Sales Development", "min_years": 1, "aliases": ["BDR"]}]}'
+
+    async def fake_ainvoke(_prompt):
+        return _FakeCriteriaResponse()
+
+    class _FakeLLM:
+        model_name = "fake-model"
+        ainvoke = staticmethod(fake_ainvoke)
+
+    async def fake_reasoning(profile, *_args, **_kwargs):
+        return f"{profile['name']} matches."
+
+    monkeypatch.setattr(query, "is_cache_initialized", lambda: True)
+    monkeypatch.setattr(query, "normalize_query_with_llm", lambda value: value)
+    monkeypatch.setattr(query, "llm", _FakeLLM())
+    monkeypatch.setattr(query, "generate_reasoning_for_profile", fake_reasoning)
+    monkeypatch.setattr(query, "PROFILES_BY_ID", {p["id"]: p for p in profiles})
+
+    async def collect():
+        out = []
+        async for item in query.process_query_main("BDR partner sales", "session", query.TokenCostTracker()):
+            out.append(item)
+        return out
+
+    events = asyncio.run(collect())
+    assert any(isinstance(e, dict) and e.get("type") == "complete" for e in events)
+    for event in events:
+        jsonable_encoder(event if isinstance(event, dict) else {"message": event})
+
+
+def test_websocket_send_survives_unserializable_event_and_logs_traceback():
+    src = inspect.getsource(candidates_route.websocket_search)
+    assert "_strip_unserializable" in src
+    assert 'logger.exception("Error during screening search")' in src
+    assert 'print(f"Error during search' not in src
+    stripped = candidates_route._strip_unserializable(
+        {"type": "candidate_batch", "data": [{"id": 1, "row": {"file_bytes": memoryview(b"x")}}]}
+    )
+    assert stripped == {"type": "candidate_batch", "data": [{"id": 1, "row": {"file_bytes": None}}]}

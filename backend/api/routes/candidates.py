@@ -363,6 +363,18 @@ async def export_candidates(
 
 # --- WebSocket for Real-time Search Streaming ---
 
+def _strip_unserializable(value: Any) -> Any:
+    """Encode what can be encoded; replace any leaf the encoder rejects with None."""
+    if isinstance(value, dict):
+        return {str(k): _strip_unserializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_strip_unserializable(v) for v in value]
+    try:
+        return jsonable_encoder(value, custom_encoder={memoryview: lambda _m: None})
+    except (ValueError, TypeError):
+        return None
+
+
 @router.websocket("/ws/search")
 async def websocket_search(websocket: WebSocket):
     """
@@ -457,8 +469,19 @@ async def websocket_search(websocket: WebSocket):
             try:
                 async def send_event(payload: Dict[str, Any]) -> bool:
                     try:
+                        # A stray buffer (e.g. a bytea column) must never take
+                        # down a whole screening run; drop it and log loudly.
+                        encoded = jsonable_encoder(
+                            payload, custom_encoder={memoryview: lambda _m: None}
+                        )
+                    except (ValueError, TypeError):
+                        logger.exception(
+                            "Screening event %s is not serializable", payload.get("type")
+                        )
+                        encoded = _strip_unserializable(payload)
+                    try:
                         async with send_lock:
-                            await websocket.send_json(jsonable_encoder(payload))
+                            await websocket.send_json(encoded)
                         return True
                     except (WebSocketDisconnect, RuntimeError):
                         return False
@@ -552,8 +575,9 @@ async def websocket_search(websocket: WebSocket):
                             break
 
             except Exception as e:
-                # Log error but don't crash loop unless critical
-                print(f"Error during search: {e}")
+                # The traceback must reach the hosted log stream: the client
+                # only ever sees str(e).
+                logger.exception("Error during screening search")
                 # Try to send error to client if possible
                 if not await send_event({
                     "type": "error",
@@ -566,9 +590,9 @@ async def websocket_search(websocket: WebSocket):
 
     except (WebSocketDisconnect, RuntimeError):
         # RuntimeError is raised by Starlette if we try to send after close
-        print("WebSocket client disconnected")
-    except Exception as e:
-        print(f"Unexpected WebSocket error: {e}")
+        logger.info("WebSocket client disconnected")
+    except Exception:
+        logger.exception("Unexpected WebSocket error")
 
 @router.patch("/candidates/{candidate_id}")
 async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user: schemas.User = Depends(deps.get_current_user)):

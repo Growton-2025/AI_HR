@@ -2233,6 +2233,32 @@ def compact_evidence_catalog_for_prompt(
     }
 
 
+# Schema evidence rows are streamed to the browser inside every candidate
+# event and stringified into LLM evidence; binary/vector columns can't be
+# serialized (a bytea comes back as a memoryview and aborted whole screening
+# runs) and add nothing to matching.
+_SCHEMA_EVIDENCE_SKIP_TYPES = {"bytea", "user-defined", "tsvector"}
+_SCHEMA_EVIDENCE_SKIP_COLUMNS = {
+    "file_bytes", "embedding", "checksum_sha256", "storage_key", "storage_backend",
+}
+_SCHEMA_EVIDENCE_MAX_TEXT = 1500
+
+
+def _schema_evidence_column_allowed(column: Dict[str, Any]) -> bool:
+    name = str(column.get("name") or "")
+    if not name or name in _SCHEMA_EVIDENCE_SKIP_COLUMNS or name.endswith("_cache"):
+        return False
+    return str(column.get("type") or "").strip().lower() not in _SCHEMA_EVIDENCE_SKIP_TYPES
+
+
+def _sanitize_schema_evidence_value(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    if isinstance(value, str) and len(value) > _SCHEMA_EVIDENCE_MAX_TEXT:
+        return value[:_SCHEMA_EVIDENCE_MAX_TEXT]
+    return value
+
+
 def attach_schema_evidence_to_profiles(profiles: List[Dict[str, Any]], catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Attach rows from candidate-related schema tables so shortlist evidence can use the full DB shape."""
     ids = sorted({int(profile.get("id")) for profile in profiles if profile.get("id") is not None})
@@ -2255,7 +2281,11 @@ def attach_schema_evidence_to_profiles(profiles: List[Dict[str, Any]], catalog: 
     try:
         with conn.cursor() as cur:
             for table, info in candidate_tables:
-                columns = [str(column.get("name")) for column in info.get("columns") or [] if column.get("name")]
+                columns = [
+                    str(column.get("name"))
+                    for column in info.get("columns") or []
+                    if _schema_evidence_column_allowed(column)
+                ]
                 if "candidate_id" not in columns:
                     continue
                 try:
@@ -2266,11 +2296,11 @@ def attach_schema_evidence_to_profiles(profiles: List[Dict[str, Any]], catalog: 
                     )
                     description = [desc[0] for desc in cur.description]
                     for row in cur.fetchall():
-                        row_dict = {
-                            key: value
-                            for key, value in zip(description, row)
-                            if value not in (None, "", [], {})
-                        }
+                        row_dict = {}
+                        for key, value in zip(description, row):
+                            value = _sanitize_schema_evidence_value(value)
+                            if value not in (None, "", [], {}):
+                                row_dict[key] = value
                         candidate_id = row_dict.get("candidate_id")
                         if candidate_id in candidate_rows and row_dict:
                             candidate_rows[int(candidate_id)].append(
