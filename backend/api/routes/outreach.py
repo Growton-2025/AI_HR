@@ -170,6 +170,12 @@ def _sync_li_messages(
                 )
                 final_messages = existing
 
+        # The two fallbacks above pull from in-memory state that predates
+        # this fix (a long-lived worker can still hold a pre-fix, duplicate-
+        # laden thread) — dedupe whichever list won before it's cached/persisted,
+        # not just the freshly-fetched branch.
+        final_messages = _dedupe_consecutive_messages(final_messages)
+
         previous_li_entry = _li_chat_cache.get(candidate_id) or {}
         new_li_entry = {
             "messages": final_messages or [],
