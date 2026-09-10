@@ -2321,6 +2321,19 @@ def attach_schema_evidence_to_profiles(profiles: List[Dict[str, Any]], catalog: 
     return profiles
 
 
+# Country-level spellings that must match each other (a "UAE" screen must see
+# "Dubai - 2 Years"). Deliberately no region entries: region membership is
+# handled one-way, region query -> its countries.
+GEOGRAPHY_COUNTRY_SYNONYMS: List[frozenset] = [
+    frozenset({"uae", "united arab emirates", "emirates", "dubai", "abu dhabi", "sharjah"}),
+    frozenset({"saudi arabia", "saudi", "ksa", "riyadh", "jeddah"}),
+    frozenset({"united states", "usa", "us", "u s"}),
+    frozenset({"united kingdom", "uk", "u k", "britain", "england", "london"}),
+    frozenset({"singapore", "sg"}),
+    frozenset({"india", "bharat"}),
+]
+
+
 def _expanded_terms(value: str, criterion_key: str) -> List[str]:
     value_l = _normalize_search_text(value)
     if not value_l:
@@ -2358,10 +2371,14 @@ def _expanded_terms(value: str, criterion_key: str) -> List[str]:
     elif criterion_key == "required_geographies":
         regions = {region for region in GEOGRAPHY_COUNTRY_TO_REGION_MAP.values()}
         if value_l in regions:
+            # A region query is satisfied by any of its countries.
             terms.update(country for country, region in GEOGRAPHY_COUNTRY_TO_REGION_MAP.items() if region == value_l)
-        mapped_region = GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(value_l)
-        if mapped_region:
-            terms.add(mapped_region)
+        # A country query is NOT satisfied by its super-region: "uae" used to
+        # expand to "emea", so every "Account Executive - EMEA" headline passed
+        # a UAE screen while candidates with real UAE experience were rejected.
+        for group in GEOGRAPHY_COUNTRY_SYNONYMS:
+            if value_l in group:
+                terms.update(group)
 
     return sorted(term for term in terms if term)
 
@@ -2389,10 +2406,8 @@ def _geography_match_terms(value: str, criterion: Any = None) -> List[str]:
     if value_l in regions:
         terms.add(value_l)
         terms.update(regions[value_l])
-    mapped_region = GEOGRAPHY_COUNTRY_TO_REGION_MAP.get(value_l)
-    if mapped_region:
-        terms.add(mapped_region)
-        terms.add(value_l)
+    # Country -> super-region expansion deliberately absent (see _expanded_terms).
+    terms.add(value_l)
     for item in _criteria_objects(criterion):
         for key in ("expanded_countries", "countries", "regions", "aliases", "expanded_terms"):
             raw = item.get(key)
@@ -2443,7 +2458,8 @@ def _profile_geography_experience_text(profile: Dict[str, Any]) -> str:
         key_l = _normalize_search_text(key)
         if any(token in key_l for token in ("address", "current location", "base location", "located", "city")):
             continue
-        if any(token in key_l for token in ("geograph", "market", "region", "country", "territory", "coverage", "summary", "notes", "profile")):
+        # "geo" also catches imported columns like "Focused Geo" / "Geo focus".
+        if any(token in key_l for token in ("geo", "market", "region", "country", "territory", "coverage", "summary", "notes", "profile")):
             likely_claims[key] = value
     return " ".join(
         _flatten_value_for_evidence(
@@ -2623,7 +2639,8 @@ def _profile_claim_geography_text(profile: Dict[str, Any]) -> str:
         key_l = _normalize_search_text(key)
         if any(token in key_l for token in ("address", "current location", "base location", "located", "city")):
             continue
-        if any(token in key_l for token in ("geograph", "market", "region", "country", "territory", "coverage", "summary", "notes", "profile")):
+        # "geo" also catches imported columns like "Focused Geo" / "Geo focus".
+        if any(token in key_l for token in ("geo", "market", "region", "country", "territory", "coverage", "summary", "notes", "profile")):
             likely_claims[key] = value
     return " ".join(_flatten_value_for_evidence(likely_claims, max_items=60)).lower()
 
@@ -3629,15 +3646,22 @@ def _audit_output_is_evidence_valid(profile: Dict[str, Any], payload: Any) -> bo
 
 
 def _fallback_audit_payload_from_evidence(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Used when the evidence audit fails or returns an unusable answer.
+
+    This must never verify: it once returned verified_match whenever any
+    evidence existed, so an audit that errored (or a rejection the model
+    forgot to cite) surfaced as a "100% evidence fit" shortlist card.
+    """
     evidence_ids = [str(item.get("id")) for item in (profile.get("evidence_log") or []) if isinstance(item, dict) and item.get("id")]
-    reasoning = _fallback_reasoning_from_evidence(profile)
+    reasoning = "Evidence audit unavailable for this candidate; not verified."
     return {
-        "final_status": "verified_match" if evidence_ids else "not_verified",
+        "final_status": "not_verified",
         "answer": reasoning,
         "reasoning": reasoning,
         "evidence_ids": evidence_ids[:6],
-        "confidence": "high" if evidence_ids else "low",
+        "confidence": "low",
         "match_score": profile.get("match_score"),
+        "audit_unavailable": True,
     }
 
 

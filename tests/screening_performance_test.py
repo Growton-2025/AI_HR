@@ -276,7 +276,10 @@ def test_geography_uses_enriched_profile_and_market_evidence():
     assert any(item["criterion"] == "Geographies" for item in explicit_scored["matched_criteria"])
 
 
-def test_country_query_matches_explicit_region_profile_evidence():
+def test_country_query_is_not_satisfied_by_region_only_evidence():
+    # "UAE" used to expand to "EMEA", so every "Account Executive - EMEA"
+    # headline passed a UAE screen (35 of 365 on one list) while the auditor
+    # rejected them all; the real UAE candidates never got that far.
     criteria = {"required_geographies": {"operator": "OR", "values": ["Singapore"]}}
     profile = {
         "id": 605,
@@ -285,9 +288,10 @@ def test_country_query_matches_explicit_region_profile_evidence():
         "roles": [{"title": "Channel Manager", "company": "Acme", "details": "APAC partner ecosystem.", "duration_years": 4}],
     }
 
-    scored = query._strict_shortlist_score_candidate(profile, criteria)
+    assert query._strict_shortlist_score_candidate(profile, criteria) is None
 
-    assert scored["shortlist_status"] == "shortlisted"
+    region_query = {"required_geographies": {"operator": "OR", "values": ["APAC"]}}
+    assert query._strict_shortlist_score_candidate(profile, region_query)["shortlist_status"] == "shortlisted"
 
 
 def test_current_company_scope_requires_latest_employer():
@@ -2242,3 +2246,92 @@ def test_websocket_send_survives_unserializable_event_and_logs_traceback():
         {"type": "candidate_batch", "data": [{"id": 1, "row": {"file_bytes": memoryview(b"x")}}]}
     )
     assert stripped == {"type": "candidate_batch", "data": [{"id": 1, "row": {"file_bytes": None}}]}
+
+
+# ── country-level geography screens ──────────────────────────────────────────
+#
+# On the "Account Executive (ME & SEA)" list a UAE screen returned nobody real:
+# the seven candidates with UAE/Dubai experience carry it in an imported
+# "Focused Geo" column the geography matcher never read, "uae" expanded to its
+# super-region "emea" so 35 EMEA-headline candidates passed instead, and the
+# one card that did render came from an audit failure that auto-verified.
+
+def _focused_geo_profile(pid, geo, headline="Account Executive"):
+    return {
+        "id": pid,
+        "name": f"Candidate {pid}",
+        "headline": headline,
+        "location": "Bengaluru, Karnataka, India",
+        "raw_fields": {"Focused Geo": geo, "Current Location": "Bengaluru"},
+        "roles": [{"title": headline, "company": "Acme", "details": "Enterprise sales", "duration_years": 3}],
+    }
+
+
+def test_imported_focused_geo_column_counts_as_geography_evidence():
+    claim = query._profile_claim_geography_text(_focused_geo_profile(1, "India, APAC, UAE, SEA, ME"))
+    assert "uae" in claim
+    assert "bengaluru" not in claim  # current-location fields stay excluded
+
+
+def test_uae_screen_accepts_dubai_and_rejects_emea_only_headlines():
+    uae = {"required_geographies": {"operator": "OR", "values": ["UAE"]}}
+    dubai = _focused_geo_profile(1, "Canada, US - 5 years. Earlier India - 8 years and Dubai - 2 Years")
+    explicit = _focused_geo_profile(2, "APAC (4-5 Years), EMEA, SEA, UAE (Major - 2.5 Years)")
+    emea_only = _focused_geo_profile(3, "", headline="Senior Account Executive - Central EMEA")
+    middle_east_only = _focused_geo_profile(4, "North America (US) - 2.5 Years; Middle East - JungleWorks")
+
+    assert query._strict_shortlist_score_candidate(dubai, uae)["shortlist_status"] == "shortlisted"
+    assert query._strict_shortlist_score_candidate(explicit, uae)["shortlist_status"] == "shortlisted"
+    assert query._strict_shortlist_score_candidate(emea_only, uae) is None
+    assert query._strict_shortlist_score_candidate(middle_east_only, uae) is None
+
+    emea = {"required_geographies": {"operator": "OR", "values": ["EMEA"]}}
+    assert query._strict_shortlist_score_candidate(emea_only, emea)["shortlist_status"] == "shortlisted"
+    assert query._strict_shortlist_score_candidate(explicit, emea)["shortlist_status"] == "shortlisted"
+
+
+def test_failed_audit_never_verifies_a_candidate():
+    profile = {"id": 9, "evidence_log": [{"id": "ev1", "source": "headline", "snippet": "AE - EMEA"}], "match_score": 90}
+    payload = query._fallback_audit_payload_from_evidence(profile)
+    assert payload["final_status"] == "not_verified"
+    assert payload["confidence"] == "low"
+    assert payload["audit_unavailable"] is True
+
+
+def test_candidate_with_unusable_audit_output_is_not_returned(monkeypatch):
+    profiles = [_focused_geo_profile(1, "UAE (Major - 2.5 Years)"), _focused_geo_profile(2, "Dubai - 2 Years")]
+
+    class _FakeCriteriaResponse:
+        content = '{"required_geographies": {"operator": "OR", "values": ["UAE"]}}'
+
+    async def fake_ainvoke(_prompt):
+        return _FakeCriteriaResponse()
+
+    class _FakeLLM:
+        model_name = "fake-model"
+        ainvoke = staticmethod(fake_ainvoke)
+
+    def fake_audit(system_prompt, user_prompt, **kwargs):
+        # Candidate 1: proper cited verdict. Candidate 2: rejection with no
+        # citations — the exact shape that used to flip into verified_match.
+        if '"candidate_id": 1' in user_prompt:
+            return {"final_status": "verified_match", "answer": "UAE experience per ev1.", "reasoning": "ev1", "evidence_ids": ["ev1"], "confidence": "high"}
+        return {"final_status": "not_verified", "answer": "", "reasoning": "", "evidence_ids": []}
+
+    monkeypatch.setattr(query, "is_cache_initialized", lambda: True)
+    monkeypatch.setattr(query, "normalize_query_with_llm", lambda value: value)
+    monkeypatch.setattr(query, "llm", _FakeLLM())
+    monkeypatch.setattr(query, "call_openai_json", fake_audit)
+    monkeypatch.setattr(query, "PROFILES_BY_ID", {p["id"]: p for p in profiles})
+
+    async def collect():
+        out = []
+        async for item in query.process_query_main("Candidates with experience at uae", "session", query.TokenCostTracker()):
+            out.append(item)
+        return out
+
+    events = asyncio.run(collect())
+    complete = next(e for e in events if isinstance(e, dict) and e.get("type") == "complete")
+    assert complete["filter_debug"]["passed"] == 2
+    assert [c["id"] for c in complete["data"]] == [1]
+    assert complete["data"][0]["shortlist_status"] == "verified_match"
