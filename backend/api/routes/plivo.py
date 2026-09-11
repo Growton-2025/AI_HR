@@ -71,13 +71,37 @@ def _extract_dial_token(form_data) -> str:
     return ""
 
 
+def _is_hangup_payload(form_data) -> bool:
+    return str(form_data.get("Event") or "").lower() == "hangup" or bool(
+        form_data.get("HangupCause") or form_data.get("HangupCauseName")
+    )
+
+
+def _record_hangup_from_form(form_data) -> str:
+    return plivo_service.record_browser_hangup(
+        form_data.get("CallUUID"),
+        _extract_dial_token(form_data),
+        form_data.get("HangupCauseName") or form_data.get("HangupCause"),
+        form_data.get("HangupCauseCode"),
+        form_data.get("HangupSource"),
+        form_data.get("Duration"),
+    )
+
+
 @router.post("/dial")
 async def plivo_dial(request: Request):
     form_data = await request.form()
     to_number = form_data.get("To")
     from_uri = form_data.get("From")
     call_uuid = form_data.get("CallUUID")
-    
+
+    # Applications provisioned before the hangup URL existed still post their
+    # hangup callback here; it is not a dial and must not re-attribute the row.
+    if _is_hangup_payload(form_data):
+        summary = await asyncio.to_thread(_record_hangup_from_form, form_data)
+        logger.info("Hangup callback for %s arrived on the answer URL: %s", call_uuid, summary)
+        return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response/>', media_type="application/xml")
+
     logger.info(f"Dialing from endpoint to: {to_number}, From: {from_uri}, CallUUID: {call_uuid}")
 
     # Probe for docs/call-attribution-plan.md Phase 3: does Plivo actually
@@ -214,6 +238,18 @@ async def plivo_incoming_voicemail(request: Request):
     )
     return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response/>',
                     media_type="application/xml")
+
+
+@router.post("/outbound-hangup")
+async def plivo_outbound_hangup(request: Request):
+    """hangup_url of the softphone Application: why a browser dial ended."""
+    form_data = await request.form()
+    summary = await asyncio.to_thread(_record_hangup_from_form, form_data)
+    logger.info(
+        "Browser call %s hung up: %s (duration=%s)",
+        form_data.get("CallUUID"), summary, form_data.get("Duration"),
+    )
+    return Response(status_code=200)
 
 
 @router.post("/incoming-hangup")
@@ -473,20 +509,28 @@ async def get_last_call_uuid(username: str):
     return {"call_uuid": uuid}
 
 @router.get("/call-state-by-token/{dial_token}")
-async def get_call_state_by_token(dial_token: str):
+async def get_call_state_by_token(dial_token: str, include_hangup: bool = False):
     """Dial handshake keyed on the attempt rather than the SIP username.
 
     The username-keyed route below returns whatever call that endpoint placed
     most recently and is never cleared, so a redial passes the handshake
     instantly on the *previous* call's UUID — masking genuine webhook failures.
+
+    `include_hangup` adds Plivo's hangup reason, falling back to the calls row
+    (the hangup webhook may have hit another worker). Only the post-call
+    lookup asks for it: the handshake polls this twice a second.
     """
     state = plivo_service.dial_token_states.get(dial_token) or {}
+    hangup = state.get("hangup")
+    if include_hangup and not hangup:
+        hangup = await asyncio.to_thread(plivo_service.get_hangup_for_token, dial_token)
     return {
         "call_uuid": state.get("call_uuid"),
         "username": state.get("username"),
         "to_number": state.get("to_number"),
         "seen_at": state.get("seen_at"),
         "dial_token": dial_token,
+        "hangup": hangup,
     }
 
 

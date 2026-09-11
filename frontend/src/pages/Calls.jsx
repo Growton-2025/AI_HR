@@ -215,6 +215,40 @@ const cleanVoipReasonText = (value) => (
     .trim()
 );
 
+// Plivo's hangup reason for the browser leg, recorded by the backend's hangup
+// webhook. The SDK's own reason is usually just "busy"; the carrier code is
+// the only thing that says whether the candidate, the network or our own
+// calling number ended the attempt.
+const describePlivoHangup = (hangup) => {
+  const summary = String(hangup?.summary || hangup?.cause_name || '').trim();
+  if (!summary) return '';
+  const lower = summary.toLowerCase();
+  const source = String(hangup?.source || '').toLowerCase();
+  if (lower.includes('rejected') && source.includes('carrier')) {
+    return `Plivo reported "${summary}": the carrier refused the outbound call from our calling number before it rang. This is not the candidate declining — if it repeats across candidates, raise it with Plivo support.`;
+  }
+  if (lower.includes('normal hangup') && source.includes('callee')) {
+    return `Plivo reported "${summary}": the candidate ended the call.`;
+  }
+  return `Plivo reported "${summary}".`;
+};
+
+const fetchPlivoHangup = async (dialToken, attempts = 4) => {
+  const token = String(dialToken || '').trim();
+  if (!token) return null;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const response = await fetch(`${API_BASE}/plivo/call-state-by-token/${encodeURIComponent(token)}?include_hangup=1`);
+      const state = await response.json().catch(() => ({}));
+      if (response.ok && state?.hangup) return state.hangup;
+    } catch (_) {
+      // best effort — the hangup webhook can land a second or two after the SDK event
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+  }
+  return null;
+};
+
 const buildCallWrapUpMeta = (event, candidateName) => {
   const firstName = candidateName?.trim()?.split(/\s+/)?.[0] || 'The candidate';
   const reasonText = cleanVoipReasonText(event?.reasonText || event?.message || '');
@@ -1732,6 +1766,9 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   } = useVoIP();
   const isInitiated = useRef(false);
   const lastHandledCallEventRef = useRef(0);
+  // Token of the attempt currently being dialled, so a failure can be looked
+  // up on the backend for Plivo's hangup reason.
+  const lastDialTokenRef = useRef('');
   const autoRetriedSoftphoneRef = useRef(false);
   // Timing diagnostics: when the modal opened and what the softphone status
   // was at that moment, so the wait-for-registration leg is measurable.
@@ -1842,6 +1879,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       // calls row), so the recording cannot be attributed to another
       // recruiter's call. See docs/call-attribution-plan.md.
       const dialToken = res?.data?.plivo_data?.dial_token || '';
+      lastDialTokenRef.current = dialToken;
 
       if (placeCall && call.candidate_phone) {
         const placeStart = performance.now();
@@ -2071,6 +2109,15 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       setOutcome(nextMeta.suggestedOutcome);
     }
     setCallState('ended');
+
+    // Replace the SDK's vague reason with Plivo's hangup cause once the
+    // backend has it (arrives via webhook shortly after the SDK event).
+    const handledAt = voipCallEvent.at;
+    fetchPlivoHangup(lastDialTokenRef.current).then((hangup) => {
+      const detail = describePlivoHangup(hangup);
+      if (!detail || lastHandledCallEventRef.current !== handledAt) return;
+      setCallWrapUpMeta((prev) => (prev ? { ...prev, message: detail } : prev));
+    });
 
     if (voipCallEvent.origin !== 'local') {
       if (voipCallEvent.type === 'failed') {

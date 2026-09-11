@@ -852,3 +852,122 @@ def test_unknown_binding_is_treated_as_owned_not_free(monkeypatch):
 
     monkeypatch.setattr(plivo_service.plivo, "RestClient", _Client)
     assert plivo_service._inbound_number_owner_env() == "unknown"
+
+
+# ── hangup reasons ───────────────────────────────────────────────────────────
+#
+# The softphone Application had no hangup URL, so Plivo posted its hangup
+# callback to the answer URL. /dial treated that as a second dial and threw
+# away the reason; when the carrier started rejecting every outbound leg
+# ("Rejected (3020, Carrier)") the recruiter only ever saw "Call did not
+# connect".
+
+class _HangupRequest:
+    def __init__(self, **extra):
+        self.extra = extra
+
+    async def form(self):
+        return {
+            "Event": "Hangup",
+            "CallUUID": "plivo-call-uuid-9",
+            "From": "sip:endpointuser@phone.plivo.com",
+            "To": "8618884276",
+            "HangupCause": "Rejected",
+            "HangupCauseName": "Rejected",
+            "HangupCauseCode": "3020",
+            "HangupSource": "Carrier",
+            "Duration": "0",
+            "X-PH-DialToken": "tok-9",
+            **self.extra,
+        }
+
+
+class _RowCursor(_FakeCursor):
+    def __init__(self, row=None):
+        super().__init__()
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+def _fake_calls_db(monkeypatch, cursor=None):
+    from backend.api.routes import calls
+
+    conn = _FakeConnection()
+    if cursor is not None:
+        conn.cursor_obj = cursor
+    monkeypatch.setattr(calls, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda c: None)
+    return conn
+
+
+def test_hangup_callback_on_the_answer_url_is_not_a_dial(monkeypatch):
+    _reset_plivo_setup_state()
+    plivo_service.dial_token_states.clear()
+    conn = _fake_calls_db(monkeypatch)
+    plivo_service.dial_token_states["tok-9"] = {"call_uuid": "plivo-call-uuid-9", "username": "endpointuser"}
+
+    response = asyncio.run(plivo_routes.plivo_dial(_HangupRequest()))
+
+    assert response.status_code == 200
+    assert b"<Response/>" in response.body
+    assert "endpointuser" not in plivo_service.last_calls  # no re-attribution
+    assert plivo_service.dial_token_states["tok-9"]["hangup"]["summary"] == "Rejected (3020, Carrier)"
+    query, params = conn.cursor_obj.executed[0]
+    assert "plivo_hangup_cause" in query
+    assert params[0] == "Rejected (3020, Carrier)" and params[1] == "tok-9"
+
+
+def test_outbound_hangup_is_exposed_to_the_call_state_poll(monkeypatch):
+    _reset_plivo_setup_state()
+    plivo_service.dial_token_states.clear()
+    _fake_calls_db(monkeypatch)
+    plivo_service.dial_token_states["tok-9"] = {"call_uuid": "plivo-call-uuid-9", "username": "endpointuser"}
+
+    response = asyncio.run(plivo_routes.plivo_outbound_hangup(_HangupRequest()))
+    assert response.status_code == 200
+
+    state = asyncio.run(plivo_routes.get_call_state_by_token("tok-9"))
+    assert state["hangup"]["cause_name"] == "Rejected"
+    assert state["hangup"]["cause_code"] == "3020"
+    assert state["hangup"]["source"] == "Carrier"
+
+
+def test_call_state_reads_the_hangup_from_the_calls_row_only_when_asked(monkeypatch):
+    plivo_service.dial_token_states.clear()
+    cursor = _RowCursor(row=("Rejected (3020, Carrier)",))
+    _fake_calls_db(monkeypatch, cursor)
+
+    # The dial handshake polls twice a second: no DB read unless asked.
+    assert asyncio.run(plivo_routes.get_call_state_by_token("tok-other"))["hangup"] is None
+    assert cursor.executed == []
+
+    state = asyncio.run(plivo_routes.get_call_state_by_token("tok-other", include_hangup=True))
+    assert state["hangup"]["summary"] == "Rejected (3020, Carrier)"
+    assert state["hangup"]["cause_name"] == "Rejected"
+    assert "plivo_hangup_cause" in cursor.executed[0][0]
+
+
+def test_softphone_application_is_created_with_a_hangup_url(monkeypatch, tmp_path):
+    _reset_plivo_setup_state()
+    plivo_service._hangup_url_applied.clear()
+    monkeypatch.setattr(plivo_service, "_PLIVO_STATE_FILE", str(tmp_path / "plivo_state.json"))
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_ID", "auth-id")
+    monkeypatch.setattr(plivo_service, "PLIVO_AUTH_TOKEN", "auth-token")
+    monkeypatch.setattr(plivo_service, "get_ngrok_url", lambda: "https://backend.example.com")
+    monkeypatch.setattr(plivo_service, "_load_app_state", lambda kind: None)
+    monkeypatch.setattr(plivo_service, "_save_app_state", lambda *a, **k: True)
+    monkeypatch.setattr(plivo_service, "_provision_app_once", lambda kind, answer_url, create_fn: create_fn())
+    _FakeRestClient.calls = []
+    monkeypatch.setattr(plivo_service.plivo, "RestClient", _FakeRestClient)
+
+    result = asyncio.run(plivo_service.setup_plivo(force=True))
+
+    assert result["success"]
+    app_kwargs = next(kwargs for kind, kwargs in _FakeRestClient.calls if kind == "application")
+    assert app_kwargs["answer_url"] == "https://backend.example.com/api/plivo/dial"
+    assert app_kwargs["hangup_url"] == "https://backend.example.com/api/plivo/outbound-hangup"
+    assert app_kwargs["hangup_method"] == "POST"
+    _FakeRestClient.calls = []
+    _reset_plivo_setup_state()

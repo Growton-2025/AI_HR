@@ -35,6 +35,9 @@ last_call_states = {}
 # SIP username), which is never cleared and so hands a redial the previous
 # call's UUID.
 dial_token_states = {}
+# app_id -> hangup_url this worker has confirmed on the Plivo Application, so
+# reuse of a persisted app costs one REST update per process, not per login.
+_hangup_url_applied = {}
 call_insights = {}
 latest_call_uuid = None
 
@@ -597,6 +600,98 @@ async def ensure_inbound_application() -> Optional[str]:
         return None
 
 
+def _hangup_summary(cause_name: str, cause_code, source: str) -> str:
+    parts = [str(cause_name or "Unknown").strip()]
+    details = [p for p in (str(cause_code or "").strip(), str(source or "").strip()) if p]
+    if details:
+        parts.append(f"({', '.join(details)})")
+    return " ".join(parts)[:160]
+
+
+def record_browser_hangup(
+    call_uuid: str,
+    dial_token: str,
+    cause_name: str,
+    cause_code=None,
+    source: str = "",
+    duration=None,
+) -> str:
+    """Keep Plivo's hangup reason for a browser dial — memory for the polling
+    modal, the calls row for whichever worker (or later page) asks.
+
+    Until now the softphone Application had no hangup URL, so Plivo posted
+    these to the answer URL where they were mistaken for a new dial and the
+    reason ("Rejected (3020, Carrier)") was thrown away; the recruiter only
+    ever saw "Call did not connect"."""
+    summary = _hangup_summary(cause_name, cause_code, source)
+    hangup = {
+        "cause_name": str(cause_name or "Unknown"),
+        "cause_code": str(cause_code or ""),
+        "source": str(source or ""),
+        "duration": str(duration or "0"),
+        "summary": summary,
+        "at": time.time(),
+    }
+    if dial_token and dial_token in dial_token_states:
+        dial_token_states[dial_token]["hangup"] = hangup
+    for state in last_call_states.values():
+        if state.get("call_uuid") == call_uuid:
+            state["hangup"] = hangup
+    try:
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+        conn = get_calls_db_connection()
+        if not conn:
+            return summary
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE calls
+                SET plivo_hangup_cause = %s, updated_at = NOW()
+                WHERE (dial_token = %s AND %s <> '') OR plivo_call_uuid = %s
+                """,
+                (summary, dial_token or "", dial_token or "", call_uuid),
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            return_db_connection(conn)
+    except Exception as exc:
+        logger.warning("Could not persist hangup cause for %s: %s", call_uuid, exc)
+    return summary
+
+
+def get_hangup_for_token(dial_token: str):
+    """Hangup details for a dial attempt: this worker's memory first, then the
+    calls row (the hangup webhook may have been served by another worker)."""
+    state = dial_token_states.get(dial_token) or {}
+    if state.get("hangup"):
+        return state["hangup"]
+    if not dial_token:
+        return None
+    try:
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+        conn = get_calls_db_connection()
+        if not conn:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT plivo_hangup_cause FROM calls WHERE dial_token = %s LIMIT 1",
+                (dial_token,),
+            )
+            row = cur.fetchone()
+            cur.close()
+        finally:
+            return_db_connection(conn)
+    except Exception as exc:
+        logger.warning("Could not read hangup cause for token %s: %s", dial_token, exc)
+        return None
+    if row and row[0]:
+        return {"summary": row[0], "cause_name": str(row[0]).split(" (")[0]}
+    return None
+
+
 def record_browser_dial(username: str, call_uuid: str, to_number: str, dial_token: str = None):
     global latest_call_uuid
     if not username or not call_uuid:
@@ -750,6 +845,10 @@ async def setup_plivo(force: bool = False):
             
         client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
         answer_url = f"{ngrok_url}/api/plivo/dial"
+        # Without an explicit hangup URL Plivo posts the hangup callback to the
+        # answer URL, where it looked like a second dial and its HangupCause
+        # was discarded.
+        hangup_url = f"{ngrok_url}/api/plivo/outbound-hangup"
 
         # Reuse the previously provisioned app + endpoint when possible so a
         # backend restart (or URL change) doesn't pay two Plivo REST calls and
@@ -800,19 +899,25 @@ async def setup_plivo(force: bool = False):
                     persisted = legacy
         if persisted:
             try:
-                if persisted["answer_url"] != answer_url:
+                if (
+                    persisted["answer_url"] != answer_url
+                    or _hangup_url_applied.get(persisted["app_id"]) != hangup_url
+                ):
                     await asyncio.to_thread(
                         client.applications.update,
                         app_id=persisted["app_id"],
                         answer_url=answer_url,
                         answer_method="POST",
+                        hangup_url=hangup_url,
+                        hangup_method="POST",
                     )
+                    _hangup_url_applied[persisted["app_id"]] = hangup_url
                     _persist_softphone_state(persisted["app_id"], persisted["username"], persisted["password"], answer_url)
                     await asyncio.to_thread(
                         _save_app_state, "softphone", persisted["app_id"], answer_url,
                         persisted["username"], persisted["password"],
                     )
-                    logger.info(f"Updated answer_url on existing Plivo app {persisted['app_id']}")
+                    logger.info(f"Updated answer/hangup URLs on existing Plivo app {persisted['app_id']}")
                 endpoint_username = persisted["username"]
                 endpoint_password = persisted["password"]
                 _last_setup_ngrok_url = ngrok_url
@@ -840,8 +945,11 @@ async def setup_plivo(force: bool = False):
                     app_name=app_name,
                     answer_url=answer_url,
                     answer_method="POST",
+                    hangup_url=hangup_url,
+                    hangup_method="POST",
                 )
                 new_app_id = app_response.app_id
+                _hangup_url_applied[str(new_app_id)] = hangup_url
                 logger.info("Created Plivo App: %s", new_app_id)
 
                 new_username = f"user{uuid.uuid4().hex[:20]}"

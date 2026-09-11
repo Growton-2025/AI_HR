@@ -1085,6 +1085,10 @@ def ensure_calls_schema_ready(force: bool = False):
             # shared fallback endpoint, or one recruiter redialling quickly) and
             # silently writes a recording onto the wrong candidate.
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS dial_token VARCHAR(64);")
+            # Plivo's hangup callback for the browser leg ("Rejected (3020,
+            # Carrier)" etc.) — the only place the reason a call never
+            # connected is available.
+            cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS plivo_hangup_cause VARCHAR(160);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_source VARCHAR(100);")
             cur.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_synced_at TIMESTAMP;")
             # Follow-up calls carry an exact slot (date + time); cadence calls only a date.
