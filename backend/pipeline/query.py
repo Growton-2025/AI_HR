@@ -459,6 +459,7 @@ def _profile_dicts_from_candidates_and_roles(
                     json.loads(cand[36]) if isinstance(cand[36], str) and cand[36]
                     else (cand[36] if isinstance(cand[36], dict) else {})
                 ),
+                "years_team_management": float(cand[38]) if len(cand) > 38 and cand[38] is not None else 0.0,
                 "roles": roles_by_candidate.get(candidate_id, []),
             }
         )
@@ -477,7 +478,8 @@ _CANDIDATE_SELECT_BODY = """
                 co.li_sent_count, co.message_sent_count,
                 c.owner_user_id, c.pool_source, c.normalized_linkedin, c.source_master_candidate_id,
                 c.is_archived,
-                res.id, res.filename, res.summary, res.parsed_json, res.created_at
+                res.id, res.filename, res.summary, res.parsed_json, res.created_at,
+                c.years_team_management
             FROM candidates c
             LEFT JOIN candidate_outreach co ON c.id = co.candidate_id AND co.recruitment_role_id IS NULL
             LEFT JOIN LATERAL (
@@ -1075,31 +1077,88 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
             return False
     return True
 
+
+def check_excluded_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    criteria_obj = criteria.get("excluded_industries")
+    if not criteria_obj: return True
+    values = [v.lower() for v in get_values_from_criteria(criteria_obj)]
+    if not values: return True
+
+    for role in profile.get('roles', []):
+        company_details = role.get('company_details') or {}
+        role_text = (
+            f"{(role.get('company') or '').lower()} "
+            f"{(company_details.get('industry', '') or '').lower()} "
+            f"{(company_details.get('product_service', '') or '').lower()}"
+        )
+        if any(v in role_text for v in values):
+            return False
+    return True
+
+def _criterion_years_value(value: Any, keys: Tuple[str, ...] = ("min_years", "years", "avg_years", "value", "min", "shape")) -> Optional[float]:
+    """Read a year threshold from a bare number or the planner's dict shapes.
+
+    The filter-plan contract declares these rules as objects
+    (``{"min_years": 2, "last_n": 2}``), while older callers pass plain numbers.
+    A ``min_months`` key is converted to years.
+    """
+    if isinstance(value, dict):
+        months = _coerce_positive_float(value.get("min_months") or value.get("months"))
+        if months:
+            return months / 12.0
+        for key in keys:
+            years = _coerce_positive_float(value.get(key))
+            if years:
+                return years
+        return None
+    return _coerce_positive_float(value)
+
+
+def _criterion_role_count(value: Any) -> Optional[int]:
+    if not isinstance(value, dict):
+        return None
+    for key in ("last_n", "num_roles", "n", "roles", "count"):
+        try:
+            count = int(value.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+    return None
+
+
 def check_tenure_in_latest_role(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
-    min_tenure = criteria.get("min_tenure_in_latest_role")
+    min_tenure = _criterion_years_value(criteria.get("min_tenure_in_latest_role"))
     if not min_tenure: return True
 
     roles = profile.get('roles', [])
     if not roles: return False
-    
+
     latest_role = roles[0]
-    duration = latest_role.get('duration_years', 0.0)
+    duration = float(latest_role.get('duration_years') or 0.0)
     is_met = duration >= min_tenure
     if is_met:
-         profile.setdefault('evidence_log', []).append({
-            "criterion": "min_tenure_in_latest_role",
-            "source_text": f"Latest role tenure {duration} >= {min_tenure}."
+        snippet = f"{latest_role.get('title') or 'Latest role'} at {latest_role.get('company') or 'current employer'}: {duration:.1f} years (minimum {min_tenure:g})"
+        profile.setdefault('evidence_log', []).append({
+            "criterion": "Tenure in latest role",
+            "value": f"{duration:.1f} years",
+            "source": "role dates",
+            "snippet": snippet,
+            "source_text": snippet,
         })
     return is_met
 
 def check_avg_tenure_in_last_n_roles(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     tenure_criteria = criteria.get("avg_tenure_in_last_n_roles")
-    if not tenure_criteria or not isinstance(tenure_criteria, dict):
+    if not tenure_criteria:
         return True
-    
-    avg_years = tenure_criteria.get("avg_years")
-    num_roles = tenure_criteria.get("num_roles")
-    if not avg_years or not num_roles:
+
+    # Planner contract is {"min_years": N, "last_n": K}; legacy callers used
+    # {"avg_years": N, "num_roles": K}. Reading only the legacy keys made this
+    # rule a silent no-op that passed every candidate.
+    avg_years = _criterion_years_value(tenure_criteria)
+    num_roles = _criterion_role_count(tenure_criteria) or 2
+    if not avg_years:
         return True
 
     roles = profile.get('roles', [])
@@ -1107,14 +1166,19 @@ def check_avg_tenure_in_last_n_roles(profile: Dict[str, Any], criteria: Dict[str
         return False
 
     last_n_roles = roles[:num_roles]
-    total_duration = sum(role.get('duration_years', 0.0) for role in last_n_roles)
+    total_duration = sum(float(role.get('duration_years') or 0.0) for role in last_n_roles)
     calculated_avg = total_duration / num_roles
-    
+
     is_met = calculated_avg >= avg_years
     if is_met:
+        parts = [f"{r.get('company') or r.get('title') or 'role'} {float(r.get('duration_years') or 0.0):.1f}y" for r in last_n_roles]
+        snippet = f"Average {calculated_avg:.1f} years across last {num_roles} roles ({'; '.join(parts)}); minimum {avg_years:g}"
         profile.setdefault('evidence_log', []).append({
-            "criterion": "avg_tenure_in_last_n_roles",
-            "source_text": f"Avg tenure {calculated_avg:.1f} >= {avg_years}."
+            "criterion": "Average tenure in recent roles",
+            "value": f"{calculated_avg:.1f} years",
+            "source": "role dates",
+            "snippet": snippet,
+            "source_text": snippet,
         })
     return is_met
 
@@ -1203,6 +1267,28 @@ def _coerce_positive_float(value: Any) -> Optional[float]:
         return None
     number = float(match.group(0))
     return number if number > 0 else None
+
+
+def _coerce_scalar_threshold(value: Any) -> Optional[float]:
+    """Read a bare numeric threshold, tolerating the planner's dict shapes
+    (e.g. {"operator": "AND", "values": [15]}, or {"integer": 30} when it
+    echoes a schema-contract type hint as the key) instead of only plain numbers."""
+    if isinstance(value, dict):
+        for key in ("min_years", "years", "value", "min", "count"):
+            coerced = _coerce_positive_float(value.get(key))
+            if coerced is not None:
+                return coerced
+        values_list = value.get("values")
+        if isinstance(values_list, list) and values_list:
+            coerced = _coerce_positive_float(values_list[0])
+            if coerced is not None:
+                return coerced
+        # Last resort: a single-key dict wrapping the number under some other
+        # invented key name (e.g. {"integer": 30}) — take that lone value.
+        if len(value) == 1:
+            return _coerce_positive_float(next(iter(value.values())))
+        return None
+    return _coerce_positive_float(value)
 
 
 def _raw_experience_roles(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1486,14 +1572,36 @@ def _scoped_duration_role_text(profile: Dict[str, Any], role: Dict[str, Any], di
     return " ".join(_flatten_value_for_evidence(payload, max_items=80)).lower()
 
 
+_MARKET_ACTION_PATTERN = re.compile(
+    r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|pipeline|quota|revenue|territor(?:y|ies)|region(?:al)?|market)\b"
+)
+
+
 def _has_market_action_text(text: str) -> bool:
     normalized = _normalize_search_text(text)
-    return bool(
-        re.search(
-            r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|pipeline|quota|revenue|territor(?:y|ies)|region(?:al)?|market)\b",
-            normalized,
-        )
-    )
+    return bool(_MARKET_ACTION_PATTERN.search(normalized))
+
+
+def _geography_term_near_market_action(term: str, text: str, window: int = 100) -> bool:
+    """A country/region mention only counts as market-tenure evidence when it
+    sits near actual market-action language, not merely anywhere in a long
+    company-boilerplate blob (e.g. "founded ... with offices in India, UK, USA
+    ... serving the Global market" should not count as "worked in India/APAC
+    market" just because both words appear somewhere in the same paragraph)."""
+    normalized = _normalize_search_text(text)
+    term_l = _normalize_search_text(term)
+    if not term_l:
+        return False
+    try:
+        term_positions = [m.start() for m in re.finditer(re.escape(term_l), normalized)]
+    except re.error:
+        return False
+    if not term_positions:
+        return False
+    action_positions = [m.start() for m in _MARKET_ACTION_PATTERN.finditer(normalized)]
+    if not action_positions:
+        return False
+    return any(abs(tp - ap) <= window for tp in term_positions for ap in action_positions)
 
 
 def evaluate_scoped_duration(
@@ -1541,9 +1649,18 @@ def evaluate_scoped_duration(
 
     for role in duration_roles:
         role_text = _scoped_duration_role_text(profile, role, dimension)
-        if dimension == "geography" and not _has_market_action_text(role_text):
-            continue
-        matched_term = next((term for term in terms if _term_matches_text(term, role_text)), None)
+        if dimension == "geography":
+            if not _has_market_action_text(role_text):
+                continue
+            matched_term = next(
+                (
+                    term for term in terms
+                    if _term_matches_text(term, role_text) and _geography_term_near_market_action(term, role_text)
+                ),
+                None,
+            )
+        else:
+            matched_term = next((term for term in terms if _term_matches_text(term, role_text)), None)
         if not matched_term:
             continue
         matching_roles.append(role)
@@ -3050,7 +3167,10 @@ def _funding_rank(value: Any) -> Optional[int]:
         return FUNDING_STAGE_RANKS["private equity"]
     if "growth" in text:
         return FUNDING_STAGE_RANKS["growth"]
-    series_match = re.search(r"\bseries\s*([a-z])\+?\b", text)
+    # The planner writes "series-b" / "series_b" as often as "Series B"; an
+    # unparsed stage used to disable the funding filter entirely while the
+    # auditor still enforced it, so every candidate was rejected.
+    series_match = re.search(r"\bseries[\s_-]*([a-z])\+?\b", text)
     if series_match:
         letter = series_match.group(1).lower()
         return max(2, ord(letter) - ord("a") + 2)
@@ -3639,10 +3759,12 @@ def _audit_output_is_evidence_valid(profile: Dict[str, Any], payload: Any) -> bo
     if any(evidence_id not in valid_ids for evidence_id in cited_ids):
         return False
     text = " ".join(str(payload.get(key) or "") for key in ("answer", "reasoning", "auditor_reasoning"))
-    if not text.strip():
-        return False
-    # Require the visible explanation to carry at least one cited evidence ID.
-    return any(evidence_id in text for evidence_id in cited_ids)
+    # The structured evidence_ids field is the citation contract; it is already
+    # checked against the evidence log above. Do not also require the ID to be
+    # repeated inline in the prose: gpt-4o omits "ev1" from the sentence about
+    # half the time, and every such (correct, fully cited) verdict was being
+    # discarded as "unsupported output" and the candidate silently dropped.
+    return bool(text.strip())
 
 
 def _fallback_audit_payload_from_evidence(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -5095,16 +5217,18 @@ def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, An
         if rank is None:
             continue
         if rank >= min_rank:
-            snippet = f"{role.get('company')}: {stage_text}"
+            # stage_text is flattened as "funding stage: Series D"; show the bare stage.
+            stage_label = re.sub(r"^(funding stage|company status|ownership)\s*:\s*", "", stage_text.strip(), flags=re.IGNORECASE) or stage_text
+            snippet = f"{role.get('company')}: {stage_label} (meets minimum {min_stage})"
             return {
                 "applicable": True,
                 "met": True,
                 "score": 1.0,
-                "matched": [min_stage],
+                "matched": [f"{stage_label} (>= {min_stage})"],
                 "missing": [],
                 "evidence": [{
                     "criterion": "Funding stage",
-                    "value": min_stage,
+                    "value": f"{stage_label} (meets minimum {min_stage})",
                     "source": "role company details",
                     "snippet": snippet,
                     "source_text": snippet,
@@ -5260,15 +5384,49 @@ def _strict_shortlist_score_candidate(
 
     min_managed = criteria.get("min_people_managed")
     if min_managed is not None:
-        actual = int(profile_copy.get("max_people_managed") or 0)
-        if actual < int(min_managed):
-            reject("min_people_managed")
-            return None
-        score_parts.append(1.0)
-        matched_criteria.append({"criterion": "People managed", "value": str(actual)})
+        min_managed_val = _coerce_scalar_threshold(min_managed)
+        if min_managed_val is not None:
+            actual = int(profile_copy.get("max_people_managed") or 0)
+            if actual < min_managed_val:
+                reject("min_people_managed")
+                return None
+            score_parts.append(1.0)
+            matched_criteria.append({"criterion": "People managed", "value": str(actual)})
+            evidence_log.append({
+                "criterion": "People managed",
+                "value": str(min_managed_val),
+                "source": "profile",
+                "snippet": f"Managed team of {actual} people",
+                "source_text": f"Managed team of {actual} people",
+            })
+
+    min_team_mgmt_years = criteria.get("min_team_management_years")
+    if min_team_mgmt_years is not None:
+        min_team_mgmt_years_val = _coerce_scalar_threshold(min_team_mgmt_years)
+        if min_team_mgmt_years_val is not None:
+            actual_tm_years = float(
+                profile_copy.get("years_team_management")
+                or (profile_copy.get("raw_fields") or {}).get("years_team_management")
+                or 0
+            )
+            if actual_tm_years < min_team_mgmt_years_val:
+                reject("min_team_management_years")
+                return None
+            score_parts.append(1.0)
+            matched_criteria.append({"criterion": "Team management tenure", "value": f"{actual_tm_years:g} years"})
+            evidence_log.append({
+                "criterion": "Team management tenure",
+                "value": str(min_team_mgmt_years_val),
+                "source": "profile",
+                "snippet": f"{actual_tm_years:g} years of team management experience",
+                "source_text": f"{actual_tm_years:g} years of team management experience",
+            })
 
     if not check_excluded_geography_presence(profile_copy, criteria):
         reject("excluded_geography")
+        return None
+    if not check_excluded_industry_presence(profile_copy, criteria):
+        reject("excluded_industry")
         return None
     if not check_tenure_in_latest_role(profile_copy, criteria):
         reject("min_tenure_in_latest_role")
@@ -5451,7 +5609,12 @@ async def generate_reasoning_for_profile(
         "Treat every requirement in the original screening query as mandatory AND logic. "
         "Never return verified_match for a partial match or when any stated requirement lacks evidence. "
         "Mention evidence IDs inline, e.g. ev1. Do not invent missing candidate facts. "
-        "If evidence is insufficient, return not_verified."
+        "If evidence is insufficient, return not_verified. "
+        "Criteria semantics: funding_stage_min means the named stage OR ANY LATER stage "
+        "(Seed < Series A < Series B < Series C < ... < Growth < Private Equity < Public), so a later stage satisfies it. "
+        "avg_tenure_in_last_n_roles is the average duration of the candidate's most recent N roles; "
+        "min_tenure_in_latest_role is the duration of the current/latest role; min_total_experience is total career years. "
+        "Durations in calculated_experience, scoped_tenure and evidence_log were computed from role dates and are authoritative."
     )
     user_prompt = (
         f"Original filtering criteria:\n{json.dumps(original_criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
@@ -5543,6 +5706,75 @@ async def _expand_keywords_with_llm(values: List[str], category: str, tracker: T
         return []
 
 
+# Cities whose official name differs from the name recruiters type, and vice
+# versa. Candidate locations are stored however the source spelled them
+# ("Bengaluru India"), so a query for "Bangalore" must match both spellings
+# without depending on the LLM expansion remembering to include the alias.
+LOCATION_ALIASES: Dict[str, List[str]] = {
+    "bangalore": ["bengaluru"],
+    "mumbai": ["bombay"],
+    "chennai": ["madras"],
+    "kolkata": ["calcutta"],
+    "pune": ["poona"],
+    "gurugram": ["gurgaon"],
+    "delhi": ["new delhi", "delhi ncr", "ncr"],
+    "noida": ["greater noida"],
+    "kochi": ["cochin"],
+    "thiruvananthapuram": ["trivandrum"],
+    "vadodara": ["baroda"],
+    "mysuru": ["mysore"],
+    "mangaluru": ["mangalore"],
+    "hubballi": ["hubli"],
+    "belagavi": ["belgaum"],
+    "visakhapatnam": ["vizag"],
+    "prayagraj": ["allahabad"],
+    "shimla": ["simla"],
+    "puducherry": ["pondicherry"],
+    "ahmedabad": ["amdavad"],
+    "hyderabad": ["secunderabad", "cyberabad"],
+    "new york": ["nyc", "new york city"],
+    "san francisco": ["sf", "bay area"],
+    "los angeles": ["la"],
+    "washington": ["washington dc", "dc"],
+    "ho chi minh city": ["saigon"],
+    "beijing": ["peking"],
+    "mumbai metropolitan region": ["navi mumbai", "thane"],
+}
+_LOCATION_ALIAS_LOOKUP: Dict[str, List[str]] = {}
+for _canonical, _alternates in LOCATION_ALIASES.items():
+    _group = [_canonical] + list(_alternates)
+    for _name in _group:
+        _LOCATION_ALIAS_LOOKUP.setdefault(_name, [])
+        _LOCATION_ALIAS_LOOKUP[_name].extend(n for n in _group if n != _name)
+
+
+def _location_alias_terms(values: List[str]) -> List[str]:
+    """Deterministic alternate spellings for the given locations (order-stable, deduped)."""
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        key = _normalize_search_text(value)
+        for alias in _LOCATION_ALIAS_LOOKUP.get(key, []):
+            if alias not in seen:
+                seen.add(alias)
+                out.append(alias)
+    return out
+
+
+def _expanded_location_values(values: List[str], llm_values: List[str]) -> List[str]:
+    """Original locations first, then static aliases, then LLM suggestions (deduped, case-insensitive)."""
+    merged: List[str] = []
+    seen = set()
+    for value in list(values) + _location_alias_terms(values) + list(llm_values or []):
+        text = str(value or "").strip()
+        key = _normalize_search_text(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+    return merged
+
+
 async def _expand_locations_with_llm(values: List[str], tracker: TokenCostTracker) -> List[str]:
     values = [str(value).strip() for value in values if str(value or "").strip()]
     if not values:
@@ -5550,7 +5782,7 @@ async def _expand_locations_with_llm(values: List[str], tracker: TokenCostTracke
     prompt = PromptTemplate(
         input_variables=["locations"],
         template="""
-        You are a geography expert. For the given countries, states, cities, or regions, generate a JSON list containing original names, common abbreviations, and up to 5 major cities or business hubs.
+        You are a geography expert. For the given countries, states, cities, or regions, generate a JSON list containing original names, alternate and official spellings (e.g. Bangalore/Bengaluru, Bombay/Mumbai, Gurgaon/Gurugram), common abbreviations, and up to 5 major cities or business hubs.
 
         Initial Locations: {locations}
         JSON List:
@@ -5658,6 +5890,7 @@ FILTER_PLAN_CRITERIA_KEYS = {
     "required_locations",
     "required_geographies",
     "excluded_geographies",
+    "excluded_industries",
     "required_company_details",
     "required_culture_type",
     "required_keywords",
@@ -5666,6 +5899,7 @@ FILTER_PLAN_CRITERIA_KEYS = {
     "funding_stage_min",
     "min_total_experience",
     "min_people_managed",
+    "min_team_management_years",
     "min_tenure_in_latest_role",
     "avg_tenure_in_last_n_roles",
     "min_function_years",
@@ -5707,12 +5941,14 @@ def _executable_criteria_contract() -> Dict[str, Any]:
         "required_geographies": {**common_text_shape, "supports_min_years": True, "meaning": "market/territory experience"},
         "required_locations": {**common_text_shape, "meaning": "candidate current/base location"},
         "excluded_geographies": common_text_shape,
+        "excluded_industries": {**common_text_shape, "meaning": "industries/company types the candidate must NOT have worked in"},
         "funding_stage_min": {
             "shape": {"stage": "funding stage", "employment_scope": "current_employer|any_employer"},
             "comparison": "ordered minimum",
         },
         "min_total_experience": {"shape": "number"},
-        "min_people_managed": {"shape": "integer"},
+        "min_people_managed": {"shape": "integer", "meaning": "team size/headcount managed, NOT duration"},
+        "min_team_management_years": {"shape": "number", "meaning": "years spent in a people-management/leadership capacity, NOT team headcount"},
         "min_tenure_in_latest_role": {"shape": "number"},
         "avg_tenure_in_last_n_roles": {"shape": {"min_years": "number", "last_n": "integer"}},
         "required_keywords": common_text_shape,
@@ -6342,6 +6578,34 @@ def _enforce_explicit_query_requirements(criteria: Dict[str, Any], query: str) -
         )
 
 
+_LOCATION_FALLBACK_STOPWORDS = re.compile(
+    r"^(who|with|and|that|managed|worked|has|have|top|candidates?|people|team|years?|experience)$",
+    re.IGNORECASE,
+)
+
+
+def _fallback_location_phrase_from_query(query: str) -> Optional[str]:
+    """Best-effort extraction of a bare location phrase (e.g. "in the US") when
+    the filter-plan LLM sets geography_policy.use_current_location but forgets
+    to populate an actual required_locations value."""
+    text = (query or "")
+    match = re.search(
+        r"\b(?:based in|located in|in)\s+(?:the\s+)?([A-Za-z][A-Za-z.]*(?:\s+[A-Za-z][A-Za-z.]*){0,3})",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    words = match.group(1).split()
+    kept: List[str] = []
+    for word in words:
+        if _LOCATION_FALLBACK_STOPWORDS.match(word):
+            break
+        kept.append(word)
+    phrase = " ".join(kept).strip(" .,")
+    return phrase or None
+
+
 def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         return {}
@@ -6362,6 +6626,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
         "required_locations",
         "required_geographies",
         "excluded_geographies",
+        "excluded_industries",
         "required_company_details",
         "required_culture_type",
         "required_keywords",
@@ -6513,6 +6778,16 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
     elif not any(word in _normalize_search_text(query) for word in ["top", "one", "maximum", "best"]):
         criteria.pop("top_n", None)
 
+    geography_policy = source.get("geography_policy") if isinstance(source.get("geography_policy"), dict) else {}
+    if (
+        geography_policy.get("use_current_location")
+        and not criteria.get("required_locations")
+        and not criteria.get("required_geographies")
+    ):
+        fallback_location = _fallback_location_phrase_from_query(query)
+        if fallback_location:
+            criteria["required_locations"] = {"operator": "OR", "values": [fallback_location]}
+
     _enforce_explicit_query_requirements(criteria, query)
 
     criteria["_filter_plan_debug"] = {
@@ -6545,13 +6820,13 @@ Terminology pack:
 
 Rules:
 - Return JSON only.
-- Use only these executable criteria keys when possible: required_companies, competitors_of, required_functions, min_function_years, required_industries, required_segments, required_company_details, required_culture_type, required_geographies, required_locations, excluded_geographies, funding_stage_min, min_total_experience, min_people_managed, min_tenure_in_latest_role, avg_tenure_in_last_n_roles, required_keywords, top_n.
+- Use only these executable criteria keys when possible: required_companies, competitors_of, required_functions, min_function_years, required_industries, required_segments, required_company_details, required_culture_type, required_geographies, required_locations, excluded_geographies, excluded_industries, funding_stage_min, min_total_experience, min_people_managed, min_team_management_years, min_tenure_in_latest_role, avg_tenure_in_last_n_roles, required_keywords, top_n.
 - In hard_filters, emit only executable values such as operator, values, min_years, stage, and employment_scope. Never copy schema-reference metadata keys such as shape, value_shape, evidence, meaning, comparison, or supports_* into hard_filters.
-- Current/base location filters only for phrases like "candidates in X", "based in X", "located in X".
+- Current/base location filters (required_locations) are for phrases like "candidates in X", "based in X", "located in X" — this applies to ANY location granularity (city, state, country, e.g. "in the US", "in India"), not only states/cities. You MUST populate hard_filters.required_locations with the literal value(s) whenever such a phrase appears; geography_policy.use_current_location is only a policy note and must never be the sole representation of a location filter — never leave hard_filters empty because you set that flag instead.
 - Market/geography experience filters for phrases like "X experience", "X market", "worked in X", "sold into X", "covered X".
 - APAC/EMEA/etc. are market regions. Expand them through geography policy; do not treat them as candidate current location.
 - A country query can match explicit region evidence when the country belongs to that region.
-- Company geography can be inferred only from headquarters/offices/operations/location fields for companies the candidate worked at. Never infer from subsidiaries, customer presence, revenue, or broad company assumptions.
+- Company geography can be inferred only from headquarters/offices/operations/location fields for companies the candidate worked at. Never infer from subsidiaries, customer presence, revenue, or broad company assumptions. Generic company-description boilerplate (e.g. "founded with offices in India, UK, USA" as part of a copied company blurb) is weak evidence and must not by itself satisfy a specific market/geography tenure requirement unless the candidate's own role text ties their work to that market.
 - "working for/at/in COMPANY" means current_employer. "worked at/from/ex COMPANY" means any_employer.
 - "current company/employer", "present company/employer", and company attributes attached to "currently working" mean current_employer.
 - employment_scope applies to required companies, industries, customer segments, company details/business model/product, culture, and funding stage. Preserve that scope on every affected criterion.
@@ -6560,8 +6835,13 @@ Rules:
 - "outbound exp" should map to Sales Development/BDR/SDR/outbound prospecting unless the query explicitly asks AE/hunting/new-logo closing.
 - Function-specific years must become min_function_years or min_years on required_functions.
 - Years attached to an industry, domain, company type, product, service, or business model must become min_years on required_industries or required_company_details. Example: "5 years in SaaS/software/fintech" is not min_function_years.
+- A customer-segment/company-size qualifier (SMB, SME, Mid-Market, Enterprise, Startup, etc.) attached to ANY function or sales phrase (e.g. "SMB sales", "enterprise sales experience", "worked in SMB for 10 years") must ALWAYS populate required_segments with that qualifier, in addition to whatever required_functions/min_function_years the rest of the phrase implies. Never drop the segment qualifier by folding it entirely into a required_functions/Sales Development mapping — "SMB sales" is a segment (SMB) plus a function (sales), not just a function.
 - Years attached to a customer segment must become min_years on required_segments. Example: "3 years selling enterprise/MM/SMB" is segment tenure.
 - Years attached to a market, territory, or geography must become min_years on required_geographies. Example: "2 years selling into APAC" is market tenure; current location alone cannot satisfy it.
+- "N years of team management/people management/managing people/staff/direct reports/leadership experience" (supervising OTHER EMPLOYEES, a DURATION) must become min_team_management_years. "managed a team of N / manage at least N people / team size of N" (a HEADCOUNT) must become min_people_managed. These are never interchangeable — a bare number before "years" next to "team/people management" is always a duration for min_team_management_years, never a headcount for min_people_managed.
+- "Account management" is an unrelated SALES FUNCTION (owning client/customer accounts and relationships) and must NEVER be treated as team/people management. "N years in account management" is function tenure (min_function_years / required_functions with function "Account management"), not min_team_management_years, even though both phrases contain the word "management".
+- "have NOT worked in INDUSTRY/company-type" or "excluding candidates from INDUSTRY" must become excluded_industries. excluded_geographies is ONLY for excluding a location/region — never put an industry, segment, or company-type term into excluded_geographies.
+- "customer-centric", "customer-focused", "customer-first" describe COMPANY CULTURE (required_culture_type) — they are unrelated to "customer engagement" (an industry/product category for required_industries or required_company_details, e.g. CRM/engagement-platform companies). Never put "customer engagement" into required_culture_type just because both phrases contain the word "customer".
 - Total experience can satisfy only min_total_experience; it cannot satisfy function, industry, segment, or geography tenure.
 
 Return shape:
@@ -6769,10 +7049,20 @@ async def process_query_main(
                 return
 
             yield f"Found competitors: {', '.join(final_competitors)}"
+            # Merge with (not overwrite) any explicit required_companies the query also
+            # named — e.g. "worked at HCL or Tech Mahindra AND is a Salesforce competitor"
+            # must keep BOTH sets of acceptable employers, not silently drop the explicit one.
+            existing_companies_criterion = criteria.get("required_companies")
+            if isinstance(existing_companies_criterion, dict):
+                existing_company_values = existing_companies_criterion.get("values") or []
+            elif isinstance(existing_companies_criterion, list):
+                existing_company_values = existing_companies_criterion
+            else:
+                existing_company_values = []
             criteria["required_companies"] = {
                 "operator": "OR",
                 "employment_scope": competitor_scope,
-                "values": [
+                "values": list(existing_company_values) + [
                     {"company": company, "employment_scope": competitor_scope, "source": f"competitor_of:{target}"}
                     for company in final_competitors
                 ],
@@ -6876,7 +7166,11 @@ async def process_query_main(
         if criteria.get("required_locations"):
             yield "Expanding locations..."
             values = _criteria_values_for_search(criteria, "required_locations")
-            _set_criteria_values(criteria, "required_locations", values + await _expand_locations_with_llm(values, tracker))
+            _set_criteria_values(
+                criteria,
+                "required_locations",
+                _expanded_location_values(values, await _expand_locations_with_llm(values, tracker)),
+            )
 
         for key in (
             "required_industries",
@@ -6886,6 +7180,7 @@ async def process_query_main(
             "required_company_details",
             "required_culture_type",
             "excluded_geographies",
+            "excluded_industries",
             "required_locations",
             "required_keywords",
         ):
@@ -6999,11 +7294,14 @@ async def process_query_main(
     hard_filters_present = (
         criteria.get("required_locations")
         or criteria.get("min_people_managed") is not None
+        or criteria.get("min_team_management_years") is not None
         or criteria.get("min_total_experience") is not None
         or criteria.get("required_companies")
         or criteria.get("funding_stage_min")
         or criteria.get("min_tenure_in_latest_role")
         or criteria.get("avg_tenure_in_last_n_roles")
+        or criteria.get("excluded_geographies")
+        or criteria.get("excluded_industries")
     )
     if not search_query_text and not hard_filters_present:
         yield "Your query is too broad. Please specify industries, functions, segments, geographies, or locations."
