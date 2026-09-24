@@ -12,7 +12,6 @@ A growton.co product for Candidate Search & Talent Intelligence, built with Reac
   - **`db/`**: Database connection and schema.
 - **`data/`**: Processed datasets and cache.
 - **`scripts/`**: Utility scripts (e.g., `run_pipeline.py`).
-- **`_archive/`**: Legacy code backup.
 
 ## Prerequisites
 
