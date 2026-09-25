@@ -1016,6 +1016,8 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'inbound_calls')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'calls' AND column_name = 'plivo_hangup_cause')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'plivo_endpoints' AND column_name = 'device_id')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'plivo_endpoints')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
@@ -1282,9 +1284,18 @@ def ensure_calls_schema_ready(force: bool = False):
             # with the laptop's ngrok answer URL.
             cur.execute("ALTER TABLE plivo_endpoints ADD COLUMN IF NOT EXISTS env_key VARCHAR(255) NOT NULL DEFAULT 'legacy';")
             cur.execute("ALTER TABLE plivo_endpoints DROP CONSTRAINT IF EXISTS plivo_endpoints_user_id_key;")
+            # One endpoint per recruiter AND per browser/device. Plivo's SDK
+            # refuses to log an endpoint in while it is "currently logged in"
+            # (Browser SDK changelog v2.0.22/v2.1.0) and re-REGISTERs every
+            # 120s, so two browsers on one endpoint kept displacing each other:
+            # the displaced one's next INVITE died in "DELAYED NEGOTIATION"
+            # before the candidate's phone rang. Existing rows are the
+            # 'primary' device, so nobody is re-provisioned by this migration.
+            cur.execute("ALTER TABLE plivo_endpoints ADD COLUMN IF NOT EXISTS device_id VARCHAR(64) NOT NULL DEFAULT 'primary';")
+            cur.execute("DROP INDEX IF EXISTS ux_plivo_endpoints_user_env;")
             cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_plivo_endpoints_user_env
-                ON plivo_endpoints (user_id, env_key);
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_plivo_endpoints_user_env_device
+                ON plivo_endpoints (user_id, env_key, device_id);
             """)
 
             cur.execute("""

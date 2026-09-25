@@ -326,7 +326,7 @@ def test_credentials_flag_shared_endpoint_fallback_as_degraded(monkeypatch):
     candidate — so the recruiter has to be told before they place calls."""
     app = _build_credentials_app(monkeypatch)
 
-    async def _no_endpoint(_user_id):
+    async def _no_endpoint(_user_id, _device_id="primary"):
         return None
 
     monkeypatch.setattr(plivo_service, "ensure_endpoint_for_user", _no_endpoint)
@@ -347,7 +347,7 @@ def test_credentials_flag_shared_endpoint_fallback_as_degraded(monkeypatch):
 def test_credentials_are_not_degraded_on_the_normal_per_user_path(monkeypatch):
     app = _build_credentials_app(monkeypatch)
 
-    async def _own_endpoint(_user_id):
+    async def _own_endpoint(_user_id, _device_id="primary"):
         return {"username": "ownuser", "password": "ownpass"}
 
     monkeypatch.setattr(plivo_service, "ensure_endpoint_for_user", _own_endpoint)
@@ -674,7 +674,9 @@ def test_registration_and_busy_writes_are_environment_scoped(monkeypatch):
 
     reg_query, reg_params = conn.cursor_obj.executed[0]
     busy_query, busy_params = conn.cursor_obj.executed[1]
-    assert "env_key = %s" in reg_query and reg_params == (4, "hosted.example.com")
+    # Registration is per device (defaulting to the pre-device 'primary' line);
+    # busy applies to every device of the recruiter.
+    assert "env_key = %s" in reg_query and reg_params == (4, "hosted.example.com", "primary")
     assert "env_key = %s" in busy_query and busy_params == (4, "hosted.example.com")
 
 
@@ -1039,3 +1041,33 @@ def test_final_recording_callback_is_cached_stored_and_processed(monkeypatch):
     assert persisted == [("rec-call-1", "https://plivo/rec-call-1.mp3")]
     assert len(tasks.tasks) == 1 and tasks.tasks[0][0] is plivo_service.process_call_insights
     plivo_service.recordings.clear()
+
+
+def test_credentials_provision_the_endpoint_for_the_calling_device(monkeypatch):
+    """Two browsers on one endpoint displace each other (Plivo SDK: a second
+    login of a logged-in endpoint is refused; every browser re-REGISTERs every
+    120s), so the endpoint is keyed by the browser's device id."""
+    import httpx
+    app = _build_credentials_app(monkeypatch)
+    seen = []
+
+    async def _own_endpoint(user_id, device_id="primary"):
+        seen.append((user_id, device_id))
+        return {"username": f"user-{device_id}", "password": "pw", "device_id": device_id}
+
+    monkeypatch.setattr(plivo_service, "ensure_endpoint_for_user", _own_endpoint)
+    monkeypatch.setattr(plivo_service, "setup_plivo",
+                        lambda *a, **k: asyncio.sleep(0, result={"success": True}))
+
+    async def call(headers):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.get("/api/plivo/credentials", headers=headers)
+
+    body = asyncio.run(call({"X-Softphone-Device": "dLaptopA"})).json()
+    assert body["username"] == "user-dLaptopA" and body["device_id"] == "dLaptopA"
+    body = asyncio.run(call({"X-Softphone-Device": "dLaptopB"})).json()
+    assert body["username"] == "user-dLaptopB"
+    body = asyncio.run(call({})).json()
+    assert body["device_id"] == "primary"          # old clients keep their line
+    assert seen == [(42, "dLaptopA"), (42, "dLaptopB"), (42, "primary")]

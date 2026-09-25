@@ -12,6 +12,7 @@ import tempfile
 import asyncio
 import json
 import uuid
+from datetime import timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -267,9 +268,28 @@ def _env_alias_slug() -> str:
     return f"{head}_{digest}" if head else digest
 
 
-def endpoint_alias_for_user(user_id: int) -> str:
-    """The alias this user's endpoint carries in Plivo, for this environment."""
-    return f"recruiter_{user_id}_{_env_alias_slug()}"[:_ALIAS_MAX]
+PRIMARY_DEVICE_ID = "primary"
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def normalize_device_id(value) -> str:
+    """The browser's stable device id, or 'primary' when absent or malformed.
+    Existing endpoints (provisioned before per-device lines) are the primary
+    device, so a client that never sends the header keeps its line."""
+    text = str(value or "").strip()
+    return text if _DEVICE_ID_RE.match(text) else PRIMARY_DEVICE_ID
+
+
+def endpoint_alias_for_user(user_id: int, device_id: str = PRIMARY_DEVICE_ID) -> str:
+    """The alias this user's endpoint carries in Plivo, for this environment
+    and device. The primary device keeps the pre-device alias so endpoints
+    provisioned earlier are still found by adoption."""
+    base = f"recruiter_{user_id}_{_env_alias_slug()}"
+    device_id = normalize_device_id(device_id)
+    if device_id == PRIMARY_DEVICE_ID:
+        return base[:_ALIAS_MAX]
+    tail = hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:8]
+    return f"{base[:_ALIAS_MAX - 9]}_{tail}"
 
 
 # Arbitrary but fixed: the advisory-lock id every worker agrees on before
@@ -694,6 +714,10 @@ def get_hangup_for_token(dial_token: str):
 
 def _dial_state_from_row(row, dial_token: str = ""):
     call_uuid, username, to_number, seen_at = row
+    if seen_at is not None and seen_at.tzinfo is None:
+        # calls.updated_at is a naive TIMESTAMP holding UTC; a bare
+        # .timestamp() would read it in the server's local zone.
+        seen_at = seen_at.replace(tzinfo=timezone.utc)
     return {
         "call_uuid": call_uuid,
         "username": username or "",
@@ -1135,7 +1159,8 @@ def get_shared_endpoint_holder():
         return _shared_endpoint_holder["user_id"]
 
 
-def _persist_endpoint_row(user_id: int, endpoint_id, username: str, password: str, app_id) -> bool:
+def _persist_endpoint_row(user_id: int, endpoint_id, username: str, password: str, app_id,
+                          device_id: str = PRIMARY_DEVICE_ID) -> bool:
     from backend.db.connection import get_db_connection, return_db_connection
 
     conn = get_db_connection(validate=False, register_pgvector=False)
@@ -1145,16 +1170,16 @@ def _persist_endpoint_row(user_id: int, endpoint_id, username: str, password: st
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO plivo_endpoints (user_id, endpoint_id, username, password, app_id, env_key)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id, env_key) DO UPDATE
+                INSERT INTO plivo_endpoints (user_id, endpoint_id, username, password, app_id, env_key, device_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, env_key, device_id) DO UPDATE
                 SET endpoint_id = EXCLUDED.endpoint_id,
                     username = EXCLUDED.username,
                     password = EXCLUDED.password,
                     app_id = EXCLUDED.app_id
                 """,
                 (user_id, str(endpoint_id) if endpoint_id else None, username, password,
-                 app_id, _env_key()),
+                 app_id, _env_key(), normalize_device_id(device_id)),
             )
         conn.commit()
         return True
@@ -1204,7 +1229,7 @@ async def _rebind_if_stale(user_id: int, row: dict) -> dict:
 
     await asyncio.to_thread(
         _persist_endpoint_row, user_id, row["endpoint_id"],
-        row["username"], row["password"], current_app_id,
+        row["username"], row["password"], current_app_id, row.get("device_id", PRIMARY_DEVICE_ID),
     )
     row["app_id"] = current_app_id
     return row
@@ -1229,7 +1254,7 @@ async def _delete_endpoint_quietly(endpoint_id, user_id: int) -> None:
         )
 
 
-async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
+async def _adopt_orphaned_endpoint(user_id: int, device_id: str = PRIMARY_DEVICE_ID) -> Optional[dict]:
     """Reclaim an endpoint that exists in Plivo but not in our registry.
 
     Endpoints are created in Plivo first and persisted second, so any failure
@@ -1254,7 +1279,10 @@ async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
     # "recruiter_4_local" reclaims that endpoint instead of minting a second.
     # On hosted deployments the pre-slug form was too long for Plivo to ever
     # create, so there is nothing of that shape to find.
-    aliases = {endpoint_alias_for_user(user_id), f"recruiter_{user_id}_{_env_key()}"}
+    device_id = normalize_device_id(device_id)
+    aliases = {endpoint_alias_for_user(user_id, device_id)}
+    if device_id == PRIMARY_DEVICE_ID:
+        aliases.add(f"recruiter_{user_id}_{_env_key()}")
     try:
         client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 
@@ -1290,15 +1318,15 @@ async def _adopt_orphaned_endpoint(user_id: int) -> Optional[dict]:
         return None
 
     app_id = (_load_persisted_softphone_state() or {}).get("app_id")
-    if not await asyncio.to_thread(_persist_endpoint_row, user_id, endpoint_id, username, password, app_id):
+    if not await asyncio.to_thread(_persist_endpoint_row, user_id, endpoint_id, username, password, app_id, device_id):
         return None
 
-    logger.info("Adopted orphaned Plivo endpoint %s for user %s", username, user_id)
+    logger.info("Adopted orphaned Plivo endpoint %s for user %s (device %s)", username, user_id, device_id)
     return {"username": username, "password": password,
-            "endpoint_id": str(endpoint_id), "app_id": app_id}
+            "endpoint_id": str(endpoint_id), "app_id": app_id, "device_id": device_id}
 
 
-async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
+async def ensure_endpoint_for_user(user_id: int, device_id: str = PRIMARY_DEVICE_ID) -> Optional[dict]:
     """Return this user's own SIP endpoint, creating it on first use.
 
     Inbound "ring everyone" dials one <User> per recruiter, so each recruiter
@@ -1314,6 +1342,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
 
     if not user_id:
         return None
+    device_id = normalize_device_id(device_id)
 
     def _read():
         """Returns (ok, row). `ok=False` means we could not look at all.
@@ -1330,8 +1359,8 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT username, password, endpoint_id, app_id FROM plivo_endpoints "
-                    "WHERE user_id = %s AND env_key = %s",
-                    (user_id, _env_key()),
+                    "WHERE user_id = %s AND env_key = %s AND device_id = %s",
+                    (user_id, _env_key(), device_id),
                 )
                 return True, cur.fetchone()
         except Exception as exc:
@@ -1354,7 +1383,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
     if existing:
         return await _rebind_if_stale(user_id, {
             "username": existing[0], "password": existing[1],
-            "endpoint_id": existing[2], "app_id": existing[3],
+            "endpoint_id": existing[2], "app_id": existing[3], "device_id": device_id,
         })
 
     # Provisioning touches the Plivo API; serialise so two concurrent logins by
@@ -1366,13 +1395,13 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
         if existing:
             return await _rebind_if_stale(user_id, {
                 "username": existing[0], "password": existing[1],
-                "endpoint_id": existing[2], "app_id": existing[3],
+                "endpoint_id": existing[2], "app_id": existing[3], "device_id": device_id,
             })
 
         # Adopt an endpoint this user already owns in Plivo but which is missing
         # from the registry — otherwise a past failed write means we mint a
         # second one now, and another on the next login.
-        adopted = await _adopt_orphaned_endpoint(user_id)
+        adopted = await _adopt_orphaned_endpoint(user_id, device_id)
         if adopted:
             return adopted
 
@@ -1391,7 +1420,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
                 client.endpoints.create,
                 username=username,
                 password=password,
-                alias=endpoint_alias_for_user(user_id),
+                alias=endpoint_alias_for_user(user_id, device_id),
                 app_id=app_id,
             )
             endpoint_id = getattr(resp, "endpoint_id", None) or getattr(resp, "id", None)
@@ -1411,7 +1440,7 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
         # left env_key at its 'legacy' default, which the reader below and
         # mark_endpoint_registered would never match again.
         stored = await asyncio.to_thread(
-            _persist_endpoint_row, user_id, endpoint_id, username, password, app_id,
+            _persist_endpoint_row, user_id, endpoint_id, username, password, app_id, device_id,
         )
         if not stored:
             # An endpoint we cannot store is unreachable and permanent: nothing
@@ -1419,14 +1448,16 @@ async def ensure_endpoint_for_user(user_id: int) -> Optional[dict]:
             # Plivo rather than leaving it in the account forever.
             await _delete_endpoint_quietly(endpoint_id, user_id)
             return None
-        logger.info("Provisioned Plivo endpoint %s for user %s", username, user_id)
+        logger.info("Provisioned Plivo endpoint %s for user %s (device %s)", username, user_id, device_id)
         return {"username": username, "password": password,
-                "endpoint_id": str(endpoint_id) if endpoint_id else None, "app_id": app_id}
+                "endpoint_id": str(endpoint_id) if endpoint_id else None, "app_id": app_id,
+                "device_id": device_id}
 
 
-def mark_endpoint_registered(user_id: int) -> None:
-    """Record that this user's softphone is live, so inbound only rings plausibly
-    online endpoints. Stale rows simply do not answer — the <Dial timeout> covers it."""
+def mark_endpoint_registered(user_id: int, device_id: str = PRIMARY_DEVICE_ID) -> None:
+    """Record that this user's softphone (on this device) is live, so inbound
+    only rings plausibly online endpoints. Stale rows simply do not answer —
+    the <Dial timeout> covers it."""
     from backend.db.connection import get_db_connection, return_db_connection
 
     conn = get_db_connection(validate=False, register_pgvector=False)
@@ -1436,8 +1467,8 @@ def mark_endpoint_registered(user_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE plivo_endpoints SET last_registered_at = CURRENT_TIMESTAMP "
-                "WHERE user_id = %s AND env_key = %s",
-                (user_id, _env_key()),
+                "WHERE user_id = %s AND env_key = %s AND device_id = %s",
+                (user_id, _env_key(), normalize_device_id(device_id)),
             )
         conn.commit()
     except Exception as exc:

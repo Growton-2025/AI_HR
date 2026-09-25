@@ -31,6 +31,35 @@ const VoIPContext = createContext({
 const RELOGIN_THROTTLE_MS = 4000;
 const RELOGIN_WAIT_AT_DIAL_MS = 8000;
 const PLIVO_SDK_URL = '/plivo.min.js';
+
+// One SIP endpoint per recruiter *per browser*. Plivo's SDK refuses to log an
+// endpoint in that is already logged in elsewhere and re-REGISTERs every 120s,
+// so two browsers on one endpoint (a second laptop, a colleague on the same
+// account) displaced each other and the loser's next dial died in Plivo's
+// "DELAYED NEGOTIATION" before the candidate's phone rang. The id is stable
+// per browser profile; the backend keys the endpoint on it.
+const SOFTPHONE_DEVICE_KEY = 'hayasa_softphone_device';
+export const getSoftphoneDeviceId = () => {
+  try {
+    let id = window.localStorage.getItem(SOFTPHONE_DEVICE_KEY);
+    if (!id || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+      const raw = (window.crypto?.randomUUID?.() || `${Date.now()}${Math.random()}`).replace(/[^A-Za-z0-9]/g, '');
+      id = `d${raw.slice(0, 20)}`;
+      window.localStorage.setItem(SOFTPHONE_DEVICE_KEY, id);
+    }
+    return id;
+  } catch (_) {
+    return 'primary';
+  }
+};
+const deviceHeaders = () => ({ headers: { 'X-Softphone-Device': getSoftphoneDeviceId() } });
+
+// Only one tab per browser may hold the softphone: a second tab logging the
+// same endpoint in is exactly the displacement above, just within one machine.
+const SOFTPHONE_LOCK_NAME = 'hayasa-softphone';
+// After a hangup the SDK still tears the old media session down; a dial placed
+// inside that window went out as an INVITE with no media and died in 0s.
+const REDIAL_COOLDOWN_MS = 2500;
 const PLIVO_SDK_LOAD_TIMEOUT_MS = 15000;
 const PLIVO_LOGIN_TIMEOUT_MS = 20000;
 const PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS = 12000;
@@ -416,6 +445,24 @@ export function VoIPProvider({ children }) {
   // Kept so a dropped WebSocket can re-register without refetching /credentials.
   const credentialsRef = useRef(null);
   const lastReloginAtRef = useRef(0);
+  const softphoneLockReleaseRef = useRef(null);
+  const lastCallEndedAtRef = useRef(0);
+  const dialStartedWallRef = useRef(0);
+
+  // Resolves true once this tab holds the browser-wide softphone lock (or the
+  // browser has no Web Locks, in which case there is nothing to hold). The
+  // lock is kept for the life of the tab; Chrome releases it when the tab
+  // closes, and the other tab's 30s error-recovery loop then takes over.
+  const acquireSoftphoneLock = () => new Promise((resolve) => {
+    if (softphoneLockReleaseRef.current) { resolve(true); return; }
+    const locks = typeof navigator !== 'undefined' ? navigator.locks : null;
+    if (!locks?.request) { resolve(true); return; }
+    locks.request(SOFTPHONE_LOCK_NAME, { ifAvailable: true }, (lock) => {
+      if (!lock) { resolve(false); return undefined; }
+      resolve(true);
+      return new Promise((release) => { softphoneLockReleaseRef.current = release; });
+    }).catch(() => resolve(true));
+  });
 
   // Locally generated ringback: the real Plivo ringback only starts once the
   // remote leg is ringing (~5s after the click: backend initiate + SIP setup),
@@ -721,7 +768,7 @@ export function VoIPProvider({ children }) {
   useEffect(() => {
     if (voipStatus !== 'registered' && voipStatus !== 'connected') return undefined;
     const beat = () => {
-      axios.post(`${API_BASE}/plivo/registered`).catch(() => { /* best effort */ });
+      axios.post(`${API_BASE}/plivo/registered`, {}, deviceHeaders()).catch(() => { /* best effort */ });
     };
     beat();
     const id = window.setInterval(beat, REGISTRATION_HEARTBEAT_MS);
@@ -739,7 +786,7 @@ export function VoIPProvider({ children }) {
     const busy = Boolean(activeCall);
     if (busyBeaconRef.current === busy) return;
     busyBeaconRef.current = busy;
-    axios.post(`${API_BASE}/plivo/busy`, { busy }).catch(() => { /* best effort */ });
+    axios.post(`${API_BASE}/plivo/busy`, { busy }, deviceHeaders()).catch(() => { /* best effort */ });
   }, [activeCall]);
 
   useEffect(() => {
@@ -835,7 +882,29 @@ export function VoIPProvider({ children }) {
       clearVoipErrorState();
       setVoipStatus('connecting');
       setVoipCallEvent(null);
+      if (!(await acquireSoftphoneLock())) {
+        if (softphoneGenerationRef.current !== instanceId) return { success: false };
+        const message = 'The softphone is already active in another tab of this browser. Use that tab to call, or close it and this one will take over.';
+        setVoipStatus('error');
+        setVoipError(message);
+        setVoipErrorCode('softphone_in_other_tab');
+        console.warn('[VoIP] Softphone lock held by another tab');
+        return { success: false, error: message };
+      }
       if (force && softphoneRef.current) {
+        // A dial in flight cannot survive the old client being torn down, and
+        // the old client's terminal event is discarded by the generation guard
+        // below — so report it here or the modal sits on "Ringing" forever.
+        if (activeCallRef.current) {
+          setVoipCallEvent(buildVoipCallEvent(
+            'failed',
+            { origin: 'local', reason: 'softphone reconnected while dialing' },
+            activeCallRef.current?.number,
+          ));
+          lastCallEndedAtRef.current = Date.now();
+          setActiveCall(null);
+          activeCallRef.current = null;
+        }
         try {
           // Deregister the old client for real (.client.logout, not .logout —
           // the latter doesn't exist and left a zombie registration that
@@ -865,7 +934,7 @@ export function VoIPProvider({ children }) {
       // page and nowhere else.
       for (let attempt = 0; attempt < CREDENTIALS_ATTEMPTS && !credentialsOk; attempt += 1) {
         try {
-          const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`);
+          const credentialsResponse = await axios.get(`${API_BASE}/plivo/credentials`, deviceHeaders());
           res = credentialsResponse.data || {};
           credentialsOk = true;
         } catch (error) {
@@ -955,7 +1024,7 @@ export function VoIPProvider({ children }) {
           setVoipStatus('registered');
           console.log('[VoIP] Connected to Plivo softphone');
           // Tell the backend this endpoint is live so inbound calls ring it.
-          axios.post(`${API_BASE}/plivo/registered`).catch(() => { /* best effort */ });
+          axios.post(`${API_BASE}/plivo/registered`, {}, deviceHeaders()).catch(() => { /* best effort */ });
           resolve();
         });
 
@@ -1107,6 +1176,7 @@ export function VoIPProvider({ children }) {
 
       sdk.client.on('onCallTerminated', (reason) => {
         if (softphoneGenerationRef.current !== instanceId) return;
+        lastCallEndedAtRef.current = Date.now();
         stopDialTone();
         stopInboundAlert();
         setIncomingCall(null);
@@ -1117,6 +1187,7 @@ export function VoIPProvider({ children }) {
 
       sdk.client.on('onCallFailed', (reason) => {
         if (softphoneGenerationRef.current !== instanceId) return;
+        lastCallEndedAtRef.current = Date.now();
         stopDialTone();
         stopInboundAlert();
         console.warn('[VoIP] Call failed', reason);
@@ -1173,10 +1244,18 @@ export function VoIPProvider({ children }) {
       clearVoipErrorState();
       setVoipStatus('registered');
     }
+    // Let the SDK finish tearing the previous call down before the next INVITE.
+    const sinceLastEnd = Date.now() - (lastCallEndedAtRef.current || 0);
+    if (lastCallEndedAtRef.current && sinceLastEnd < REDIAL_COOLDOWN_MS) {
+      const wait = REDIAL_COOLDOWN_MS - sinceLastEnd;
+      reportTiming('redial_cooldown_wait', wait);
+      await new Promise(resolve => window.setTimeout(resolve, wait));
+    }
     try {
       setVoipCallEvent({ at: Date.now(), type: 'dialing', origin: 'local', number: dialNumber, reasonText: '', raw: null });
       setActiveCall({ state: 'dialing', number: dialNumber });
       dialStartedAtRef.current = performance.now();
+      dialStartedWallRef.current = Date.now();
       // The token identifies this specific dial attempt, so the backend can
       // attribute the call to the exact `calls` row instead of guessing the
       // most recently updated row for this SIP username. Hex only: Plivo
@@ -1193,7 +1272,7 @@ export function VoIPProvider({ children }) {
         softphoneRef.current.client.call(dialNumber);
       }
       setVoipStatus('connecting');
-      return { success: true, dialNumber, username: endpointUsernameRef.current };
+      return { success: true, dialNumber, username: endpointUsernameRef.current, dialStartedAt: dialStartedWallRef.current };
     } catch (error) {
       setActiveCall(null);
       return { success: false, error: error?.message || 'Mic access denied or Plivo failure' };
@@ -1218,6 +1297,7 @@ export function VoIPProvider({ children }) {
     timeoutMs = PLIVO_DIAL_HANDSHAKE_TIMEOUT_MS,
     dialToken = '',
     dialedNumber = '',
+    dialStartedAt = 0,
   ) => {
     const cleanUsername = String(username || '').trim();
     const cleanToken = String(dialToken || '').trim();
@@ -1260,7 +1340,13 @@ export function VoIPProvider({ children }) {
         if (usernameUrl) {
           const state = await readState(usernameUrl);
           const stateTail = String(state?.to_number || '').replace(/\D/g, '').slice(-10);
-          if (state?.call_uuid && (!dialedTail || stateTail === dialedTail)) {
+          // ...and that the state is from THIS attempt: a redial of the same
+          // candidate 30s later otherwise passed on the previous call's UUID
+          // while the new INVITE had already died, leaving the modal on
+          // "Ringing" with nothing ringing. seen_at is epoch seconds.
+          const seenAtMs = Number(state?.seen_at || 0) * 1000;
+          const freshEnough = !dialStartedAt || !seenAtMs || seenAtMs >= dialStartedAt - 3000;
+          if (state?.call_uuid && (!dialedTail || stateTail === dialedTail) && freshEnough) {
             return { success: true, state };
           }
         }
@@ -1334,6 +1420,7 @@ export function VoIPProvider({ children }) {
   const rejectCall = async () => {
     hangupSoftphoneCall();
     stopCallAudio();
+    lastCallEndedAtRef.current = Date.now();
     setVoipCallEvent({
       at: Date.now(),
       type: 'terminated',

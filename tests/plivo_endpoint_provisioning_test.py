@@ -142,10 +142,11 @@ def test_persist_uses_the_composite_conflict_target(monkeypatch, hosted):
     assert ps._persist_endpoint_row(19, "ep-1", "user123", "pw", "app-1") is True
     sql, params = cursor.executed[0]
 
-    # The table's only unique index is (user_id, env_key); naming user_id alone
-    # raised InvalidColumnReference on every provisioning attempt.
-    assert "ON CONFLICT (user_id, env_key)" in sql
+    # The table's only unique index is (user_id, env_key, device_id); naming
+    # user_id alone raised InvalidColumnReference on every provisioning attempt.
+    assert "ON CONFLICT (user_id, env_key, device_id)" in sql
     assert "ON CONFLICT (user_id) " not in sql
+    assert params[-1] == "primary"     # no device header -> the pre-existing line
     assert "env_key" in sql
     assert HOSTED in params           # the row is stamped with this deployment
     assert conn.committed
@@ -228,3 +229,71 @@ def test_rollback_deletes_the_orphan(monkeypatch):
     asyncio.run(ps._delete_endpoint_quietly("ep-9", 19))
 
     assert deleted == ["ep-9"]
+
+
+# ── 5. one endpoint per recruiter per browser ───────────────────────────────
+
+def test_device_ids_are_normalised():
+    assert ps.normalize_device_id(None) == "primary"
+    assert ps.normalize_device_id("") == "primary"
+    assert ps.normalize_device_id("d0123abc_-XYZ") == "d0123abc_-XYZ"
+    assert ps.normalize_device_id("bad id!") == "primary"          # charset
+    assert ps.normalize_device_id("x" * 65) == "primary"           # length
+
+
+def test_primary_device_keeps_the_pre_device_alias(hosted):
+    # Endpoints provisioned before per-device lines must still be found by
+    # adoption, so the primary alias is byte-for-byte what it was.
+    assert ps.endpoint_alias_for_user(19) == ps.endpoint_alias_for_user(19, "primary")
+
+
+def test_each_device_gets_its_own_legal_alias(hosted):
+    a = ps.endpoint_alias_for_user(19, "d1111111111111111111")
+    b = ps.endpoint_alias_for_user(19, "d2222222222222222222")
+    assert a != b != ps.endpoint_alias_for_user(19)
+    for alias in (a, b):
+        assert len(alias) <= PLIVO_ALIAS_MAX
+        assert PLIVO_ALIAS_CHARSET.fullmatch(alias)
+    assert a == ps.endpoint_alias_for_user(19, "d1111111111111111111")   # stable
+
+
+def test_persist_and_lookup_are_keyed_by_device(monkeypatch, hosted):
+    cursor = _Cursor()
+    _patch_db(monkeypatch, cursor)
+    ps._persist_endpoint_row(19, "ep-2", "user456", "pw", "app-1", "dABC")
+    sql, params = cursor.executed[0]
+    assert "device_id" in sql and params[-1] == "dABC"
+
+    ps.mark_endpoint_registered(19, "dABC")
+    sql, params = cursor.executed[1]
+    assert "device_id = %s" in sql and params[-1] == "dABC"
+
+
+def test_busy_applies_to_every_device_of_the_recruiter(monkeypatch, hosted):
+    # On a call on one laptop means "do not ring me" on the other one too.
+    cursor = _Cursor()
+    _patch_db(monkeypatch, cursor)
+    ps.mark_endpoint_busy(user_id=19)
+    sql, params = cursor.executed[0]
+    assert "user_id = %s" in sql and "device_id" not in sql
+
+
+def test_credentials_route_reads_the_device_header():
+    from backend.api.routes import plivo as plivo_routes
+
+    class _Req:
+        def __init__(self, headers=None, query=None):
+            self.headers = headers or {}
+            self.query_params = query or {}
+
+    assert plivo_routes._device_id_from_request(_Req({"x-softphone-device": "dAbC123"})) == "dAbC123"
+    assert plivo_routes._device_id_from_request(_Req(query={"device": "dQ"})) == "dQ"
+    assert plivo_routes._device_id_from_request(_Req()) == "primary"
+    assert plivo_routes._device_id_from_request(_Req({"x-softphone-device": "no spaces!"})) == "primary"
+
+
+def test_dial_state_timestamps_are_read_as_utc():
+    import datetime as dt
+    naive_utc = dt.datetime(2026, 9, 25, 12, 0, 0)
+    state = ps._dial_state_from_row(("uuid", "user", "9999999999", naive_utc), "tok")
+    assert state["seen_at"] == dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.timezone.utc).timestamp()

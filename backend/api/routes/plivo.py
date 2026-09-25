@@ -360,8 +360,21 @@ async def client_timing(request: Request):
     return Response(status_code=204)
 
 
+def _device_id_from_request(request: Request) -> str:
+    """The browser's stable device id (`X-Softphone-Device`, or `?device=`).
+
+    One SIP endpoint per recruiter *per device*: Plivo's SDK will not log an
+    endpoint in that is already logged in elsewhere, and each browser
+    re-REGISTERs every 120s, so two browsers on one endpoint displaced each
+    other and the loser's next dial died before the candidate's phone rang.
+    Clients that do not send it keep the pre-existing 'primary' line."""
+    header = request.headers.get("x-softphone-device") if request else None
+    query = request.query_params.get("device") if request else None
+    return plivo_service.normalize_device_id(header or query)
+
+
 @router.get("/credentials")
-async def get_credentials(current_user: schemas.User = Depends(deps.get_current_user)):
+async def get_credentials(request: Request, current_user: schemas.User = Depends(deps.get_current_user)):
     """SIP credentials for the caller's own softphone.
 
     Now authenticated and per-user: inbound "ring everyone" dials one <User> per
@@ -383,12 +396,13 @@ async def get_credentials(current_user: schemas.User = Depends(deps.get_current_
 
     # Fall back to the shared endpoint if per-user provisioning fails, so a
     # Plivo hiccup degrades to the previous behaviour instead of killing dialling.
-    own = await plivo_service.ensure_endpoint_for_user(current_user.id)
+    device_id = _device_id_from_request(request)
+    own = await plivo_service.ensure_endpoint_for_user(current_user.id, device_id)
     if not own:
         # Transient Plivo 5xx is the common failure here and a single retry
         # usually clears it, which is far preferable to the shared endpoint.
         await asyncio.sleep(0.75)
-        own = await plivo_service.ensure_endpoint_for_user(current_user.id)
+        own = await plivo_service.ensure_endpoint_for_user(current_user.id, device_id)
 
     if not own and not plivo_service.claim_shared_endpoint(current_user.id):
         # Someone else already holds the shared endpoint. Sharing it would give
@@ -445,14 +459,17 @@ async def get_credentials(current_user: schemas.User = Depends(deps.get_current_
         "password": own["password"],
         "public_url": plivo_service.endpoint_public_url or None,
         "degraded": False,
+        "device_id": device_id,
     }
 
 
 @router.post("/registered")
-async def mark_registered(current_user: schemas.User = Depends(deps.get_current_user)):
+async def mark_registered(request: Request, current_user: schemas.User = Depends(deps.get_current_user)):
     """Called when the browser softphone finishes SIP registration, so inbound
     calls only ring endpoints that are plausibly online."""
-    await asyncio.to_thread(plivo_service.mark_endpoint_registered, current_user.id)
+    await asyncio.to_thread(
+        plivo_service.mark_endpoint_registered, current_user.id, _device_id_from_request(request)
+    )
     return {"success": True}
 
 @router.post("/busy")
@@ -462,7 +479,9 @@ async def mark_busy(
 ):
     """Browser reports whether this recruiter is currently on a call, so the
     inbound ring-all fork can skip them. Best-effort: `get_registered_endpoint_usernames`
-    ages the flag out, so a lost 'idle' beacon cannot strand an endpoint."""
+    ages the flag out, so a lost 'idle' beacon cannot strand an endpoint.
+    Applies to every device of this recruiter: a person on a call on one
+    device must not be rung on another."""
     busy = bool(payload.get("busy"))
     if busy:
         await asyncio.to_thread(plivo_service.mark_endpoint_busy, current_user.id)

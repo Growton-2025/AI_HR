@@ -1891,10 +1891,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       const dialToken = res?.data?.plivo_data?.dial_token || '';
       lastDialTokenRef.current = dialToken;
 
+      let dialStartedAt = 0;
       if (placeCall && call.candidate_phone) {
         const placeStart = performance.now();
         const placeResult = await placeCall(call.candidate_phone, dialToken);
         reportTiming('place_call', performance.now() - placeStart);
+        dialStartedAt = placeResult?.dialStartedAt || 0;
         if (!placeResult?.success) {
           const message = placeResult?.error || 'Browser VoIP could not start the call';
           setInitiationError(message);
@@ -1906,7 +1908,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       }
 
       const handshakeStart = performance.now();
-      const dialState = await waitForPlivoDial(endpointUsername, undefined, dialToken, call.candidate_phone);
+      const dialState = await waitForPlivoDial(endpointUsername, undefined, dialToken, call.candidate_phone, dialStartedAt);
       reportTiming('dial_handshake', performance.now() - handshakeStart);
       reportTiming('click_to_webhook_total', performance.now() - clickStart);
       if (!dialState?.success) {
@@ -2137,6 +2139,29 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       }
     }
   }, [call.candidate_name, callState, outcome, voipCallEvent]);
+
+  // Watchdog: the modal shows "Ringing" while the softphone reports an active
+  // call. If the SDK drops the call (INVITE died, softphone re-initialised
+  // mid-dial, event lost) the modal used to stay on "Ringing" indefinitely —
+  // the recruiter had no way to know nothing was ringing. Two seconds without
+  // an active SDK call in a ringing state is the end of the attempt.
+  useEffect(() => {
+    if (!['waiting_for_invite', 'invite_received'].includes(callState) || activeCall) return undefined;
+    const timer = window.setTimeout(() => {
+      const event = { at: Date.now(), type: 'failed', origin: 'local', reasonText: 'the call ended before it connected', raw: null };
+      const nextMeta = buildCallWrapUpMeta(event, call.candidate_name);
+      setCallWrapUpMeta(nextMeta);
+      if (!outcome && nextMeta.suggestedOutcome) {
+        setOutcome(nextMeta.suggestedOutcome);
+      }
+      setCallState('ended');
+      fetchPlivoHangup(lastDialTokenRef.current).then((hangup) => {
+        const detail = describePlivoHangup(hangup);
+        if (detail) setCallWrapUpMeta((prev) => (prev ? { ...prev, message: detail } : prev));
+      });
+    }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [activeCall, callState, call.candidate_name, outcome]);
 
   useEffect(() => {
     let t;
