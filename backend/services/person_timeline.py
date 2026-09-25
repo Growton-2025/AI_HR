@@ -184,6 +184,31 @@ def build_timeline(cur, candidate_id: int, *, viewer_email: str, viewer_is_admin
                     "campaign": campaign_name, "you": False,
                 })
 
+    # ── threads fetched from the providers for this person (PR 3) ────────
+    pending: List[str] = []
+    if person_key and table_exists(cur, "person_provider_threads"):
+        from backend.services.person_history_backfill import pending_providers, provider_threads
+        for provider, thread_ref, messages in provider_threads(cur, person_key):
+            platform = "linkedin" if provider == "heyreach" else "email"
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                key = _message_key(platform, msg)
+                if key in seen_messages:
+                    continue
+                seen_messages.add(key)
+                inbound = _is_inbound(msg)
+                items.append({
+                    "type": f"{platform}_message", "id": key, "candidate_id": candidate_id,
+                    "occurred_at": _iso(msg.get("time") or msg.get("created_at")),
+                    "direction": "inbound" if inbound else "outbound",
+                    "subject": msg.get("subject"), "body": msg.get("email_body") or msg.get("text") or "",
+                    "sender_name": msg.get("sender_name"), "role": None,
+                    "campaign": thread_ref, "you": False, "source": provider,
+                })
+        if table_exists(cur, "person_history_jobs"):
+            pending = pending_providers(cur, person_key)
+
     # ── status changes ───────────────────────────────────────────────────
     status_rows = []
     if table_exists(cur, "candidate_status_history"):
@@ -247,5 +272,5 @@ def build_timeline(cur, candidate_id: int, *, viewer_email: str, viewer_is_admin
              "pool_source": r["pool_source"], "is_archived": r["is_archived"]}
             for r in rows
         ],
-        "counts": counts, "items": items, "pending_backfill": [],
+        "counts": counts, "items": items, "pending_backfill": pending,
     }

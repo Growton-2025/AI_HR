@@ -1023,6 +1023,8 @@ def ensure_calls_schema_ready(force: bool = False):
                         -- the startup migrations, so this is where it runs.
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'candidate_person_links')
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'person_history_jobs')
                         AND NOT EXISTS (SELECT 1 FROM candidates
                                         WHERE normalized_linkedin IS NOT NULL
                                           AND normalized_linkedin !~ '^/in/[^/]+(_legacy_[0-9]+)?$')
@@ -1315,8 +1317,10 @@ def ensure_calls_schema_ready(force: bool = False):
             try:
                 from backend.services.linkedin_backfill import canonicalise_linkedin_keys
                 from backend.services.person_identity import ensure_person_links_schema
+                from backend.services.person_history_backfill import ensure_backfill_schema
                 canonicalise_linkedin_keys(cur)
                 ensure_person_links_schema(cur)
+                ensure_backfill_schema(cur)
                 cur.execute(
                     "UPDATE candidates SET email = LOWER(TRIM(email)) "
                     "WHERE email IS NOT NULL AND email <> LOWER(TRIM(email));"

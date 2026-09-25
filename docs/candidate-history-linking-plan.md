@@ -271,7 +271,18 @@ Also pre-warm on **lookup** (2.7) so that by the time the recruiter clicks
   pool write path; frontend: Add-Candidate banner, History tab, "Previous
   attempts" in the Calls modal. Timeline cost on hosted ≈ 4 s (8 statements);
   candidate for a single CTE later.
-* **PR 3 — provider backfill**: not started.
+* **PR 3 — provider backfill** shipped, **off by default**:
+  `backend/services/person_history_backfill.py` — `person_history_jobs`
+  (claimed with `FOR UPDATE SKIP LOCKED`, exponential backoff, 5 attempts),
+  `person_provider_threads`, one daemon worker per process (tick 12 s, one
+  job per tick ⇒ ≤ 20 jobs/min across 4 workers), HeyReach by profile URL,
+  Smartlead by email across every campaign of the lead, last 12 months.
+  Jobs are enqueued on candidate create and on Add-modal lookup; the
+  timeline merges provider threads (deduped by message id) and reports
+  `pending_backfill`, which the UI shows as "Fetching older … messages" and
+  re-reads once after 15 s. **To enable on hosted:** app setting
+  `ENABLE_PERSON_HISTORY_BACKFILL=true` (HEYREACH_API_KEY / SMARTLEAD_API_KEY
+  already present); optional `PERSON_HISTORY_TICK_SECONDS`.
 
 ## 3. Work breakdown (incremental, each shippable)
 

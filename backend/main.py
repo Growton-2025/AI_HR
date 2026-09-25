@@ -202,6 +202,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"SMARTLEAD REPLY POLLER FAILED TO START: {e}")
 
+    # Provider history backfill for newly added / looked-up people
+    # (docs/candidate-history-linking-plan.md PR 3). Off unless
+    # ENABLE_PERSON_HISTORY_BACKFILL=true; the worker checks the flag itself.
+    try:
+        from backend.services import person_history_backfill
+        person_history_backfill.start_worker()
+    except Exception as e:
+        print(f"PERSON HISTORY BACKFILL WORKER FAILED TO START: {e}")
+
     # Register the HeyReach reply webhook (EVERY_MESSAGE_REPLY_RECEIVED) so
     # candidate replies land in near real-time instead of waiting for a manual
     # sync. Requires the backend to be publicly reachable; set e.g.

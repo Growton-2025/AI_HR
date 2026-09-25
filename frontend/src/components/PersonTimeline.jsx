@@ -112,6 +112,17 @@ export default function PersonTimeline({ candidateId, candidateName, compact = f
   };
   useEffect(() => { if (candidateId) load(); }, [candidateId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Older provider history (HeyReach / Smartlead) is fetched in the background
+  // after a person is added or looked up. Never block on it: show what we
+  // have, say what is still coming, and re-read once it should have landed.
+  const pending = data?.pending_backfill || [];
+  useEffect(() => {
+    if (!pending.length) return undefined;
+    const t = setTimeout(() => load(true), 15000);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending.join(',')]);
+
   let items = data?.items || [];
   if (filterTypes) items = items.filter(i => filterTypes.includes(i.type));
   if (limit) items = items.slice(0, limit);
@@ -125,11 +136,21 @@ export default function PersonTimeline({ candidateId, candidateName, compact = f
     return <div style={{ padding: compact ? 8 : 24, fontSize: 13, color: '#dc2626' }}>{error}</div>;
   }
   if (!items.length) {
-    return <div style={{ padding: compact ? 8 : 24, fontSize: 13, color: '#94a3b8' }}>No previous interactions with this person.</div>;
+    return (
+      <div style={{ padding: compact ? 8 : 24, fontSize: 13, color: '#94a3b8' }}>
+        No previous interactions with this person.
+        {pending.length > 0 && <div style={{ marginTop: 6 }}>Fetching older messages from {pending.join(' and ')}…</div>}
+      </div>
+    );
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: compact ? 8 : 12 }}>
+      {pending.length > 0 && (
+        <div style={{ fontSize: 12, color: '#64748b', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <RefreshCw size={12} className="animate-spin" /> Fetching older {pending.map(p => (p === 'heyreach' ? 'LinkedIn' : 'email')).join(' and ')} messages…
+        </div>
+      )}
       {!compact && (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, color: '#64748b' }}>
           <span>

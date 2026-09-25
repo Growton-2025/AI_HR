@@ -304,8 +304,18 @@ def link_candidate(cur, candidate_id: int, *, by: str = "system") -> dict:
         return {"known": False}
     prior = _public_rows(resolution.rows, exclude=candidate_id)
     summary = person_summary(cur, resolution.candidate_ids, exclude=candidate_id)
+    me = next((r for r in resolution.rows if r["id"] == candidate_id), None)
+    queued = []
+    if me and resolution.person_key:
+        # Older provider history (HeyReach by profile URL, Smartlead by email)
+        # is fetched in the background; enqueue_backfill picks the providers
+        # it has an identity and an API key for, and is a no-op when the
+        # feature flag is off.
+        from backend.services.person_history_backfill import enqueue_backfill
+        queued = enqueue_backfill(cur, resolution.person_key, linkedin_url=me.get("linkedin"), email=me.get("email"))
     return {"known": bool(prior), "person_key": resolution.person_key,
-            "matched_on": resolution.matched_on, "prior_rows": prior, **summary}
+            "matched_on": resolution.matched_on, "prior_rows": prior,
+            "pending_backfill": queued, **summary}
 
 
 def lookup_person(cur, *, linkedin: Optional[str] = None, email: Optional[str] = None,
@@ -318,5 +328,9 @@ def lookup_person(cur, *, linkedin: Optional[str] = None, email: Optional[str] =
     li_key = key if matched_on == MATCHED_LINKEDIN else None
     rows = _resolve_rows(cur, None, key=li_key, mail=canonical_email(email), tail=phone_tail(phone))
     summary = person_summary(cur, [r["id"] for r in rows])
+    # Pre-warm: by the time the recruiter clicks Add, older provider history
+    # is usually already fetched.
+    from backend.services.person_history_backfill import enqueue_backfill
+    queued = enqueue_backfill(cur, key, linkedin_url=linkedin, email=email)
     return {"known": bool(rows), "person_key": key, "matched_on": matched_on,
-            "prior_rows": _public_rows(rows), **summary}
+            "prior_rows": _public_rows(rows), "pending_backfill": queued, **summary}
