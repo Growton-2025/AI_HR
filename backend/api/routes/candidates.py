@@ -57,6 +57,41 @@ _profile_drift_reload_running = False
 _profile_drift_lock = threading.Lock()
 
 
+# The hand-edited contact fields (PATCH /candidates/{id}) are the one part of a
+# profile that changes without the row count moving, so the drift check above
+# never notices them: a recruiter's notes saved through one worker stayed
+# invisible on the other three — the call modal pre-fills from this endpoint,
+# so yesterday's "Not Reachable" reasons looked lost. Reading these few columns
+# fresh is one indexed lookup; the merge also heals this worker's snapshot.
+# `name` is left out: the cached display name is composed from first/last name
+# and would be clobbered by a blank `name` column.
+_DB_FRESH_PROFILE_FIELDS = ("notes", "email", "mobile_phone", "linkedin", "status")
+
+
+def _overlay_editable_fields_from_db(candidate_id: int, prof: Dict[str, Any]) -> None:
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                return
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {', '.join(_DB_FRESH_PROFILE_FIELDS)} FROM candidates WHERE id = %s",
+                    (candidate_id,),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        logger.warning("Could not refresh editable fields for candidate %s: %s", candidate_id, exc)
+        return
+    if not row:
+        return
+    for field, value in zip(_DB_FRESH_PROFILE_FIELDS, row):
+        if field == "status":
+            prof[field] = value or prof.get("status") or "To be started"
+        else:
+            prof[field] = value or ""
+    prof["phone"] = prof["mobile_phone"]
+
+
 def _reload_profile_cache_if_drifted() -> None:
     """Compare the cached profile count against the DB and rebuild on mismatch."""
     global _profile_drift_reload_running
@@ -254,6 +289,7 @@ async def get_candidate(
     prof = PROFILES_BY_ID.get(candidate_id)
     if not prof or prof.get("is_archived"):
         raise HTTPException(status_code=404, detail="Candidate not found")
+    _overlay_editable_fields_from_db(candidate_id, prof)
     if (current_user.role or "").strip().lower() == "admin":
         scope = view_scope or VIEW_SCOPE_MASTER
         if not profile_passes_scope(

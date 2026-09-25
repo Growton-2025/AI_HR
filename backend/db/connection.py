@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Database Configuration
 DB_NAME = os.getenv("DB_NAME", "growton")
 DB_USER = os.getenv("DB_USER", "growton")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Postgres-2026")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
 # Default 4, not 1. /candidates/browse checks out TWO connections per request

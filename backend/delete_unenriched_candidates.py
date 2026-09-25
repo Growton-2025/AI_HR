@@ -22,7 +22,7 @@ load_dotenv()
 DB_PARAMS = dict(
     dbname=os.getenv("DB_NAME", "growton"),
     user=os.getenv("DB_USER", "growton"),
-    password=os.getenv("DB_PASSWORD", "Postgres-2026"),
+    password=os.getenv("DB_PASSWORD"),
     host=os.getenv("DB_HOST", "growton-restore-may26.postgres.database.azure.com"),
     port=int(os.getenv("DB_PORT", "5432")),
     sslmode="require",

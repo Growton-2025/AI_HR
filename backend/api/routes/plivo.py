@@ -519,8 +519,11 @@ async def get_call_state_by_token(dial_token: str, include_hangup: bool = False)
     `include_hangup` adds Plivo's hangup reason, falling back to the calls row
     (the hangup webhook may have hit another worker). Only the post-call
     lookup asks for it: the handshake polls this twice a second.
+
+    The dial state itself also falls back to the calls row: under gunicorn the
+    dial webhook and these polls are routinely served by different workers.
     """
-    state = plivo_service.dial_token_states.get(dial_token) or {}
+    state = await asyncio.to_thread(plivo_service.get_dial_state_for_token, dial_token) or {}
     hangup = state.get("hangup")
     if include_hangup and not hangup:
         hangup = await asyncio.to_thread(plivo_service.get_hangup_for_token, dial_token)
@@ -536,7 +539,7 @@ async def get_call_state_by_token(dial_token: str, include_hangup: bool = False)
 
 @router.get("/call-state/{username}")
 async def get_call_state(username: str):
-    state = plivo_service.last_call_states.get(username) or {}
+    state = await asyncio.to_thread(plivo_service.get_dial_state_for_username, username) or {}
     return {
         "call_uuid": state.get("call_uuid"),
         "username": state.get("username") or username,

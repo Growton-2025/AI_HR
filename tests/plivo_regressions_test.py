@@ -934,19 +934,33 @@ def test_outbound_hangup_is_exposed_to_the_call_state_poll(monkeypatch):
     assert state["hangup"]["source"] == "Carrier"
 
 
+class _DispatchCursor(_FakeCursor):
+    """Answers the hangup lookup only; the dial-state lookup finds no row."""
+
+    def __init__(self, hangup_row):
+        super().__init__()
+        self.hangup_row = hangup_row
+
+    def fetchone(self):
+        query = self.executed[-1][0] if self.executed else ""
+        return self.hangup_row if "plivo_hangup_cause" in query else None
+
+
 def test_call_state_reads_the_hangup_from_the_calls_row_only_when_asked(monkeypatch):
     plivo_service.dial_token_states.clear()
-    cursor = _RowCursor(row=("Rejected (3020, Carrier)",))
+    cursor = _DispatchCursor(hangup_row=("Rejected (3020, Carrier)",))
     _fake_calls_db(monkeypatch, cursor)
 
-    # The dial handshake polls twice a second: no DB read unless asked.
+    # The dial handshake polls twice a second. It may look the dial state up in
+    # the calls row (another worker served the webhook), but never the hangup
+    # unless asked.
     assert asyncio.run(plivo_routes.get_call_state_by_token("tok-other"))["hangup"] is None
-    assert cursor.executed == []
+    assert all("plivo_hangup_cause" not in query for query, _ in cursor.executed)
 
     state = asyncio.run(plivo_routes.get_call_state_by_token("tok-other", include_hangup=True))
     assert state["hangup"]["summary"] == "Rejected (3020, Carrier)"
     assert state["hangup"]["cause_name"] == "Rejected"
-    assert "plivo_hangup_cause" in cursor.executed[0][0]
+    assert "plivo_hangup_cause" in cursor.executed[-1][0]
 
 
 def test_softphone_application_is_created_with_a_hangup_url(monkeypatch, tmp_path):

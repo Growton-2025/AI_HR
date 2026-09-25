@@ -692,6 +692,100 @@ def get_hangup_for_token(dial_token: str):
     return None
 
 
+def _dial_state_from_row(row, dial_token: str = ""):
+    call_uuid, username, to_number, seen_at = row
+    return {
+        "call_uuid": call_uuid,
+        "username": username or "",
+        "to_number": normalize_number(to_number),
+        "seen_at": seen_at.timestamp() if seen_at else None,
+        "dial_token": dial_token or "",
+    }
+
+
+def get_dial_state_for_token(dial_token: str):
+    """Dial state for one attempt: this worker's memory first, then the calls row.
+
+    Hosted runs WEB_CONCURRENCY=4. Plivo's answer-URL webhook lands on one
+    worker and fills `dial_token_states` there only, while the browser's
+    handshake polls ride a keep-alive connection pinned to another worker —
+    which never sees the entry and times out after 12s with "Plivo browser
+    call did not reach the backend" even though the candidate's phone is
+    already ringing. record_browser_dial() writes the same fact to the calls
+    row before answering Plivo, so every worker can answer from there."""
+    if not dial_token:
+        return None
+    state = dial_token_states.get(dial_token)
+    if state and state.get("call_uuid"):
+        return state
+    try:
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+        conn = get_calls_db_connection()
+        if not conn:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.plivo_call_uuid, c.plivo_endpoint_username,
+                       COALESCE(NULLIF(TRIM(cand.mobile_phone), ''), NULLIF(TRIM(cand.phone), '')),
+                       c.updated_at
+                FROM calls c
+                LEFT JOIN candidates cand ON cand.id = c.candidate_id
+                WHERE c.dial_token = %s AND c.plivo_call_uuid IS NOT NULL
+                LIMIT 1
+                """,
+                (dial_token,),
+            )
+            row = cur.fetchone()
+            cur.close()
+        finally:
+            return_db_connection(conn)
+    except Exception as exc:
+        logger.warning("Could not read dial state for token %s: %s", dial_token, exc)
+        return None
+    return _dial_state_from_row(row, dial_token) if row else None
+
+
+def get_dial_state_for_username(username: str):
+    """Most recent dial this endpoint placed — memory, then the calls row.
+    Same cross-worker reasoning as get_dial_state_for_token(); this is the
+    fallback the browser uses when Plivo did not forward the dial token."""
+    if not username:
+        return None
+    state = last_call_states.get(username)
+    if state and state.get("call_uuid"):
+        return state
+    try:
+        from backend.api.routes.calls import get_calls_db_connection, return_db_connection
+        conn = get_calls_db_connection()
+        if not conn:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.plivo_call_uuid, c.plivo_endpoint_username,
+                       COALESCE(NULLIF(TRIM(cand.mobile_phone), ''), NULLIF(TRIM(cand.phone), '')),
+                       c.updated_at
+                FROM calls c
+                LEFT JOIN candidates cand ON cand.id = c.candidate_id
+                WHERE c.plivo_endpoint_username = %s AND c.plivo_call_uuid IS NOT NULL
+                ORDER BY c.updated_at DESC NULLS LAST, c.id DESC
+                LIMIT 1
+                """,
+                (username,),
+            )
+            row = cur.fetchone()
+            cur.close()
+        finally:
+            return_db_connection(conn)
+    except Exception as exc:
+        logger.warning("Could not read dial state for username %s: %s", username, exc)
+        return None
+    return _dial_state_from_row(row) if row else None
+
+
 def record_browser_dial(username: str, call_uuid: str, to_number: str, dial_token: str = None):
     global latest_call_uuid
     if not username or not call_uuid:
