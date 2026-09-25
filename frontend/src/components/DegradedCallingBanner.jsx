@@ -24,7 +24,7 @@ import { useVoIP } from '../context/VoIPContext';
  * follows them across every page rather than only the Calls workspace.
  */
 export default function DegradedCallingBanner() {
-  const { voipDegraded, voipStatus, voipError, retryVoip } = useVoIP();
+  const { voipDegraded, voipStatus, voipError, voipErrorCode, retryVoip } = useVoIP();
   const [retrying, setRetrying] = useState(false);
 
   // 'error' is the terminal state of the credentials fetch / SDK login. The
@@ -42,12 +42,19 @@ export default function DegradedCallingBanner() {
     }
   };
 
-  const title = noLine ? 'YOUR CALLING LINE IS NOT SET UP' : 'CALLING IS DEGRADED';
-  const body = noLine
-    ? (voipError
-        ? `${voipError}. Candidate callbacks will not ring on this computer.`
-        : 'Candidate callbacks will not ring on this computer, and you cannot place calls.')
-    : voipDegraded.reason;
+  // The line exists but another tab of this browser holds it: not a setup
+  // problem, and the fix is one click ("Use this tab" moves it here).
+  const otherTab = noLine && voipErrorCode === 'softphone_in_other_tab';
+  const title = otherTab
+    ? 'CALLING IS ACTIVE IN ANOTHER TAB'
+    : noLine ? 'YOUR CALLING LINE IS NOT SET UP' : 'CALLING IS DEGRADED';
+  const body = otherTab
+    ? `${voipError}. Callbacks ring in the tab that holds the line.`
+    : noLine
+      ? (voipError
+          ? `${voipError}. Candidate callbacks will not ring on this computer.`
+          : 'Candidate callbacks will not ring on this computer, and you cannot place calls.')
+      : voipDegraded.reason;
 
   return (
     <div
@@ -87,7 +94,7 @@ export default function DegradedCallingBanner() {
           }}
         >
           <RefreshCcw size={13} className={retrying ? 'animate-spin' : ''} />
-          {retrying ? 'Retrying…' : 'Retry'}
+          {retrying ? (otherTab ? 'Moving…' : 'Retrying…') : (otherTab ? 'Use this tab' : 'Retry')}
         </button>
       )}
     </div>

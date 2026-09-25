@@ -453,15 +453,44 @@ export function VoIPProvider({ children }) {
   // browser has no Web Locks, in which case there is nothing to hold). The
   // lock is kept for the life of the tab; Chrome releases it when the tab
   // closes, and the other tab's 30s error-recovery loop then takes over.
-  const acquireSoftphoneLock = () => new Promise((resolve) => {
+  // Give the line back. Called when this tab's softphone fails to come up,
+  // when the provider unmounts (logout / app teardown) and when another tab
+  // takes the line over — otherwise a tab whose line never worked, or one
+  // left minimised in another window, keeps every new tab locked out.
+  const releaseSoftphoneLock = () => {
+    const release = softphoneLockReleaseRef.current;
+    softphoneLockReleaseRef.current = null;
+    if (typeof release === 'function') release();
+  };
+
+  // Another tab pressed "Use this tab": Chrome aborts our held lock. Step
+  // down cleanly — Plivo refuses a second login for the same endpoint anyway.
+  const handleLockStolen = () => {
+    softphoneLockReleaseRef.current = null;
+    try {
+      softphoneRef.current?.client?.logout?.();
+      softphoneRef.current?.logout?.();
+    } catch (_) { /* stale SDK */ }
+    setVoipStatus('error');
+    setVoipErrorCode('softphone_in_other_tab');
+    setVoipError('Another tab of this browser took over calling. Use that tab, or press "Use this tab" here to take it back');
+    console.warn('[VoIP] Softphone lock taken by another tab');
+  };
+
+  const acquireSoftphoneLock = ({ steal = false } = {}) => new Promise((resolve) => {
     if (softphoneLockReleaseRef.current) { resolve(true); return; }
     const locks = typeof navigator !== 'undefined' ? navigator.locks : null;
     if (!locks?.request) { resolve(true); return; }
-    locks.request(SOFTPHONE_LOCK_NAME, { ifAvailable: true }, (lock) => {
+    let held = false;
+    locks.request(SOFTPHONE_LOCK_NAME, steal ? { steal: true } : { ifAvailable: true }, (lock) => {
       if (!lock) { resolve(false); return undefined; }
+      held = true;
       resolve(true);
       return new Promise((release) => { softphoneLockReleaseRef.current = release; });
-    }).catch(() => resolve(true));
+    }).catch((err) => {
+      if (held && err?.name === 'AbortError') { handleLockStolen(); return; }
+      resolve(true);
+    });
   });
 
   // Locally generated ringback: the real Plivo ringback only starts once the
@@ -697,6 +726,7 @@ export function VoIPProvider({ children }) {
       } catch (_) {
         // Ignore shutdown errors when the provider unmounts.
       }
+      releaseSoftphoneLock();
       remoteAudio.remove();
       localAudio.remove();
     };
@@ -869,7 +899,7 @@ export function VoIPProvider({ children }) {
     }
   };
 
-  const initSoftphone = async ({ force = false } = {}) => {
+  const initSoftphone = async ({ force = false, steal = false } = {}) => {
     if (initInFlightRef.current) {
       if (force) queuedForceInitRef.current = true;
       return { success: false, pending: true };
@@ -882,9 +912,9 @@ export function VoIPProvider({ children }) {
       clearVoipErrorState();
       setVoipStatus('connecting');
       setVoipCallEvent(null);
-      if (!(await acquireSoftphoneLock())) {
+      if (!(await acquireSoftphoneLock({ steal }))) {
         if (softphoneGenerationRef.current !== instanceId) return { success: false };
-        const message = 'The softphone is already active in another tab of this browser. Use that tab to call, or close it and this one will take over.';
+        const message = 'Calling is active in another tab of this browser. Use that tab, or press "Use this tab" to move calling here';
         setVoipStatus('error');
         setVoipError(message);
         setVoipErrorCode('softphone_in_other_tab');
@@ -967,11 +997,13 @@ export function VoIPProvider({ children }) {
             : 'Unable to prepare Plivo softphone');
         setVoipStatus('error');
         setVoipError(message);
+        releaseSoftphoneLock();
         return;
       }
       if (!res.username || !res.password) {
         setVoipStatus('error');
         setVoipError('Plivo softphone credentials are missing');
+        releaseSoftphoneLock();
         return;
       }
       setAgentEmail(res.username);
@@ -1207,6 +1239,7 @@ export function VoIPProvider({ children }) {
       setVoipStatus('error');
       const message = error?.message || 'Failed to initialize Plivo VoIP Softphone';
       setVoipError(message);
+      releaseSoftphoneLock();
       return { success: false, error: message };
     } finally {
       initInFlightRef.current = false;
@@ -1462,7 +1495,7 @@ export function VoIPProvider({ children }) {
         voipDegraded,
         connectedInbound,
         clearConnectedInbound,
-        retryVoip: () => initSoftphone({ force: true }),
+        retryVoip: () => initSoftphone({ force: true, steal: voipErrorCode === 'softphone_in_other_tab' }),
       }}
     >
       {children}
