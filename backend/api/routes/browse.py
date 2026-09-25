@@ -1277,6 +1277,13 @@ async def browse_candidates(
 ):
     """Browse candidates with role-based pool scope."""
     started = time.monotonic()
+    # Talent Pool reads this worker's PROFILES_BY_ID; pull in edits other
+    # workers made (notes, phone, status) on the same cadence as /candidates.
+    try:
+        from backend.api.routes.candidates import schedule_profile_cache_drift_check
+        schedule_profile_cache_drift_check()
+    except Exception:
+        pass
     for label, value in (("added_from", added_from), ("added_to", added_to)):
         if value:
             try:

@@ -197,3 +197,48 @@ def test_unknown_candidate_is_still_404(monkeypatch):
         assert exc.status_code == 404
     else:
         raise AssertionError("expected 404")
+
+
+def test_edits_made_on_another_worker_are_merged_by_the_drift_check(monkeypatch):
+    import datetime as _dt
+    from backend.pipeline import query as query_mod
+    cache = {14427: {"id": 14427, "notes": ""}}
+    monkeypatch.setattr(candidates, "PROFILES_BY_ID", cache)
+    monkeypatch.setattr(candidates, "_profile_sync_watermark", None)
+    monkeypatch.setattr(candidates, "invalidate_candidate_analytics_cache", lambda: None)
+    ts = _dt.datetime(2026, 9, 25, 10, 0, 0)
+    seen = {}
+
+    def updates_since(since):
+        seen["since"] = since
+        return [(14427, ts)]
+
+    def refresh(ids):
+        assert ids == [14427]
+        cache[14427]["notes"] = "Not reachable - Incoming freeze"
+        return 1
+
+    monkeypatch.setattr(query_mod, "candidate_updates_since", updates_since)
+    monkeypatch.setattr(query_mod, "refresh_profiles_in_cache", refresh)
+
+    assert candidates._sync_profiles_edited_elsewhere() == 1
+    assert cache[14427]["notes"] == "Not reachable - Incoming freeze"
+    assert candidates._profile_sync_watermark == ts
+    # Second pass starts from the new watermark and merges nothing.
+    monkeypatch.setattr(query_mod, "candidate_updates_since", lambda since: [] if since == ts else [(1, ts)])
+    assert candidates._sync_profiles_edited_elsewhere() == 0
+
+
+def test_a_flood_of_edits_falls_back_to_a_full_reload(monkeypatch):
+    import datetime as _dt
+    from backend.pipeline import query as query_mod
+    monkeypatch.setattr(candidates, "PROFILES_BY_ID", {1: {"id": 1}})
+    monkeypatch.setattr(candidates, "_profile_sync_watermark", _dt.datetime(2026, 9, 25))
+    monkeypatch.setattr(candidates, "invalidate_candidate_analytics_cache", lambda: None)
+    ts = _dt.datetime(2026, 9, 25, 10)
+    monkeypatch.setattr(query_mod, "candidate_updates_since", lambda since: [(i, ts) for i in range(600)])
+    called = {}
+    monkeypatch.setattr(query_mod, "initialize_cache", lambda: called.setdefault("full", True))
+    monkeypatch.setattr(query_mod, "refresh_profiles_in_cache", lambda ids: (_ for _ in ()).throw(AssertionError("should not merge one by one")))
+    assert candidates._sync_profiles_edited_elsewhere() == 600
+    assert called.get("full") is True

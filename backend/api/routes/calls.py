@@ -861,6 +861,22 @@ def fetch_call_by_id(cur, call_id: int, owner: Optional[str] = None) -> Optional
     return call_row_to_dict(row) if row else None
 
 
+def call_never_connected(call_data: Optional[dict]) -> bool:
+    """A completed call with no recording and zero talk time never reached
+    the candidate (busy, no answer, rejected). `duration` is the recruiter's
+    measured connect-to-hangup time and is 0 when the call was never answered;
+    anything Plivo did record arrives as recording_url regardless."""
+    if not isinstance(call_data, dict):
+        return False
+    if call_data.get("recording_url"):
+        return False
+    try:
+        duration = int(call_data.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    return duration <= 0
+
+
 def call_artifacts_need_repair(call_data: Optional[dict]) -> bool:
     if not isinstance(call_data, dict):
         return False
@@ -3300,6 +3316,14 @@ async def sync_call_recording(
             cur.close()
             return_db_connection(conn)
             return updated_call
+        return call
+
+    if call_never_connected(call):
+        # Nothing to wait for: the candidate never picked up, so Plivo has no
+        # recording and never will. Answering 404 here read as "not ready yet"
+        # to the page, which kept polling every second for every unanswered
+        # call. The row itself is the definitive answer.
+        logger.info("Call %s never connected; no recording to sync.", call_id)
         return call
 
     raise HTTPException(

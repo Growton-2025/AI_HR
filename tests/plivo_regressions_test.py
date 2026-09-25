@@ -985,3 +985,57 @@ def test_softphone_application_is_created_with_a_hangup_url(monkeypatch, tmp_pat
     assert app_kwargs["hangup_method"] == "POST"
     _FakeRestClient.calls = []
     _reset_plivo_setup_state()
+
+
+class _RecordingRequest:
+    def __init__(self, **fields):
+        self.fields = {"CallUUID": "rec-call-1", "RecordingUrl": "https://plivo/rec-call-1.mp3", **fields}
+
+    async def form(self):
+        return dict(self.fields)
+
+
+class _NoBackgroundTasks:
+    def __init__(self):
+        self.tasks = []
+
+    def add_task(self, fn, *args, **kwargs):
+        self.tasks.append((fn, args, kwargs))
+
+
+def _quiet_recording_side_effects(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(plivo_service, "persist_recording_url", lambda uuid, url: persisted.append((uuid, url)) or True)
+    monkeypatch.setattr(plivo_routes.calls_module, "invalidate_calls_cache", lambda: None)
+    return persisted
+
+
+def test_interim_recording_callback_is_not_cached_as_a_recording(monkeypatch):
+    plivo_service.recordings.clear()
+    persisted = _quiet_recording_side_effects(monkeypatch)
+    tasks = _NoBackgroundTasks()
+
+    # The interim callback: fired when recording *starts*, -1 durations. For a
+    # call that is never answered this is the only callback that ever comes.
+    resp = asyncio.run(plivo_routes.plivo_recording(
+        _RecordingRequest(RecordingDuration="-1", RecordingDurationMs="-1", RecordingEndMs="-1"), tasks))
+
+    assert resp.status_code == 200
+    assert "rec-call-1" not in plivo_service.recordings
+    assert persisted == []
+    assert tasks.tasks == []
+
+
+def test_final_recording_callback_is_cached_stored_and_processed(monkeypatch):
+    plivo_service.recordings.clear()
+    persisted = _quiet_recording_side_effects(monkeypatch)
+    tasks = _NoBackgroundTasks()
+
+    resp = asyncio.run(plivo_routes.plivo_recording(
+        _RecordingRequest(RecordingDuration="37", RecordingDurationMs="37000", RecordingEndMs="37000"), tasks))
+
+    assert resp.status_code == 200
+    assert plivo_service.recordings["rec-call-1"] == "https://plivo/rec-call-1.mp3"
+    assert persisted == [("rec-call-1", "https://plivo/rec-call-1.mp3")]
+    assert len(tasks.tasks) == 1 and tasks.tasks[0][0] is plivo_service.process_call_insights
+    plivo_service.recordings.clear()

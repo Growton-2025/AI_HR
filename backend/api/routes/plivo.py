@@ -274,11 +274,17 @@ async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
     logger.info(f"Received recording callback. CallUUID: {call_uuid}, RecordingUrl: {recording_url}")
     
     if call_uuid and recording_url:
-        plivo_service.recordings[call_uuid] = recording_url
-        logger.info(f"Stored recording for {call_uuid}")
         duration_seconds = _extract_duration_seconds(form_data)
         logger.info(f"Provider recording duration for {call_uuid}: {duration_seconds}s")
         if _recording_callback_is_final(form_data):
+            # Only a FINAL callback goes into the in-memory map. The interim
+            # one (fired when a startOnDialAnswer recording *starts*) arrives
+            # for calls that then never connect and never produce a file: the
+            # worker that had cached its URL kept answering the poll with it,
+            # downloading it (403) on every poll, while the other workers said
+            # "no recording yet" — so the page polled forever.
+            plivo_service.recordings[call_uuid] = recording_url
+            logger.info(f"Stored recording for {call_uuid}")
             # Put the URL on the row NOW, before any of the slow work. The
             # player is gated on calls.recording_url, and that used to be
             # written only once transcription and summarising had finished — so

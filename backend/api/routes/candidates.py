@@ -8,7 +8,7 @@ import time
 import asyncio
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -111,11 +111,56 @@ def _overlay_editable_fields_from_db(candidate_id: int, prof: Dict[str, Any]) ->
     prof["phone"] = prof["mobile_phone"]
 
 
+# Newest candidates.updated_at this worker has merged. Edits made through
+# another worker are pulled in by _sync_profiles_edited_elsewhere() on the
+# same 60s cadence as the count check, so Talent Pool / search / analytics on
+# every worker converge on a notes or phone edit within a minute.
+_profile_sync_watermark: Optional[datetime] = None
+# Past this many changed rows a full reload is cheaper than N single merges.
+_PROFILE_SYNC_FULL_RELOAD_THRESHOLD = 500
+
+
+def _sync_profiles_edited_elsewhere() -> int:
+    """Merge candidates written since this worker's watermark. Returns rows merged."""
+    global _profile_sync_watermark
+    from backend.pipeline import query as query_mod
+
+    if _profile_sync_watermark is None:
+        # First pass in this worker: the cache was loaded from the DB, so only
+        # edits that raced that load can be missing. Two minutes covers it.
+        _profile_sync_watermark = datetime.utcnow() - timedelta(minutes=2)
+    changes = query_mod.candidate_updates_since(_profile_sync_watermark)
+    if not changes:
+        return 0
+    if len(changes) > _PROFILE_SYNC_FULL_RELOAD_THRESHOLD:
+        query_mod.initialize_cache()
+        merged = len(changes)
+    else:
+        merged = query_mod.refresh_profiles_in_cache([cid for cid, _ in changes])
+    _profile_sync_watermark = max(ts for _, ts in changes if ts is not None) or _profile_sync_watermark
+    if merged:
+        invalidate_candidate_analytics_cache()
+        try:
+            from backend.api.routes import browse as browse_mod
+
+            browse_mod._invalidate_browse_cache()
+        except Exception:
+            pass
+    return merged
+
+
 def _reload_profile_cache_if_drifted() -> None:
     """Compare the cached profile count against the DB and rebuild on mismatch."""
     global _profile_drift_reload_running
     try:
         from backend.pipeline import query as query_mod
+
+        try:
+            merged = _sync_profiles_edited_elsewhere()
+            if merged:
+                logger.info("Merged %s candidate profile(s) edited via other workers.", merged)
+        except Exception as exc:
+            logger.warning("Cross-worker profile sync failed: %s", exc)
 
         db_total = query_mod.count_all_candidates_from_db()
         cached_total = len(query_mod.PROFILES_BY_ID)

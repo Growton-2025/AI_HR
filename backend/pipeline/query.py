@@ -315,6 +315,29 @@ def count_active_candidates_from_db() -> Optional[int]:
         return_db_connection(conn)
 
 
+def candidate_updates_since(since) -> Optional[List[tuple]]:
+    """(id, updated_at) for every candidate row written after `since` (naive UTC,
+    like the column). Lets each gunicorn worker pull in edits that other
+    workers made — a notes or phone PATCH refreshes PROFILES_BY_ID only in the
+    process that served it, and the count-based drift check cannot see an
+    edit that changes no row count."""
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, updated_at FROM candidates WHERE updated_at > %s ORDER BY updated_at",
+                (since,),
+            )
+            return [(int(r[0]), r[1]) for r in cur.fetchall()]
+    except Exception as e:
+        logger.error("Failed to list candidates updated since %s: %s", since, e)
+        return None
+    finally:
+        return_db_connection(conn)
+
+
 def count_all_candidates_from_db() -> Optional[int]:
     """Total candidate rows, archived included — the comparable figure for
     len(PROFILES_BY_ID), since the profile load has no is_archived filter."""

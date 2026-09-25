@@ -197,8 +197,17 @@ const BACKGROUND_ANALYSIS_POLL_MS = 9000;
 // overview don't sit stale for longer than the backend itself would.
 const STATS_POLL_MS = 15000;
 
+// A call that was never answered has nothing to sync: Plivo records from the
+// moment the candidate picks up, so an unanswered attempt produces no file and
+// no transcript, ever. Polling for one just hammered the backend (~2,000
+// requests per unanswered call) until the 30-minute window closed.
+const callConnected = (callData) => (
+  Boolean(callData?.recording_url) || Number(callData?.duration) > 0
+);
+
 const isPendingAnalysis = (callData) => (
   callData?.status === 'completed'
+  && callConnected(callData)
   && needsPostCallArtifacts(callData)
   && Boolean(callData.completed_at)
   && (Date.now() - new Date(callData.completed_at).getTime()) < PENDING_ANALYSIS_WINDOW_MS
@@ -1782,6 +1791,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   // Live call timer shown next to the "Connected" label while the call is active.
   const [callElapsedSeconds, setCallElapsedSeconds] = useState(0);
   const [reviewCallData, setReviewCallData] = useState(call);
+  const reviewCallConnected = connectedAtRef.current !== null || callConnected(reviewCallData);
   const reviewSummary = (reviewCallData?.summary || '').trim();
   const reviewTranscript = (reviewCallData?.transcript || '').trim();
   const showReviewSummary = reviewSummary && !hasPlaceholderSummary(reviewSummary);
@@ -2130,7 +2140,9 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
 
   useEffect(() => {
     let t;
-    if (callState === 'review' && needsPostCallArtifacts(reviewCallData)) {
+    // Only a call that actually connected can have artifacts to wait for.
+    const wasConnected = connectedAtRef.current !== null || callConnected(reviewCallData);
+    if (callState === 'review' && wasConnected && needsPostCallArtifacts(reviewCallData)) {
       const fetchReviewData = async () => {
          if (!isDocumentVisible()) return;
          try {
@@ -2735,6 +2747,10 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                         <div style={{ fontSize: '13px', fontWeight: 700, color: '#64748b', marginBottom: '8px' }}>Recording</div>
                         <audio src={reviewCallData.recording_url} controls style={{ width: '100%', height: '40px' }} />
                       </div>
+                    ) : !reviewCallConnected ? (
+                      <div style={{ padding: '12px', background: '#f8fafc', borderRadius: '8px', color: '#64748b', fontSize: '13px', marginBottom: '24px' }}>
+                        No recording — the call was not answered.
+                      </div>
                     ) : (
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '12px', background: '#eff6ff', borderRadius: '8px', color: '#1e40af', fontSize: '13px', marginBottom: '24px' }}>
                         <RefreshCw size={14} style={{ animation: 'spin 2s linear infinite' }} /> Waiting for the recording from Plivo…
@@ -2767,6 +2783,10 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                             candidateName={reviewCallData?.candidate_name}
                             recruiterName={recruiterDisplayName(reviewCallData)}
                           />
+                        </div>
+                      ) : !reviewCallConnected ? (
+                        <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
+                          No transcript — the call was not answered.
                         </div>
                       ) : reviewCallData?.completed_at && (new Date() - new Date(reviewCallData.completed_at)) > PENDING_ANALYSIS_WINDOW_MS ? (
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>

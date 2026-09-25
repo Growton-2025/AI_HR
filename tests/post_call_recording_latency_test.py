@@ -253,3 +253,34 @@ def test_finished_calls_short_circuit(monkeypatch):
 
     assert run["result"]["transcript"] == "hello there"
     assert run["started"] == []
+
+
+# ── an unanswered call is a definitive answer, not "not ready yet" ──────────
+
+def test_a_never_connected_call_is_answered_definitively(monkeypatch):
+    # No recording anywhere (memory, row, Plivo REST) and zero talk time.
+    run = _sync(monkeypatch, _row(recording_url=None, duration=0), lookup=None)
+
+    # 200 with the row, so the page stops polling — previously a 404 that the
+    # frontend read as "keep trying", ~2,000 requests per unanswered call.
+    assert run["result"]["id"] == 1
+    assert run["started"] == []
+    assert run["stored"] == []
+
+
+def test_a_connected_call_without_a_recording_yet_still_says_not_ready(monkeypatch):
+    from fastapi import HTTPException
+    try:
+        _sync(monkeypatch, _row(recording_url=None, duration=42), lookup=None)
+    except HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("a connected call whose recording has not landed must still report 404")
+
+
+def test_never_connected_predicate():
+    assert calls_route.call_never_connected({"recording_url": None, "duration": 0})
+    assert calls_route.call_never_connected({"recording_url": "", "duration": None})
+    assert not calls_route.call_never_connected({"recording_url": "https://x/rec.mp3", "duration": 0})
+    assert not calls_route.call_never_connected({"recording_url": None, "duration": 12})
+    assert not calls_route.call_never_connected(None)
