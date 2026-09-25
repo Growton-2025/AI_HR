@@ -179,8 +179,19 @@ def main() -> None:
         found = next((s for s in result["statuses"] if s.startswith("Found competitors")), "")
         reasons = debug.get("reject_reason_counts") or {}
         top_reasons = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:3])
+        # Evidence hygiene: nothing a recruiter reads may carry an internal
+        # evidence id, and every returned card must carry its checklist.
+        id_re = re.compile(r"\bev\d+\b", re.I)
+        answers_with_ids = sum(
+            1 for c in returned
+            if id_re.search(" ".join([str(c.get("answer") or ""), str(c.get("decision_narrative") or ""),
+                                       *[str(i.get("why_it_supports") or "") for i in (c.get("requirement_breakdown") or [])],
+                                       *[str(cl.get("text") or "") for cl in (c.get("audit_claims") or [])]]))
+        )
+        missing_breakdown = sum(1 for c in returned if not c.get("requirement_breakdown"))
         row = {
             "id": entry["id"], "query": entry["q"], "ground_truth": len(gt_ids), "passed_strict": passed,
+            "answers_with_ids": answers_with_ids, "missing_breakdown": missing_breakdown,
             "returned": len(returned_ids), "recall": None if recall is None else round(recall, 2),
             "precision": None if precision is None else round(precision, 2),
             "missed_ids": sorted(gt_ids - returned_ids)[:15], "false_positive_ids": sorted(returned_ids - gt_ids)[:15],
@@ -189,7 +200,8 @@ def main() -> None:
         }
         rows.append(row)
         print(f"[{row['id']:>2}] gt={row['ground_truth']:<4} strict={passed!s:<5} returned={row['returned']:<4} "
-              f"recall={row['recall']!s:<5} precision={row['precision']!s:<5} ${row['cost_usd']:<7} {row['seconds']}s  {entry['q']}", flush=True)
+              f"recall={row['recall']!s:<5} precision={row['precision']!s:<5} ${row['cost_usd']:<7} {row['seconds']}s  "
+              f"ids_in_text={answers_with_ids} no_breakdown={missing_breakdown}  {entry['q']}", flush=True)
         if found:
             print(f"      {found[:160]}")
         if top_reasons:

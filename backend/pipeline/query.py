@@ -4290,11 +4290,11 @@ def _fallback_reasoning_from_evidence(profile: Dict[str, Any]) -> str:
     snippets = []
     for item in evidence[:4]:
         source = item.get("source") or "profile"
-        evidence_id = item.get("id") or "evidence"
+        criterion = item.get("criterion") or "Evidence"
         snippet = item.get("snippet") or item.get("value") or ""
         if snippet:
-            snippets.append(f"{evidence_id} {source}: {snippet}")
-    return "Verified from structured evidence: " + "; ".join(snippets[:4])
+            snippets.append(f"{criterion} from {source}: {snippet}")
+    return _clean_visible_evidence_ids("Verified from structured evidence: " + "; ".join(snippets[:4]))
 
 
 def _audit_evidence_id_set(profile: Dict[str, Any]) -> set:
@@ -4322,10 +4322,103 @@ def _extract_audit_evidence_ids(payload: Dict[str, Any]) -> List[str]:
     return ids
 
 
+SHORTLIST_AUDIT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "shortlist_audit",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["final_status", "match_score", "confidence", "verdict", "claims", "missing_criteria", "reasoning"],
+            "properties": {
+                "final_status": {"type": "string", "enum": ["verified_match", "not_verified"]},
+                "match_score": {"type": "number"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "verdict": {"type": "string"},
+                "claims": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["requirement_key", "text", "evidence_id"],
+                        "properties": {
+                            "requirement_key": {"type": "string"},
+                            "text": {"type": "string"},
+                            "evidence_id": {"type": "string"},
+                        },
+                    },
+                },
+                "missing_criteria": {"type": "array", "items": {"type": "string"}},
+                "reasoning": {"type": "string"},
+            },
+        },
+    },
+}
+
+
+_CLAIM_FILLER_TOKENS = {"has", "have", "had", "is", "was", "were", "are", "been", "be", "mentioned", "mentions", "matching", "text",
+                        "includes", "include", "worked", "work", "works", "at", "on", "as", "an", "this", "that", "which", "their", "his", "her",
+                        "they", "he", "she", "it", "with", "from", "by", "into", "and", "or", "the", "a", "to", "of", "in", "for", "per"}
+
+
+def _verify_audit_claims(profile: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only claims that cite a real evidence item and talk about it;
+    assemble the visible answer from what survives. Ids never appear in
+    prose. A legacy answer+evidence_ids payload becomes one claim."""
+    by_id = {str(e.get("id")): e for e in (profile.get("evidence_log") or []) if isinstance(e, dict) and e.get("id")}
+    raw_claims = payload.get("claims")
+    if not isinstance(raw_claims, list):
+        cited = [i for i in _extract_audit_evidence_ids(payload) if i in by_id]
+        answer = _clean_visible_evidence_ids(payload.get("answer") or payload.get("reasoning") or "")
+        raw_claims = [{"requirement_key": "", "text": answer, "evidence_id": cited[0]}] if cited and answer else []
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for item in raw_claims:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        evidence_id = str(item.get("evidence_id") or "").strip()
+        text = _clean_visible_evidence_ids(item.get("text") or "")
+        entry = by_id.get(evidence_id)
+        if not entry or not text:
+            dropped += 1
+            continue
+        # The claim must be about the stored text it cites: overlap on the
+        # evidence's own words, not on sentence filler ("has", "mentioned").
+        grounding = _audit_tokens(f"{entry.get('value')} {entry.get('snippet')} {entry.get('criterion')}") - _CLAIM_FILLER_TOKENS
+        if grounding and not (_audit_tokens(text) - _CLAIM_FILLER_TOKENS) & grounding:
+            dropped += 1
+            continue
+        kept.append({"requirement_key": str(item.get("requirement_key") or "").strip(), "text": text, "evidence_id": evidence_id})
+    if dropped:
+        logger.info("SHORTLIST audit claims dropped candidate=%s dropped=%s kept=%s", profile.get("id"), dropped, len(kept))
+    verdict = _clean_visible_evidence_ids(payload.get("verdict") or "")
+    sentences = [c["text"] for c in kept]
+    answer = " ".join(part for part in [verdict, *sentences] if part).strip()
+    if not answer:
+        answer = payload.get("answer") and _clean_visible_evidence_ids(payload.get("answer")) or ""
+    out = dict(payload)
+    out["claims"] = kept
+    out["dropped_claims"] = dropped
+    out["verdict"] = verdict
+    out["answer"] = answer.replace("\n", " ").replace("|", " ").strip()
+    out["reasoning"] = _clean_visible_evidence_ids(payload.get("reasoning") or answer).replace("\n", " ").replace("|", " ").strip()
+    out["evidence_ids"] = list(dict.fromkeys(c["evidence_id"] for c in kept))
+    return out
+
+
 def _audit_output_is_evidence_valid(profile: Dict[str, Any], payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     valid_ids = _audit_evidence_id_set(profile)
+    if isinstance(payload.get("claims"), list):
+        claim_ids = [str((c or {}).get("evidence_id") or "") for c in payload["claims"] if isinstance(c, dict)]
+        if not valid_ids or not claim_ids:
+            return False
+        if any(cid not in valid_ids for cid in claim_ids):
+            return False
+        return any(str((c or {}).get("text") or "").strip() for c in payload["claims"] if isinstance(c, dict))
     cited_ids = _extract_audit_evidence_ids(payload)
     if not valid_ids or not cited_ids:
         return False
@@ -4454,7 +4547,7 @@ def _prepare_shortlist_visible_candidate(
 
     if not visible.get("answer"):
         if status == "verified_match":
-            visible["answer"] = visible.get("reasoning") or "Verified match based on AI review."
+            visible["answer"] = visible.get("decision_narrative") or visible.get("reasoning") or "Verified match based on AI review."
         elif verification_pending:
             visible["answer"] = ""
         elif status == "verification_error":
@@ -5767,6 +5860,7 @@ def _strict_presence_result(
         value = item_value["company"] if isinstance(item_value, dict) else str(item_value)
         terms = _company_match_terms(item_value) if criteria_key == "required_companies" and isinstance(item_value, dict) else _criterion_match_terms(value, criteria_key, criterion)
         found = None
+        found_sources: List[Dict[str, Any]] = []
 
         if criteria_key == "required_companies":
             current_only = _company_scope_current_only(item_value if isinstance(item_value, dict) else {}, default_company_scope)
@@ -5841,6 +5935,7 @@ def _strict_presence_result(
                     term = next((term for term in terms if _term_matches_text(term, web_text)), None)
                     if term:
                         found = ("web company profile", _evidence_snippet(web_text, term), role, web_text)
+                        found_sources = [src for src in ((web_item or {}).get("sources") or []) if isinstance(src, dict)]
                         break
             if not found and criteria_key == "required_segments":
                 # "Enterprise segment experience" is about who the candidate
@@ -5864,15 +5959,16 @@ def _strict_presence_result(
         if found:
             source, snippet, role, source_text = found
             matched.append(value)
-            evidence.append(
-                {
-                    "criterion": TEXT_CRITERIA_CONFIG.get(criteria_key, {}).get("label", criteria_key),
-                    "value": value,
-                    "source": source,
-                    "snippet": snippet,
-                    "source_text": source_text,
-                }
-            )
+            entry = {
+                "criterion": TEXT_CRITERIA_CONFIG.get(criteria_key, {}).get("label", criteria_key),
+                "value": value,
+                "source": source,
+                "snippet": snippet,
+                "source_text": source_text,
+            }
+            if found_sources:
+                entry["sources"] = found_sources
+            evidence.append(entry)
             if role:
                 roles.append(role)
         else:
@@ -5922,25 +6018,40 @@ def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, An
             )
         )
         rank = _funding_rank(stage_text)
+        evidence_source = "role company details"
+        web_sources: List[Dict[str, Any]] = []
+        if rank is None:
+            # No stage stored on the role: the web research step may know it
+            # (same lookup the non-strict scorer uses).
+            web_hit = _web_company_funding_rank(str(role.get("company") or ""), criteria)
+            if web_hit:
+                rank, web_item = web_hit
+                stage_text = str(web_item.get("stage") or web_item.get("funding_stage") or web_item.get("status") or "")
+                evidence_source = "web company facts"
+                web_sources = [src for src in (web_item.get("sources") or []) if isinstance(src, dict)]
         if rank is None:
             continue
         if rank >= min_rank:
             # stage_text is flattened as "funding stage: Series D"; show the bare stage.
             stage_label = re.sub(r"^(funding stage|company status|ownership)\s*:\s*", "", stage_text.strip(), flags=re.IGNORECASE) or stage_text
             snippet = f"{role.get('company')}: {stage_label} (meets minimum {min_stage})"
+            entry = {
+                "criterion": "Funding stage",
+                "value": f"{stage_label} (meets minimum {min_stage})",
+                "source": evidence_source,
+                "snippet": snippet,
+                "source_text": snippet,
+                "role": {"company": role.get("company"), "title": role.get("title"), "duration_years": role.get("duration_years")},
+            }
+            if web_sources:
+                entry["sources"] = web_sources
             return {
                 "applicable": True,
                 "met": True,
                 "score": 1.0,
                 "matched": [f"{stage_label} (>= {min_stage})"],
                 "missing": [],
-                "evidence": [{
-                    "criterion": "Funding stage",
-                    "value": f"{stage_label} (meets minimum {min_stage})",
-                    "source": "role company details",
-                    "snippet": snippet,
-                    "source_text": snippet,
-                }],
+                "evidence": [entry],
                 "roles": [role],
             }
         below_threshold.append(f"{role.get('company')}: {stage_text}")
@@ -5957,6 +6068,688 @@ def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, An
         "evidence": [],
         "roles": [],
     }
+
+
+# ── Recruiter-facing explanation layer ───────────────────────────────────
+# Everything below is deterministic. The quote a recruiter sees is the text
+# the scorer matched, copied from the stored record; the LLM never rewrites
+# it. Evidence ids ("ev3") are an internal join key and never reach the UI.
+
+_EVIDENCE_ID_PAREN_RE = re.compile(r"\s*[\(\[\{]\s*(?:(?:per|see|via|from|cf\.?)\s+)?(?:ev\d+\s*(?:[,;/&]|and)?\s*)+[\)\]\}]", re.I)
+_EVIDENCE_ID_INLINE_RE = re.compile(r"\s*\b(?:(?:per|see|via|from|cf\.?)\s+)?ev\d+\b(?:\s*[,;/&]\s*ev\d+\b)*", re.I)
+
+
+def _clean_visible_evidence_ids(text: Any) -> str:
+    """"…in Sales Development (ev1), worked in SaaS (ev2, ev3)." → the same
+    sentence without the ids, punctuation tidied."""
+    out = str(text or "")
+    if not out:
+        return ""
+    out = _EVIDENCE_ID_PAREN_RE.sub("", out)
+    out = _EVIDENCE_ID_INLINE_RE.sub("", out)
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"([,.;:])\1+", r"\1", out)
+    out = re.sub(r"\(\s*\)|\[\s*\]", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
+def _readable_quote(text: Any, *, max_len: int = 600) -> str:
+    """Like _readable_exact_text but keeps the record's casing."""
+    out = re.sub(r"\s+", " ", str(text or "")).strip()
+    out = re.sub(r"^\.{3}\s*|\s*\.{3}$", "", out)
+    out = re.sub(r"\s*[•●▪◦]\s*|\s+\*\s+", "\n- ", out).strip()
+    if len(out) > max_len:
+        cut = out[:max_len]
+        boundary = max(cut.rfind(". "), cut.rfind("\n- "), cut.rfind(" "))
+        out = cut[: boundary + 1] if boundary > max_len // 2 else cut
+    return out.strip()
+
+
+def _readable_exact_text(text: Any, *, max_len: int = 2000) -> str:
+    """Lower-cased full text with bullets on their own lines; never truncated
+    with an ellipsis (cut at a sentence boundary if it must be cut)."""
+    raw = re.sub(r"\n-\s", " • ", str(text or ""))      # keep bullets already on their own lines
+    out = re.sub(r"\s+", " ", raw).strip().lower()
+    out = re.sub(r"^\.{3}\s*|\s*\.{3}$", "", out)
+    out = re.sub(r"\.(?=[a-z])", ". ", out)
+    out = re.sub(r"\s*[•●▪◦]\s*|\s+\*\s+", "\n- ", out)
+    out = out.strip()
+    if len(out) > max_len:
+        cut = out[:max_len]
+        boundary = max(cut.rfind(". "), cut.rfind("\n- "))
+        out = cut[: boundary + 1] if boundary > max_len // 2 else cut
+    return out.strip()
+
+
+_PROVENANCE_RULES = (
+    (re.compile(r"^uploaded (?:field|fields|geography claims)", re.I), "uploaded_sheet"),
+    (re.compile(r"^(?:headline|about|location|city|candidate_services|extracted_industry|candidate location|enriched profile geography|profile text|profile)$", re.I), "linkedin_profile"),
+    (re.compile(r"^(?:role history|role company|role \d+ .*|role company details|role/company geography|candidate selling record|current employer|employer history)$", re.I), "role_history"),
+    (re.compile(r"^(?:notes|response|recruiter notes?)$", re.I), "recruiter_notes"),
+    (re.compile(r"web|employer history matched web company facts", re.I), "web_research"),
+    (re.compile(r"^(?:schema |role dates|calculated)", re.I), "computed"),
+)
+_PROVENANCE_LABEL = {
+    "uploaded_sheet": "Uploaded sheet",
+    "linkedin_profile": "LinkedIn profile",
+    "role_history": "Work history",
+    "recruiter_notes": "Recruiter notes",
+    "web_research": "Web research",
+    "computed": "Calculated from work history",
+}
+
+
+def _source_domain(sources: Any) -> str:
+    for item in sources if isinstance(sources, list) else []:
+        url = str((item or {}).get("url") or "").strip() if isinstance(item, dict) else str(item or "")
+        m = re.match(r"https?://(?:www\.)?([^/]+)", url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _evidence_provenance(entry: Dict[str, Any]) -> Dict[str, str]:
+    """Where a piece of evidence came from, in the recruiter's words."""
+    source = str(entry.get("source") or "").strip()
+    role = entry.get("role") if isinstance(entry.get("role"), dict) else {}
+    provenance = "computed"
+    for pattern, name in _PROVENANCE_RULES:
+        if pattern.search(source):
+            provenance = name
+            break
+    if provenance == "uploaded_sheet":
+        column = re.sub(r"^uploaded (?:fields?\.?|geography claims)", "", source, flags=re.I).strip(" .")
+        if not column:
+            m = re.match(r"^([^:]{1,60}):", str(entry.get("snippet") or ""))
+            column = m.group(1).strip() if m else ""
+        where = f"Uploaded sheet · {column}" if column else "Uploaded sheet"
+    elif provenance == "linkedin_profile":
+        where = {
+            "headline": "LinkedIn headline", "about": "LinkedIn about", "location": "Profile location",
+            "city": "Profile location", "candidate location": "Profile location",
+            "enriched profile geography": "Profile geography", "profile text": "Profile summary",
+        }.get(source.lower(), "LinkedIn profile")
+    elif provenance == "role_history":
+        title, company = str(role.get("title") or "").strip(), str(role.get("company") or "").strip()
+        if title and company:
+            where = f"Work history · {title} at {company}"
+        elif company:
+            where = f"Work history · {company}"
+        else:
+            where = "Work history"
+    elif provenance == "web_research":
+        domain = _source_domain(entry.get("sources"))
+        where = f"Web: {domain}" if domain else "Web research"
+    elif provenance == "recruiter_notes":
+        where = "Recruiter notes"
+    else:
+        m = re.match(r"^schema\s+(\w+)", source, re.I)
+        where = f"Database · {m.group(1)}" if m else _PROVENANCE_LABEL["computed"]
+    return {"provenance": provenance, "where": where}
+
+
+def _candidate_subject(profile: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    """("Priya", "Priya's") from the stored name; ("The candidate", "their") otherwise."""
+    name = str((profile or {}).get("name") or "").strip()
+    first = re.split(r"[\s,]+", name)[0] if name else ""
+    first = re.sub(r"[^A-Za-z.'-]", "", first)
+    if len(first) < 2 or first.lower() in {"mr", "mrs", "ms", "dr", "candidate", "unnamed", "unknown"}:
+        return "The candidate", "their"
+    return first, f"{first}'s"
+
+
+def _quotable_text(entry: Dict[str, Any], *, max_len: int = 240) -> str:
+    """The text to put in quotes: the whole stored field when it is short,
+    otherwise the matched window trimmed to whole words with no dangling
+    '...tently delivering' fragments."""
+    full = re.sub(r"\s+", " ", str(entry.get("source_text") or "")).strip()
+    snippet = re.sub(r"\s+", " ", str(entry.get("snippet") or "")).strip()
+    text = full if full and len(full) <= max_len else (snippet or full)
+    text = re.sub(r"^\.{3}\s*", "", text)
+    text = re.sub(r"\s*\.{3}$", "", text)
+    if full and text != full and not full.startswith(text):
+        # window starts mid-word: drop the partial first word
+        text = re.sub(r"^\S*?\s+", "", text, count=1) if " " in text else text
+    if full and text != full and not full.endswith(text):
+        text = re.sub(r"\s+\S*$", "", text) if " " in text else text
+    if len(text) > max_len:
+        cut = text[:max_len]
+        text = cut[: cut.rfind(" ")] if " " in cut else cut
+    return text.strip(" ,;:")
+
+
+def _friendly_evidence_text(entry: Dict[str, Any], *, subject: str = "The candidate", possessive: str = "their") -> str:
+    """One plain sentence per evidence item, built from the stored text."""
+    value = str(entry.get("value") or "").strip()
+    mention = str(entry.get("matched_term") or value).strip()
+    snippet = re.sub(r"\s+", " ", str(entry.get("quote_text") or "")).strip() or _quotable_text(entry)
+    if entry.get("quote_label") and entry.get("quote_text"):
+        snippet = f"{entry['quote_label']}: {snippet}" if not re.match(r"^headline$", str(entry["quote_label"]), re.I) else snippet
+    source = str(entry.get("source") or "").strip().lower()
+    role = entry.get("role") if isinstance(entry.get("role"), dict) else {}
+    prov = _evidence_provenance(entry)["provenance"]
+    company = str(role.get("company") or "").strip()
+    title = str(role.get("title") or "").strip()
+    criterion = str(entry.get("criterion") or "")
+
+    if source == "role history" and company and title:
+        counted = re.sub(r"\s+tenure$", "", criterion, flags=re.I) or value
+        return f"At {company}, {possessive} role was {title}, so this role was counted toward {counted} experience."
+    if source in {"role company", "current employer", "employer history"} or re.match(r"^role \d+ company$", source):
+        employer = company or snippet
+        if title:
+            return f"{subject} worked at {employer} as {title}, which matches the required company {value}."
+        return f"{subject} worked at {employer}, which matches the required company {value}."
+    if prov == "web_research":
+        target = company or value
+        return f'Web research on {target} describes it as "{snippet}".'
+    if source == "role company details" or re.match(r"^role \d+ company details$", source):
+        target = company or value
+        return f"{target} is recorded as {snippet}, which satisfies {value}."
+    if prov in {"uploaded_sheet", "linkedin_profile", "role_history", "recruiter_notes"} and value and snippet:
+        return f'{subject} has mentioned {mention}; the matching text includes "{snippet}".'
+    text = snippet or value
+    if not text:
+        return f"{criterion} verified from the stored record." if criterion else "Verified from the stored record."
+    text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else f"{text}."
+
+
+_LABEL_SEGMENT_RE = re.compile(r"(?:^|(?<=\s))([a-z][a-z0-9 _/()&'-]{1,40}?):\s(?=\S)")
+_CRITERION_KEY_BY_LABEL = {}
+
+
+def _criterion_key_for_label(label: Any) -> str:
+    if not _CRITERION_KEY_BY_LABEL:
+        for key, cfg in TEXT_CRITERIA_CONFIG.items():
+            _CRITERION_KEY_BY_LABEL[_normalize_search_text(cfg.get("label") or key)] = key
+    return _CRITERION_KEY_BY_LABEL.get(_normalize_search_text(label), "")
+
+
+def _matched_term_for(entry: Dict[str, Any]) -> str:
+    """Which spelling actually hit: the requirement said "EMEA", the sheet
+    says "Europe". Recomputed from the same expansions the scorer used."""
+    value = str(entry.get("value") or "").strip()
+    text = _normalize_search_text(f"{entry.get('source_text') or ''} {entry.get('snippet') or ''}")
+    if not value or not text:
+        return value
+    key = _criterion_key_for_label(entry.get("criterion"))
+    terms: List[str] = [value]
+    try:
+        if key == "required_geographies":
+            terms += _geography_match_terms(value, {"operator": "OR", "values": [value], "allow_region_reverse_match": True})
+        elif key:
+            terms += _criterion_match_terms(value, key, {"operator": "OR", "values": [value]})
+    except Exception:
+        pass
+    if _term_matches_text(value, text):
+        return value
+    original = f"{entry.get('source_text') or ''} {entry.get('snippet') or ''}"
+    for term in sorted({t for t in terms if str(t or "").strip()}, key=lambda t: -len(t)):
+        if _term_matches_text(term, text):
+            return _restore_case(term, original)
+    return value
+
+
+def _restore_case(term: str, original: str) -> str:
+    """The term as it is spelled in the original text ("Europe", not "europe")."""
+    m = re.search(re.escape(term), original, re.I)
+    return m.group(0) if m else term
+
+
+def _labelled_segment(text: str, term: str) -> Tuple[str, str]:
+    """From a composed field string ("headline: … focused geo: apac, europe
+    …") return (label, segment) for the segment that contains the term."""
+    text = str(text or "")
+    marks = list(_LABEL_SEGMENT_RE.finditer(text))
+    if not marks:
+        return "", text
+    segments: List[Tuple[str, str]] = []
+    for idx, m in enumerate(marks):
+        end = marks[idx + 1].start() if idx + 1 < len(marks) else len(text)
+        segments.append((m.group(1).strip(), text[m.end():end].strip(" ,;|")))
+    for label, seg in segments:
+        if term and _term_matches_text(term, _normalize_search_text(seg)):
+            return label, seg
+    return "", text
+
+
+def _sentence_around(text: str, term: str, *, max_len: int = 260) -> str:
+    """The sentence (or bullet) containing the term, trimmed to max_len."""
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    m = re.search(re.escape(str(term)), flat, re.I)
+    if not m:
+        return flat[:max_len]
+    boundaries = [0] + [x.end() for x in re.finditer(r"[.!?]\s+|\s[•●▪◦]\s|\n-\s|;\s", flat)] + [len(flat)]
+    start = max(b for b in boundaries if b <= m.start())
+    end = min(b for b in boundaries if b > m.end()) if any(b > m.end() for b in boundaries) else len(flat)
+    sentence = flat[start:end].strip(" •-;")
+    if len(sentence) > max_len:
+        left = max(start, m.start() - max_len // 2)
+        right = min(end, left + max_len)
+        sentence = flat[left:right]
+        sentence = re.sub(r"^\S*\s", "", sentence) if left > start else sentence
+        sentence = re.sub(r"\s\S*$", "", sentence) if right < end else sentence
+    return sentence.strip()
+
+
+def _add_friendly_evidence_text(evidence: List[Dict[str, Any]], profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    subject, possessive = _candidate_subject(profile)
+    raw_fields = (profile or {}).get("raw_fields") if isinstance((profile or {}).get("raw_fields"), dict) else {}
+    raw_by_norm = {_normalize_search_text(k): (str(k), v) for k, v in raw_fields.items() if v not in (None, "")}
+    out: List[Dict[str, Any]] = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        next_item = dict(item)
+        next_item.update(_evidence_provenance(next_item))
+        term = _matched_term_for(next_item)
+        source_text = str(next_item.get("source_text") or next_item.get("snippet") or "")
+        label, segment = _labelled_segment(source_text, term)
+        if label and segment:
+            # The composed string carries field labels; quote only the field
+            # that matched, in the sheet's own casing when we hold it.
+            raw_hit = raw_by_norm.get(_normalize_search_text(label))
+            if raw_hit:
+                column, raw_value = raw_hit
+                next_item["quote_text"] = re.sub(r"\s+", " ", str(raw_value)).strip()
+                next_item["quote_label"] = column
+                next_item["provenance"] = "uploaded_sheet"
+                next_item["where"] = f"Uploaded sheet · {column}"
+            else:
+                next_item["quote_text"] = segment
+                next_item["quote_label"] = label
+                if label.lower() == "headline":
+                    next_item["provenance"], next_item["where"] = "linkedin_profile", "LinkedIn headline"
+                elif label.lower() == "about":
+                    next_item["provenance"], next_item["where"] = "linkedin_profile", "LinkedIn about"
+            term = _restore_case(term, next_item["quote_text"]) or term
+        elif len(source_text) > 220 and term:
+            # Long free text (a role description, a summary): quote the
+            # sentence that carries the match, not the paragraph's opening.
+            next_item["quote_text"] = _sentence_around(source_text, term)
+            term = _restore_case(term, next_item["quote_text"]) or term
+        next_item["matched_term"] = term
+        next_item["friendly_text"] = _clean_visible_evidence_ids(
+            _friendly_evidence_text(next_item, subject=subject, possessive=possessive)
+        )
+        out.append(next_item)
+    return out
+
+
+# criteria key → (category, evidence criterion labels it is satisfied by)
+_REQUIREMENT_CATEGORY = {
+    "min_function_years": ("Tenure", ("function-specific tenure", "tenure")),
+    "min_total_experience": ("Tenure", ("total experience",)),
+    "min_tenure_in_latest_role": ("Tenure", ("latest role tenure", "tenure in latest role", "tenure")),
+    "avg_tenure_in_last_n_roles": ("Tenure", ("average tenure", "tenure")),
+    "min_team_management_years": ("Tenure", ("team management tenure",)),
+    "min_people_managed": ("Team", ("people managed",)),
+    "max_notice_period_days": ("Availability", ("notice period",)),
+    "funding_stage_min": ("Funding", ("funding stage",)),
+    "required_companies": ("Companies", ("companies", "competitor")),
+    "competitor_of": ("Competitor", ("companies", "competitor")),
+    "competitors_of": ("Competitor", ("companies", "competitor")),
+    "required_industries": ("Industry", ("industries",)),
+    "required_segments": ("Customer segments", ("customer segments",)),
+    "required_company_details": ("Company details", ("company details",)),
+    "required_geographies": ("Geography", ("geographies",)),
+    "required_locations": ("Location", ("locations",)),
+    "required_culture_type": ("Culture", ("culture",)),
+    "required_keywords": ("Keywords", ("keywords",)),
+    "required_functions": ("Function", ("functions",)),
+}
+_NOT_COUNTED_BY_CATEGORY = {
+    "Geography": [
+        "Company headquarters or office locations (an employer's geography is not the candidate's market experience)",
+        "Current home city or preferred location",
+    ],
+    "Location": ["Markets the candidate sold into (only where the candidate is based counts)"],
+    "Company details": ["Customers the candidate sold to (only the employer's own business counts)"],
+    "Industry": ["Customers the candidate sold to (only the employer's own industry counts)"],
+    "Funding": ["Funding of past employers when the requirement is about the current employer"],
+    "Competitor": ["The target company itself"],
+    "Companies": [],
+    "Tenure": ["Roles whose title did not match the function; overlapping roles counted once"],
+}
+
+
+def _requirement_values(criterion: Any) -> List[str]:
+    """The values the recruiter asked for. When the plan expanded a value
+    into taxonomy variants ("Account Executive" → 70 titles) the original
+    is kept in query_values; the expansion is a matching aid, not the
+    requirement. Case variants ("emea", "EMEA") collapse to one."""
+    source = criterion
+    if isinstance(criterion, dict) and criterion.get("query_values"):
+        source = {"values": criterion.get("query_values")}
+    values: List[str] = []
+    seen = set()
+    for item in get_values_from_criteria(source) if source else []:
+        if isinstance(item, dict):
+            text = str(item.get("company") or item.get("value") or item.get("name") or "").strip()
+        else:
+            text = str(item or "").strip()
+        key = _normalize_search_text(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        values.append(text if any(ch.isupper() for ch in text) or len(text) > 4 else text.upper())
+    return values
+
+
+def _display_company_name(name: Any) -> str:
+    """"testsigma" as the plan wrote it → the spelling our data uses."""
+    text = str(name or "").strip()
+    if not text:
+        return text
+    if any(ch.isupper() for ch in text):
+        return text
+    try:
+        for known in _known_employer_names():
+            if _normalize_company_key(known) == _normalize_company_key(text):
+                return known
+    except Exception:
+        pass
+    return text[0].upper() + text[1:]
+
+
+def _requirement_specs(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One (key, category, requirement sentence, evidence labels, terms) per
+    criterion in the query — the checklist the recruiter sees."""
+    specs: List[Dict[str, Any]] = []
+    competitor_target = ""
+    resolution = criteria.get("_competitor_resolution") if isinstance(criteria.get("_competitor_resolution"), dict) else {}
+    if resolution.get("target"):
+        competitor_target = str(resolution.get("target"))
+    for key in ("competitor_of", "competitors_of"):
+        for item in _criteria_objects(criteria.get(key)) if criteria.get(key) else []:
+            competitor_target = competitor_target or str(item.get("target") or item.get("company") or item.get("value") or "")
+    competitor_target = _display_company_name(competitor_target)
+
+    for key, raw in criteria.items():
+        if str(key).startswith("_") or key == "top_n" or raw in (None, "", [], {}):
+            continue
+        if key == "min_function_years" and isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                function = str(item.get("function") or "").strip() or "the function"
+                years = _coerce_positive_float(item.get("min_years")) or 0
+                specs.append({
+                    "key": "min_function_years" if len(raw) == 1 else f"min_function_years:{function}",
+                    "category": "Tenure",
+                    "requirement": f"At least {years:g} years in {function}",
+                    "labels": ("function-specific tenure", f"{function.lower()} tenure"),
+                    "terms": [function, *[str(a) for a in (item.get("aliases") or [])]],
+                    "function": function,
+                })
+            continue
+        if key == "min_total_experience":
+            specs.append({"key": key, "category": "Tenure", "requirement": f"At least {float(raw):g} years of total experience", "labels": ("total experience",), "terms": []})
+            continue
+        if key == "min_tenure_in_latest_role":
+            specs.append({"key": key, "category": "Tenure", "requirement": f"At least {float(raw):g} years in the current role", "labels": ("latest role", "tenure"), "terms": []})
+            continue
+        if key == "avg_tenure_in_last_n_roles":
+            years = raw.get("min_years") if isinstance(raw, dict) else raw
+            n = raw.get("n") or raw.get("roles") if isinstance(raw, dict) else None
+            specs.append({"key": key, "category": "Tenure", "requirement": f"Average of at least {float(years or 0):g} years across the last {n or 'few'} roles", "labels": ("average tenure", "tenure"), "terms": []})
+            continue
+        if key == "min_team_management_years":
+            specs.append({"key": key, "category": "Tenure", "requirement": f"At least {float(raw):g} years managing a team", "labels": ("team management tenure",), "terms": []})
+            continue
+        if key == "min_people_managed":
+            specs.append({"key": key, "category": "Team", "requirement": f"Managed at least {int(float(raw))} people", "labels": ("people managed",), "terms": []})
+            continue
+        if key == "max_notice_period_days":
+            specs.append({"key": key, "category": "Availability", "requirement": f"Notice period of {float(raw):g} days or less", "labels": ("notice period",), "terms": []})
+            continue
+        if key == "funding_stage_min":
+            stage = _funding_min_value(criteria) or str(raw)
+            specs.append({"key": key, "category": "Funding", "requirement": f"Current employer funded at {stage} or later", "labels": ("funding stage",), "terms": [stage]})
+            continue
+        if key in ("competitor_of", "competitors_of"):
+            target = competitor_target or "the target company"
+            validated = [str(v) for v in (resolution.get("validated_companies") or [])]
+            specs.append({"key": key, "category": "Competitor", "requirement": f"Worked at a competitor of {target}", "labels": ("companies", "competitor"), "terms": [target, *validated]})
+            continue
+        if key == "required_companies":
+            values = _requirement_values(raw)
+            is_competitor = bool(competitor_target) or any(
+                isinstance(v, dict) and str(v.get("source") or "").startswith("competitor_of") for v in (raw.get("values") if isinstance(raw, dict) else raw or [])
+            )
+            if is_competitor:
+                target = competitor_target or next(
+                    (str(v.get("source")).split(":", 1)[1] for v in (raw.get("values") if isinstance(raw, dict) else []) if isinstance(v, dict) and ":" in str(v.get("source") or "")),
+                    "the target company",
+                )
+                specs.append({"key": key, "category": "Competitor", "requirement": f"Worked at a competitor of {target}", "labels": ("companies", "competitor"), "terms": [target, *values]})
+            else:
+                specs.append({"key": key, "category": "Companies", "requirement": f"Companies: {', '.join(values)}", "labels": ("companies",), "terms": values})
+            continue
+        if key in _REQUIREMENT_CATEGORY:
+            category, labels = _REQUIREMENT_CATEGORY[key]
+            label = TEXT_CRITERIA_CONFIG.get(key, {}).get("label", category)
+            remembered = (criteria.get("_query_values") or {}).get(key) if isinstance(criteria.get("_query_values"), dict) else None
+            values = [str(v) for v in remembered] if remembered else _requirement_values(raw)
+            specs.append({"key": key, "category": category, "requirement": f"{label}: {', '.join(values)}" if values else label, "labels": labels, "terms": values})
+            continue
+        if str(key).startswith("excluded_"):
+            values = _requirement_values(raw)
+            specs.append({"key": key, "category": "Exclusions", "requirement": f"No {', '.join(values)}" if values else "Exclusions", "labels": (), "terms": values, "exclusion": True})
+    return specs
+
+
+def _evidence_matches_spec(entry: Dict[str, Any], spec: Dict[str, Any]) -> bool:
+    criterion = _normalize_search_text(entry.get("criterion"))
+    if not criterion:
+        return False
+    labels = [str(label).lower() for label in spec.get("labels") or ()]
+    if spec.get("function"):
+        # Several function requirements share the "Function-specific tenure"
+        # label; the value ("15.3 years in Sales Development") names which.
+        haystack = _normalize_search_text(f"{entry.get('value')} {entry.get('snippet')} {criterion}")
+        wanted = [_normalize_search_text(t) for t in spec.get("terms") or [] if str(t or "").strip()]
+        if criterion in labels or any(criterion.endswith(label) for label in labels):
+            return not wanted or any(term in haystack for term in wanted) or criterion.startswith(_normalize_search_text(spec["function"]))
+        return False
+    return any(criterion == label or criterion.endswith(label) for label in labels)
+
+
+def _profile_evidence_group_key(entry: Dict[str, Any]) -> Tuple[str, str]:
+    role = entry.get("role") if isinstance(entry.get("role"), dict) else {}
+    prov = entry.get("provenance") or _evidence_provenance(entry)["provenance"]
+    if prov == "role_history" and (role.get("company") or role.get("title")):
+        return prov, _normalize_search_text(f"{role.get('company')}|{role.get('title')}")
+    if prov == "uploaded_sheet":
+        return prov, _normalize_search_text(entry.get("where") or entry.get("source"))
+    return prov, _normalize_search_text(entry.get("source_text") or entry.get("snippet") or entry.get("value"))
+
+
+def _profile_evidence_item(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    first = entries[0]
+    role = first.get("role") if isinstance(first.get("role"), dict) else {}
+    prov = first.get("provenance") or _evidence_provenance(first)["provenance"]
+    where = first.get("where") or _evidence_provenance(first)["where"]
+    sources: List[Dict[str, Any]] = []
+    for e in entries:
+        for src in e.get("sources") or []:
+            if isinstance(src, dict) and src not in sources:
+                sources.append(src)
+    terms: List[str] = []
+    for e in entries:
+        v = str(e.get("matched_term") or e.get("value") or "").strip()
+        if v and _normalize_search_text(v) not in {_normalize_search_text(t) for t in terms}:
+            terms.append(v)
+    # Short fields are quoted whole; long free text is quoted at the matched
+    # window so the recruiter sees the sentence that satisfied the query.
+    # The card keeps the record's own casing; exact_evidence_text (below)
+    # stays lower-cased for comparison.
+    if first.get("quote_text"):
+        quote = _readable_quote(first["quote_text"], max_len=600)
+    else:
+        quote = _readable_quote(_quotable_text(first, max_len=600) or first.get("value"), max_len=600)
+    if prov == "role_history" and (role.get("company") or role.get("title")):
+        title = str(role.get("title") or "").strip()
+        duration = role.get("duration_years")
+        subtitle_bits = [title] if title else []
+        try:
+            if duration is not None and float(duration) > 0:
+                subtitle_bits.append(f"{float(duration):g} yrs")
+        except (TypeError, ValueError):
+            pass
+        display_title = str(role.get("company") or title or "Work history")
+        display_subtitle = " · ".join(subtitle_bits) or "Work history"
+    elif prov == "uploaded_sheet":
+        display_title = where.split("·", 1)[1].strip() if "·" in where else "Uploaded sheet"
+        display_subtitle = "Uploaded sheet"
+    elif prov == "web_research":
+        display_title = str(role.get("company") or first.get("value") or "Web research")
+        display_subtitle = where
+    else:
+        display_title = where
+        display_subtitle = _PROVENANCE_LABEL.get(prov, "Profile data")
+    return {
+        "display_title": display_title,
+        "display_subtitle": display_subtitle,
+        "matched_terms": terms,
+        "quote": quote,
+        "where": where,
+        "provenance": prov,
+        "evidence_ids": [str(e.get("id")) for e in entries if e.get("id")],
+        "sources": sources,
+    }
+
+
+def _build_requirement_breakdown(
+    criteria: Dict[str, Any],
+    *,
+    matched_criteria: Optional[List[Any]] = None,
+    missing_criteria: Optional[List[Any]] = None,
+    evidence_log: Optional[List[Dict[str, Any]]] = None,
+    calculated_experience: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """The recruiter's checklist: one item per requirement in the query,
+    with the exact stored text that satisfied it and where it came from."""
+    evidence = [dict(e) for e in (evidence_log or []) if isinstance(e, dict)]
+    for e in evidence:
+        if not e.get("provenance"):
+            e.update(_evidence_provenance(e))
+        if not e.get("friendly_text"):
+            e["friendly_text"] = _clean_visible_evidence_ids(_friendly_evidence_text(e))
+    missing_texts = [_normalize_search_text(m if not isinstance(m, dict) else f"{m.get('criterion')} {m.get('value')}") for m in (missing_criteria or [])]
+    linked_ids: Set[str] = set()
+    breakdown: List[Dict[str, Any]] = []
+
+    for spec in _requirement_specs(criteria):
+        linked = [e for e in evidence if _evidence_matches_spec(e, spec)]
+        linked_ids.update(str(e.get("id")) for e in linked if e.get("id"))
+        req_norm = _normalize_search_text(spec["requirement"])
+        cat_norm = _normalize_search_text(spec["category"])
+        is_missing = any(req_norm and (req_norm in m or m in req_norm) or (cat_norm and m.startswith(cat_norm)) for m in missing_texts if m)
+        status = "missing" if (is_missing or (not linked and not spec.get("exclusion"))) else "qualified"
+
+        groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for e in linked:
+            groups.setdefault(_profile_evidence_group_key(e), []).append(e)
+        profile_evidence = [_profile_evidence_item(entries) for entries in list(groups.values())[:4]]
+        exact_texts: List[str] = []
+        for item in profile_evidence:
+            lowered = _readable_exact_text(item["quote"])
+            if lowered and lowered not in exact_texts:
+                exact_texts.append(lowered)
+        for item in profile_evidence:
+            if spec["category"] == "Competitor":
+                for t in spec.get("terms") or []:
+                    if t and t not in item["matched_terms"]:
+                        item["matched_terms"].append(t)
+        sources: List[Dict[str, Any]] = []
+        for e in linked:
+            for src in e.get("sources") or []:
+                if isinstance(src, dict) and src not in sources:
+                    sources.append(src)
+        evidence_found = [
+            {
+                "id": str(e.get("id") or ""),
+                "summary": e.get("friendly_text") or "",
+                "value": str(e.get("value") or ""),
+                "where": e.get("where") or "",
+                "provenance": e.get("provenance") or "computed",
+                "sources": [src for src in (e.get("sources") or []) if isinstance(src, dict)],
+            }
+            for e in linked
+        ]
+        cross_check = []
+        for e in linked:
+            text = e.get("friendly_text") or ""
+            if text and text not in cross_check:
+                cross_check.append(text)
+        not_counted = list(_NOT_COUNTED_BY_CATEGORY.get(spec["category"], []))
+        if status == "qualified":
+            if linked:
+                first_where = linked[0].get("where") or ""
+                why = (
+                    f"{spec['requirement']} is supported by {len(linked)} evidence item{'s' if len(linked) != 1 else ''}"
+                    f" from {first_where}: {cross_check[0] if cross_check else 'matching stored text'}"
+                )
+            else:
+                why = f"{spec['requirement']} was checked against the stored record and nothing contradicted it."
+        else:
+            why = f"No evidence in the stored profile or web research could directly verify {spec['requirement']}."
+        breakdown.append({
+            "key": spec["key"],
+            "category": spec["category"],
+            "requirement": spec["requirement"],
+            "status": status,
+            "evidence_ids": [str(e.get("id")) for e in linked if e.get("id")],
+            "why_it_supports": _clean_visible_evidence_ids(why),
+            "exact_evidence_text": exact_texts[:4],
+            "cross_check": [_clean_visible_evidence_ids(c) for c in cross_check[:6]],
+            "not_counted": not_counted,
+            "evidence_found": evidence_found[:8],
+            "profile_evidence": profile_evidence,
+            "sources": sources,
+        })
+
+    # Evidence the query never asked for is not shown as support; the one
+    # case worth naming is employer HQ text sitting next to a market
+    # geography requirement, which recruiters otherwise assume counted.
+    for item in breakdown:
+        if item["category"] != "Geography":
+            continue
+        for e in evidence:
+            if str(e.get("id")) in linked_ids:
+                continue
+            text = f"{e.get('snippet')} {e.get('source_text')}".lower()
+            if "headquarter" in text or "head office" in text:
+                note = f"Employer location text was not counted: \"{re.sub(r'\\s+', ' ', str(e.get('snippet') or '')).strip()[:120]}\""
+                if note not in item["not_counted"]:
+                    item["not_counted"].append(note)
+    return breakdown
+
+
+def _build_decision_narrative(criteria: Dict[str, Any], breakdown: List[Dict[str, Any]]) -> str:
+    qualified = [b for b in breakdown if b.get("status") == "qualified"]
+    missing = [b for b in breakdown if b.get("status") != "qualified"]
+    verdict = "Yes" if breakdown and not missing else "No"
+    query_text = str(criteria.get("_screening_query") or "").strip()
+    parts = [f"Qualified match: {verdict}."]
+    if query_text:
+        parts.append(f'Screening query: "{query_text}".')
+    if breakdown:
+        met = "; ".join(f"{b['requirement']} — {b['why_it_supports']}" for b in qualified) or "none"
+        parts.append(f"Met {len(qualified)} of {len(breakdown)} requirements: {met}.")
+    if missing:
+        parts.append("Not verified: " + "; ".join(f"{b['requirement']} — {b['why_it_supports']}" for b in missing) + ".")
+    notes: List[str] = []
+    for b in breakdown:
+        for n in b.get("not_counted") or []:
+            if n not in notes:
+                notes.append(n)
+    if notes:
+        parts.append("Not counted: " + "; ".join(notes[:4]) + ".")
+    return _clean_visible_evidence_ids(" ".join(parts))
 
 
 def _assign_evidence_ids(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -6118,7 +6911,7 @@ def _strict_shortlist_score_candidate(
         evidence_log.append({
             "criterion": "Total experience",
             "value": str(min_total_exp),
-            "source": "profile",
+            "source": profile_copy.get("_total_experience_source") or "profile",
             "snippet": f"Total experience {actual:g} years",
             "source_text": f"Total experience {actual:g} years",
         })
@@ -6320,7 +7113,7 @@ def _strict_shortlist_score_candidate(
             break
 
     evidence_log = _assign_evidence_ids(
-        _dedupe_evidence_log(_prioritize_scoped_tenure_evidence(evidence_log))
+        _add_friendly_evidence_text(_dedupe_evidence_log(_prioritize_scoped_tenure_evidence(evidence_log)), profile_copy)
     )
     calculated_experience = _link_calculated_experience_evidence_ids(calculated_experience, evidence_log)
 
@@ -6335,6 +7128,23 @@ def _strict_shortlist_score_candidate(
     profile_copy["scoped_tenure"] = _scoped_tenure_summary(calculated_experience)
     profile_copy["contributing_roles_details"] = {"roles": role_details}
     profile_copy["confidence"] = "high" if score >= 85 else "medium"
+    # What the recruiter reads: one checklist row per query requirement with
+    # the exact stored text and where it came from, plus a plain narrative.
+    breakdown = _build_requirement_breakdown(
+        criteria,
+        matched_criteria=matched_criteria,
+        missing_criteria=[],
+        evidence_log=evidence_log,
+        calculated_experience=calculated_experience,
+    )
+    profile_copy["requirement_breakdown"] = breakdown
+    profile_copy["decision_narrative"] = _build_decision_narrative(criteria, breakdown)
+    web_sources: List[Dict[str, Any]] = []
+    for item in breakdown:
+        for src in item.get("sources") or []:
+            if src not in web_sources:
+                web_sources.append(src)
+    profile_copy["sources"] = web_sources
     return profile_copy
 
 
@@ -6346,23 +7156,38 @@ async def generate_reasoning_for_profile(
     use_web_search: bool = False,
 ) -> Any:
     profile_safe = {k: v for k, v in (profile or {}).items() if k != "embedding"}
+    requirement_keys = [str(k) for k in (original_criteria or {}).keys() if not str(k).startswith("_") and k != "top_n"]
     evidence_card = {
         "candidate_id": profile_safe.get("id"),
         "name": profile_safe.get("name"),
         "headline": profile_safe.get("headline"),
+        "requirement_keys": requirement_keys,
         "matched_criteria": profile_safe.get("matched_criteria") or [],
         "missing_criteria": profile_safe.get("missing_criteria") or [],
         "calculated_experience": profile_safe.get("calculated_experience") or {},
         "scoped_tenure": profile_safe.get("scoped_tenure") or [],
         "contributing_roles": (profile_safe.get("contributing_roles_details") or {}).get("roles") or [],
-        "evidence_log": profile_safe.get("evidence_log") or [],
+        # Trimmed: the long source_text and the recruiter-facing fields add
+        # tokens the auditor does not need.
+        "evidence_log": [
+            {k: e.get(k) for k in ("id", "criterion", "value", "source", "snippet", "role") if e.get(k) not in (None, "", [], {})}
+            for e in (profile_safe.get("evidence_log") or []) if isinstance(e, dict)
+        ],
     }
     system_prompt = (
         "You are a strict evidence auditor for recruiting shortlist results. "
         "Use only the candidate evidence card. Return valid JSON only with keys: "
-        "final_status, match_score, answer, reasoning, matched_criteria, missing_criteria, evidence_ids, confidence. "
+        "final_status, match_score, confidence, verdict, claims, missing_criteria, reasoning. "
         "final_status must be verified_match or not_verified. "
-        "Every factual claim in answer/reasoning must be supported by the cited evidence_ids. "
+        "verdict: one plain-English sentence for a recruiter (max 160 characters) saying whether the candidate meets the screening query and why. "
+        "claims: one entry per requirement in requirement_keys that the evidence supports. Each claim has requirement_key "
+        "(copied exactly from requirement_keys), text (one sentence in plain recruiter language that restates what the cited "
+        "evidence literally says and names the requirement it satisfies — quote the evidence snippet where possible) and "
+        "evidence_id (exactly one id from evidence_log). evidence_id is the ONLY place an evidence id may appear: never write "
+        "ids such as ev1 inside verdict, text, reasoning or missing_criteria. Never state a fact that is not in the cited evidence entry. "
+        "Write verdict and claim text the way you would tell a colleague: refer to the candidate by first name, never say "
+        "'evidence', 'snippet', 'evidence card', 'criteria' or 'requirement key' — say what the record shows (e.g. "
+        "\"Tushar's headline reads 'Account Executive - Europe'\"). "
         "Treat every requirement in the original screening query as mandatory AND logic. "
         "Never return verified_match for a partial match or when any stated requirement lacks evidence. "
         "The requirements are exactly the keys of the original filtering criteria (keys starting with '_' are context, not requirements). "
@@ -6371,18 +7196,19 @@ async def generate_reasoning_for_profile(
         "a role-company match already establishes employment at that company under the criterion's employment_scope. "
         "Do not add requirements the criteria do not state: never demand tenure, durations, start/end dates, seniority or role titles "
         "unless a criterion asks for them; missing dates or a 0.0 duration are absent data, not disqualifying. "
-        "Mention evidence IDs inline, e.g. ev1. Do not invent missing candidate facts. "
-        "If evidence is insufficient, return not_verified. "
+        "Do not invent missing candidate facts. "
+        "If evidence is insufficient, return not_verified and list the unmet requirement in missing_criteria. "
         "Criteria semantics: funding_stage_min means the named stage OR ANY LATER stage "
         "(Seed < Series A < Series B < Series C < ... < Growth < Private Equity < Public), so a later stage satisfies it. "
         "avg_tenure_in_last_n_roles is the average duration of the candidate's most recent N roles; "
         "min_tenure_in_latest_role is the duration of the current/latest role; min_total_experience is total career years. "
-        "Durations in calculated_experience, scoped_tenure and evidence_log were computed from role dates and are authoritative."
+        "Durations in calculated_experience, scoped_tenure and evidence_log were computed from role dates and are authoritative. "
+        "reasoning is internal (not shown to recruiters): one short paragraph."
     )
     user_prompt = (
         f"Original filtering criteria:\n{json.dumps(original_criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate evidence card:\n{json.dumps(evidence_card, ensure_ascii=False, indent=2, default=str)}\n\n"
-        "Return JSON only. Keep answer and reasoning to one concise paragraph each."
+        "Return JSON only."
     )
     try:
         structured = await asyncio.to_thread(
@@ -6393,6 +7219,7 @@ async def generate_reasoning_for_profile(
             use_web=False,
             temperature=0.0,
             timeout=90.0,
+            response_format=SHORTLIST_AUDIT_RESPONSE_FORMAT,
         )
         tracker.add_usage(
             SCREENING_AUDIT_MODEL,
@@ -6401,9 +7228,7 @@ async def generate_reasoning_for_profile(
             "Shortlist Evidence-Cited Audit",
         )
         if _audit_output_is_evidence_valid(profile_safe, structured):
-            structured["answer"] = str(structured.get("answer") or structured.get("reasoning") or "").replace("\n", " ").replace("|", " ").strip()
-            structured["reasoning"] = str(structured.get("reasoning") or structured.get("answer") or "").replace("\n", " ").replace("|", " ").strip()
-            return structured
+            return _verify_audit_claims(profile_safe, structured)
         valid_ids = sorted(_audit_evidence_id_set(profile_safe))
         if isinstance(structured, dict) and _normalize_shortlist_status(structured.get("final_status")) == "verified_match" and valid_ids:
             # The verdict is fine; only the citation slipped (an "ev2" that
@@ -6412,11 +7237,13 @@ async def generate_reasoning_for_profile(
             # evidence instead of dropping the person.
             logger.info("SHORTLIST audit citations repaired candidate=%s cited=%s valid=%s",
                         profile_safe.get("id"), _extract_audit_evidence_ids(structured), valid_ids)
-            structured["evidence_ids"] = valid_ids[:6]
-            structured["answer"] = str(structured.get("answer") or structured.get("reasoning") or _fallback_reasoning_from_evidence(profile_safe)).replace("\n", " ").replace("|", " ").strip()
-            structured["reasoning"] = str(structured.get("reasoning") or structured.get("answer")).replace("\n", " ").replace("|", " ").strip()
-            structured["auditor_status"] = "citations_repaired"
-            return structured
+            repaired = _verify_audit_claims(profile_safe, structured)
+            repaired["evidence_ids"] = repaired.get("evidence_ids") or valid_ids[:6]
+            if not repaired.get("answer"):
+                repaired["answer"] = profile_safe.get("decision_narrative") or _fallback_reasoning_from_evidence(profile_safe)
+            repaired["reasoning"] = repaired.get("reasoning") or repaired["answer"]
+            repaired["auditor_status"] = "citations_repaired"
+            return repaired
         logger.warning("Shortlist audit returned unsupported output for candidate %s", profile_safe.get("id"))
     except Exception as e:
         logger.warning("Evidence-cited audit failed for candidate %s: %s", profile_safe.get("id"), e)
@@ -7955,8 +8782,11 @@ async def process_query_main(
             yield f"Identifying competitors for {target}..."
 
             try:
-                if web_enabled:
-                    yield "Researching company facts..."
+                if True:
+                    # Web on: live research (cached 30 days). Web off: the
+                    # cache alone, then the role's own employers via the
+                    # judge — a recruiter who leaves the toggle off still
+                    # gets the competitors we already know about.
                     company_fact_criteria = copy.deepcopy(criteria)
                     company_fact_criteria["competitor_of"] = [
                         {
@@ -7965,12 +8795,16 @@ async def process_query_main(
                         }
                     ]
                     company_fact_criteria.pop("competitors_of", None)
-                    web_enriched = await enrich_criteria_with_company_web_facts(
-                        normalized_query,
-                        company_fact_criteria,
-                        tracker,
-                    )
-                    web_facts = web_enriched.get("_web_company_facts") if isinstance(web_enriched.get("_web_company_facts"), dict) else {}
+                    if web_enabled:
+                        yield "Researching company facts..."
+                        web_enriched = await enrich_criteria_with_company_web_facts(
+                            normalized_query,
+                            company_fact_criteria,
+                            tracker,
+                        )
+                        web_facts = web_enriched.get("_web_company_facts") if isinstance(web_enriched.get("_web_company_facts"), dict) else {}
+                    else:
+                        web_facts = _cached_company_facts_for_criteria(company_fact_criteria) or {}
                     web_competitor_names: List[Any] = []
                     for item in web_facts.get("competitors") or []:
                         if isinstance(item, str):
@@ -7994,7 +8828,7 @@ async def process_query_main(
                         web_competitor_names.extend(entry for entry in (_company_entry(raw) for raw in raw_names) if entry)
                     web_competitor_names.extend(_reverse_competitors_from_cache(target))
                     competitor_entries = _validate_competitor_entries(web_competitor_names, exclude=target)
-                    if not competitor_entries:
+                    if not competitor_entries and web_enabled:
                         # The structured research call sometimes returns no
                         # JSON at all (Hevo, 2026-09-25). A plain "list the
                         # competitors of X" web call is the second attempt.
@@ -8082,6 +8916,15 @@ async def process_query_main(
             logger.info("SHORTLIST competitor_validation=%s", json.dumps(criteria["_competitor_resolution"], ensure_ascii=False, default=str))
             criteria.pop("competitors_of", None)
             criteria.pop("competitor_of", None)
+
+    # Remember what the recruiter actually asked for before the values are
+    # expanded into taxonomy variants; the checklist shows these, not the
+    # 70 title spellings the matcher uses.
+    criteria["_query_values"] = {
+        key: [str(v) for v in _requirement_values(criteria.get(key))]
+        for key in TEXT_CRITERIA_CONFIG
+        if criteria.get(key)
+    }
 
     try:
         company_keywords = criteria.pop("required_companies", [])
@@ -8403,8 +9246,9 @@ async def process_query_main(
                 review = {
                     **review,
                     "final_status": "verified_match",
-                    "answer": _fallback_reasoning_from_evidence(updated),
+                    "answer": updated.get("decision_narrative") or _fallback_reasoning_from_evidence(updated),
                     "reasoning": _fallback_reasoning_from_evidence(updated),
+                    "claims": [],
                     "matched_criteria": [m.get("criterion") for m in (updated.get("matched_criteria") or []) if isinstance(m, dict)],
                     "missing_criteria": [],
                     "match_score": None,
@@ -8423,8 +9267,9 @@ async def process_query_main(
                 review = {
                     **review,
                     "final_status": "verified_match",
-                    "answer": review.get("answer") or _fallback_reasoning_from_evidence(updated),
+                    "answer": updated.get("decision_narrative") or _fallback_reasoning_from_evidence(updated),
                     "reasoning": _fallback_reasoning_from_evidence(updated),
+                    "claims": [],
                     "matched_criteria": review.get("matched_criteria") or [m.get("criterion") for m in (updated.get("matched_criteria") or []) if isinstance(m, dict)],
                     "missing_criteria": [],
                     "match_score": None,
@@ -8444,8 +9289,11 @@ async def process_query_main(
             updated["is_verified_match"] = True
             updated["review_stage"] = "evidence_audited"
             updated["auditor_status"] = review.get("auditor_status") or "passed"
-            updated["answer"] = str(review.get("answer") or review.get("reasoning") or _fallback_reasoning_from_evidence(updated)).strip()
-            updated["reasoning"] = str(review.get("reasoning") or updated["answer"]).strip()
+            updated["audit_claims"] = [c for c in (review.get("claims") or []) if isinstance(c, dict)]
+            updated["answer"] = _clean_visible_evidence_ids(
+                review.get("answer") or updated.get("decision_narrative") or _fallback_reasoning_from_evidence(updated)
+            )
+            updated["reasoning"] = _clean_visible_evidence_ids(review.get("reasoning") or updated["answer"])
             updated["evidence_ids"] = _extract_audit_evidence_ids(review)
             updated["confidence"] = str(review.get("confidence") or updated.get("confidence") or "high").strip().lower()
             if isinstance(review.get("matched_criteria"), list):
@@ -8454,15 +9302,20 @@ async def process_query_main(
                 updated["missing_criteria"] = review["missing_criteria"]
             if review.get("match_score") is not None:
                 try:
-                    updated["match_score"] = round(float(review.get("match_score")), 1)
+                    audited_score = float(review.get("match_score"))
+                    if 0 < audited_score <= 1:          # the model answered on a 0–1 scale
+                        audited_score *= 100
+                    if 0 <= audited_score <= 100:
+                        updated["match_score"] = round(audited_score, 1)
                 except Exception:
                     pass
         else:
             updated["shortlist_status"] = "verified_match"
             updated["is_verified_match"] = True
             updated["review_stage"] = "evidence_fallback"
-            updated["reasoning"] = str(review or _fallback_reasoning_from_evidence(updated)).strip()
-            updated["answer"] = updated["reasoning"]
+            updated["reasoning"] = _clean_visible_evidence_ids(review or _fallback_reasoning_from_evidence(updated))
+            updated["answer"] = updated.get("decision_narrative") or updated["reasoning"]
+            updated["audit_claims"] = []
         return updated
 
     async def _producer_task():

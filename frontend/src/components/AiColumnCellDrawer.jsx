@@ -70,6 +70,29 @@ export function renderTextWithLinks(text) {
   });
 }
 
+// Card list of web sources (title, note, "Open Source" link). Shared with the
+// shortlist card's evidence details.
+export function SourcesList({ sources, emptyText = 'No sources captured.' }) {
+  const list = Array.isArray(sources) ? sources.filter(Boolean) : [];
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {list.length === 0 && <div style={{ fontSize: 12, color: '#94a3b8' }}>{emptyText}</div>}
+      {list.map((source, index) => (
+        <div key={`${source.url || source.title || 'source'}-${index}`} style={{ border: '1px solid #eef2f7', borderRadius: 14, padding: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>{source.title || source.url || `Source ${index + 1}`}</div>
+          {source.note && <div style={{ fontSize: 12, color: '#475569', marginTop: 4 }}>{source.note}</div>}
+          {source.url && (
+            <a href={source.url} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#2563eb', marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 6, textDecoration: 'none' }}>
+              Open Source
+              <ExternalLink size={12} />
+            </a>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function isMeaningfulAiValue(value) {
   const text = String(value ?? '').trim();
   const lower = text.toLowerCase();
@@ -375,21 +398,7 @@ export default function AiColumnCellDrawer({ open, loading, detail, title, onClo
 
             <div style={sectionStyle}>
               <div style={sectionLabelStyle}>Sources</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {sources.length === 0 && <div style={{ fontSize: 12, color: '#94a3b8' }}>No sources captured.</div>}
-                {sources.map((source, index) => (
-                  <div key={`${source.url || source.title || 'source'}-${index}`} style={{ border: '1px solid #eef2f7', borderRadius: 14, padding: 12 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>{source.title || source.url || `Source ${index + 1}`}</div>
-                    {source.note && <div style={{ fontSize: 12, color: '#475569', marginTop: 4 }}>{source.note}</div>}
-                    {source.url && (
-                      <a href={source.url} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: '#2563eb', marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 6, textDecoration: 'none' }}>
-                        Open Source
-                        <ExternalLink size={12} />
-                      </a>
-                    )}
-                  </div>
-                ))}
-              </div>
+              <SourcesList sources={sources} />
             </div>
           </>
         )}

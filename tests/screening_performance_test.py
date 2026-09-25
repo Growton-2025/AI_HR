@@ -1289,14 +1289,19 @@ def test_friendly_evidence_text_explains_where_signal_was_mentioned():
         "role": {"title": "Senior Business Development Consultant", "company": "Oracle"},
     })
 
+    # No candidate name given → neutral subject; with a profile the first
+    # name is used ("Priya has mentioned …", "Priya's role was …").
     assert uploaded == (
-        'He has mentioned SaaS; the matching text includes '
+        'The candidate has mentioned SaaS; the matching text includes '
         '"CRM, Enterprise Software, SaaS, Lead Generation".'
     )
     assert role == (
-        "At Oracle, his role was Senior Business Development Consultant, "
+        "At Oracle, their role was Senior Business Development Consultant, "
         "so this role was counted toward Sales Development experience."
     )
+    named = query._add_friendly_evidence_text([{"criterion": "Industries", "value": "SaaS", "source": "uploaded fields.Skills", "snippet": "SaaS"}], {"name": "Priya Nair"})
+    assert named[0]["friendly_text"].startswith("Priya has mentioned SaaS")
+    assert named[0]["provenance"] == "uploaded_sheet" and named[0]["where"] == "Uploaded sheet · Skills"
 
 
 def test_strict_shortlist_sort_prefers_relevant_duration_then_score():
@@ -1757,7 +1762,8 @@ def test_requirement_exact_evidence_keeps_full_bulleted_text_readable():
     assert "Verify" not in guide_text
     assert "Check" not in guide_text
     assert "Confirm" not in guide_text
-    assert "he has mentioned" in guide_text.lower()
+    assert "market has mentioned" in guide_text.lower()          # first name of "Market Evidence Seller"
+    assert "..." not in guide_text
 
 
 def test_requirement_breakdown_includes_web_source_links_for_funding_and_company_facts():

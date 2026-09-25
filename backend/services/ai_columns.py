@@ -360,7 +360,10 @@ def call_openai_json(
     web_search_context_size: str = "high",
     temperature: float = 0.2,
     timeout: Optional[float] = None,
+    response_format: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """`response_format` (e.g. a strict json_schema) applies to the plain
+    chat path only; if the API rejects it the call is retried without it."""
     if not _OPENAI_CLIENT:
         return {}
     try:
@@ -422,15 +425,25 @@ def call_openai_json(
             parsed["model"] = model
             return parsed
 
-        response = _OPENAI_CLIENT.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=[
+        request_kwargs: Dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            timeout=request_timeout,
-        )
+            "timeout": request_timeout,
+        }
+        if response_format:
+            request_kwargs["response_format"] = response_format
+        try:
+            response = _OPENAI_CLIENT.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            if not response_format or not re.search(r"response_format|json_schema|schema", str(exc), re.I):
+                raise
+            logger.warning("OpenAI rejected response_format (%s); retrying without it", str(exc)[:160])
+            request_kwargs.pop("response_format", None)
+            response = _OPENAI_CLIENT.chat.completions.create(**request_kwargs)
         content = ""
         choices = getattr(response, "choices", None) or []
         if choices:
