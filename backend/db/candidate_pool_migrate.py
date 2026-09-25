@@ -248,6 +248,15 @@ def ensure_candidate_pool_migrations(conn) -> None:
             except Exception as e:  # never block startup on a data-quality pass
                 logger.warning("LinkedIn key canonicalisation failed: %s", e, exc_info=True)
 
+            # Person links (docs/candidate-history-linking-plan.md): which rows
+            # are the same human being. Created here so every worker sees the
+            # table from its first request.
+            try:
+                from backend.services.person_identity import ensure_person_links_schema
+                ensure_person_links_schema(cur)
+            except Exception as e:
+                logger.warning("candidate_person_links schema failed: %s", e, exc_info=True)
+
             # Email keys are compared lower-cased and trimmed everywhere now;
             # store them that way too so the indexes on email stay useful.
             cur.execute(

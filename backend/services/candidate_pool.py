@@ -162,6 +162,16 @@ def profile_passes_scope(
     return oid is not None and oid == user_id
 
 
+def _link_quietly(cur, candidate_id) -> None:
+    """Record which person a just-written row is (person_identity). Never
+    fails the write: a missing link is only a missing shortcut."""
+    try:
+        from backend.services.person_identity import link_candidates_bulk
+        link_candidates_bulk(cur, [candidate_id], by="import")
+    except Exception:
+        pass
+
+
 def fetch_best_contact_for_normalized_li(
     cur, normalized_li: Optional[str]
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -353,6 +363,7 @@ def upsert_master_catalog_row(
                 mid,
             ),
         )
+        _link_quietly(cur, mid)
         return mid
 
     cur.execute(
@@ -381,7 +392,9 @@ def upsert_master_catalog_row(
             pool_source,
         ),
     )
-    return cur.fetchone()[0]
+    new_id = cur.fetchone()[0]
+    _link_quietly(cur, new_id)
+    return new_id
 
 
 def upsert_recruiter_pool_row(
@@ -499,6 +512,7 @@ def upsert_recruiter_pool_row(
                 cid,
             ),
         )
+        _link_quietly(cur, cid)
         return cid, "updated"
 
     cur.execute(
@@ -535,7 +549,9 @@ def upsert_recruiter_pool_row(
             str(owner_id),
         ),
     )
-    return cur.fetchone()[0], "inserted"
+    new_id = cur.fetchone()[0]
+    _link_quietly(cur, new_id)
+    return new_id, "inserted"
 
 
 def assign_master_to_recruiter(
@@ -602,6 +618,7 @@ def assign_master_to_recruiter(
                 cid,
             ),
         )
+        _link_quietly(cur, cid)
         return cid, "merged"
 
     name = m.get("name") or ""
@@ -638,7 +655,9 @@ def assign_master_to_recruiter(
             str(recruiter_user_id),
         ),
     )
-    return cur.fetchone()[0], "inserted"
+    new_id = cur.fetchone()[0]
+    _link_quietly(cur, new_id)
+    return new_id, "inserted"
 
 
 def assert_recruiter_can_touch_candidate(cur, user_id: int, candidate_id: int) -> None:

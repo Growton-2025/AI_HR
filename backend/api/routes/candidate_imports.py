@@ -1119,6 +1119,11 @@ def _bulk_insert_new_import_rows(
     recruiter_ids_by_norm = {row[1]: int(row[0]) for row in recruiter_rows}
     recruiter_ids = [recruiter_ids_by_norm[row["normalized_li"]] for row in rows]
     role_count = _bulk_assign_role(cur, role_id=role_id, candidate_ids=recruiter_ids)
+    try:
+        from backend.services.person_identity import link_candidates_bulk
+        link_candidates_bulk(cur, list(master_ids) + list(recruiter_ids), by="import")
+    except Exception:
+        pass
     return master_ids, recruiter_ids, role_count
 
 

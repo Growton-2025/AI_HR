@@ -3218,6 +3218,34 @@ export const useAppStore = create(persist((set, get) => ({
         }
     },
 
+    // Person-level history: every row that is the same human (master copy,
+    // each recruiter's copy, archived rows). See docs/candidate-history-linking-plan.md.
+    fetchCandidateTimeline: async (candidateId, options = {}) => {
+        const force = options.force === true
+        const scope = options.scope || 'person'
+        const key = `${candidateId}:${scope}`
+        const state = get()
+        const cached = state.candidateTimelineCache?.[key]
+        if (!force && cached && (Date.now() - cached.at) < 30 * 1000) {
+            return { success: true, data: cached.data, cached: true }
+        }
+        try {
+            const res = await axios.get(`${API_BASE}/candidates/${candidateId}/timeline`, { params: { scope }, timeout: CALL_REQUEST_TIMEOUT_MS })
+            set(s => ({ candidateTimelineCache: { ...(s.candidateTimelineCache || {}), [key]: { at: Date.now(), data: res.data } } }))
+            return { success: true, data: res.data }
+        } catch (e) {
+            return { success: false, error: getRequestErrorMessage(e, 'Failed to load history') }
+        }
+    },
+    // Before saving a new candidate: is this person already in Hayasa?
+    lookupCandidatePerson: async ({ linkedin, email, phone }) => {
+        try {
+            const res = await axios.get(`${API_BASE}/candidates/lookup`, { params: { linkedin, email, phone } })
+            return { success: true, data: res.data }
+        } catch (e) {
+            return { success: false, error: getRequestErrorMessage(e, 'Lookup failed') }
+        }
+    },
     fetchCandidateActivity: async (candidateId, options = {}) => {
         const force = typeof options === 'boolean' ? options : options.force === true
         const maxAgeMs = 15 * 1000

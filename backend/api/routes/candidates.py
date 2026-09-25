@@ -344,6 +344,72 @@ async def get_candidate_analytics(current_user: schemas.User = Depends(deps.get_
     _analytics_cache[key] = (time.monotonic(), data)
     return data
 
+@router.get("/candidates/lookup")
+async def lookup_candidate_person(
+    linkedin: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Is this person already in Hayasa, and what have we done with them?
+
+    Asked by the Add Candidate modal on LinkedIn/email/phone blur, before
+    anything is saved, so the recruiter sees "Already in Hayasa: 3 calls · 1
+    LinkedIn reply · last contact 24 Sep" instead of a fresh, empty profile.
+    Company-wide on purpose: the question is whether *we* contacted them.
+    Declared before /candidates/{candidate_id} so 'lookup' is not parsed as an id.
+    """
+    from backend.services.person_identity import lookup_person
+
+    if not any((linkedin, email, phone)):
+        raise HTTPException(status_code=400, detail="Provide linkedin, email or phone")
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                result = lookup_person(cur, linkedin=linkedin, email=email, phone=phone)
+            conn.rollback()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
+@router.get("/candidates/{candidate_id}/timeline")
+async def get_candidate_timeline(
+    candidate_id: int,
+    scope: str = "person",
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Everything Hayasa has done with this *person*, across every row that is
+    the same human (master copy, each recruiter's copy, archived rows): calls,
+    inbound callbacks, LinkedIn and email messages, status changes, notes.
+    `scope=row` limits it to this row. See docs/candidate-history-linking-plan.md.
+    """
+    from backend.services.person_timeline import build_timeline
+
+    if scope not in ("person", "row"):
+        raise HTTPException(status_code=400, detail="scope must be 'person' or 'row'")
+    is_admin = (current_user.role or "").strip().lower() == "admin"
+    try:
+        with get_db_connection_context(validate=False, register_pgvector=False) as conn:
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            with conn.cursor() as cur:
+                result = build_timeline(
+                    cur, candidate_id, viewer_email=current_user.email or "",
+                    viewer_is_admin=is_admin, scope=scope,
+                )
+            conn.rollback()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result
+
+
 @router.get("/candidates/{candidate_id}")
 async def get_candidate(
     candidate_id: int,
@@ -998,6 +1064,15 @@ async def create_candidate(
                         """,
                         (payload.role_id, candidate_id),
                     )
+                # Link the new row to the person it is (same LinkedIn / email /
+                # phone as existing rows) and describe what we already know,
+                # so the UI can say "known — 3 previous calls" straight away.
+                try:
+                    from backend.services.person_identity import link_candidate
+                    known_person = link_candidate(cur, candidate_id, by=current_user.email or "system")
+                except Exception as link_exc:
+                    logger.warning("Person link failed for new candidate %s: %s", candidate_id, link_exc)
+                    known_person = {"known": False}
                 conn.commit()
     except HTTPException:
         raise
@@ -1012,4 +1087,4 @@ async def create_candidate(
         except Exception:
             pass
 
-    return {"success": True, "candidate_id": candidate_id}
+    return {"success": True, "candidate_id": candidate_id, "known_person": known_person}

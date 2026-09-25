@@ -1018,6 +1018,14 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'calls' AND column_name = 'plivo_hangup_cause')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
                                     WHERE table_name = 'plivo_endpoints' AND column_name = 'device_id')
+                        -- Identity keys canonical and person links present
+                        -- (docs/candidate-history-linking-plan.md). Hosted skips
+                        -- the startup migrations, so this is where it runs.
+                        AND EXISTS (SELECT 1 FROM information_schema.tables
+                                    WHERE table_name = 'candidate_person_links')
+                        AND NOT EXISTS (SELECT 1 FROM candidates
+                                        WHERE normalized_linkedin IS NOT NULL
+                                          AND normalized_linkedin !~ '^/in/[^/]+(_legacy_[0-9]+)?$')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'plivo_endpoints')
                         AND EXISTS (SELECT 1 FROM information_schema.columns
@@ -1297,6 +1305,24 @@ def ensure_calls_schema_ready(force: bool = False):
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_plivo_endpoints_user_env_device
                 ON plivo_endpoints (user_id, env_key, device_id);
             """)
+
+            # Candidate identity (docs/candidate-history-linking-plan.md).
+            # normalized_linkedin held three formats side by side, so the same
+            # person's rows could not find each other; rewrite to '/in/<slug>'
+            # (batched, ~4s for 5.6k rows), create the person-links table and
+            # store emails lower-cased. Idempotent; the sentinel above skips
+            # all of this once it has run.
+            try:
+                from backend.services.linkedin_backfill import canonicalise_linkedin_keys
+                from backend.services.person_identity import ensure_person_links_schema
+                canonicalise_linkedin_keys(cur)
+                ensure_person_links_schema(cur)
+                cur.execute(
+                    "UPDATE candidates SET email = LOWER(TRIM(email)) "
+                    "WHERE email IS NOT NULL AND email <> LOWER(TRIM(email));"
+                )
+            except Exception as identity_exc:
+                logger.warning("Candidate identity migration failed: %s", identity_exc, exc_info=True)
 
             cur.execute("""
                 CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$

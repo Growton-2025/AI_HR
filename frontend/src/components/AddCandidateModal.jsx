@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { toast } from 'sonner';
-import { X } from 'lucide-react';
+import { History, X } from 'lucide-react';
 
 const FIELD_STYLE = {
   width: '100%', padding: '12px 16px', borderRadius: 12, border: '1.5px solid #e2e8f0',
@@ -39,6 +39,7 @@ function Field({ label, required, value, onChange, placeholder, type = 'text', m
 
 export default function AddCandidateModal({ roleId, onClose, onSuccess }) {
   const createCandidate = useAppStore(state => state.createCandidate);
+  const lookupCandidatePerson = useAppStore(state => state.lookupCandidatePerson);
   const [loading, setLoading] = useState(false);
   const [fields, setFields] = useState({
     first_name: '', last_name: '', linkedin: '', city: '', title: '',
@@ -46,6 +47,24 @@ export default function AddCandidateModal({ roleId, onClose, onSuccess }) {
   });
 
   const setField = (key) => (value) => setFields(prev => ({ ...prev, [key]: value }));
+
+  // Is this person already in Hayasa? Asked as soon as the LinkedIn URL or
+  // email is filled in, so the recruiter sees the previous calls and replies
+  // before saving instead of a fresh, empty profile afterwards.
+  const [known, setKnown] = useState(null);
+  const lookupKey = `${(fields?.linkedin || '').trim()}|${(fields?.email || '').trim()}`;
+  useEffect(() => {
+    const linkedin = fields.linkedin.trim();
+    const email = fields.email.trim();
+    if (!linkedin && !email) { setKnown(null); return undefined; }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      const res = await lookupCandidatePerson({ linkedin: linkedin || undefined, email: email || undefined });
+      if (!cancelled) setKnown(res.success ? res.data : null);
+    }, 500);
+    return () => { cancelled = true; clearTimeout(t); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lookupKey]);
 
   const missingRequired = ['first_name', 'last_name', 'linkedin', 'city', 'title']
     .filter(key => !fields[key].trim());
@@ -66,7 +85,12 @@ export default function AddCandidateModal({ roleId, onClose, onSuccess }) {
 
       const res = await createCandidate(payload);
       if (res.success) {
-        toast.success(`Added ${fields.first_name} ${fields.last_name}`);
+        const kp = res.data?.known_person;
+        if (kp?.known) {
+          toast.success(`Added ${fields.first_name} ${fields.last_name} — linked to ${kp.prior_rows?.length || 0} existing record(s): ${kp.calls} call(s), ${kp.linkedin_replies} LinkedIn repl${kp.linkedin_replies === 1 ? 'y' : 'ies'}, ${kp.emails} email(s)`);
+        } else {
+          toast.success(`Added ${fields.first_name} ${fields.last_name}`);
+        }
         onSuccess?.(res.data);
       } else {
         toast.error(res.error || 'Failed to add candidate');
@@ -99,6 +123,20 @@ export default function AddCandidateModal({ roleId, onClose, onSuccess }) {
         <div style={{ marginBottom: '16px' }}>
           <Field label="LinkedIn URL" required value={fields.linkedin} onChange={setField('linkedin')} placeholder="https://linkedin.com/in/janedoe" />
         </div>
+
+        {known?.known && (
+          <div style={{ marginBottom: '16px', padding: '12px 14px', borderRadius: '12px', background: '#fffbeb', border: '1px solid #fde68a', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+            <History size={16} color="#b45309" style={{ marginTop: 2, flexShrink: 0 }} />
+            <div style={{ fontSize: '13px', color: '#78350f', lineHeight: 1.5 }}>
+              <strong>Already in Hayasa</strong> ({known.matched_on}): {known.prior_rows.map(r => `${r.name || 'record'}${r.owner_email ? ` · ${r.owner_email}` : ' · master library'}`).join('; ')}.
+              <div>
+                {known.calls} call{known.calls === 1 ? '' : 's'} · {known.inbound_calls} callback{known.inbound_calls === 1 ? '' : 's'} · {known.linkedin_replies} LinkedIn repl{known.linkedin_replies === 1 ? 'y' : 'ies'} · {known.emails} email{known.emails === 1 ? '' : 's'}
+                {known.last_interaction_at ? ` · last contact ${new Date(known.last_interaction_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}` : ''}
+              </div>
+              <div style={{ marginTop: 4, color: '#92400e' }}>Saving adds this person to your pool and links the full history to the new record.</div>
+            </div>
+          </div>
+        )}
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
           <Field label="City" required value={fields.city} onChange={setField('city')} placeholder="Bengaluru" />

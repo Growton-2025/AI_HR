@@ -257,6 +257,22 @@ Also pre-warm on **lookup** (2.7) so that by the time the recruiter clicks
 
 ---
 
+## Status (2026-09-25)
+
+* **PR 1 — identity** shipped (`aaf8692`): canonical `normalize_linkedin`,
+  `person_key`, batched key backfill, PATCH recompute, lower-cased emails.
+  Note: hosted skips startup migrations (`RUN_STARTUP_MIGRATIONS` unset), so
+  the backfill runs from `ensure_calls_schema_ready` on first request, with
+  a sentinel that checks for non-canonical keys.
+* **PR 2 — link + timeline** shipped: `candidate_person_links`,
+  `person_identity.py` (resolve / link / summary / lookup),
+  `person_timeline.py`, `GET /candidates/lookup`,
+  `GET /candidates/{id}/timeline`, `known_person` on create, hooks in every
+  pool write path; frontend: Add-Candidate banner, History tab, "Previous
+  attempts" in the Calls modal. Timeline cost on hosted ≈ 4 s (8 statements);
+  candidate for a single CTE later.
+* **PR 3 — provider backfill**: not started.
+
 ## 3. Work breakdown (incremental, each shippable)
 
 | # | Deliverable | Files | Tests |

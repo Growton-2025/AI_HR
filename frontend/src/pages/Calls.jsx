@@ -8,6 +8,7 @@ import CandidateActivityPanel, { OutcomeBadge, PossibleVoicemailBadge, formatDat
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
 import CandidateConversationModal from '../components/CandidateConversationModal';
+import PersonTimeline from '../components/PersonTimeline';
 import { SelectFilter } from '../components/FilterComponents';
 import { TranscriptView } from '../components/TranscriptView';
 import {
@@ -2739,6 +2740,19 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                         <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px' }}>Follow-up Time *</label>
                         <input type="time" value={followupDueTime} onChange={e => setFollowupDueTime(e.target.value)} style={{ width: '100%', padding: '12px', borderRadius: '12px', border: '1px solid rgba(203,213,225,0.9)', background: '#fff', boxSizing: 'border-box' }} />
                       </div>
+                    </div>
+                  )}
+
+                  {/* Previous attempts with this person — across every record of
+                      them, not just this call row — so the "Not Reachable —
+                      incoming freeze" note from yesterday is in view before
+                      the recruiter dials again. */}
+                  {call.candidate_id && (
+                    <div style={{ marginBottom: '20px' }}>
+                      <label style={{ display: 'block', fontSize: '12px', fontWeight: 700, color: '#94a3b8', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        Previous attempts
+                      </label>
+                      <PersonTimeline candidateId={call.candidate_id} candidateName={call.candidate_name} compact limit={3} filterTypes={['call', 'inbound_call']} />
                     </div>
                   )}
 

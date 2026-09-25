@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Linkedin, Loader2, Mail, MessageSquare, Phone, RefreshCcw, Send, X } from 'lucide-react'
+import { History, Linkedin, Loader2, Mail, MessageSquare, Phone, RefreshCcw, Send, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAppStore } from '../store/useAppStore'
 import StatusDropdown from './StatusDropdown'
 import CandidateActivityPanel from './CandidateActivityPanel'
+import PersonTimeline from './PersonTimeline'
 import { formatIstDateTime } from '../utils/istTime'
 
 const EMPTY_THREAD = { messages: [], loaded: false, error: '' }
@@ -175,7 +176,7 @@ export default function CandidateConversationModal({
   const threadsRef = useRef(threads)
   useEffect(() => { threadsRef.current = threads }, [threads])
   useEffect(() => {
-    if (platform === 'calls') return undefined
+    if (platform === 'calls' || platform === 'timeline') return undefined
     const intervalId = setInterval(() => {
       if (document.visibilityState !== 'visible') return
       const thread = threadsRef.current[platform]
@@ -203,6 +204,8 @@ export default function CandidateConversationModal({
     { id: 'linkedin', label: 'LinkedIn', icon: Linkedin, hasResponse: Boolean(candidate.li_response_text) },
     { id: 'email', label: 'Email', icon: Mail, hasResponse: Boolean(candidate.response) },
     { id: 'calls', label: 'Calls', icon: Phone },
+    // Everything we have done with this person, across every record of them.
+    { id: 'timeline', label: 'History', icon: History },
   ]), [candidate.li_response_text, candidate.response])
 
   const handleRefresh = async () => {
@@ -314,6 +317,10 @@ export default function CandidateConversationModal({
               candidateId={candidate.id}
               candidateName={candidate.first_name || candidate.name}
             />
+          ) : platform === 'timeline' ? (
+            <div style={{ padding: 16 }}>
+              <PersonTimeline candidateId={candidate.id} candidateName={candidate.first_name || candidate.name} />
+            </div>
           ) : !activeThread.loaded ? (
             <div className="candidate-conversation-empty">
               <Loader2 size={32} className="animate-spin" />
@@ -350,7 +357,7 @@ export default function CandidateConversationModal({
           <div ref={endRef} />
         </main>
 
-        {platform !== 'calls' && (
+        {platform !== 'calls' && platform !== 'timeline' && (
         <footer className="candidate-conversation-composer">
           <div>
             <textarea
