@@ -2298,7 +2298,12 @@ def test_failed_audit_never_verifies_a_candidate():
     assert payload["audit_unavailable"] is True
 
 
-def test_candidate_with_unusable_audit_output_is_not_returned(monkeypatch):
+def test_candidate_with_unusable_audit_output_is_returned_flagged_not_verified_at_100(monkeypatch):
+    """An unusable audit answer is our outage, not the candidate's: the
+    deterministic match stays in the list, flagged audit_unavailable with
+    low confidence and no match_score — never the "100% evidence fit" that
+    the old fallback produced, and never silently dropped either (that is
+    how a 63-person competitor screen came back with one name)."""
     profiles = [_focused_geo_profile(1, "UAE (Major - 2.5 Years)"), _focused_geo_profile(2, "Dubai - 2 Years")]
 
     class _FakeCriteriaResponse:
@@ -2333,5 +2338,8 @@ def test_candidate_with_unusable_audit_output_is_not_returned(monkeypatch):
     events = asyncio.run(collect())
     complete = next(e for e in events if isinstance(e, dict) and e.get("type") == "complete")
     assert complete["filter_debug"]["passed"] == 2
-    assert [c["id"] for c in complete["data"]] == [1]
-    assert complete["data"][0]["shortlist_status"] == "verified_match"
+    by_id = {c["id"]: c for c in complete["data"]}
+    assert set(by_id) == {1, 2}
+    assert by_id[1]["shortlist_status"] == "verified_match" and by_id[1]["auditor_status"] == "passed"
+    assert by_id[2]["auditor_status"] == "audit_unavailable" and by_id[2]["confidence"] == "low"
+    assert by_id[2]["review_stage"] == "evidence_audited" and by_id[2]["reasoning"].startswith("Verified from structured evidence")

@@ -7,12 +7,19 @@ import hashlib
 import redis
 import tiktoken
 import copy
+from backend.services.profile_experience import (
+    employer_names_from_profiles,
+    function_years_for,
+    raw_function_years,
+    raw_total_experience_years,
+    synthesize_roles,
+)
 import re
 import pandas as pd
 import io
 import psycopg2
-from typing import List, Dict, Any, AsyncIterator, Tuple, Optional
-from datetime import datetime
+from typing import List, Dict, Any, AsyncIterator, Tuple, Optional, Set
+from datetime import timezone, datetime
 from pathlib import Path
 from collections import Counter
 from dotenv import load_dotenv
@@ -148,6 +155,13 @@ SCREENING_LLM_REVIEW_MIN_SCORE = float(os.getenv("SCREENING_LLM_REVIEW_MIN_SCORE
 SCREENING_LOCAL_POTENTIAL_THRESHOLD = float(os.getenv("SCREENING_LOCAL_POTENTIAL_THRESHOLD", "45"))
 SCREENING_WEB_SEARCH_TOOL = os.getenv("SCREENING_WEB_SEARCH_TOOL", os.getenv("AI_COLUMN_WEB_SEARCH_TOOL", "web_search"))
 SCREENING_WEB_SEARCH_CONTEXT_SIZE = os.getenv("SCREENING_WEB_SEARCH_CONTEXT_SIZE", os.getenv("AI_COLUMN_WEB_SEARCH_CONTEXT_SIZE", "high"))
+SHORTLIST_COMPANY_FACT_TTL_DAYS = int(os.getenv("SHORTLIST_COMPANY_FACT_TTL_DAYS", "30"))
+# Bump when the research prompt changes shape; older cache entries are refetched.
+SHORTLIST_COMPANY_FACT_PROMPT_VERSION = 3
+# One call per competitor query: "which of these employer names compete with
+# the target?" over the web list plus the role's own employers.
+SCREENING_COMPETITOR_JUDGE_MODEL = os.getenv("SCREENING_COMPETITOR_JUDGE_MODEL", "gpt-4o")
+SCREENING_COMPETITOR_JUDGE_MAX_NAMES = int(os.getenv("SCREENING_COMPETITOR_JUDGE_MAX_NAMES", "800"))
 SHORTLIST_COMPANY_FACT_CACHE_PATH = Path(
     os.getenv(
         "SHORTLIST_COMPANY_FACT_CACHE_PATH",
@@ -1368,7 +1382,7 @@ def _profile_roles_with_raw_experience(profile: Dict[str, Any]) -> List[Dict[str
     normalized_roles = [copy.deepcopy(role) for role in (profile.get("roles") or []) if isinstance(role, dict)]
     raw_roles = _raw_experience_roles(profile)
     if not raw_roles:
-        return normalized_roles
+        return _with_synthesized_roles(profile, normalized_roles)
 
     merged = normalized_roles[:]
     for raw_role in raw_roles:
@@ -1413,7 +1427,22 @@ def _profile_roles_with_raw_experience(profile: Dict[str, Any]) -> List[Dict[str
                 matched_existing["location"] = raw_role.get("location")
         else:
             merged.append(raw_role)
-    return merged
+    return _with_synthesized_roles(profile, merged)
+
+
+def _with_synthesized_roles(profile: Dict[str, Any], roles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add the employers the sheet recorded outside experiences/N: the
+    uploaded `import_company` (the current employer — placed first so the
+    current-employer scope resolves to it when nothing carries dates), wide
+    `Company N Name` columns and a "Title at Company" headline. Without this
+    most uploaded candidates had no roles at all, so every employer-based
+    criterion (competitors, required companies, tenure) rejected them."""
+    synthesized = synthesize_roles(profile, roles)
+    if not synthesized:
+        return roles
+    current_first = [r for r in synthesized if r.get("_source") == "raw_fields.import_company"]
+    rest = [r for r in synthesized if r.get("_source") != "raw_fields.import_company"]
+    return current_first + roles + rest
 
 
 # --- DURATION CALCULATIONS ---
@@ -2072,7 +2101,15 @@ def _term_matches_text(term: str, text: str) -> bool:
         return False
     if len(term_l) <= 3:
         return re.search(rf"\b{re.escape(term_l)}\b", text) is not None
-    return term_l in text
+    if term_l in text:
+        return True
+    # "mid-market" must find "Mid Market" and "midmarket" headlines.
+    if "-" in term_l or " " in term_l:
+        spaced = re.sub(r"[-\s]+", " ", term_l)
+        joined = spaced.replace(" ", "")
+        hyphenated = spaced.replace(" ", "-")
+        return spaced in text or hyphenated in text or (len(joined) >= 6 and joined in text)
+    return False
 
 
 def _iter_evidence_leaf_values(value: Any, prefix: str = "", depth: int = 0, max_depth: int = 5) -> List[Tuple[str, Any]]:
@@ -2537,6 +2574,21 @@ def _region_to_countries() -> Dict[str, List[str]]:
     return {region: sorted(set(countries)) for region, countries in regions.items()}
 
 
+# Sales-territory spellings of the super-regions in GEOGRAPHY_COUNTRY_TO_REGION_MAP.
+# A sub-region name is also listed under its super-region: an AE who covered
+# Europe has EMEA experience, ANZ sits inside APAC.
+REGION_ALIASES = {
+    "americas": ("amer", "namer", "north america", "the americas"),
+    "emea": ("europe middle east and africa", "europe, middle east and africa", "europe", "middle east", "mea", "uk & europe", "uk and europe"),
+    "apac": ("asia pacific", "asia-pacific", "anz", "asean", "sea", "south east asia", "southeast asia"),
+    "latam": ("latin america", "south america"),
+}
+# A country expands to its region only where covering the region implies
+# covering the country: an "AMER"/"North America" AE sold into the US. "uae"
+# must still not expand to "emea" (100+ countries) — see _expanded_terms.
+REGION_DOMINANT_COUNTRIES = {"americas": ("united states", "us", "usa", "u s")}
+
+
 def _geography_match_terms(value: str, criterion: Any = None) -> List[str]:
     value_l = _normalize_search_text(value)
     if not value_l:
@@ -2546,7 +2598,14 @@ def _geography_match_terms(value: str, criterion: Any = None) -> List[str]:
     if value_l in regions:
         terms.add(value_l)
         terms.update(regions[value_l])
-    # Country -> super-region expansion deliberately absent (see _expanded_terms).
+        terms.update(REGION_ALIASES.get(value_l, ()))
+    # Country -> super-region expansion deliberately absent (see _expanded_terms),
+    # except for a region's dominant market when the plan policy allows it.
+    if isinstance(criterion, dict) and criterion.get("allow_region_reverse_match"):
+        for region, dominant in REGION_DOMINANT_COUNTRIES.items():
+            if value_l in dominant:
+                terms.add(region)
+                terms.update(REGION_ALIASES.get(region, ()))
     terms.add(value_l)
     for item in _criteria_objects(criterion):
         for key in ("expanded_countries", "countries", "regions", "aliases", "expanded_terms"):
@@ -2881,8 +2940,21 @@ def _company_matches(candidate_company: str, target_company: str) -> bool:
     )
 
 
+def _known_employer_names() -> List[str]:
+    """Employers seen anywhere in candidate data, not only the companies table
+    (which holds employers of candidates with a roles row — 5 of 680 on the
+    role that surfaced this). A competitor list validated against the table
+    alone dropped LambdaTest, Katalon, testRigor and Testsigma itself."""
+    names = {str(name).strip() for name in ALL_COMPANY_NAMES if str(name or "").strip()}
+    try:
+        names |= employer_names_from_profiles(PROFILES_BY_ID.values())
+    except Exception:
+        logger.debug("employer name scan failed", exc_info=True)
+    return sorted(names, key=str.lower)
+
+
 def _validate_company_names_against_db(company_names: List[str], *, exclude: Optional[str] = None) -> List[str]:
-    lookup = {_normalize_company_key(name): name for name in ALL_COMPANY_NAMES if str(name or "").strip()}
+    lookup = {_normalize_company_key(name): name for name in _known_employer_names() if str(name or "").strip()}
     exclude_key = _normalize_company_key(exclude)
     validated: List[str] = []
     seen = set()
@@ -2895,10 +2967,28 @@ def _validate_company_names_against_db(company_names: List[str], *, exclude: Opt
             continue
         matched_name = lookup.get(company_key)
         if not matched_name:
+            # Containment only between names long enough to mean something:
+            # "Labs" must not absorb "Sauce Labs", nor "AI" every AI company.
+            # Containment only when the shorter side is a real name (two
+            # words or 6+ characters): "Labs" must not absorb "Sauce Labs",
+            # nor "AI" every AI company; exact matches above still cover
+            # short brands like "mabl".
+            def _substantial(key: str) -> bool:
+                return (" " in key or len(key) >= 6) and not _generic_company_name(key)
+
+            def _product_of(db_key: str) -> bool:
+                # "Amazon DynamoDB" must not validate as the employer "Amazon":
+                # when the employer is the shorter side, the leftover words
+                # have to be corporate noise, not a product name.
+                if len(db_key) >= len(company_key):
+                    return False
+                leftover = [t for t in re.split(r"[^a-z0-9]+", company_key.replace(db_key, " ")) if t]
+                return any(t not in _CORPORATE_NOISE_TOKENS for t in leftover)
             matched_name = next(
                 (
                     db_name for db_key, db_name in lookup.items()
-                    if db_key != exclude_key and _company_matches(db_name, company_text)
+                    if db_key != exclude_key and _substantial(min(db_key, company_key, key=len))
+                    and _company_matches(db_name, company_text) and not _product_of(db_key)
                 ),
                 "",
             )
@@ -2957,6 +3047,24 @@ def _company_fact_targets(criteria: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _parse_cache_timestamp(value: Any) -> Optional[datetime]:
+    """ISO-8601 as written by the cache ('2026-09-25T20:10:00Z'), naive UTC.
+    _shortlist_parse_date is a *role date* parser and reads that string as
+    2026-01-01, which made every entry look months old: the web research
+    re-ran on every query (≈$0.10 each) and returned a different competitor
+    list each time."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def _cached_company_facts_for_criteria(criteria: Dict[str, Any]) -> Dict[str, Any]:
     cache = _load_shortlist_company_fact_cache()
     competitors: List[Dict[str, Any]] = []
@@ -2966,6 +3074,14 @@ def _cached_company_facts_for_criteria(criteria: Dict[str, Any]) -> Dict[str, An
         cached = cache.get(_shortlist_company_cache_key(target))
         if not isinstance(cached, dict):
             continue
+        # Competitor landscapes move; a cached entry never expired before, so
+        # the first answer ever fetched for a company was the answer forever.
+        verified_raw = cached.get("last_verified_at") or cached.get("cached_at")
+        verified_at = _parse_cache_timestamp(verified_raw)
+        if verified_at is not None and (datetime.utcnow() - verified_at).days > SHORTLIST_COMPANY_FACT_TTL_DAYS:
+            continue
+        if cached.get("competitors") and int(cached.get("prompt_version") or 0) < SHORTLIST_COMPANY_FACT_PROMPT_VERSION:
+            continue  # fetched with the old prompt (8 product names, no aliases) — research again
         target_name = cached.get("target") or target
         comps = cached.get("competitors") or []
         if comps:
@@ -2995,6 +3111,320 @@ def _cached_company_facts_for_criteria(criteria: Dict[str, Any]) -> Dict[str, An
     return out
 
 
+def _company_entry_aliases(entry: Any) -> List[str]:
+    """Former names / rebrands the research step attached to a competitor."""
+    if not isinstance(entry, dict):
+        return []
+    raw = entry.get("aliases") or entry.get("former_names") or entry.get("also_known_as") or []
+    if isinstance(raw, str):
+        raw = re.split(r"[,;|]", raw)
+    seen, out = set(), []
+    for alias in raw if isinstance(raw, list) else []:
+        text = str(alias or "").strip()
+        key = _normalize_company_key(text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def _company_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Cache shape: {"name": ..., "aliases": [...]} (older entries were bare strings)."""
+    name = _company_entry_name(entry)
+    if not name:
+        return None
+    return {"name": name, "aliases": _company_entry_aliases(entry)}
+
+
+_GENERIC_COMPANY_TOKENS = {
+    "software", "testing", "test", "tests", "automation", "platform", "cloud", "ai", "web", "data", "solutions",
+    "solution", "services", "service", "group", "labs", "lab", "systems", "system", "digital", "global", "india",
+    "international", "consulting", "enterprise", "enterprises", "company", "co", "the", "and", "of", "tools", "tool",
+    "studio", "suite", "api", "mobile", "app", "apps", "quality", "qa", "engineering", "products", "product", "tech",
+    "network", "networks", "security", "analytics", "intelligence", "smart", "functional", "performance", "management",
+    "sales", "marketing", "media", "online", "it", "saas", "b2b", "startup", "ventures", "partners", "capital",
+    "healthcare", "health", "staffing", "recruitment", "recruiting", "hr", "holdings", "industries", "labs", "innovations",
+    "infotech", "info", "private", "limited", "llp", "pvt", "ltd",
+}
+
+
+_CORPORATE_NOISE_TOKENS = {
+    "inc", "corp", "corporation", "co", "company", "ltd", "limited", "llc", "llp", "plc", "pvt", "private", "group",
+    "holdings", "labs", "india", "global", "international", "worldwide", "solutions", "systems", "technologies",
+    "technology", "software", "tech", "io", "com", "ai", "hq", "the", "and", "of", "official", "careers", "uk", "us", "usa",
+}
+
+
+def _generic_company_name(value: Any) -> bool:
+    """Alias hygiene only: 'Test Automation' or 'AI Platform' offered as an
+    *alias* would tag every QA vendor, and aliases never reach the judge
+    model. Whether a listed company *name* is a real employer is the judge's
+    call (it is told to exclude anything it does not know)."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", _normalize_company_key(value)) if t]
+    return not tokens or all(t in _GENERIC_COMPANY_TOKENS for t in tokens)
+
+
+_REBRAND_PATTERNS = (
+    re.compile(r"^(?P<old>.+?)\s+(?:is|are)\s+now\s+(?P<new>.+)$", re.I),
+    re.compile(r"^(?P<new>.+?)\s*\((?:formerly|previously|earlier|fka|f\.k\.a\.?)\s+(?P<old>[^)]+)\)$", re.I),
+    re.compile(r"^(?P<old>.+?)\s*\(now\s+(?P<new>[^)]+)\)$", re.I),
+    re.compile(r"^(?P<new>.+?),\s*(?:formerly|previously)\s+(?P<old>.+)$", re.I),
+    re.compile(r"^(?P<old>.+?),\s*now\s+(?P<new>.+)$", re.I),
+    re.compile(r"^(?P<old>.+?)\s*(?:→|->)\s*(?P<new>.+)$"),
+)
+_rebrand_alias_cache: Dict[int, Dict[str, Set[str]]] = {}
+
+
+def _rebrand_aliases_from_employers() -> Dict[str, Set[str]]:
+    """Rebrands recorded by the candidates themselves: employer strings such
+    as "LambdaTest is now TestMu AI", "Micro Focus (formerly HP)",
+    "Cordys is now OpenText". Both names become aliases of each other, so a
+    competitor list naming the new brand still matches profiles that carry
+    the old one — without depending on the research model remembering it."""
+    stamp = len(PROFILES_BY_ID)
+    cached = _rebrand_alias_cache.get(stamp)
+    if cached is not None:
+        return cached
+    graph: Dict[str, Set[str]] = {}
+    for raw in _known_employer_names():
+        text = str(raw or "").strip()
+        for pattern in _REBRAND_PATTERNS:
+            m = pattern.match(text)
+            if not m:
+                continue
+            names = []
+            for part in (m.group("old"), m.group("new")):
+                part = re.sub(r"^\s*(?:the|a)\s+", "", part.strip(" .,-"), flags=re.I)
+                part = re.split(r"\s*(?:/|\bor\b|\band\b|&)\s*", part)[0].strip(" .,-")
+                key = _normalize_company_key(part)
+                if key and len(key) >= 4 and not _generic_company_name(part):
+                    names.append(part)
+            if len(names) == 2:
+                a, b = names
+                graph.setdefault(_normalize_company_key(a), set()).add(b)
+                graph.setdefault(_normalize_company_key(b), set()).add(a)
+            break
+    _rebrand_alias_cache.clear()
+    _rebrand_alias_cache[stamp] = graph
+    return graph
+
+
+def _reverse_competitors_from_cache(target: str) -> List[Dict[str, Any]]:
+    """Competition is symmetric: every cached company whose researched list
+    names the target is a competitor of the target. Testsigma's list names
+    BrowserStack, so a "BrowserStack competitor" screen gets Testsigma even
+    when BrowserStack's own research page forgot it."""
+    out: List[Dict[str, Any]] = []
+    for key, cached in _load_shortlist_company_fact_cache().items():
+        if not isinstance(cached, dict) or int(cached.get("prompt_version") or 0) < SHORTLIST_COMPANY_FACT_PROMPT_VERSION:
+            continue
+        other = str(cached.get("target") or key).strip()
+        if not other or _company_matches(other, target):
+            continue
+        for entry in cached.get("competitors") or []:
+            name = _company_entry_name(entry)
+            if name and (_company_matches(name, target) or any(_company_matches(a, target) for a in _company_entry_aliases(entry))):
+                out.append({"name": other, "aliases": [], "source": "reverse"})
+                break
+    return out
+
+
+def _validate_competitor_entries(entries: List[Any], *, exclude: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Map researched competitors onto employer names we actually hold. A
+    competitor is kept when its name OR any alias is an employer in the
+    candidate data (TestMu AI matches the AEs whose sheet says LambdaTest);
+    the returned item carries every name so the strict matcher accepts all.
+    Names nobody in the data works at are dropped — they cannot match."""
+    rebrands = _rebrand_aliases_from_employers()
+    validated: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in entries:
+        name = _company_entry_name(entry)
+        # "Hevo Data" is not a competitor of Hevo: containment, not equality.
+        if not name or (exclude and _company_matches(name, exclude)):
+            continue
+        aliases = [a for a in _company_entry_aliases(entry) if not _generic_company_name(a)]
+        # Product names ("SmartBear ReadyAPI") add nothing the company name
+        # does not already match, and they are where the junk lives.
+        aliases = [a for a in aliases if not _company_matches(a, name)]
+        for candidate in [name, *aliases]:
+            aliases.extend(rebrands.get(_normalize_company_key(candidate), ()))
+        db_names = _validate_company_names_against_db([name, *aliases], exclude=exclude)
+        if not db_names:
+            continue
+        primary = db_names[0]
+        key = _normalize_company_key(primary)
+        if key in seen or (exclude and _company_matches(primary, exclude)):
+            continue
+        seen.add(key)
+        # Match terms: the web name plus every alias that is an employer we
+        # hold (or a recorded rebrand) — never an unverified free-text alias.
+        keep = [name, *db_names[1:]]
+        keep += [a for a in aliases if any(_company_matches(a, d) for d in db_names) or _normalize_company_key(a) in rebrands]
+        extra = {a for a in keep if _normalize_company_key(a) != key and not _generic_company_name(a)}
+        validated.append({"company": primary, "aliases": sorted(extra, key=str.lower)})
+    return validated
+
+
+def _role_scope_employer_names(role_id: Optional[int], screening_r: str, screening_user_id: Optional[int]) -> List[str]:
+    """Employers of the candidates attached to the role being screened."""
+    if not role_id:
+        return []
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            if screening_r == "recruiter" and screening_user_id is not None:
+                cur.execute("SELECT id FROM recruitment_roles WHERE id = %s AND user_id = %s", (int(role_id), screening_user_id))
+            else:
+                cur.execute("SELECT id FROM recruitment_roles WHERE id = %s", (int(role_id),))
+            if not cur.fetchone():
+                return []
+            cur.execute("SELECT candidate_id FROM recruitment_role_candidates WHERE role_id = %s", (int(role_id),))
+            ids = [int(row[0]) for row in cur.fetchall() if row and row[0] is not None]
+    except Exception:
+        logger.debug("scope employer scan failed", exc_info=True)
+        return []
+    finally:
+        return_db_connection(conn)
+    names = employer_names_from_profiles(PROFILES_BY_ID[i] for i in ids if i in PROFILES_BY_ID)
+    return sorted(names, key=str.lower)
+
+
+def _pick_competitor_list(structured: Dict[str, Any]) -> List[Any]:
+    """The model names the list 'competitors', 'key_competitors',
+    'direct_competitors', 'companies'… take the first competitor-ish list."""
+    for key in ("competitors", "companies"):
+        if isinstance(structured.get(key), list):
+            return structured[key]
+    for key, value in structured.items():
+        if isinstance(value, list) and re.search(r"compet|compan|vendor|rival", str(key), re.I):
+            return value
+    for value in structured.values():
+        if isinstance(value, list) and value and all(isinstance(v, dict) and v.get("name") for v in value[:3]):
+            return value
+    return []
+
+
+async def _web_competitor_names_fallback(target: str, query: str, tracker: TokenCostTracker) -> List[str]:
+    """Plain web call: the competitor names of one company, nothing else."""
+    hints = _target_disambiguation_hints([target])
+    # No word about recruiting anywhere in this prompt: with "for a recruiting
+    # team's screening tool" in the text, the web model answered "MongoDB
+    # competitors" with X0PA AI, Talsense and ScalerHire.
+    system_prompt = (
+        "You are a market analyst. Identify the current direct competitors of one company using live web knowledge. "
+        "When the company name is ambiguous, the 'employer name(s) in our data' and headline hints identify which company is meant. "
+        "Return JSON only with key competitors: a list of objects with name (the company name as used on LinkedIn, "
+        "never a product name) and aliases (former names / rebrands). Direct competitors only — same product "
+        "category and buyer; never platforms the company integrates with, tests or sells into. Up to 30 companies."
+    )
+    user_prompt = (
+        f"Company: {target}\n"
+        + (f"Hints:\n{hints}\n" if hints else "")
+        + "JSON only."
+    )
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json, system_prompt, user_prompt,
+            model=SCREENING_REASONING_MODEL, use_web=True, web_search_tool=SCREENING_WEB_SEARCH_TOOL,
+            web_search_context_size=SCREENING_WEB_SEARCH_CONTEXT_SIZE, temperature=0.0, timeout=90.0,
+        )
+        tracker.add_usage(SCREENING_REASONING_MODEL, f"{system_prompt}\n\n{user_prompt}", json.dumps(structured), "Competitor Web Identification")
+    except Exception as e:
+        logger.warning("Competitor web identification failed for %s: %s", target, e)
+        return []
+    if not isinstance(structured, dict):
+        return []
+    raw = _pick_competitor_list(structured)
+    names = [n for n in (_company_entry_name(item) for item in (raw if isinstance(raw, list) else [])) if n]
+    for item in raw if isinstance(raw, list) else []:
+        names.extend(_company_entry_aliases(item))
+    return names
+
+
+async def _judge_competitors(
+    target: str,
+    product_service: Any,
+    web_entries: List[Dict[str, Any]],
+    scope_names: List[str],
+    tracker: TokenCostTracker,
+) -> List[Dict[str, Any]]:
+    """One model call decides, per employer name, whether it is a direct
+    competitor of the target. Input is the validated web list plus the
+    employers of the role's own candidates, so a competitor the web page
+    forgot (testRigor) is still found, and a web hallucination (Salesforce
+    as a Testsigma competitor because Testsigma tests Salesforce apps) is
+    dropped. Returns web entries (with aliases) that passed, then scope-only
+    names as new entries. On any failure the web list is returned unchanged."""
+    by_key: Dict[str, Dict[str, Any]] = {_normalize_company_key(e["company"]): e for e in web_entries}
+    scope_only = [n for n in scope_names if _normalize_company_key(n) not in by_key and not _company_matches(n, target)]
+    if not scope_only and not web_entries:
+        return web_entries
+    names = [e["company"] for e in web_entries] + scope_only[: max(0, SCREENING_COMPETITOR_JUDGE_MAX_NAMES - len(web_entries))]
+    if not names:
+        return web_entries
+    system_prompt = (
+        "You classify employers for a recruiting search. Given a target company and a list of employer names, "
+        "return the names that are direct competitors of the target: companies whose primary product or service is "
+        "in the same category and sold to the same kind of buyer. Customers, partners, platforms the target integrates "
+        "with or tests, consultancies and adjacent categories are not competitors. Rebrands and former names of a "
+        "competitor count. Skip entries that are not a company (a product category, a job title, a headline fragment). "
+        "Skip companies you do not know. "
+        "Return valid JSON only: {\"competitors\": [{\"name\": <exact name from the list>, "
+        "\"confidence\": \"high\"|\"medium\"|\"low\", \"reason\": <short>}]}."
+    )
+    user_prompt = (
+        f"Target company: {target}\n"
+        f"Target product/service: {product_service or 'unknown'}\n\n"
+        f"Employer names:\n" + "\n".join(f"- {n}" for n in names) + "\n\nJSON only."
+    )
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json, system_prompt, user_prompt,
+            model=SCREENING_COMPETITOR_JUDGE_MODEL, use_web=False, temperature=0.0, timeout=90.0,
+        )
+        tracker.add_usage(SCREENING_COMPETITOR_JUDGE_MODEL, f"{system_prompt}\n\n{user_prompt}",
+                          json.dumps(structured, ensure_ascii=False, default=str), "Competitor Judge")
+    except Exception as e:
+        logger.warning("Competitor judge failed for %s: %s", target, e)
+        return web_entries
+    if not isinstance(structured, dict):
+        return web_entries
+    # Additive only. A web-researched competitor that also exists as an
+    # employer in our data has two signals behind it; this model rejected
+    # BrowserStack as a Testsigma competitor "with high confidence" on one
+    # run and kept it on the next, so it never removes a web entry. It adds
+    # employers from the role's own candidates it is confident about.
+    accepted: Dict[str, str] = {}
+    for item in structured.get("competitors") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _company_entry_name(item)
+        key = _normalize_company_key(name)
+        # Recall first: a medium-confidence "yes" on an employer that is
+        # already in the role is worth showing (the recruiter sees the list).
+        if key and not _company_matches(name, target) and str(item.get("confidence") or "high").strip().lower() in {"high", "medium"}:
+            accepted[key] = name
+    # Never removes a web entry. A web-researched competitor that is also an
+    # employer in our data has two signals behind it, and the model's idea
+    # of "direct competitor" is narrower than a recruiter's: gpt-4o rejected
+    # BrowserStack as a Testsigma competitor with high confidence on three
+    # separate runs. Hallucinated entries are kept out at the research step
+    # (its prompt excludes integrations, test targets and customers).
+    kept = list(web_entries)
+    listed = {_normalize_company_key(n): n for n in names}
+    rebrands = _rebrand_aliases_from_employers()
+    for key, original in listed.items():
+        if key in accepted and key not in by_key:
+            kept.append({"company": original, "aliases": sorted(rebrands.get(key, set()), key=str.lower), "source": "scope"})
+    dropped: List[str] = []
+    logger.info("SHORTLIST competitor_judge target=%s kept=%s dropped_web=%s added_scope=%s",
+                target, [e["company"] for e in kept], dropped, [e["company"] for e in kept if e.get("source") == "scope"])
+    return kept
+
+
 def _company_entry_name(entry: Any) -> str:
     """Company lists from the LLM may hold plain names, dicts, or (from older
     cache writes) stringified dicts — always reduce to the company name."""
@@ -3011,6 +3441,86 @@ def _company_entry_name(entry: Any) -> str:
                 continue
         return ""
     return text
+
+
+def _target_disambiguation_hints(targets: List[str], *, max_headlines: int = 4) -> str:
+    """"Hevo" alone was researched as a staffing firm. Our own data knows
+    better: the employer string candidates typed ("Hevo Data") and a few of
+    their headlines ("Account Executive - data pipelines") pin the company."""
+    lines: List[str] = []
+    for target in targets:
+        if not str(target or "").strip():
+            continue
+        names: Set[str] = set()
+        headlines: List[str] = []
+        for profile in PROFILES_BY_ID.values():
+            raw = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+            employer = str(raw.get("import_company") or "").strip()
+            role_companies = [str(r.get("company") or "") for r in (profile.get("roles") or []) if isinstance(r, dict)]
+            hit = next((n for n in [employer, *role_companies] if n and _company_matches(n, target)), None)
+            if not hit:
+                continue
+            names.add(hit)
+            headline = str(profile.get("headline") or "").strip()
+            if headline and len(headlines) < max_headlines and _term_matches_text(target, _normalize_search_text(headline)):
+                headlines.append(headline[:120])
+        if names or headlines:
+            lines.append(
+                f"- {target}: employer name(s) in our data: {', '.join(sorted(names)[:5]) or 'n/a'}; "
+                f"candidate headlines: {' | '.join(headlines) or 'n/a'}"
+            )
+    return "\n".join(lines)
+
+
+def _regroup_competitor_entries(competitors: Any, requested_targets: List[str]) -> List[Dict[str, Any]]:
+    """The research model answers in two shapes: grouped
+    ``{"target": "Hevo", "companies": [...]}`` or one entry per competitor
+    ``{"target": "Airbyte", "companies": ["Airbyte, Inc."]}``. The latter
+    used to be skipped (target != Hevo) and then cached under "airbyte" —
+    which is how the cache grew keys like google, oracle, salesforce. Fold
+    per-company entries into the requested target's list."""
+    if not isinstance(competitors, list):
+        return []
+    requested = [t for t in requested_targets if str(t or "").strip()]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    strays: List[Dict[str, Any]] = []
+    for item in competitors:
+        if not isinstance(item, dict):
+            continue
+        item_target = str(item.get("target") or "").strip()
+        matched = next((t for t in requested if item_target and _company_matches(item_target, t)), None)
+        if matched:
+            key = _normalize_company_key(matched)
+            if key not in grouped:
+                grouped[key] = {**item, "target": matched, "companies": []}
+                order.append(key)
+            raw = item.get("companies") or item.get("competitors") or []
+            if isinstance(raw, str):
+                raw = re.split(r"[,;|]", raw)
+            grouped[key]["companies"].extend(entry for entry in (_company_entry(c) for c in raw) if entry)
+            continue
+        # Per-company entry: the "target" (or name) is the competitor itself.
+        name = str(item.get("name") or item_target).strip()
+        if not name:
+            continue
+        raw = item.get("companies") or []
+        if isinstance(raw, str):
+            raw = re.split(r"[,;|]", raw)
+        aliases = [a for a in (_company_entry_name(c) for c in raw) if a and _normalize_company_key(a) != _normalize_company_key(name)]
+        aliases += _company_entry_aliases(item)
+        strays.append({"name": name, "aliases": aliases, "sources": item.get("sources") or []})
+    if strays and len(requested) == 1:
+        key = _normalize_company_key(requested[0])
+        if key not in grouped:
+            grouped[key] = {"target": requested[0], "companies": [], "sources": []}
+            order.append(key)
+        grouped[key]["companies"].extend({"name": s["name"], "aliases": s["aliases"]} for s in strays)
+        for stray in strays:
+            for src in stray["sources"] if isinstance(stray["sources"], list) else []:
+                if src not in grouped[key].setdefault("sources", []):
+                    grouped[key]["sources"].append(src)
+    return [grouped[k] for k in order]
 
 
 def _cache_company_facts_from_structured(criteria: Dict[str, Any], structured: Dict[str, Any]) -> None:
@@ -3037,14 +3547,25 @@ def _cache_company_facts_from_structured(criteria: Dict[str, Any], structured: D
         companies = item.get("companies") or item.get("competitors") or []
         if isinstance(companies, str):
             companies = re.split(r"[,;|]", companies)
-        companies = [name for name in (_company_entry_name(company) for company in companies) if name][:50]
+        companies = [entry for entry in (_company_entry(company) for company in companies) if entry]
         cached = cache.get(key) if isinstance(cache.get(key), dict) else {}
+        if int(cached.get("prompt_version") or 0) >= SHORTLIST_COMPANY_FACT_PROMPT_VERSION:
+            # Research answers differ run to run; union them so the list only
+            # grows (the judge pass prunes non-competitors at query time).
+            known_keys = {_normalize_company_key(e["name"]) for e in companies}
+            for prior in cached.get("competitors") or []:
+                prior_entry = _company_entry(prior)
+                if prior_entry and _normalize_company_key(prior_entry["name"]) not in known_keys:
+                    companies.append(prior_entry)
+                    known_keys.add(_normalize_company_key(prior_entry["name"]))
+        companies = companies[:50]
         profile = profiles_by_key.get(key, {})
         cache[key] = {
             **cached,
             **profile,
             "target": target,
             "competitors": companies,
+            "prompt_version": SHORTLIST_COMPANY_FACT_PROMPT_VERSION,
             "similar_companies": item.get("similar_companies") or cached.get("similar_companies") or [],
             "sources": item.get("sources") or profile.get("sources") or cached.get("sources") or [],
             "last_verified_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -3107,7 +3628,12 @@ def _score_competitor_criteria(profile: Dict[str, Any], criteria: Dict[str, Any]
         raw_companies = item.get("companies") or item.get("competitors") or item.get("competitor_companies") or []
         if isinstance(raw_companies, str):
             raw_companies = re.split(r"[,;|]", raw_companies)
-        competitor_companies = [str(company).strip() for company in raw_companies if str(company or "").strip()]
+        competitor_companies = []
+        for company in raw_companies:
+            name = _company_entry_name(company)
+            if name:
+                competitor_companies.append(name)
+                competitor_companies.extend(_company_entry_aliases(company))
         scope = _normalize_search_text(item.get("employment_scope") or item.get("scope") or "current_employer")
         current_only = scope not in {"any_employer", "past_or_current", "worked_at", "worked_with", "all_roles"}
 
@@ -3454,7 +3980,7 @@ def _score_hiring_company_relevance(profile: Dict[str, Any], criteria: Dict[str,
             target = str(item.get("target") or "").strip()
             if target and not any(_company_matches(target, wanted) for wanted in targets):
                 continue
-            relevant_companies.extend(str(company) for company in (item.get("companies") or []) if str(company or "").strip())
+            relevant_companies.extend(name for name in (_company_entry_name(company) for company in (item.get("companies") or [])) if name)
 
     if not relevant_companies:
         return 1.2, 0.0, [], [{
@@ -3494,6 +4020,30 @@ def score_candidate_against_criteria(profile: Dict[str, Any], criteria: Dict[str
     calculated_experience: Dict[str, Any] = {}
     total_weight = 0.0
     earned_weight = 0.0
+
+    max_notice_days = criteria.get("max_notice_period_days")
+    if max_notice_days is not None:
+        raw_fields = profile_copy.get("raw_fields") if isinstance(profile_copy.get("raw_fields"), dict) else {}
+        notice_key, notice_days = None, None
+        for key, value in raw_fields.items():
+            if _NOTICE_FIELD_RE.search(str(key)):
+                parsed = _notice_period_days(value)
+                if parsed is not None:
+                    notice_key, notice_days = str(key), parsed
+                    break
+        if notice_days is None or notice_days > float(max_notice_days):
+            reject("max_notice_period_days")
+            return None
+        score_parts.append(1.0)
+        label = "Immediate" if notice_days == 0 else f"{notice_days:g} days"
+        matched_criteria.append({"criterion": "Notice period", "value": label})
+        evidence_log.append({
+            "criterion": "Notice period",
+            "value": f"<= {float(max_notice_days):g} days",
+            "source": "uploaded field",
+            "snippet": f"{notice_key}: {raw_fields.get(notice_key)}",
+            "source_text": f"{notice_key}: {raw_fields.get(notice_key)}",
+        })
 
     min_total_exp = criteria.get("min_total_experience")
     if min_total_exp is not None:
@@ -3790,6 +4340,73 @@ def _audit_output_is_evidence_valid(profile: Dict[str, Any], payload: Any) -> bo
     return bool(text.strip())
 
 
+_AUDIT_STOPWORDS = {"required", "min", "max", "in", "of", "n", "the", "a", "and", "or", "for", "with", "at", "to", "is", "not",
+                    "no", "years", "year", "criteria", "criterion", "requirement", "evidence", "candidate", "last", "latest",
+                    # too generic to tie a rejection to a criterion: "Role experience" must not
+                    # count as min_total_experience just because both say "experience".
+                    "experience", "exper", "role", "roles", "current", "specific", "specifically", "as", "an"}
+_AUDIT_TENURE_KEYS = ("tenure", "experience", "years", "duration")
+_STRUCTURED_EVIDENCE_SOURCE_RE = re.compile(
+    r"^(?:role \d+ (?:company|title|dates|company details)|role company|headline|uploaded field|candidate location"
+    r"|role/company geography|enriched profile geography|profile|web company profile)$"
+)
+
+
+def _audit_tokens(text: Any) -> set:
+    """Word stems (first 5 letters) so 'geography' meets 'geographies' and
+    'company' meets 'companies'."""
+    out = set()
+    for token in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        if token and token not in _AUDIT_STOPWORDS:
+            out.add(token[:5] if len(token) > 5 else token)
+    return out
+
+
+def _audit_rejection_is_grounded(review: Dict[str, Any], original_criteria: Dict[str, Any], profile: Dict[str, Any]) -> bool:
+    """A not_verified verdict counts only when it names a requirement the
+    query actually has. gpt-4o-mini rejected 46 of 51 deterministic matches
+    on "at a Testsigma competitor" for "duration of current role not
+    specified" — the query never asked for a duration; the sheet just has no
+    dates. Such a verdict is the auditor inventing criteria, not auditing.
+    A rejection that cites nothing at all is likewise ungrounded."""
+    criterion_keys = [k for k in (original_criteria or {}).keys() if not str(k).startswith("_")]
+    allowed = set()
+    for key in criterion_keys:
+        allowed |= _audit_tokens(key)
+        label = TEXT_CRITERIA_CONFIG.get(key, {}).get("label") if isinstance(TEXT_CRITERIA_CONFIG, dict) else None
+        if label:
+            allowed |= _audit_tokens(label)
+    for item in profile.get("missing_criteria") or []:
+        allowed |= _audit_tokens(item.get("criterion") if isinstance(item, dict) else item)
+    has_tenure_criterion = any(any(t in key for t in _AUDIT_TENURE_KEYS) for key in criterion_keys)
+    if has_tenure_criterion:
+        allowed |= {"tenur", "durat", "years", "date", "start", "end", "exper"}
+    missing = review.get("missing_criteria") if isinstance(review.get("missing_criteria"), list) else []
+    named = [m for m in missing if str(m or "").strip()]
+    if not named:
+        return False
+    # Structured evidence is not the auditor's to overrule: a role company,
+    # a title, an uploaded column, a location field. It may still reject a
+    # match that rests only on loose free text ("profile text", "about").
+    evidence = [e for e in (profile.get("evidence_log") or []) if isinstance(e, dict)]
+    settled = 0
+    for m in named:
+        m_tokens = _audit_tokens(m)
+        related = [e for e in evidence if _audit_tokens(e.get("criterion")) & m_tokens]
+        if related and all(_STRUCTURED_EVIDENCE_SOURCE_RE.match(str(e.get("source") or "")) for e in related):
+            settled += 1
+    if settled == len(named):
+        return False
+    if not has_tenure_criterion:
+        # "The headline indicates enterprise segment (ev1) but there is no
+        # duration or specific roles confirming it" names a real criterion
+        # while rejecting for a tenure the query never asked about.
+        reasoning = " ".join(str(review.get(k) or "") for k in ("reasoning", "answer")).lower()
+        if re.search(r"\b(?:duration|tenure|how long|length of|start|end)\b|\bdates?\b|\byears?\b", reasoning):
+            return False
+    return any(_audit_tokens(m) & allowed for m in named)
+
+
 def _fallback_audit_payload_from_evidence(profile: Dict[str, Any]) -> Dict[str, Any]:
     """Used when the evidence audit fails or returns an unusable answer.
 
@@ -3979,8 +4596,9 @@ def _dynamic_retrieval_terms(original_query: str, criteria: Dict[str, Any]) -> L
     for item in web_facts.get("competitors") or []:
         if isinstance(item, dict):
             for company in item.get("companies") or []:
-                if str(company or "").strip():
-                    terms.add(_normalize_search_text(company))
+                for name in [_company_entry_name(company), *_company_entry_aliases(company)]:
+                    if name:
+                        terms.add(_normalize_search_text(name))
     return sorted(term for term in terms if term)
 
 
@@ -3991,7 +4609,7 @@ def _dynamic_company_fact_names(criteria: Dict[str, Any], fact_key: str) -> List
         if not isinstance(item, dict):
             continue
         if fact_key in {"competitors", "similar_companies"}:
-            names.extend(str(company) for company in (item.get("companies") or []) if str(company or "").strip())
+            names.extend(name for name in (_company_entry_name(company) for company in (item.get("companies") or [])) if name)
         else:
             company = str(item.get("company") or item.get("name") or "").strip()
             if company:
@@ -4106,7 +4724,8 @@ def _merge_web_company_facts(criteria: Dict[str, Any], structured: Dict[str, Any
             companies = item.get("companies") or item.get("competitors") or []
             if isinstance(companies, str):
                 companies = re.split(r"[,;|]", companies)
-            companies = [str(company).strip() for company in companies if str(company or "").strip()][:50]
+            # Keep {name, aliases} objects intact; bare strings stay strings.
+            companies = [company for company in companies if _company_entry_name(company)][:50]
             sources = item.get("sources") if isinstance(item.get("sources"), list) else []
             next_item = dict(item)
             next_item.update({
@@ -4148,12 +4767,21 @@ async def enrich_criteria_with_company_web_facts(
         if requested_targets and requested_targets.issubset(cached_targets):
             return criteria
 
+    hints = _target_disambiguation_hints(_company_fact_targets(criteria))
     system_prompt = (
-        "You are a company research assistant for recruiting search. Resolve only company-level facts needed by the query. "
+        "You are a market analyst resolving company-level facts. The targets are companies whose competitors and "
+        "profile we need; resolve only company-level facts needed by the criteria. "
+        "When a target name is ambiguous, use the 'employer name(s) in our data' hints to pick the right company. "
         "Use web evidence when available. Do not infer or create candidate career facts. "
         "Return valid JSON only with keys: competitors, similar_companies, company_profiles, funding, geography, notes. "
         "competitors must be a list of objects with target, companies, sources, product_service, customer_segment, customer_presence. "
-        "For each hiring_company or competitor_of target, return up to the top 50 closest competitors with similar product/service and buyer segment. "
+        "For each hiring_company or competitor_of target, return up to the top 50 closest competitors with similar product/service and buyer segment "
+        "(direct competitors only — never platforms the target integrates with, tests or sells into, and never its customers); "
+        "list at least 15 when the category has that many (include well-funded startups, not only large vendors). "
+        "Each entry in companies is an object {name, aliases}: name is the COMPANY (employer) name as it appears on LinkedIn, never a product name "
+        "(SmartBear, not SmartBear ReadyAPI; Tricentis, not Tricentis Tosca; UiPath, not UiPath Test Cloud). "
+        "aliases lists former names, rebrands, parent/child brand names and common spellings the company has been known by "
+        "(e.g. TestMu AI was LambdaTest; Micro Focus is now OpenText). Aliases matter: candidates' profiles carry the name used at the time. "
         "similar_companies must list non-direct competitors with similar product/service, segment, geography, funding, or culture when sources support it. "
         "company_profiles must include target/company, product_service, customer_segment, customer_presence, funding_stage, revenue, culture_type, headquarters, sources. "
         "funding must be a list of objects with company, stage/status, sources. "
@@ -4161,9 +4789,10 @@ async def enrich_criteria_with_company_web_facts(
         "Every source must include a non-empty url, title, and note. Omit facts that do not have reliable source URLs."
     )
     user_prompt = (
-        f"Recruiting query:\n{original_query}\n\n"
+        f"Screening query (context only):\n{original_query}\n\n"
         f"Extracted structured criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
-        "Resolve competitor_of and hiring_company targets dynamically. Prefer direct competitor/category pages or reputable company/research sources. "
+        + (f"Targets as seen in our data:\n{hints}\n\n" if hints else "")
+        + "Resolve competitor_of and hiring_company targets dynamically. Prefer direct competitor/category pages or reputable company/research sources. "
         "Do not use a hardcoded taxonomy. Company facts may come from the web; candidate facts must not. Return JSON only."
     )
     try:
@@ -4184,6 +4813,11 @@ async def enrich_criteria_with_company_web_facts(
         return criteria
 
     if isinstance(structured, dict):
+        if not isinstance(structured.get("competitors"), list):
+            picked = _pick_competitor_list(structured)
+            if picked:
+                structured["competitors"] = [{"target": t, "companies": picked} for t in _company_fact_targets(criteria)[:1]] or picked
+        structured["competitors"] = _regroup_competitor_entries(structured.get("competitors"), _company_fact_targets(criteria))
         _cache_company_facts_from_structured(criteria, structured)
     return _merge_web_company_facts(criteria, structured if isinstance(structured, dict) else {})
 
@@ -5047,6 +5681,32 @@ def _profile_location_text(profile: Dict[str, Any]) -> str:
     return " ".join(_flatten_value_for_evidence(location_bits, max_items=20)).lower()
 
 
+_SELLING_FIELD_RE = re.compile(
+    r"segment|market|industry|industries|vertical|domain|customer|client|deal|acv|arr|quota|sold|selling|sales|persona|buyer|territory|geo"
+    r"|summary|about|profile|bio|resume|experience|extra",
+    re.I,
+)
+
+
+def _profile_selling_text(profile: Dict[str, Any]) -> str:
+    """Headline, titles, role details, summary and the uploaded columns that
+    describe whom the candidate sold to — not the whole record, so a
+    'Reasoning: not enterprise' note cannot satisfy 'enterprise'."""
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    parts: List[str] = [str(profile.get("headline") or ""), str(profile.get("about") or "")]
+    for role in profile.get("roles") or []:
+        if isinstance(role, dict):
+            parts.append(str(role.get("title") or ""))
+            parts.append(str(role.get("details") or ""))
+    for key, value in raw_fields.items():
+        if value in (None, "") or not _SELLING_FIELD_RE.search(str(key)):
+            continue
+        if re.search(r"reason|note|comment|remark|feedback|status", str(key), re.I):
+            continue
+        parts.append(f"{key}: {value}")
+    return _normalize_search_text(" ".join(part for part in parts if part))
+
+
 def _profile_general_text(profile: Dict[str, Any]) -> str:
     raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
     role_text = []
@@ -5117,6 +5777,17 @@ def _strict_presence_result(
                 if matched_company:
                     found = ("role company", role_company, role, role_company)
                     break
+            if not found and not current_only:
+                # Employer history also lives in free text ("Previously at
+                # LambdaTest" in a summary or headline). Any-employer scope
+                # only: a mention is not evidence of the *current* employer.
+                general_text = _profile_general_text(profile)
+                term = next(
+                    (t for t in terms if len(_normalize_company_key(t)) >= 4 and _term_matches_text(t, general_text)),
+                    None,
+                )
+                if term:
+                    found = ("profile text", _evidence_snippet(general_text, term), None, general_text)
         elif criteria_key == "required_locations":
             location_text = _profile_location_text(profile)
             term = next((term for term in terms if _term_matches_text(term, location_text)), None)
@@ -5171,6 +5842,17 @@ def _strict_presence_result(
                     if term:
                         found = ("web company profile", _evidence_snippet(web_text, term), role, web_text)
                         break
+            if not found and criteria_key == "required_segments":
+                # "Enterprise segment experience" is about who the candidate
+                # sold to: an "Enterprise Account Executive" title or a
+                # "Segment: Mid-Market" column. company_details exist for the
+                # 5 of 680 people with a roles row; without this the criterion
+                # matched nobody. Industries stay an employer attribute — a
+                # fintech *customer* does not make the employer a fintech.
+                selling_text = _profile_selling_text(profile)
+                term = next((term for term in terms if _term_matches_text(term, selling_text)), None)
+                if term:
+                    found = ("candidate selling record", _evidence_snippet(selling_text, term), None, selling_text)
         else:
             chunks = build_profile_evidence_chunks(profile)
             for chunk in chunks:
@@ -5197,11 +5879,14 @@ def _strict_presence_result(
             missing.append(value)
 
     met = len(matched) == len(values) if operator == "AND" else bool(matched)
+    # An OR list is satisfied by any one value: "at a Testsigma competitor" is
+    # a full match at one of six competitors, not a 16.7% evidence fit.
+    score = (1.0 if matched else 0.0) if operator != "AND" else len(matched) / max(1, len(values))
     return {
         "applicable": True,
         "met": met,
         "operator": operator,
-        "score": len(matched) / max(1, len(values)),
+        "score": score,
         "matched": matched,
         "missing": missing,
         "evidence": evidence,
@@ -5379,6 +6064,15 @@ def _strict_shortlist_score_candidate(
     # strict check. This makes dates and current-employer semantics available to
     # all criteria instead of only to duration helpers.
     profile_copy["roles"] = _profile_roles_with_raw_experience(profile_copy)
+    # Tenure the recruiter typed into the sheet ("Overall Exp (yrs)", "Work Ex",
+    # "AE Exp (yrs)") stands in when the roles carry no dates.
+    _raw_fields_for_tenure = profile_copy.get("raw_fields") if isinstance(profile_copy.get("raw_fields"), dict) else {}
+    if not float(profile_copy.get("total_experience_years") or 0):
+        uploaded_total_years = raw_total_experience_years(_raw_fields_for_tenure)
+        if uploaded_total_years:
+            profile_copy["total_experience_years"] = uploaded_total_years
+            profile_copy["_total_experience_source"] = "uploaded field"
+    uploaded_function_years = raw_function_years(_raw_fields_for_tenure)
     matched_criteria: List[Dict[str, Any]] = []
     evidence_log: List[Dict[str, Any]] = []
     contributing_roles: List[Dict[str, Any]] = []
@@ -5388,6 +6082,30 @@ def _strict_shortlist_score_candidate(
     def reject(reason: str) -> None:
         if debug_reasons is not None:
             debug_reasons.append(reason)
+
+    max_notice_days = criteria.get("max_notice_period_days")
+    if max_notice_days is not None:
+        raw_fields = profile_copy.get("raw_fields") if isinstance(profile_copy.get("raw_fields"), dict) else {}
+        notice_key, notice_days = None, None
+        for key, value in raw_fields.items():
+            if _NOTICE_FIELD_RE.search(str(key)):
+                parsed = _notice_period_days(value)
+                if parsed is not None:
+                    notice_key, notice_days = str(key), parsed
+                    break
+        if notice_days is None or notice_days > float(max_notice_days):
+            reject("max_notice_period_days")
+            return None
+        score_parts.append(1.0)
+        label = "Immediate" if notice_days == 0 else f"{notice_days:g} days"
+        matched_criteria.append({"criterion": "Notice period", "value": label})
+        evidence_log.append({
+            "criterion": "Notice period",
+            "value": f"<= {float(max_notice_days):g} days",
+            "source": "uploaded field",
+            "snippet": f"{notice_key}: {raw_fields.get(notice_key)}",
+            "source_text": f"{notice_key}: {raw_fields.get(notice_key)}",
+        })
 
     min_total_exp = criteria.get("min_total_experience")
     if min_total_exp is not None:
@@ -5481,6 +6199,22 @@ def _strict_shortlist_score_candidate(
                 min_years=min_years,
                 label=function,
             )
+            if not scoped["qualified"]:
+                uploaded_years = function_years_for(uploaded_function_years, function, aliases)
+                if uploaded_years is not None and uploaded_years >= min_years:
+                    scoped = dict(
+                        scoped,
+                        qualified=True,
+                        duration=uploaded_years,
+                        evidence=[{
+                            "criterion": "Function-specific tenure",
+                            "value": f"{uploaded_years:g} years in {function}",
+                            "source": "uploaded field",
+                            "snippet": f"Recruiter sheet records {uploaded_years:g} years as {function}",
+                            "source_text": "",
+                        }],
+                        roles=[],
+                    )
             calculated_experience.setdefault("min_function_years", []).append(
                 {
                     "duration": scoped["duration"],
@@ -5631,6 +6365,12 @@ async def generate_reasoning_for_profile(
         "Every factual claim in answer/reasoning must be supported by the cited evidence_ids. "
         "Treat every requirement in the original screening query as mandatory AND logic. "
         "Never return verified_match for a partial match or when any stated requirement lacks evidence. "
+        "The requirements are exactly the keys of the original filtering criteria (keys starting with '_' are context, not requirements). "
+        "A criterion whose operator is OR is satisfied by any one listed value. "
+        "matched_criteria and evidence_log were produced by a deterministic scorer over the candidate's stored data: "
+        "a role-company match already establishes employment at that company under the criterion's employment_scope. "
+        "Do not add requirements the criteria do not state: never demand tenure, durations, start/end dates, seniority or role titles "
+        "unless a criterion asks for them; missing dates or a 0.0 duration are absent data, not disqualifying. "
         "Mention evidence IDs inline, e.g. ev1. Do not invent missing candidate facts. "
         "If evidence is insufficient, return not_verified. "
         "Criteria semantics: funding_stage_min means the named stage OR ANY LATER stage "
@@ -5663,6 +6403,19 @@ async def generate_reasoning_for_profile(
         if _audit_output_is_evidence_valid(profile_safe, structured):
             structured["answer"] = str(structured.get("answer") or structured.get("reasoning") or "").replace("\n", " ").replace("|", " ").strip()
             structured["reasoning"] = str(structured.get("reasoning") or structured.get("answer") or "").replace("\n", " ").replace("|", " ").strip()
+            return structured
+        valid_ids = sorted(_audit_evidence_id_set(profile_safe))
+        if isinstance(structured, dict) and _normalize_shortlist_status(structured.get("final_status")) == "verified_match" and valid_ids:
+            # The verdict is fine; only the citation slipped (an "ev2" that
+            # does not exist, or none at all). 18 of 139 enterprise-segment
+            # matches were being discarded for this. Cite the deterministic
+            # evidence instead of dropping the person.
+            logger.info("SHORTLIST audit citations repaired candidate=%s cited=%s valid=%s",
+                        profile_safe.get("id"), _extract_audit_evidence_ids(structured), valid_ids)
+            structured["evidence_ids"] = valid_ids[:6]
+            structured["answer"] = str(structured.get("answer") or structured.get("reasoning") or _fallback_reasoning_from_evidence(profile_safe)).replace("\n", " ").replace("|", " ").strip()
+            structured["reasoning"] = str(structured.get("reasoning") or structured.get("answer")).replace("\n", " ").replace("|", " ").strip()
+            structured["auditor_status"] = "citations_repaired"
             return structured
         logger.warning("Shortlist audit returned unsupported output for candidate %s", profile_safe.get("id"))
     except Exception as e:
@@ -5734,8 +6487,9 @@ async def _expand_keywords_with_llm(values: List[str], category: str, tracker: T
 # ("Bengaluru India"), so a query for "Bangalore" must match both spellings
 # without depending on the LLM expansion remembering to include the alias.
 LOCATION_ALIASES: Dict[str, List[str]] = {
-    "bangalore": ["bengaluru"],
+    "bangalore": ["bengaluru", "blr"],
     "mumbai": ["bombay"],
+    "hyderabad": ["hyd"],
     "chennai": ["madras"],
     "kolkata": ["calcutta"],
     "pune": ["poona"],
@@ -6049,24 +6803,47 @@ def _build_terminology_pack() -> Dict[str, Any]:
     }
 
 
-def _query_company_scope(query: str) -> str:
+def _query_signals_current_employer(query: str) -> bool:
+    """True only when the recruiter said *current*: "currently at", "working
+    at", "present company". "Experience at X" / "from X" / "ex-X" are career
+    history, and the filter-plan model marks those current_employer about half
+    the time — which is how "experience at Testsigma competitors" was scoped
+    to the current job and lost every ex-BrowserStack AE."""
     query_l = _normalize_search_text(query)
-    if re.search(r"\b(?:current|present)\s+(?:company|employer|organisation|organization)\b", query_l):
-        return "current_employer"
-    if re.search(r"\b(?:working|employed)\s+(?:currently\s+)?(?:for|at|in|with)\b", query_l):
-        return "current_employer"
-    if re.search(r"\bcurrently\s+(?:working|employed)(?:\s+(?:for|at|in|with))?\b", query_l):
-        return "current_employer"
-    if re.search(r"\bcurrently\s+(?:for|at|with)\b", query_l):
-        return "current_employer"
-    if re.search(r"\b(ex[-\s]?|worked|from|previously|past)\s*(?:for|at|in|with)?\b", query_l):
+    return any(
+        re.search(pattern, query_l)
+        for pattern in (
+            r"\b(?:current|present)\s+(?:company|employer|organisation|organization|role|job)\b",
+            r"\b(?:working|employed)\s+(?:currently\s+)?(?:for|at|in|with)\b",
+            r"\bcurrently\s+(?:working|employed)(?:\s+(?:for|at|in|with))?\b",
+            r"\bcurrently\s+(?:for|at|with|in)\b",
+            r"\b(?:now|today)\s+(?:at|with)\b",
+        )
+    )
+
+
+def _query_company_scope(query: str) -> str:
+    return "current_employer" if _query_signals_current_employer(query) else "any_employer"
+
+
+def _reconcile_company_scope(scope: Any, query: str) -> str:
+    """The plan model's employment_scope is advisory: current_employer is kept
+    only when the query itself says so; anything else is any_employer."""
+    scope_l = _normalize_search_text(scope or "")
+    if scope_l == "current_employer" and not _query_signals_current_employer(query):
         return "any_employer"
-    return "any_employer"
+    return scope_l or _query_company_scope(query)
 
 
 def _query_uses_current_location(query: str) -> bool:
+    """"Candidates in X", but also "account executives based in X": the
+    phrase, not the noun before it, says the location is where they live.
+    Without this, "…based in Bangalore with US market experience" moved
+    Bangalore into the market-geography filter (OR with US)."""
     query_l = _normalize_search_text(query)
-    return re.search(r"\b(candidates?|people|person)\s+(?:who\s+are\s+)?(?:in|based in|located in|living in)\b", query_l) is not None
+    if re.search(r"\b(candidates?|people|person)\s+(?:who\s+are\s+)?(?:in|based in|located in|living in)\b", query_l):
+        return True
+    return re.search(r"\b(?:based|located|living|residing|staying|situated)\s+(?:in|at|near|out of)\b", query_l) is not None
 
 
 def _query_uses_market_geography(query: str) -> bool:
@@ -6080,11 +6857,11 @@ def _normalize_companies_with_scope(value: Any, query: str) -> Any:
         return value
     if isinstance(value, dict):
         normalized = copy.deepcopy(value)
-        normalized.setdefault("employment_scope", scope)
+        normalized["employment_scope"] = _reconcile_company_scope(normalized.get("employment_scope") or scope, query)
         values = normalized.get("values")
         if isinstance(values, list):
             normalized["values"] = [
-                {**item, "employment_scope": item.get("employment_scope") or scope}
+                {**item, "employment_scope": _reconcile_company_scope(item.get("employment_scope") or scope, query)}
                 if isinstance(item, dict)
                 else {"company": str(item), "employment_scope": scope}
                 for item in values
@@ -6370,6 +7147,199 @@ def _query_years_followed_by_terms(
             continue
         return True
     return False
+
+
+_QUERY_DURATION_SIGNAL_RE = re.compile(
+    r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty)\b|\b(?:years?|yrs?|months?|decades?)\b",
+    re.I,
+)
+_SENIORITY_RE = re.compile(r"\b(?:senior|sr\.?)\b", re.I)
+_DURATION_CRITERIA_KEYS = ("min_function_years", "min_total_experience", "min_tenure_in_latest_role", "avg_tenure_in_last_n_roles", "max_total_experience")
+
+
+def _prune_unstated_duration_requirements(criteria: Dict[str, Any], query: str) -> None:
+    """The plan model turned "mid-market sales experience" into
+    min_function_years Sales Development ≥ 1 and matched 0 of 53. A minimum
+    duration is a hard filter, so it must come from the query: a number, a
+    unit, or a seniority word. Otherwise every duration minimum is dropped."""
+    if _QUERY_DURATION_SIGNAL_RE.search(query or ""):
+        return
+    dropped = {key: criteria.pop(key) for key in _DURATION_CRITERIA_KEYS if criteria.get(key)}
+    if dropped:
+        logger.info("SHORTLIST dropped duration requirements not stated in the query: %s", json.dumps(dropped, default=str)[:400])
+
+
+def _prune_functions_not_in_query(criteria: Dict[str, Any], query: str) -> None:
+    """A required function is a hard filter, so the query must name it (or
+    one of its taxonomy aliases). "Mid-market sales experience" produced
+    required_functions = Sales Development / SDR / BDR / inside sales and
+    rejected 634 of 680 — the word "sales" is not a function."""
+    functions = criteria.get("required_functions")
+    if not functions:
+        return
+    query_l = _normalize_search_text(query or "")
+    values = [str(v).strip() for v in get_values_from_criteria(functions) if str(v or "").strip()]
+    kept = []
+    for value in values:
+        terms = [t for t in _criterion_match_terms(value, "required_functions", functions) if len(_normalize_search_text(t)) >= 2]
+        # "Senior AEs", "SDRs": the initials recruiters actually type.
+        initials = "".join(w[0] for w in re.findall(r"[a-z]+", _normalize_search_text(value)))
+        if len(initials) >= 2:
+            terms += [initials, initials + "s"]
+        if any(_term_matches_text(t, query_l) for t in terms):
+            kept.append(value)
+    if kept == values:
+        return
+    dropped = [v for v in values if v not in kept]
+    logger.info("SHORTLIST dropped function requirements the query never named: %s", dropped)
+    if kept:
+        criteria["required_functions"] = {**(functions if isinstance(functions, dict) else {}), "operator": _criterion_operator(functions), "values": kept}
+    else:
+        criteria.pop("required_functions", None)
+    items = criteria.get("min_function_years")
+    if isinstance(items, list):
+        kept_keys = {_normalize_search_text(v) for v in kept}
+        items = [i for i in items if isinstance(i, dict) and _normalize_search_text(i.get("function") or "") in kept_keys]
+        if items:
+            criteria["min_function_years"] = items
+        else:
+            criteria.pop("min_function_years", None)
+
+
+def _apply_seniority_title_hint(criteria: Dict[str, Any], query: str) -> None:
+    """"Senior account executives" means the title says senior. The plan model
+    instead demanded 5 years in each of four functions and matched 1 of 115.
+    Without a number in the query the seniority lives in the title terms."""
+    if not _SENIORITY_RE.search(query or "") or _QUERY_DURATION_SIGNAL_RE.search(query or ""):
+        return
+    functions = criteria.get("required_functions")
+    values = [str(v).strip() for v in get_values_from_criteria(functions) if str(v or "").strip()] if functions else []
+    if not values:
+        return
+    variants: List[str] = []
+    for fn in values:
+        fn_l = fn.lower()
+        if _SENIORITY_RE.search(fn):
+            variants.append(fn)
+            continue
+        variants.extend([f"Senior {fn}", f"Sr. {fn}", f"Sr {fn}"])
+        if fn_l in {"account executive", "account executives"}:
+            variants.extend(["Senior AE", "Sr. AE", "Sr AE"])
+    criteria["required_functions"] = {"operator": "OR", "values": variants}
+    criteria.pop("min_function_years", None)
+
+
+_NOTICE_FIELD_RE = re.compile(r"notice|availab|join", re.I)
+_NOTICE_DAYS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*\+?\s*(days?|weeks?|months?|d|w|m)\b", re.I)
+_NOTICE_IMMEDIATE_RE = re.compile(r"\bimmediate(?:ly)?\b|\bimmediate joiner", re.I)
+
+
+def _notice_period_days(value: Any) -> Optional[float]:
+    """'30 Days' → 30, '1 month' → 30, '2 months (negotiable)' → 60,
+    'Immediate joiner' → 0. Anything else (a city typed in the wrong column,
+    'serving notice', blank) is unknown and cannot satisfy a maximum."""
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "null", "-", "n/a"}:
+        return None
+    if _NOTICE_IMMEDIATE_RE.search(text):
+        return 0.0
+    m = _NOTICE_DAYS_RE.search(text)
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2).lower()[0]
+    return n * (30 if unit == "m" else 7 if unit == "w" else 1)
+
+
+def _apply_notice_period_hint(criteria: Dict[str, Any], query: str) -> None:
+    """"Immediate joiners or notice period of 30 days or less" became two
+    literal keyword phrases and matched 0 of 124 — the sheet has a Notice
+    Period column with '30 Days', '1 month', 'Immediate joiner'. Turn the
+    query into max_notice_period_days and let the scorer compare numbers."""
+    q_text = query or ""
+    if not re.search(r"notice|immediate|joiner|join within|can join|availability", q_text, re.I):
+        return
+    limits = []
+    for m in _NOTICE_DAYS_RE.finditer(q_text):
+        limits.append(_notice_period_days(m.group(0)))
+    if _NOTICE_IMMEDIATE_RE.search(q_text):
+        limits.append(0.0)
+    limits = [x for x in limits if x is not None]
+    if not limits:
+        return
+    criteria["max_notice_period_days"] = max(limits)
+    keywords = criteria.get("required_keywords")
+    if keywords:
+        values = [str(v) for v in get_values_from_criteria(keywords)]
+        remaining = [v for v in values if not re.search(r"notice|immediate|joiner|join", v, re.I)]
+        if remaining:
+            criteria["required_keywords"] = {"operator": _criterion_operator(keywords), "values": remaining}
+        else:
+            criteria.pop("required_keywords", None)
+
+
+_GENERIC_TARGET_WORDS = {"company", "companies", "competitor", "competitors", "target", "the company", "a company", "firm", "organisation", "organization", "vendor"}
+_TARGET_STOPWORDS = {"a", "an", "the", "at", "in", "of", "to", "for", "from", "with", "and", "or", "its", "their", "any", "some", "direct", "top", "main", "key", "close", "who", "are", "is", "currently", "working", "worked", "experience", "people", "candidates"}
+_COMPETITOR_OF_RE = re.compile(r"\bcompet\w*\s+(?:of|to|for)\s+([A-Za-z0-9][A-Za-z0-9&.'\-]*(?:\s+[A-Z][A-Za-z0-9&.'\-]*)?)", re.I)
+_BEFORE_COMPETITOR_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9&.'\-]*)(?:'s)?\s+compet\w*", re.I)
+
+
+def _competitor_target_from_query(query: str) -> str:
+    """'a BrowserStack competitor' → BrowserStack; 'competitors of Hevo' →
+    Hevo; 'testsigma competators' (sic) → testsigma."""
+    text = query or ""
+    m = _COMPETITOR_OF_RE.search(text)
+    if m and m.group(1).strip().lower() not in _TARGET_STOPWORDS:
+        return m.group(1).strip(" .,")
+    for m in _BEFORE_COMPETITOR_RE.finditer(text):
+        word = m.group(1).strip(" .,")
+        if word.lower() not in _TARGET_STOPWORDS and word.lower() not in _GENERIC_TARGET_WORDS:
+            return word
+    return ""
+
+
+def _repair_competitor_target(criteria: Dict[str, Any], query: str) -> None:
+    """The plan model sometimes returns competitors_of target "company" for
+    "currently working at a BrowserStack competitor" — then the web step
+    researches the word "company" and the screen halts with no competitors.
+    A generic or absent target is replaced by the name in the query."""
+    for key in ("competitors_of", "competitor_of"):
+        items = criteria.get(key)
+        if not items:
+            continue
+        objects = _criteria_objects(items)
+        if not objects:
+            continue
+        repaired = []
+        for item in objects:
+            target = str(item.get("target") or item.get("company") or item.get("value") or "").strip()
+            if not target or target.lower() in _GENERIC_TARGET_WORDS or target.lower() in _TARGET_STOPWORDS:
+                extracted = _competitor_target_from_query(query)
+                if extracted:
+                    logger.info("SHORTLIST competitor target repaired %r -> %r", target, extracted)
+                    item = {**item, "target": extracted}
+            repaired.append(item)
+        criteria[key] = repaired
+
+
+def _split_location_from_geography(criteria: Dict[str, Any], query: str) -> None:
+    """"Based in Bangalore with US market experience": the plan model put
+    both into required_geographies (market coverage, OR). Where the person
+    lives is required_locations, and both criteria must hold."""
+    geo = criteria.get("required_geographies")
+    if not geo:
+        return
+    values = [str(v).strip() for v in get_values_from_criteria(geo) if str(v or "").strip()]
+    lived = [v for v in values if re.search(rf"\b(?:based|located|living|residing|staying|lives?)\s+(?:in|at|near)\s+{re.escape(v)}\b", query or "", re.I)]
+    if not lived:
+        return
+    remaining = [v for v in values if v not in lived]
+    existing = [str(v) for v in get_values_from_criteria(criteria.get("required_locations") or [])]
+    criteria["required_locations"] = {"operator": "OR", "values": existing + [v for v in lived if v not in existing]}
+    if remaining:
+        criteria["required_geographies"] = {**(geo if isinstance(geo, dict) else {}), "operator": _criterion_operator(geo), "values": remaining}
+    else:
+        criteria.pop("required_geographies", None)
 
 
 def _apply_query_scoped_duration_hints(criteria: Dict[str, Any], query: str) -> None:
@@ -6741,6 +7711,16 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
             criteria.pop("min_function_years", None)
 
     _prune_function_years_shadowed_by_scoped_tenure(criteria, query)
+    _prune_unstated_duration_requirements(criteria, query)
+    _prune_functions_not_in_query(criteria, query)
+    _apply_seniority_title_hint(criteria, query)
+    _apply_notice_period_hint(criteria, query)
+    _split_location_from_geography(criteria, query)
+    _repair_competitor_target(criteria, query)
+
+    geography_policy = source.get("geography_policy") if isinstance(source.get("geography_policy"), dict) else {}
+    if geography_policy.get("allow_country_region_reverse_match") and isinstance(criteria.get("required_geographies"), dict):
+        criteria["required_geographies"]["allow_region_reverse_match"] = True
 
     company_scope = source.get("company_scope")
     inferred_company_scope = _query_company_scope(query)
@@ -6748,7 +7728,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
     if isinstance(company_scope, dict):
         explicit_company_scope = company_scope.get("employment_scope") or company_scope.get("scope")
 
-    effective_company_scope = explicit_company_scope or inferred_company_scope
+    effective_company_scope = _reconcile_company_scope(explicit_company_scope or inferred_company_scope, query)
     for scoped_key in EMPLOYMENT_SCOPED_CRITERIA_KEYS:
         criterion = criteria.get(scoped_key)
         if not criterion:
@@ -6953,6 +7933,7 @@ async def process_query_main(
         return
 
     final_competitors: List[str] = []
+    competitor_entries: List[Dict[str, Any]] = []
     competitor_values = criteria.get("competitors_of") or criteria.get("competitor_of")
     if competitor_values:
         competitor_items = _criteria_objects(competitor_values)
@@ -6961,7 +7942,9 @@ async def process_query_main(
         first_item = competitor_items[0] if competitor_items else None
         if isinstance(first_item, dict):
             target = str(first_item.get("target") or first_item.get("company") or first_item.get("value") or "").strip()
-            competitor_scope = str(first_item.get("employment_scope") or first_item.get("scope") or competitor_scope)
+            competitor_scope = _reconcile_company_scope(
+                first_item.get("employment_scope") or first_item.get("scope") or competitor_scope, normalized_query
+            )
         else:
             target = str(first_item or "").strip()
 
@@ -6988,7 +7971,7 @@ async def process_query_main(
                         tracker,
                     )
                     web_facts = web_enriched.get("_web_company_facts") if isinstance(web_enriched.get("_web_company_facts"), dict) else {}
-                    web_competitor_names: List[str] = []
+                    web_competitor_names: List[Any] = []
                     for item in web_facts.get("competitors") or []:
                         if isinstance(item, str):
                             # Older cache entries hold stringified per-company dicts.
@@ -7008,42 +7991,38 @@ async def process_query_main(
                             # Per-company entry ({'name': 'MoEngage', ...}) rather
                             # than a grouped {target, companies} entry.
                             raw_names = [item.get("name")]
-                        web_competitor_names.extend(
-                            name for name in (_company_entry_name(raw) for raw in raw_names) if name
-                        )
-                    final_competitors = _validate_company_names_against_db(web_competitor_names, exclude=target)
+                        web_competitor_names.extend(entry for entry in (_company_entry(raw) for raw in raw_names) if entry)
+                    web_competitor_names.extend(_reverse_competitors_from_cache(target))
+                    competitor_entries = _validate_competitor_entries(web_competitor_names, exclude=target)
+                    if not competitor_entries:
+                        # The structured research call sometimes returns no
+                        # JSON at all (Hevo, 2026-09-25). A plain "list the
+                        # competitors of X" web call is the second attempt.
+                        fallback_names = await _web_competitor_names_fallback(target, normalized_query, tracker)
+                        competitor_entries = _validate_competitor_entries([{"name": n} for n in fallback_names], exclude=target)
+                        if competitor_entries:
+                            _cache_company_facts_from_structured(
+                                company_fact_criteria,
+                                {"competitors": [{"target": target, "companies": [{"name": n, "aliases": []} for n in fallback_names]}]},
+                            )
+                    target_profile = next(
+                        (item for item in (web_facts.get("company_profiles") or [])
+                         if isinstance(item, dict) and _company_matches(str(item.get("target") or item.get("company") or ""), target)),
+                        {},
+                    )
+                    scope_employers = await asyncio.to_thread(
+                        _role_scope_employer_names,
+                        source_role_id if (source_type or "").strip().lower() == "role" else None,
+                        screening_r, screening_user_id,
+                    )
+                    yield "Checking which employers in this role compete with the target..."
+                    competitor_entries = await _judge_competitors(
+                        target, target_profile.get("product_service"), competitor_entries, scope_employers, tracker
+                    )
+                    final_competitors = [entry["company"] for entry in competitor_entries]
 
                 if web_enabled and not final_competitors:
-                    fallback_system_prompt = (
-                        "You identify current direct competitors for recruiting search. Use live web knowledge. "
-                        "Return JSON only with key competitors. Competitors may be strings or objects with name. "
-                        "Prefer close category competitors over generic software companies."
-                    )
-                    fallback_user_prompt = (
-                        f"Find direct competitors of {target} for this recruiting query: {normalized_query}\n"
-                        "Return companies in the same product category and buyer segment. "
-                        "For CleverTap-like companies, include customer engagement, retention, marketing automation, mobile engagement, and cross-channel messaging platforms."
-                    )
-                    fallback_structured = await asyncio.to_thread(
-                        call_openai_json,
-                        fallback_system_prompt,
-                        fallback_user_prompt,
-                        model=SCREENING_REASONING_MODEL,
-                        use_web=True,
-                        web_search_tool=SCREENING_WEB_SEARCH_TOOL,
-                        web_search_context_size=SCREENING_WEB_SEARCH_CONTEXT_SIZE,
-                        temperature=0.0,
-                        timeout=90.0,
-                    )
-                    tracker.add_usage(
-                        SCREENING_REASONING_MODEL,
-                        f"{fallback_system_prompt}\n\n{fallback_user_prompt}",
-                        json.dumps(fallback_structured),
-                        "Competitor Web Identification",
-                    )
-                    fallback_names = []
-                    if isinstance(fallback_structured, dict):
-                        fallback_names = get_list_from_llm_json(fallback_structured.get("competitors") or fallback_structured.get("companies") or [])
+                    fallback_names = await _web_competitor_names_fallback(target, normalized_query, tracker)
                     final_competitors = _validate_company_names_against_db(fallback_names, exclude=target)
 
                 if not final_competitors:
@@ -7090,6 +8069,11 @@ async def process_query_main(
                     for company in final_competitors
                 ],
             }
+            if competitor_entries:
+                alias_by_company = {entry["company"]: entry.get("aliases") or [] for entry in competitor_entries}
+                for item in criteria["required_companies"]["values"]:
+                    if isinstance(item, dict) and alias_by_company.get(item.get("company")):
+                        item["aliases"] = alias_by_company[item["company"]]
             criteria["_competitor_resolution"] = {
                 "target": target,
                 "validated_companies": final_competitors,
@@ -7319,6 +8303,7 @@ async def process_query_main(
         or criteria.get("min_people_managed") is not None
         or criteria.get("min_team_management_years") is not None
         or criteria.get("min_total_experience") is not None
+        or criteria.get("max_notice_period_days") is not None
         or criteria.get("required_companies")
         or criteria.get("funding_stage_min")
         or criteria.get("min_tenure_in_latest_role")
@@ -7410,7 +8395,47 @@ async def process_query_main(
         updated = dict(profile)
         if isinstance(review, dict):
             final_status = _normalize_shortlist_status(review.get("final_status")) or "not_verified"
+            if final_status != "verified_match" and review.get("audit_unavailable"):
+                # The audit call failed or returned unusable output. That is
+                # our outage, not the candidate's: keep the deterministic match
+                # and say the audit is missing.
+                final_status = "verified_match"
+                review = {
+                    **review,
+                    "final_status": "verified_match",
+                    "answer": _fallback_reasoning_from_evidence(updated),
+                    "reasoning": _fallback_reasoning_from_evidence(updated),
+                    "matched_criteria": [m.get("criterion") for m in (updated.get("matched_criteria") or []) if isinstance(m, dict)],
+                    "missing_criteria": [],
+                    "match_score": None,
+                    "confidence": "low",
+                    "auditor_status": "audit_unavailable",
+                }
+            elif (
+                final_status != "verified_match"
+                and not _audit_rejection_is_grounded(review, original_criteria, profile)
+            ):
+                logger.info(
+                    "SHORTLIST audit rejection overridden candidate=%s missing=%s (names no query criterion)",
+                    profile.get("id"), review.get("missing_criteria"),
+                )
+                final_status = "verified_match"
+                review = {
+                    **review,
+                    "final_status": "verified_match",
+                    "answer": review.get("answer") or _fallback_reasoning_from_evidence(updated),
+                    "reasoning": _fallback_reasoning_from_evidence(updated),
+                    "matched_criteria": review.get("matched_criteria") or [m.get("criterion") for m in (updated.get("matched_criteria") or []) if isinstance(m, dict)],
+                    "missing_criteria": [],
+                    "match_score": None,
+                    "confidence": "medium",
+                    "auditor_status": "overridden_ungrounded_rejection",
+                }
             if final_status != "verified_match":
+                logger.info(
+                    "SHORTLIST audit rejected candidate=%s missing=%s reason=%s",
+                    profile.get("id"), review.get("missing_criteria"), str(review.get("reasoning") or "")[:200],
+                )
                 updated["shortlist_status"] = final_status
                 updated["is_verified_match"] = False
                 updated["missing_criteria"] = review.get("missing_criteria") if isinstance(review.get("missing_criteria"), list) else updated.get("missing_criteria", [])
@@ -7418,7 +8443,7 @@ async def process_query_main(
             updated["shortlist_status"] = "verified_match"
             updated["is_verified_match"] = True
             updated["review_stage"] = "evidence_audited"
-            updated["auditor_status"] = "passed"
+            updated["auditor_status"] = review.get("auditor_status") or "passed"
             updated["answer"] = str(review.get("answer") or review.get("reasoning") or _fallback_reasoning_from_evidence(updated)).strip()
             updated["reasoning"] = str(review.get("reasoning") or updated["answer"]).strip()
             updated["evidence_ids"] = _extract_audit_evidence_ids(review)

@@ -1,109 +1,488 @@
 {
-  "google": {
-    "company": "Google",
-    "product_service": "Search, Cloud Computing, AI, Advertising, Consumer Electronics",
-    "customer_segment": "General consumers, businesses, enterprises, advertisers",
+  "testsigma": {
+    "company": "Testsigma",
+    "product_service": "AI-native testing platform for web, mobile, API, and Salesforce applications",
+    "customer_segment": "Software development and quality assurance teams",
     "customer_presence": "Global",
-    "funding_stage": "Public",
-    "revenue": "Approximately $402.84 billion in 2025",
-    "culture_type": "Innovative, data-driven",
-    "headquarters": "Mountain View, California, USA",
+    "funding_stage": "Not publicly disclosed",
+    "revenue": "Not publicly disclosed",
+    "culture_type": "Not publicly verifiable",
+    "headquarters": "Not publicly verifiable",
     "sources": [
       {
-        "url": "https://www.companieshistory.com/google-competitors/",
-        "title": "Google Competitors 2026: Top Rivals, Market Share And Industry Analysis",
-        "note": "An analysis of Google's top competitors in 2026, including Microsoft, Amazon, Meta Platforms, Apple, and Nvidia."
+        "url": "https://www.gartner.com/reviews/product/testsigma/alternatives",
+        "title": "Top Testsigma Alternatives & Competitors 2026 | Gartner Peer Insights",
+        "note": "A comprehensive list of Testsigma's competitors, including Katalon, BrowserStack, TestMu AI, Tricentis, SmartBear, UiPath, OpenText, Parasoft, Functionize, Testim, mabl, ACCELQ, TestArchitect, TestRail, and Postman."
       },
       {
-        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
-        "title": "Alphabet's Top Competitors & Peers",
-        "note": "A memo outlining Alphabet's main competitors and peers, including Apple, Microsoft, Meta Platforms, Amazon, Snap, and Oracle."
+        "url": "https://www.g2.com/products/testsigma/competitors/alternatives",
+        "title": "Top 10 Testsigma Alternatives & Competitors in 2026 | G2",
+        "note": "An overview of Testsigma's top competitors, such as BrowserStack, Katalon True Platform, UiPath Agentic Automation, TestRail, Postman, Tuskr, Panaya Smart Testing and Change Intelligence, and Agentforce 360 Platform."
+      },
+      {
+        "url": "https://www.capterra.com/p/171626/Testsigma/alternatives/",
+        "title": "Best Testsigma Alternatives 2026 | Capterra",
+        "note": "A comparison of Testsigma with its alternatives, including BrowserStack, Tricentis qTest, and Testiny."
+      },
+      {
+        "url": "https://www.cbinsights.com/company/testsigma-technologies/alternatives-competitors",
+        "title": "Testsigma Alternatives & Competitors",
+        "note": "A list of Testsigma's competitors, including Spirent Communications, Functionize, Tricentis, Testim, Postman, and Katalon Studio."
       }
     ],
-    "target": "Google",
+    "target": "testsigma",
     "competitors": [
-      "{'name': 'Microsoft', 'product_service': 'Search (Bing), Cloud Computing (Azure), AI (Copilot)', 'customer_segment': 'General consumers, businesses, enterprises', 'customer_presence': 'Global'}",
-      "{'name': 'Amazon', 'product_service': 'E-commerce, Cloud Computing (AWS), AI (Alexa)', 'customer_segment': 'General consumers, businesses, enterprises', 'customer_presence': 'Global'}",
-      "{'name': 'Meta Platforms', 'product_service': 'Social Media (Facebook, Instagram, WhatsApp), AI (Llama)', 'customer_segment': 'General consumers, advertisers', 'customer_presence': 'Global'}",
-      "{'name': 'Apple', 'product_service': 'Consumer Electronics (iPhone, Mac), Services, AI (Siri)', 'customer_segment': 'General consumers, businesses', 'customer_presence': 'Global'}",
-      "{'name': 'Nvidia', 'product_service': 'Semiconductors (GPUs), AI Data Center Chips, AI Models (CUDA, DGX)', 'customer_segment': 'Businesses, enterprises, AI researchers', 'customer_presence': 'Global'}"
-    ],
-    "similar_companies": [],
-    "last_verified_at": "2026-06-16T09:06:24Z"
-  },
-  "oracle": {
-    "target": "Oracle",
-    "similar_companies": [],
-    "sources": [
       {
-        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
-        "title": "Alphabet's Top Competitors & Peers",
-        "note": "A memo outlining Alphabet's main competitors and peers, including Oracle."
+        "name": "Katalon",
+        "aliases": [
+          "Katalon Studio"
+        ]
+      },
+      {
+        "name": "BrowserStack",
+        "aliases": []
+      },
+      {
+        "name": "TestMu AI",
+        "aliases": [
+          "LambdaTest"
+        ]
+      },
+      {
+        "name": "Tricentis",
+        "aliases": [
+          "Tricentis NeoLoad",
+          "Tricentis Tosca"
+        ]
+      },
+      {
+        "name": "SmartBear",
+        "aliases": [
+          "SmartBear ReadyAPI"
+        ]
+      },
+      {
+        "name": "UiPath",
+        "aliases": [
+          "UiPath Test Cloud"
+        ]
+      },
+      {
+        "name": "OpenText",
+        "aliases": [
+          "OpenText Functional Testing"
+        ]
+      },
+      {
+        "name": "Parasoft",
+        "aliases": [
+          "Parasoft SOAtest"
+        ]
+      },
+      {
+        "name": "Functionize",
+        "aliases": []
+      },
+      {
+        "name": "Testim",
+        "aliases": []
+      },
+      {
+        "name": "mabl",
+        "aliases": []
+      },
+      {
+        "name": "ACCELQ",
+        "aliases": []
+      },
+      {
+        "name": "TestArchitect",
+        "aliases": []
+      },
+      {
+        "name": "TestRail",
+        "aliases": []
+      },
+      {
+        "name": "Postman",
+        "aliases": []
       }
     ],
-    "last_verified_at": "2026-06-16T09:06:24Z"
-  },
-  "salesforce": {
-    "target": "Salesforce",
     "similar_companies": [],
-    "sources": [
-      {
-        "url": "https://www.hudson-labs.com/research/alphabets-top-competitors-peers",
-        "title": "Alphabet's Top Competitors & Peers",
-        "note": "A memo outlining Alphabet's main competitors and peers, including Salesforce."
-      }
-    ],
-    "last_verified_at": "2026-06-16T09:06:24Z"
+    "last_verified_at": "2026-09-25T15:21:28Z",
+    "prompt_version": 3
   },
-  "clevertap": {
-    "company": "CleverTap",
-    "product_service": "Customer engagement and retention platform",
-    "customer_segment": "B2C brands",
+  "browserstack": {
+    "company": "BrowserStack",
+    "product_service": "Cloud-based cross-browser and device testing platform",
+    "customer_segment": "Software development and QA teams",
     "customer_presence": "Global",
-    "funding_stage": "Series D",
+    "funding_stage": "Unicorn",
     "revenue": "Not publicly disclosed",
-    "culture_type": "Innovative and customer-focused",
-    "headquarters": "San Francisco, California, USA",
+    "culture_type": "Remote-first",
+    "headquarters": "Mumbai, India",
     "sources": [
       {
-        "url": "https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives",
-        "title": "Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights",
-        "note": "This source lists several competitors to CleverTap in the multichannel marketing hubs category."
+        "url": "https://www.capterra.com/p/162900/BrowserStack/alternatives/",
+        "title": "Best BrowserStack Alternatives 2026 | Capterra",
+        "note": "A comprehensive list of BrowserStack alternatives with user reviews and ratings."
+      },
+      {
+        "url": "https://www.drizz.dev/post/top-browserstack-alternatives-in-2026",
+        "title": "BrowserStack Alternatives 2026: 9 Options + Pricing Compared",
+        "note": "An in-depth comparison of BrowserStack alternatives, including pricing and features."
+      },
+      {
+        "url": "https://www.spotsaas.com/list/browserstack-free-alternative",
+        "title": "9 BrowserStack Alternatives Ranked by Real Users — Free Picks Included (2026)",
+        "note": "A ranking of BrowserStack alternatives based on user reviews and features."
       }
     ],
-    "target": "clevertap",
+    "target": "BrowserStack",
     "competitors": [
-      "{'name': 'MoEngage', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Mobile-first consumer brands globally', 'customer_presence': 'Strong presence in APAC, MENA, and Latin America', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'MoEngage is recognized as a top alternative to CleverTap in the multichannel marketing hubs category.'}]}",
-      "{'name': 'Braze', 'product_service': 'Customer engagement platform', 'customer_segment': 'Enterprise B2C teams with engineering resources', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Braze is listed as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
-      "{'name': 'Iterable', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Mid-market to enterprise teams', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Iterable is recognized as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
-      "{'name': 'Netcore', 'product_service': 'Customer engagement platform', 'customer_segment': 'Global', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Netcore is listed as a competitor to CleverTap in the multichannel marketing hubs category.'}]}",
-      "{'name': 'Insider One', 'product_service': 'Customer engagement and marketing automation platform', 'customer_segment': 'Enterprise brands', 'customer_presence': 'Global', 'sources': [{'url': 'https://www.gartner.com/reviews/market/multichannel-marketing-hubs/vendor/clevertap/product/clevertap/alternatives', 'title': 'Top CleverTap Alternatives & Competitors 2026 | Gartner Peer Insights', 'note': 'Insider One is recognized as a competitor to CleverTap in the multichannel marketing hubs category.'}]}"
-    ],
-    "similar_companies": [],
-    "last_verified_at": "2026-07-13T10:54:34Z"
-  },
-  "onesignal": {
-    "target": "OneSignal",
-    "similar_companies": [],
-    "sources": [
       {
-        "url": "https://www.g2.com/products/clevertap/competitors/alternatives",
-        "title": "Top 10 CleverTap Alternatives & Competitors in 2026 | G2",
-        "note": "OneSignal is listed as a top alternative to CleverTap on G2."
+        "name": "TestMu AI",
+        "aliases": [
+          "LambdaTest"
+        ]
+      },
+      {
+        "name": "Sauce Labs",
+        "aliases": []
+      },
+      {
+        "name": "TestingBot",
+        "aliases": []
+      },
+      {
+        "name": "Kobiton",
+        "aliases": []
+      },
+      {
+        "name": "Perfecto",
+        "aliases": [
+          "Perforce"
+        ]
+      },
+      {
+        "name": "HeadSpin",
+        "aliases": []
+      },
+      {
+        "name": "Firebase Test Lab",
+        "aliases": []
+      },
+      {
+        "name": "Drizz",
+        "aliases": []
+      },
+      {
+        "name": "BitBar",
+        "aliases": [
+          "SmartBear"
+        ]
+      },
+      {
+        "name": "Applitools",
+        "aliases": []
+      },
+      {
+        "name": "UiPath Test Cloud",
+        "aliases": []
+      },
+      {
+        "name": "Parasoft SOAtest",
+        "aliases": []
+      },
+      {
+        "name": "Katalon True Platform",
+        "aliases": []
+      },
+      {
+        "name": "Tricentis NeoLoad",
+        "aliases": []
+      },
+      {
+        "name": "Tricentis Tosca",
+        "aliases": []
       }
     ],
-    "last_verified_at": "2026-07-13T10:54:34Z"
-  },
-  "webengage": {
-    "target": "WebEngage",
+    "prompt_version": 3,
     "similar_companies": [],
-    "sources": [
+    "last_verified_at": "2026-09-25T15:22:05Z"
+  },
+  "hevo": {
+    "target": "Hevo",
+    "competitors": [
       {
-        "url": "https://www.g2.com/products/clevertap/competitors/alternatives",
-        "title": "Top 10 CleverTap Alternatives & Competitors in 2026 | G2",
-        "note": "WebEngage is recognized as a competitor to CleverTap on G2."
+        "name": "Fivetran",
+        "aliases": []
+      },
+      {
+        "name": "Airbyte",
+        "aliases": []
+      },
+      {
+        "name": "Matillion",
+        "aliases": []
+      },
+      {
+        "name": "Integrate.io",
+        "aliases": []
+      },
+      {
+        "name": "Keboola",
+        "aliases": []
+      },
+      {
+        "name": "Meltano",
+        "aliases": []
+      },
+      {
+        "name": "Apache NiFi",
+        "aliases": []
+      },
+      {
+        "name": "Estuary Flow",
+        "aliases": []
+      },
+      {
+        "name": "Informatica",
+        "aliases": []
+      },
+      {
+        "name": "IBM DataStage",
+        "aliases": []
+      },
+      {
+        "name": "Qlik Replicate",
+        "aliases": []
+      },
+      {
+        "name": "Stitch Data",
+        "aliases": []
+      },
+      {
+        "name": "Peliqan",
+        "aliases": []
+      },
+      {
+        "name": "Skyvia",
+        "aliases": []
+      },
+      {
+        "name": "Apache Airflow",
+        "aliases": []
+      },
+      {
+        "name": "Azure Data Factory",
+        "aliases": []
+      },
+      {
+        "name": "StreamSets",
+        "aliases": []
+      },
+      {
+        "name": "Meroxa",
+        "aliases": []
+      },
+      {
+        "name": "Preql",
+        "aliases": []
+      },
+      {
+        "name": "Dview",
+        "aliases": []
+      },
+      {
+        "name": "Artie",
+        "aliases": []
+      },
+      {
+        "name": "Hightouch",
+        "aliases": []
+      },
+      {
+        "name": "Coupler.io",
+        "aliases": []
+      },
+      {
+        "name": "Klipfolio PowerMetrics",
+        "aliases": []
+      },
+      {
+        "name": "Duckle",
+        "aliases": []
+      },
+      {
+        "name": "Datazip",
+        "aliases": []
+      },
+      {
+        "name": "Talend",
+        "aliases": []
+      },
+      {
+        "name": "Talend",
+        "aliases": []
+      },
+      {
+        "name": "Qlik",
+        "aliases": []
       }
     ],
-    "last_verified_at": "2026-07-13T10:54:34Z"
+    "prompt_version": 3,
+    "similar_companies": [],
+    "sources": [],
+    "last_verified_at": "2026-09-25T15:49:35Z"
+  },
+  "mongodb": {
+    "target": "MongoDB",
+    "competitors": [
+      {
+        "name": "PostgreSQL",
+        "aliases": []
+      },
+      {
+        "name": "Couchbase",
+        "aliases": []
+      },
+      {
+        "name": "Apache Cassandra",
+        "aliases": []
+      },
+      {
+        "name": "Amazon DynamoDB",
+        "aliases": []
+      },
+      {
+        "name": "Redis",
+        "aliases": []
+      },
+      {
+        "name": "Firebase Firestore",
+        "aliases": []
+      },
+      {
+        "name": "ArangoDB",
+        "aliases": []
+      },
+      {
+        "name": "CouchDB",
+        "aliases": []
+      },
+      {
+        "name": "Azure Cosmos DB",
+        "aliases": []
+      },
+      {
+        "name": "Elasticsearch",
+        "aliases": []
+      },
+      {
+        "name": "FerretDB",
+        "aliases": []
+      },
+      {
+        "name": "SurrealDB",
+        "aliases": []
+      },
+      {
+        "name": "Tinybird",
+        "aliases": []
+      },
+      {
+        "name": "AWS DocumentDB",
+        "aliases": []
+      },
+      {
+        "name": "Google Firestore",
+        "aliases": []
+      },
+      {
+        "name": "ScyllaDB",
+        "aliases": []
+      },
+      {
+        "name": "Pinecone",
+        "aliases": []
+      },
+      {
+        "name": "Qdrant",
+        "aliases": []
+      },
+      {
+        "name": "Weaviate",
+        "aliases": []
+      },
+      {
+        "name": "Chroma",
+        "aliases": []
+      },
+      {
+        "name": "PlanetScale",
+        "aliases": []
+      },
+      {
+        "name": "CockroachDB",
+        "aliases": []
+      },
+      {
+        "name": "Supabase",
+        "aliases": []
+      },
+      {
+        "name": "DoiT",
+        "aliases": []
+      },
+      {
+        "name": "Apache CouchDB",
+        "aliases": []
+      },
+      {
+        "name": "ClickHouse",
+        "aliases": []
+      },
+      {
+        "name": "DBeaver",
+        "aliases": []
+      },
+      {
+        "name": "QoreDB",
+        "aliases": []
+      },
+      {
+        "name": "Postgres",
+        "aliases": []
+      },
+      {
+        "name": "Cassandra",
+        "aliases": []
+      },
+      {
+        "name": "DynamoDB",
+        "aliases": []
+      },
+      {
+        "name": "Firestore",
+        "aliases": []
+      },
+      {
+        "name": "Cosmos DB",
+        "aliases": []
+      },
+      {
+        "name": "DocumentDB",
+        "aliases": []
+      },
+      {
+        "name": "CouchDB",
+        "aliases": []
+      }
+    ],
+    "prompt_version": 3,
+    "similar_companies": [],
+    "sources": [],
+    "last_verified_at": "2026-09-25T15:51:16Z"
   }
 }
