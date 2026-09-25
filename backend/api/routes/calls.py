@@ -998,6 +998,8 @@ def ensure_calls_schema_ready(force: bool = False):
                                     WHERE table_name = 'candidates' AND column_name = 'cadence_paused')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'inbound_calls')
+                        AND EXISTS (SELECT 1 FROM information_schema.columns
+                                    WHERE table_name = 'calls' AND column_name = 'plivo_hangup_cause')
                         AND EXISTS (SELECT 1 FROM information_schema.tables
                                     WHERE table_name = 'plivo_endpoints')
                         AND EXISTS (SELECT 1 FROM information_schema.columns

@@ -68,6 +68,25 @@ _profile_drift_lock = threading.Lock()
 _DB_FRESH_PROFILE_FIELDS = ("notes", "email", "mobile_phone", "linkedin", "status")
 
 
+def _cached_profile_or_load(candidate_id: int) -> Optional[Dict[str, Any]]:
+    """PROFILES_BY_ID entry for one candidate, loading it from the DB if this
+    worker has not seen it. Each gunicorn worker fills its cache lazily on its
+    first search, so right after a deploy a PATCH or GET routed to a cold
+    worker answered "Candidate not found" for candidates that plainly exist —
+    a recruiter could not correct a phone number until some search happened
+    to land on that same worker."""
+    prof = PROFILES_BY_ID.get(candidate_id)
+    if prof:
+        return prof
+    try:
+        from backend.pipeline import query as query_mod
+        query_mod.refresh_profiles_in_cache([candidate_id])
+    except Exception as exc:
+        logger.warning("Could not load candidate %s into this worker's cache: %s", candidate_id, exc)
+        return None
+    return PROFILES_BY_ID.get(candidate_id)
+
+
 def _overlay_editable_fields_from_db(candidate_id: int, prof: Dict[str, Any]) -> None:
     try:
         with get_db_connection_context(validate=False, register_pgvector=False) as conn:
@@ -286,7 +305,7 @@ async def get_candidate(
     recruiter_filter_id: Optional[int] = None,
 ):
     """Get detailed candidate profile (scoped)."""
-    prof = PROFILES_BY_ID.get(candidate_id)
+    prof = _cached_profile_or_load(candidate_id)
     if not prof or prof.get("is_archived"):
         raise HTTPException(status_code=404, detail="Candidate not found")
     _overlay_editable_fields_from_db(candidate_id, prof)
@@ -634,7 +653,7 @@ async def websocket_search(websocket: WebSocket):
 async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user: schemas.User = Depends(deps.get_current_user)):
     """Update candidate fields manually"""
 
-    prof = PROFILES_BY_ID.get(candidate_id)
+    prof = _cached_profile_or_load(candidate_id)
     if not prof or prof.get("is_archived"):
         raise HTTPException(status_code=404, detail="Candidate not found")
     if (current_user.role or "").strip().lower() != "admin" and prof.get("owner_user_id") is None:

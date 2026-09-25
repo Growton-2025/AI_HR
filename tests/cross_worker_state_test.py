@@ -37,6 +37,12 @@ class _Conn:
     def cursor(self):
         return self._cursor
 
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
 
 def _fake_calls_db(monkeypatch, rows):
     """Route plivo_service's lazy `from backend.api.routes.calls import ...` to a fake."""
@@ -142,3 +148,52 @@ def test_get_candidate_keeps_cached_profile_when_db_is_unavailable(monkeypatch):
 
     prof = asyncio.run(candidates.get_candidate(1, current_user=_User()))
     assert prof["notes"] == "kept"
+
+
+def _fake_refresh(cache, profile):
+    def refresh(ids):
+        assert ids == [profile["id"]]
+        cache[profile["id"]] = dict(profile)
+        return 1
+    return refresh
+
+
+def test_get_candidate_loads_the_profile_on_a_cold_worker(monkeypatch):
+    from backend.pipeline import query as query_mod
+    cache = {}  # this worker has not run a search since the deploy
+    monkeypatch.setattr(candidates, "PROFILES_BY_ID", cache)
+    monkeypatch.setattr(query_mod, "refresh_profiles_in_cache",
+                        _fake_refresh(cache, {"id": 2519, "name": "Nethranand", "notes": "", "owner_user_id": None}))
+    monkeypatch.setattr(candidates, "profile_passes_scope", lambda *a, **k: True)
+    _fake_candidates_db(monkeypatch, ("n", "", "+918618884276", "", "To be started"))
+
+    prof = asyncio.run(candidates.get_candidate(2519, current_user=_User()))
+    assert prof["name"] == "Nethranand"
+    assert prof["mobile_phone"] == "+918618884276"
+
+
+def test_update_candidate_no_longer_404s_on_a_cold_worker(monkeypatch):
+    from backend.pipeline import query as query_mod
+    cache = {}
+    monkeypatch.setattr(candidates, "PROFILES_BY_ID", cache)
+    monkeypatch.setattr(query_mod, "refresh_profiles_in_cache",
+                        _fake_refresh(cache, {"id": 2519, "name": "Nethranand", "notes": "", "owner_user_id": None}))
+    monkeypatch.setattr(candidates, "invalidate_candidate_count_caches", lambda *a, **k: None)
+    _fake_candidates_db(monkeypatch, None)
+
+    result = asyncio.run(candidates.update_candidate(2519, {"notes": "reachable now"}, current_user=_User()))
+    assert result.get("success") is True
+    assert cache[2519]["notes"] == "reachable now"
+
+
+def test_unknown_candidate_is_still_404(monkeypatch):
+    from fastapi import HTTPException
+    from backend.pipeline import query as query_mod
+    monkeypatch.setattr(candidates, "PROFILES_BY_ID", {})
+    monkeypatch.setattr(query_mod, "refresh_profiles_in_cache", lambda ids: 0)
+    try:
+        asyncio.run(candidates.get_candidate(999999, current_user=_User()))
+    except HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("expected 404")
