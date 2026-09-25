@@ -1774,7 +1774,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     stopDialTone,
   } = useVoIP();
   const isInitiated = useRef(false);
-  const lastHandledCallEventRef = useRef(0);
+  // Seed with whatever event is already in the shared context: it belongs to
+  // the PREVIOUS call. A modal opened right after a hangup used to "handle"
+  // that stale terminated event on mount and jump straight to "Call ended →
+  // Log Call Details" while the new dial rang on underneath it.
+  const lastHandledCallEventRef = useRef(voipCallEvent?.at || 0);
+  const modalMountedAtMsRef = useRef(Date.now());
   // Token of the attempt currently being dialled, so a failure can be looked
   // up on the backend for Plivo's hangup reason.
   const lastDialTokenRef = useRef('');
@@ -2097,6 +2102,11 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
 
   useEffect(() => {
     if (!voipCallEvent?.at || lastHandledCallEventRef.current === voipCallEvent.at || callState === 'review') {
+      return;
+    }
+    if (voipCallEvent.at < modalMountedAtMsRef.current) {
+      // Older than this modal: the previous call's event. Mark handled, ignore.
+      lastHandledCallEventRef.current = voipCallEvent.at;
       return;
     }
 
@@ -2754,7 +2764,10 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                   </div>
 
                   <div className="call-modal-actions" style={{ display: 'flex', gap: '12px' }}>
-                    <button style={{ ...CALL_SECONDARY_BUTTON, flex: 1, padding: '14px' }} onClick={handleEndCall}>Cancel</button>
+                    {/* Cancel = leave without logging. It used to call
+                        handleEndCall, which only re-entered the "ended" state,
+                        so the button appeared to do nothing. */}
+                    <button style={{ ...CALL_SECONDARY_BUTTON, flex: 1, padding: '14px' }} onClick={handleCloseModal}>Cancel</button>
                     <button onClick={handleSaveLog} disabled={saving} style={{ ...CALL_PRIMARY_BUTTON, flex: 1, padding: '14px', cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1 }}>
                       {saving ? 'Saving...' : 'Save'}
                     </button>
