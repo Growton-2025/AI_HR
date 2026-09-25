@@ -1,8 +1,9 @@
 import { useAppStore } from '../store/useAppStore'
-import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, ChevronLeft, ChevronRight, Loader2, UserPlus, CheckCircle2, AlertTriangle, FileSpreadsheet, Linkedin, Globe, StickyNote, Sparkles } from 'lucide-react'
+import { BriefcaseBusiness, ExternalLink, MapPin, ChevronDown, ChevronUp, ShieldCheck, Loader2, UserPlus, CheckCircle2, AlertTriangle, FileSpreadsheet, Linkedin, Globe, StickyNote, Sparkles } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useState, useEffect, useMemo } from 'react'
 import { renderTextWithLinks, SourcesList } from './AiColumnCellDrawer'
+import Pagination from './Pagination'
 import { toast } from 'sonner'
 
 // Internal evidence ids ("ev3") are a join key between the auditor and the
@@ -817,28 +818,6 @@ function SearchResults() {
                         </div>
                     )}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span style={{ fontSize: '13px', color: '#64748b' }}>Cards per page:</span>
-                    <select
-                        value={pageSize}
-                        onChange={e => {
-                            setPageSize(Number(e.target.value))
-                            setPage(1)
-                        }}
-                        style={{
-                            padding: '4px 8px', borderRadius: '8px', border: '1px solid rgba(203, 213, 225, 0.9)',
-                            fontSize: '12px', fontWeight: 600, color: '#0f172a', outline: 'none',
-                            background: '#fff', cursor: 'pointer'
-                        }}
-                    >
-                        <option value={10}>10</option>
-                        <option value={25}>25</option>
-                        <option value={50}>50</option>
-                        <option value={100}>100</option>
-                        <option value={200}>200</option>
-                        <option value={500}>500</option>
-                    </select>
-                </div>
             </div>
 
             <div className="shortlist-card-list">
@@ -847,51 +826,15 @@ function SearchResults() {
                 ))}
             </div>
 
-            {searchResults.length > 0 && (
-                <div style={{ padding: '14px 18px', background: 'rgba(248,250,252,0.78)', borderTop: '1px solid #eef2f7', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottomLeftRadius: '12px', borderBottomRightRadius: '12px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                        <span style={{ fontSize: 13, color: '#64748b' }}>
-                            Showing {Math.min(startIndex + 1, searchResults.length)}–{Math.min(endIndex, searchResults.length)} of <strong style={{ color: '#0f172a' }}>{searchResults.length}</strong> qualified matches
-                        </span>
-                    </div>
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                        <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
-                            style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === 1 ? 'not-allowed' : 'pointer', opacity: page === 1 ? 0.4 : 1 }}>
-                            <ChevronLeft size={14} color="#64748b" />
-                        </button>
-
-                        {(() => {
-                            const pages = [];
-                            const range = 2;
-                            for (let i = 1; i <= totalPages; i++) {
-                                if (i === 1 || i === totalPages || (i >= page - range && i <= page + range)) {
-                                    pages.push(
-                                        <button
-                                            key={i}
-                                            onClick={() => setPage(i)}
-                                            style={{
-                                                width: 34, height: 34, borderRadius: 10, fontSize: 13, fontWeight: i === page ? 700 : 600,
-                                                background: i === page ? '#f97316' : '#fff', color: i === page ? '#fff' : '#64748b',
-                                                border: i === page ? 'none' : '1px solid rgba(203, 213, 225, 0.9)', cursor: 'pointer'
-                                            }}
-                                        >
-                                            {i}
-                                        </button>
-                                    );
-                                } else if (i === page - range - 1 || i === page + range + 1) {
-                                    pages.push(<span key={i} style={{ color: '#94a3b8', margin: '0 4px' }}>...</span>);
-                                }
-                            }
-                            return pages;
-                        })()}
-
-                        <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages}
-                            style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fff', border: '1px solid rgba(203, 213, 225, 0.9)', borderRadius: 10, cursor: page === totalPages ? 'not-allowed' : 'pointer', opacity: page === totalPages ? 0.4 : 1 }}>
-                            <ChevronRight size={14} color="#64748b" />
-                        </button>
-                    </div>
-                </div>
-            )}
+            <Pagination
+                page={page}
+                pageSize={pageSize}
+                total={rankedResults.length}
+                pageSizeOptions={[10, 25, 50, 100, 200, 500]}
+                noun="qualified matches"
+                onPageChange={setPage}
+                onPageSizeChange={(size) => { setPageSize(size); setPage(1) }}
+            />
         </div>
     )
 }

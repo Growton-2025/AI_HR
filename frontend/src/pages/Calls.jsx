@@ -7,6 +7,7 @@ import CandidateActivityPanel, { OutcomeBadge, PossibleVoicemailBadge, formatDat
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import StatusDropdown from '../components/StatusDropdown';
+import Pagination, { pageWindow } from '../components/Pagination';
 import CandidateConversationModal from '../components/CandidateConversationModal';
 import PersonTimeline from '../components/PersonTimeline';
 import { SelectFilter } from '../components/FilterComponents';
@@ -682,6 +683,16 @@ export default function Calls() {
   // not just the pending queue.
   const [listCallStatus, setListCallStatus] = useState('pending');
   const [searchQuery, setSearchQuery] = useState('');
+  // Client-side paging of the table: the API returns the whole view (Completed
+  // alone is ~1,650 rows), so slice what is rendered. Per-page choice sticks.
+  const [pageSize, setPageSize] = useState(() => {
+    try {
+      const saved = Number(window.localStorage.getItem('calls.pageSize'));
+      return [10, 25, 50, 100].includes(saved) ? saved : 25;
+    } catch (_) { return 25; }
+  });
+  const [page, setPage] = useState(1);
+  const tableWrapRef = useRef(null);
   // Slicer (date range / outcome) state, restored from the URL like activeTab.
   const [rangeFilter, setRangeFilter] = useState(() => {
     const range = searchParams.get('range');
@@ -1053,6 +1064,21 @@ export default function Calls() {
     (c.candidate_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (c.candidate_title || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
+  const { current: currentPage } = pageWindow(filteredCalls.length, page, pageSize);
+  const pagedCalls = filteredCalls.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  // A new view, a new search or a new page size starts from page 1; a list
+  // that shrank under the current page (a delete, a slicer) steps back.
+  useEffect(() => { setPage(1); }, [currentCallsQueryKey, searchQuery, pageSize]);
+  useEffect(() => {
+    if (page !== currentPage) setPage(currentPage);
+  }, [page, currentPage]);
+  useEffect(() => {
+    try { window.localStorage.setItem('calls.pageSize', String(pageSize)); } catch (_) { /* private mode */ }
+  }, [pageSize]);
+  const goToPage = (next) => {
+    setPage(next);
+    tableWrapRef.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+  };
   // Show skeleton only when actively loading and no data exists yet for this view
   const isWaitingForCurrentQuery = callsLastQueryKey !== currentCallsQueryKey;
   const hasCurrentCallsData = callsLastQueryKey === currentCallsQueryKey && Boolean(callsLastFetchedAt);
@@ -1479,7 +1505,7 @@ export default function Calls() {
               </div>
             </div>
 
-            <div className="calls-table-wrap" style={{ padding: '0 24px 24px', overflowX: 'auto' }}>
+            <div ref={tableWrapRef} className="calls-table-wrap" style={{ padding: '0 24px 24px', overflowX: 'auto' }}>
               <table className="calls-table" style={{ width: '100%', minWidth: 880, borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>
@@ -1505,7 +1531,7 @@ export default function Calls() {
                       </td>
                     </tr>
                   ))}
-                  {!showCallsLoading && (filteredCalls || []).map(call => {
+                  {!showCallsLoading && pagedCalls.map(call => {
                     const isDeletingCall = deletingCallIds.has(call.id);
                     const isTogglingCadence = togglingCadenceIds.has(call.candidate_id);
                     // Completed calls stay dialable: recruiters need to call a
@@ -1662,6 +1688,16 @@ export default function Calls() {
                 </tbody>
               </table>
             </div>
+            {!showCallsLoading && (
+              <Pagination
+                page={currentPage}
+                pageSize={pageSize}
+                total={filteredCalls.length}
+                noun="calls"
+                onPageChange={goToPage}
+                onPageSizeChange={setPageSize}
+              />
+            )}
           </div>
         )}
       </div>
