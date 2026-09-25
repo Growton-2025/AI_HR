@@ -297,3 +297,18 @@ def test_dial_state_timestamps_are_read_as_utc():
     naive_utc = dt.datetime(2026, 9, 25, 12, 0, 0)
     state = ps._dial_state_from_row(("uuid", "user", "9999999999", naive_utc), "tok")
     assert state["seen_at"] == dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.timezone.utc).timestamp()
+
+
+# ── 6. the inbound ring list fits Plivo's simultaneous-dial cap ─────────────
+
+def test_ring_list_rings_one_line_per_recruiter_and_at_most_ten(monkeypatch, hosted):
+    # 12 recruiters, the first with two browsers registered (newest first).
+    rows = [("u1_laptop", 1), ("u1_desk", 1)] + [(f"u{i}", i) for i in range(2, 13)]
+    cursor = _Cursor(rows=rows)
+    _patch_db(monkeypatch, cursor)
+
+    ringing = ps.get_registered_endpoint_usernames()
+
+    assert len(ringing) == 10                       # Plivo refuses >10 destinations
+    assert ringing[0] == "u1_laptop" and "u1_desk" not in ringing   # one line per person
+    assert ringing[1:] == [f"u{i}" for i in range(2, 11)]

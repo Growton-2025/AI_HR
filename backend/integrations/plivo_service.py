@@ -1485,6 +1485,8 @@ def mark_endpoint_registered(user_id: int, device_id: str = PRIMARY_DEVICE_ID) -
 # busy on its own state changes, so a genuinely long call is not cut short from
 # ringing (it just becomes eligible again, and Plivo/the banner guard handle it).
 BUSY_STALE_SECONDS = 2 * 60 * 60
+# Hard cap on destinations in one simultaneous <Dial> (Plivo XML reference).
+PLIVO_SIMULTANEOUS_DIAL_MAX = 10
 
 
 def _set_endpoint_busy(busy: bool, *, user_id: int = None, username: str = None) -> None:
@@ -1543,7 +1545,7 @@ def get_registered_endpoint_usernames(within_seconds: int = 900) -> list:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT username FROM plivo_endpoints
+                SELECT username, user_id FROM plivo_endpoints
                 WHERE last_registered_at IS NOT NULL
                   AND last_registered_at > CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
                   AND (in_call_since IS NULL
@@ -1557,7 +1559,23 @@ def get_registered_endpoint_usernames(within_seconds: int = 900) -> list:
                 """,
                 (within_seconds, BUSY_STALE_SECONDS, _env_key()),
             )
-            usernames = [r[0] for r in cur.fetchall()]
+            rows = cur.fetchall()
+            # Plivo's simultaneous <Dial> takes at most 10 destinations
+            # (XML reference, "Simultaneous Dialing"). With one endpoint per
+            # recruiter per browser the raw list can exceed that, and an
+            # over-long <Dial> is refused outright — every callback would
+            # go to voicemail. Ring one line per recruiter (their most
+            # recently registered browser), newest registrations first.
+            usernames, seen_users = [], set()
+            for row in rows:
+                username = row[0]
+                user_id = row[1] if len(row) > 1 else username
+                if user_id in seen_users:
+                    continue
+                seen_users.add(user_id)
+                usernames.append(username)
+                if len(usernames) >= PLIVO_SIMULTANEOUS_DIAL_MAX:
+                    break
             # An inbound call that rings nobody is otherwise indistinguishable
             # from one that rang everybody and was ignored.
             logger.info(
