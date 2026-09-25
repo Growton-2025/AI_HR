@@ -7,6 +7,8 @@ import base64
 import time
 import asyncio
 import logging
+import psycopg2
+import psycopg2.errors
 import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -18,7 +20,7 @@ from backend.db.connection import (
     get_db_connection_context,
 )
 from backend.services.call_artifacts import extract_transcript_text, transcript_preview
-from backend.services.linkedin_normalize import normalize_linkedin
+from backend.services.linkedin_normalize import normalize_linkedin, canonical_email
 from backend.pipeline.query import (
     process_query_main,
     load_all_profiles_from_db,
@@ -721,6 +723,25 @@ async def update_candidate(candidate_id: int, data: Dict[str, Any], current_user
                     # Map frontend field name to actual DB column name
                     db_field = 'mobile_phone' if field == 'phone' else field
 
+                    if field == 'email':
+                        value = canonical_email(value)
+                    if field == 'linkedin':
+                        # The identity key must follow the URL, or every later
+                        # match (imports, HeyReach replies, person history) keeps
+                        # pointing at the old profile.
+                        new_key = normalize_linkedin(value)
+                        try:
+                            cur.execute(
+                                "UPDATE candidates SET linkedin = %s, normalized_linkedin = %s, updated_at = NOW() WHERE id = %s",
+                                (value, new_key, candidate_id),
+                            )
+                        except psycopg2.errors.UniqueViolation:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Another candidate in this pool already has that LinkedIn profile",
+                            )
+                        continue
+
                     cur.execute(
                         f"UPDATE candidates SET {db_field} = %s, updated_at = NOW() WHERE id = %s",
                         (value, candidate_id),
@@ -962,7 +983,7 @@ async def create_candidate(
                     """,
                     (
                         name, first_name, last_name, linkedin_raw, normalized_li, city, title,
-                        payload.location or city, payload.email, payload.phone, payload.notes, payload.about, raw_fields,
+                        payload.location or city, canonical_email(payload.email), payload.phone, payload.notes, payload.about, raw_fields,
                         owner_id, POOL_SOURCE_RECRUITER_UPLOAD, current_user.email or str(owner_id),
                     ),
                 )

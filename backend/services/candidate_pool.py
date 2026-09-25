@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from backend.services.linkedin_normalize import normalize_linkedin
+from backend.services.linkedin_normalize import normalize_linkedin, canonical_email, person_key
 
 logger = logging.getLogger(__name__)
 
@@ -299,11 +299,11 @@ def upsert_master_catalog_row(
         cur.execute(
             """
             SELECT id FROM candidates
-            WHERE owner_user_id IS NULL AND email = %s
+            WHERE owner_user_id IS NULL AND LOWER(TRIM(email)) = %s
               AND COALESCE(is_archived, FALSE) = FALSE
             LIMIT 1
             """,
-            (email,),
+            (canonical_email(email),),
         )
         ex = cur.fetchone()
     if not ex and not lookup_complete and first_name and last_name and company_name:
@@ -436,11 +436,11 @@ def upsert_recruiter_pool_row(
         cur.execute(
             """
             SELECT id FROM candidates
-            WHERE owner_user_id = %s AND email = %s
+            WHERE owner_user_id = %s AND LOWER(TRIM(email)) = %s
               AND COALESCE(is_archived, FALSE) = FALSE
             LIMIT 1
             """,
-            (owner_id, email),
+            (owner_id, canonical_email(email)),
         )
         ex = cur.fetchone()
     if not ex and not lookup_complete and first_name and last_name and company_name:
@@ -548,7 +548,9 @@ def assign_master_to_recruiter(
     m = load_master_row(cur, master_id)
     if not m:
         raise ValueError("master_not_found")
-    nli = m["normalized_linkedin"] or normalize_linkedin(m["linkedin"])
+    # person_key: a master row that lost a dedupe carries a _legacy_ suffix;
+    # the recruiter's copy must get the person's real key.
+    nli = person_key(m["normalized_linkedin"]) or normalize_linkedin(m["linkedin"])
     if not nli:
         raise ValueError("master_missing_linkedin")
 

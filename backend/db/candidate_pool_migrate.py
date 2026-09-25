@@ -237,6 +237,26 @@ def ensure_candidate_pool_migrations(conn) -> None:
                 """
             )
 
+            # Canonicalise every key to '/in/<slug>' (see linkedin_backfill).
+            # Idempotent: a second run finds nothing to change. Runs before the
+            # unique indexes below so a fresh database is clean from the start,
+            # and resolves collisions itself so an existing database's indexes
+            # are never violated mid-way.
+            try:
+                from backend.services.linkedin_backfill import canonicalise_linkedin_keys
+                canonicalise_linkedin_keys(cur)
+            except Exception as e:  # never block startup on a data-quality pass
+                logger.warning("LinkedIn key canonicalisation failed: %s", e, exc_info=True)
+
+            # Email keys are compared lower-cased and trimmed everywhere now;
+            # store them that way too so the indexes on email stay useful.
+            cur.execute(
+                """
+                UPDATE candidates SET email = LOWER(TRIM(email))
+                WHERE email IS NOT NULL AND email <> LOWER(TRIM(email));
+                """
+            )
+
             cur.execute(
                 "ALTER TABLE candidates DROP CONSTRAINT IF EXISTS candidates_linkedin_key;"
             )

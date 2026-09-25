@@ -127,10 +127,11 @@ def poll_once() -> int:
                     """
                     SELECT id FROM candidates
                     WHERE (normalized_linkedin = %s OR normalized_linkedin = %s
+                           OR normalized_linkedin = %s
                            OR linkedin ILIKE %s)
                       AND COALESCE(is_archived, FALSE) = FALSE
                     """,
-                    (item["norm"], slug, f"%/in/{slug}%"),
+                    (item["norm"], slug, f"/in/{slug}", f"%/in/{slug}%"),
                 )
                 rows = cur.fetchall()
                 if not rows:

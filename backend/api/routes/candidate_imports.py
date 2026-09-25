@@ -29,7 +29,7 @@ from backend.services.candidate_pool import (
 )
 from backend.services.imported_fields import merge_imported_extra_fields
 from backend.services.import_enrichment import repair_company_title_value
-from backend.services.linkedin_normalize import normalize_linkedin
+from backend.services.linkedin_normalize import normalize_linkedin, canonical_email
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -675,11 +675,11 @@ def _master_row_exists(
         cur.execute(
             """
             SELECT 1 FROM candidates
-            WHERE owner_user_id IS NULL AND email = %s
+            WHERE owner_user_id IS NULL AND LOWER(TRIM(email)) = %s
               AND COALESCE(is_archived, FALSE) = FALSE
             LIMIT 1
             """,
-            (email,),
+            (canonical_email(email),),
         )
         if cur.fetchone():
             return True
@@ -725,6 +725,8 @@ def _prepare_import_rows(df: pd.DataFrame, mapping: Dict[str, str]) -> List[Dict
     for source_index, row in df.iterrows():
         vals, raw_vals = _row_values(row, mapping)
         linkedin = vals.get("linkedin") or ""
+        if vals.get("email"):
+            vals["email"] = canonical_email(vals["email"])
         prepared.append(
             {
                 "source_index": source_index,
@@ -823,7 +825,7 @@ def _prefetch_candidate_matches(
             SELECT id, email
             FROM candidates
             WHERE {owner_sql}
-              AND email = ANY(%s)
+              AND LOWER(TRIM(email)) = ANY(%s)
               AND COALESCE(is_archived, FALSE) = FALSE
             ORDER BY id
             """,
@@ -831,7 +833,7 @@ def _prefetch_candidate_matches(
         )
         for candidate_id, email in cur.fetchall():
             if email:
-                cache["email"].setdefault(email, int(candidate_id))
+                cache["email"].setdefault(canonical_email(email), int(candidate_id))
 
     if identities:
         first_names = [item[0] for item in identities]
