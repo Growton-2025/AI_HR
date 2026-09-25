@@ -1781,6 +1781,11 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   // Log Call Details" while the new dial rang on underneath it.
   const lastHandledCallEventRef = useRef(voipCallEvent?.at || 0);
   const modalMountedAtMsRef = useRef(Date.now());
+  // Set once THIS modal has placed its dial. Until then any terminated/
+  // failed event can only belong to the previous call — its hangup resolves
+  // asynchronously and can land a few ms after the next modal has mounted,
+  // which flashed "Call ended → Log Call Details" over the new dial.
+  const ownDialSeenRef = useRef(false);
   // Token of the attempt currently being dialled, so a failure can be looked
   // up on the backend for Plivo's hangup reason.
   const lastDialTokenRef = useRef('');
@@ -2114,6 +2119,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     lastHandledCallEventRef.current = voipCallEvent.at;
 
     if (voipCallEvent.type === 'dialing') {
+      ownDialSeenRef.current = true;
+      return;
+    }
+
+    if (!ownDialSeenRef.current && ['terminated', 'failed'].includes(voipCallEvent.type)) {
+      // A hangup before we have dialled is the previous call finishing.
       return;
     }
 
