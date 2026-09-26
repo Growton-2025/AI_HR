@@ -233,6 +233,12 @@ def poll_once() -> int:
 
     bot = SmartleadBot(api_key=api_key)
     changed = []
+    # Threads whose cache is already current but whose reply preview may not
+    # be: the conversation modal's own refresher persists the thread without
+    # touching response_text, so "cache is up to date" no longer implies "the
+    # preview is up to date". A candidate who replied on Sep 1 and again on
+    # Sep 26 kept showing the Sep 1 text while the badge counted the new one.
+    preview_only = []
     needs_stamp = []
     for candidate_id, email, campaign_id, cached_len, last_sent_at in rows:
         try:
@@ -251,13 +257,6 @@ def poll_once() -> int:
         # last_message_sent_at NULL forever (the backfill below only runs when the
         # thread grows), so it never re-enters the priority tier and every future
         # reply on that thread waits for the slow round-robin sweep instead.
-        if len(messages) <= cached_len:
-            if last_sent_at is None:
-                stamp = _latest_outbound_time(messages)
-                if stamp:
-                    needs_stamp.append((candidate_id, stamp))
-            continue
-
         for message in messages:
             body = message.get("email_body")
             if body:
@@ -265,6 +264,16 @@ def poll_once() -> int:
                     message["email_body"] = _clean_email_body(body)
                 except Exception:
                     pass
+
+        if len(messages) <= cached_len:
+            if last_sent_at is None:
+                stamp = _latest_outbound_time(messages)
+                if stamp:
+                    needs_stamp.append((candidate_id, stamp))
+            latest = _latest_inbound(messages)
+            if latest:
+                preview_only.append((candidate_id, latest))
+            continue
 
         if count_inbound_messages(messages) == 0:
             continue
@@ -275,7 +284,7 @@ def poll_once() -> int:
     if needs_stamp:
         _backfill_send_stamps(needs_stamp)
 
-    if not changed:
+    if not changed and not preview_only:
         return 0
 
     # Phase 3 — persist the threads, then promote, in short transactions.
@@ -315,6 +324,13 @@ def poll_once() -> int:
                         promoted += 1
                 except Exception:
                     logger.exception("Failed to store Smartlead thread for candidate %s", candidate_id)
+            for candidate_id, latest in preview_only:
+                try:
+                    if _promote_reply(cur, candidate_id, latest):
+                        promoted += 1
+                        changed.append((candidate_id, None, None, latest))
+                except Exception:
+                    logger.exception("Failed to promote Smartlead reply for candidate %s", candidate_id)
         conn.commit()
 
     # Drop the in-memory thread cache so an open modal shows the new messages.

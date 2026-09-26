@@ -432,7 +432,21 @@ def _sync_email_messages(candidate_id: int, email: str, campaign_id: str) -> Lis
                                 campaign_id,
                             ),
                         )
+                        # The list's preview (response_text) used to be written
+                        # only by the reply poller, which skips a thread whose
+                        # cache is already current — and this refresh is what
+                        # made it current. So a reply seen first through the
+                        # modal never reached the list until Manual Sync.
+                        from backend.services.smartlead_reply_sync import _latest_inbound, _promote_reply
+                        latest = _latest_inbound(final_messages)
+                        promoted = bool(latest) and _promote_reply(cur, candidate_id, latest)
                         conn.commit()
+                if promoted:
+                    try:
+                        from backend.api.routes.browse import _invalidate_browse_cache
+                        _invalidate_browse_cache()
+                    except Exception:
+                        pass
             except Exception as db_err:
                 print(f"WARNING: Failed to persist Email cache to DB: {db_err}")
 
