@@ -250,7 +250,8 @@ STATIC_COMPANY_DETAILS_TAXONOMY = {
     "series-c": ["series c", "series-c"],
     "series-d": ["series d", "series-d"],
     "series-e": ["series e", "series-e", "series e+", "series f", "series g", "late stage", "growth stage"],
-    "public": ["public", "publicly traded", "ipo", "pre-ipo", "listed"],
+    "pre-ipo": ["pre-ipo", "pre ipo"],
+    "public": ["public", "publicly traded", "publicly listed", "listed", "post-ipo"],
     "b2b": ["b2b", "business-to-business"],
     "b2c": ["b2c", "business-to-consumer"],
     "saas": ["saas", "software as a service"],
@@ -3700,9 +3701,11 @@ FUNDING_STAGE_RANKS = {
     "growth equity": 9,
     "private equity": 10,
     "pe": 10,
-    "ipo": 11,
-    "public": 11,
-    "publicly traded": 11,
+    "pre-ipo": 11,
+    "pre ipo": 11,
+    "ipo": 12,
+    "public": 12,
+    "publicly traded": 12,
 }
 
 
@@ -3710,6 +3713,8 @@ def _funding_rank(value: Any) -> Optional[int]:
     text = _normalize_search_text(value)
     if not text:
         return None
+    if re.search(r"\bpre[\s_-]?ipo\b", text):
+        return FUNDING_STAGE_RANKS["pre-ipo"]
     if "public" in text or "ipo" in text:
         return FUNDING_STAGE_RANKS["public"]
     if "private equity" in text or re.search(r"\bpe backed\b|\bpe-owned\b", text):
@@ -3738,6 +3743,44 @@ def _funding_min_value(criteria: Dict[str, Any]) -> Optional[str]:
             if value.get(key):
                 return str(value.get(key))
     return str(value)
+
+
+def _funding_max_value(criteria: Dict[str, Any]) -> Optional[str]:
+    value = criteria.get("funding_stage_min")
+    if isinstance(value, dict):
+        for key in ("max_stage", "stage_max", "max"):
+            if value.get(key):
+                return str(value.get(key))
+    return None
+
+
+def _funding_window(criteria: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]:
+    """(min_stage, min_rank, max_stage, max_rank) for funding_stage_min.
+
+    "Series A companies" used to be planned as a bare minimum, so Series B/H
+    and public employers came back for it. A criterion now carries an
+    optional max_stage; when it is absent the window is open-ended.
+    """
+    min_stage = _funding_min_value(criteria)
+    min_rank = _funding_rank(min_stage)
+    max_stage = _funding_max_value(criteria)
+    max_rank = _funding_rank(max_stage) if max_stage else None
+    if min_rank is not None and max_rank is not None and max_rank < min_rank:
+        min_stage, max_stage = max_stage, min_stage
+        min_rank, max_rank = max_rank, min_rank
+    return min_stage, min_rank, max_stage, max_rank
+
+
+def _funding_rank_in_window(rank: int, min_rank: int, max_rank: Optional[int]) -> bool:
+    return rank >= min_rank and (max_rank is None or rank <= max_rank)
+
+
+def _funding_requirement_label(min_stage: Optional[str], max_stage: Optional[str]) -> str:
+    if not max_stage:
+        return f"{min_stage} or later"
+    if _funding_rank(min_stage) == _funding_rank(max_stage):
+        return f"exactly {min_stage}"
+    return f"between {min_stage} and {max_stage}"
 
 
 def _web_company_fact_items(criteria: Dict[str, Any], fact_key: str) -> List[Dict[str, Any]]:
@@ -3808,10 +3851,10 @@ def _web_company_profile_text(company_name: str, criteria: Dict[str, Any]) -> Tu
 
 
 def _score_funding_stage(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Tuple[bool, float, float, List[Dict[str, Any]], List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    min_stage = _funding_min_value(criteria)
-    min_rank = _funding_rank(min_stage)
+    min_stage, min_rank, max_stage, max_rank = _funding_window(criteria)
     if min_rank is None:
         return True, 0.0, 0.0, [], [], [], []
+    window_label = _funding_requirement_label(min_stage, max_stage)
 
     stage_criterion = criteria.get("funding_stage_min")
     scope = "current_employer"
@@ -3847,13 +3890,13 @@ def _score_funding_stage(profile: Dict[str, Any], criteria: Dict[str, Any]) -> T
             sources = web_item.get("sources") if isinstance(web_item.get("sources"), list) else []
         if rank is None:
             continue
-        if rank >= min_rank:
+        if _funding_rank_in_window(rank, min_rank, max_rank):
             return True, 1.2, 1.2, [{
                 "criterion": "Funding stage",
                 "value": f"{role.get('company')} is {stage_text or 'funding stage matched'}",
             }], [], [{
                 "criterion": "Funding stage",
-                "value": min_stage,
+                "value": window_label,
                 "source": source,
                 "snippet": f"{role.get('company')}: {stage_text}",
                 "sources": sources,
@@ -3861,7 +3904,7 @@ def _score_funding_stage(profile: Dict[str, Any], criteria: Dict[str, Any]) -> T
         known_below.append(f"{role.get('company')}: {stage_text}")
 
     if known_below:
-        return False, 1.2, 0.0, [], [f"Funding stage >= {min_stage}; DB shows below threshold ({'; '.join(known_below[:2])})"], [], []
+        return False, 1.2, 0.0, [], [f"Funding stage {window_label}; DB shows outside that window ({'; '.join(known_below[:2])})"], [], []
 
     has_other_candidate_filters = any(
         criteria.get(key)
@@ -3879,10 +3922,10 @@ def _score_funding_stage(profile: Dict[str, Any], criteria: Dict[str, Any]) -> T
             "min_function_years",
         )
     )
-    unknown_missing = [f"Funding stage >= {min_stage} needs web verification"]
+    unknown_missing = [f"Funding stage {window_label} needs web verification"]
     unknown_evidence = [{
         "criterion": "Funding stage",
-        "value": min_stage,
+        "value": window_label,
         "source": "web required",
         "snippet": "No reliable funding stage was present in DB company details; verifier must resolve it with web sources.",
     }]
@@ -4927,8 +4970,13 @@ def _candidate_company_names_for_web(profiles: List[Dict[str, Any]], criteria: D
         for item in scoped_criteria
     )
     for profile in profiles:
-        roles = profile.get("roles") or []
-        role_iter = _current_roles(profile) if current_only else roles[:5]
+        # Same role list the strict scorer sees: 675 of role 92's 680
+        # candidates carry their employer only in raw_fields.import_company,
+        # so reading profile["roles"] here sent almost no company names to
+        # the web step and every funding-stage query rejected them as
+        # "stage unknown".
+        roles = _profile_roles_with_raw_experience(profile)
+        role_iter = _current_roles({**profile, "roles": roles}) if current_only else roles[:5]
         for role in role_iter:
             company = str(role.get("company") or "").strip()
             key = _normalize_company_key(company)
@@ -4967,7 +5015,7 @@ async def enrich_criteria_with_candidate_company_web_facts(
         f"Recruiting query:\n{original_query}\n\n"
         f"Extracted structured criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate employer list to verify:\n{json.dumps(company_names, ensure_ascii=False, indent=2)}\n\n"
-        "For funding_stage_min, verify whether listed companies meet the threshold. "
+        "For funding_stage_min, report each company's current funding stage (Seed, Series A..G, growth, PE, Pre-IPO, Public) so the engine can compare it against the stage/max_stage window. "
         "For geography criteria, verify only offices/operations/headquarters in the requested country/region. "
         "For industry/company-detail/segment/culture criteria, verify source-backed product, category, segment, business model, culture, and funding facts. "
         "Return only facts for companies from the provided list. Return JSON only."
@@ -5991,8 +6039,8 @@ def _strict_presence_result(
 
 
 def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, Any]) -> Dict[str, Any]:
-    min_stage = _funding_min_value(criteria)
-    min_rank = _funding_rank(min_stage)
+    min_stage, min_rank, max_stage, max_rank = _funding_window(criteria)
+    window_label = _funding_requirement_label(min_stage, max_stage)
     if not min_stage or min_rank is None:
         return {"applicable": False, "met": True, "evidence": [], "roles": [], "matched": [], "missing": []}
 
@@ -6031,13 +6079,13 @@ def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, An
                 web_sources = [src for src in (web_item.get("sources") or []) if isinstance(src, dict)]
         if rank is None:
             continue
-        if rank >= min_rank:
+        if _funding_rank_in_window(rank, min_rank, max_rank):
             # stage_text is flattened as "funding stage: Series D"; show the bare stage.
             stage_label = re.sub(r"^(funding stage|company status|ownership)\s*:\s*", "", stage_text.strip(), flags=re.IGNORECASE) or stage_text
-            snippet = f"{role.get('company')}: {stage_label} (meets minimum {min_stage})"
+            snippet = f"{role.get('company')}: {stage_label} (meets {window_label})"
             entry = {
                 "criterion": "Funding stage",
-                "value": f"{stage_label} (meets minimum {min_stage})",
+                "value": f"{stage_label} (meets {window_label})",
                 "source": evidence_source,
                 "snippet": snippet,
                 "source_text": snippet,
@@ -6049,16 +6097,16 @@ def _strict_funding_stage_result(profile: Dict[str, Any], criteria: Dict[str, An
                 "applicable": True,
                 "met": True,
                 "score": 1.0,
-                "matched": [f"{stage_label} (>= {min_stage})"],
+                "matched": [f"{stage_label} ({window_label})"],
                 "missing": [],
                 "evidence": [entry],
                 "roles": [role],
             }
         below_threshold.append(f"{role.get('company')}: {stage_text}")
 
-    missing = f"Funding stage >= {min_stage}"
+    missing = f"Funding stage {window_label}"
     if below_threshold:
-        missing += f" (known below threshold: {'; '.join(below_threshold[:2])})"
+        missing += f" (known outside that window: {'; '.join(below_threshold[:2])})"
     return {
         "applicable": True,
         "met": False,
@@ -6507,7 +6555,14 @@ def _requirement_specs(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         if key == "funding_stage_min":
             stage = _funding_min_value(criteria) or str(raw)
-            specs.append({"key": key, "category": "Funding", "requirement": f"Current employer funded at {stage} or later", "labels": ("funding stage",), "terms": [stage]})
+            max_stage = _funding_max_value(criteria)
+            if not max_stage:
+                requirement = f"Current employer funded at {stage} or later"
+            elif _funding_rank(stage) == _funding_rank(max_stage):
+                requirement = f"Current employer at {stage} funding stage"
+            else:
+                requirement = f"Current employer funded between {stage} and {max_stage}"
+            specs.append({"key": key, "category": "Funding", "requirement": requirement, "labels": ("funding stage",), "terms": [t for t in (stage, max_stage) if t]})
             continue
         if key in ("competitor_of", "competitors_of"):
             target = competitor_target or "the target company"
@@ -7198,8 +7253,9 @@ async def generate_reasoning_for_profile(
         "unless a criterion asks for them; missing dates or a 0.0 duration are absent data, not disqualifying. "
         "Do not invent missing candidate facts. "
         "If evidence is insufficient, return not_verified and list the unmet requirement in missing_criteria. "
-        "Criteria semantics: funding_stage_min means the named stage OR ANY LATER stage "
-        "(Seed < Series A < Series B < Series C < ... < Growth < Private Equity < Public), so a later stage satisfies it. "
+        "Criteria semantics: funding_stage_min without max_stage means the named stage OR ANY LATER stage "
+        "(Seed < Series A < Series B < Series C < ... < Growth < Private Equity < Pre-IPO < Public), so a later stage satisfies it; "
+        "with max_stage the employer's stage must fall between stage and max_stage inclusive, so a later stage does NOT satisfy an exact-stage criterion. "
         "avg_tenure_in_last_n_roles is the average duration of the candidate's most recent N roles; "
         "min_tenure_in_latest_role is the duration of the current/latest role; min_total_experience is total career years. "
         "Durations in calculated_experience, scoped_tenure and evidence_log were computed from role dates and are authoritative. "
@@ -7547,8 +7603,8 @@ def _executable_criteria_contract() -> Dict[str, Any]:
         "excluded_geographies": common_text_shape,
         "excluded_industries": {**common_text_shape, "meaning": "industries/company types the candidate must NOT have worked in"},
         "funding_stage_min": {
-            "shape": {"stage": "funding stage", "employment_scope": "current_employer|any_employer"},
-            "comparison": "ordered minimum",
+            "shape": {"stage": "funding stage", "max_stage": "optional funding stage; omit only for open-ended 'X and above'", "employment_scope": "current_employer|any_employer"},
+            "comparison": "ordered range: stage <= employer stage <= max_stage; without max_stage it is an open-ended minimum",
         },
         "min_total_experience": {"shape": "number"},
         "min_people_managed": {"shape": "integer", "meaning": "team size/headcount managed, NOT duration"},
@@ -7626,6 +7682,8 @@ def _build_terminology_pack() -> Dict[str, Any]:
             "worked_at_company": "any past/current employer",
             "competitors": "LLM brainstorm then validate names against known DB company names before filtering.",
             "series_c_and_above": "Series C, Series D, Series E+, growth, pre-IPO, public/acquired/listed when present in schema.",
+            "bare_funding_stage": "'Series A companies' / 'at a Series B startup' / 'pre-IPO companies' mean that EXACT stage: funding_stage_min with stage and max_stage both set. Only 'and above', 'or later', '+', 'at least' make it open-ended.",
+            "pre_ipo": "Pre-IPO is a late private stage ranked below Public; it is not a synonym of public/listed.",
         },
     }
 
@@ -8426,6 +8484,67 @@ def _fallback_location_phrase_from_query(query: str) -> Optional[str]:
     return phrase or None
 
 
+_FUNDING_STAGE_MENTION_RE = re.compile(r"\b(pre[\s_-]?seed|seed|series[\s_-]*([a-h])|pre[\s_-]?ipo)\b(\+)?", re.I)
+_FUNDING_OPEN_ENDED_RE = re.compile(
+    r"\b(?:and|or)\s+(?:above|later|higher|up|beyond|onwards?)\b|\bat\s+least\b|\bminimum\b|\bor\s+more\b|\bupwards?\b|\bor\s+beyond\b",
+    re.I,
+)
+_PUBLIC_MARKER_RE = re.compile(r"\b(?:public|publicly|ipo|stock|exchange|nse|bse|nasdaq|nyse)\b", re.I)
+
+
+def _apply_explicit_funding_stage_window(criteria: Dict[str, Any], query: str) -> None:
+    """Pin the funding window to the stages the recruiter actually named.
+
+    The planner used to have only a minimum to express a stage, so "series a
+    companies" was executed as "Series A or later" and returned Series B,
+    Series H and public employers. A bare stage is an exact stage, a range
+    ("seed to series a", "series a or series b") is a closed window, and only
+    "and above" / "+" / "at least" leaves the window open. A bare "listed"
+    next to a named stage ("series a listed companies") is not "publicly
+    listed", so the public company-details filter the planner adds for it is
+    dropped.
+    """
+    stage_criterion = criteria.get("funding_stage_min")
+    if not stage_criterion:
+        return
+    query_l = _normalize_search_text(query)
+    mentions: List[Tuple[int, str]] = []
+    plus = False
+    for match in _FUNDING_STAGE_MENTION_RE.finditer(query_l):
+        label = re.sub(r"[\s_-]+", " ", match.group(1)).strip()
+        if match.group(3):
+            plus = True
+        rank = _funding_rank(label)
+        if rank is not None:
+            mentions.append((rank, label))
+    if not mentions:
+        return
+    if not isinstance(stage_criterion, dict):
+        stage_criterion = {"stage": str(stage_criterion)}
+        criteria["funding_stage_min"] = stage_criterion
+    if plus or _FUNDING_OPEN_ENDED_RE.search(query_l):
+        stage_criterion.pop("max_stage", None)
+        if _funding_rank(stage_criterion.get("stage")) is None:
+            stage_criterion["stage"] = min(mentions)[1]
+    else:
+        stage_criterion["stage"] = min(mentions)[1]
+        stage_criterion["max_stage"] = max(mentions)[1]
+
+    if re.search(r"\blisted\b", query_l) and not _PUBLIC_MARKER_RE.search(query_l):
+        details = criteria.get("required_company_details")
+        public_terms = set(STATIC_COMPANY_DETAILS_TAXONOMY["public"]) | {"ipo", "pre-ipo", "pre ipo"}
+        if isinstance(details, dict) and isinstance(details.get("values"), list):
+            kept = []
+            for item in details["values"]:
+                text = item.get("value") if isinstance(item, dict) else item
+                if _normalize_search_text(text) not in public_terms:
+                    kept.append(item)
+            if kept:
+                details["values"] = kept
+            else:
+                criteria.pop("required_company_details", None)
+
+
 def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         return {}
@@ -8587,6 +8706,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
 
     if criteria.get("funding_stage_min") and isinstance(criteria["funding_stage_min"], dict):
         criteria["funding_stage_min"].setdefault("employment_scope", _query_company_scope(query))
+    _apply_explicit_funding_stage_window(criteria, query)
 
     if (
         criteria.get("required_locations")
@@ -8661,7 +8781,9 @@ Rules:
 - "current company/employer", "present company/employer", and company attributes attached to "currently working" mean current_employer.
 - employment_scope applies to required companies, industries, customer segments, company details/business model/product, culture, and funding stage. Preserve that scope on every affected criterion.
 - "working for COMPANY competitors" means current_employer at a validated competitor.
-- "Series C and above" means funding_stage_min Series C with ordered funding comparison.
+- "Series C and above" / "Series C+" / "at least Series C" means funding_stage_min {{"stage": "Series C"}} with no max_stage (open-ended).
+- A bare stage ("Series A companies", "working at a Series B startup", "pre-IPO companies") means that EXACT stage: funding_stage_min {{"stage": "Series A", "max_stage": "Series A"}}. "Series A or Series B" / "seed to Series A" means {{"stage": "Seed", "max_stage": "Series A"}}. Never widen a bare stage into an open-ended minimum.
+- "listed" means publicly traded only next to "publicly"/"public"/"stock"; "series a listed companies" is just Series A. Pre-IPO is not public.
 - "outbound exp" should map to Sales Development/BDR/SDR/outbound prospecting unless the query explicitly asks AE/hunting/new-logo closing.
 - Function-specific years must become min_function_years or min_years on required_functions.
 - Years attached to an industry, domain, company type, product, service, or business model must become min_years on required_industries or required_company_details. Example: "5 years in SaaS/software/fintech" is not min_function_years.
