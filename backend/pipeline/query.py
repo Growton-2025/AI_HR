@@ -168,6 +168,20 @@ SHORTLIST_COMPANY_FACT_CACHE_PATH = Path(
         str(Path(__file__).resolve().parents[2] / "data" / "cache" / "shortlist_company_facts_cache.json"),
     )
 )
+# Per-employer facts (listed/funding stage, industry, segment) resolved by the
+# LLM for EVERY employer in the search scope, not just the most frequent ones:
+# a company-attribute query ("working at an IPO-listed company") must return
+# everyone at a matching employer. Cached per company; one classification each.
+EMPLOYER_FACTS_CACHE_PATH = Path(
+    os.getenv(
+        "EMPLOYER_FACTS_CACHE_PATH",
+        str(Path(__file__).resolve().parents[2] / "data" / "cache" / "employer_facts_cache.json"),
+    )
+)
+EMPLOYER_FACTS_MODEL = os.getenv("EMPLOYER_FACTS_MODEL", SCREENING_REASONING_MODEL)
+EMPLOYER_FACTS_BATCH_SIZE = int(os.getenv("EMPLOYER_FACTS_BATCH_SIZE", "40"))
+EMPLOYER_FACTS_CONCURRENCY = int(os.getenv("EMPLOYER_FACTS_CONCURRENCY", "16"))
+EMPLOYER_FACTS_TTL_DAYS = int(os.getenv("EMPLOYER_FACTS_TTL_DAYS", "90"))
 
 llm = ChatOpenAI(model=SCREENING_CRITERIA_MODEL, temperature=0.0)
 specialist_llm = ChatOpenAI(model=SCREENING_REASONING_MODEL, temperature=0.1)
@@ -3789,7 +3803,32 @@ def _web_company_fact_items(criteria: Dict[str, Any], fact_key: str) -> List[Dic
     return items if isinstance(items, list) else []
 
 
+def _employer_fact(company_name: str, criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    facts = criteria.get("_employer_facts")
+    if not isinstance(facts, dict) or not company_name:
+        return None
+    item = facts.get(_normalize_company_key(company_name))
+    return item if isinstance(item, dict) and item.get("known") else None
+
+
+def _employer_fact_stage(item: Dict[str, Any]) -> str:
+    if item.get("publicly_listed") is True:
+        return "Public"
+    return str(item.get("funding_stage") or "").strip()
+
+
 def _web_company_funding_rank(company_name: str, criteria: Dict[str, Any]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    employer = _employer_fact(company_name, criteria)
+    if employer:
+        stage = _employer_fact_stage(employer)
+        rank = _funding_rank(stage)
+        if rank is not None:
+            exchange = str(employer.get("stock_exchange") or "").strip()
+            return rank, {
+                "company": employer.get("company") or company_name,
+                "stage": f"{stage} ({exchange})" if exchange and stage == "Public" else stage,
+                "sources": [],
+            }
     for item in _web_company_fact_items(criteria, "funding"):
         if not isinstance(item, dict):
             continue
@@ -3826,6 +3865,29 @@ def _web_company_office_match(company_name: str, terms: List[str], criteria: Dic
 
 
 def _web_company_profile_text(company_name: str, criteria: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
+    employer = _employer_fact(company_name, criteria)
+    if employer:
+        stage = _employer_fact_stage(employer)
+        listed_terms = (
+            "publicly listed public company listed company ipo listed stock exchange"
+            if employer.get("publicly_listed") is True else ""
+        )
+        text = " ".join(
+            _flatten_value_for_evidence(
+                {
+                    "industry": employer.get("industry"),
+                    "product_service": employer.get("product_service"),
+                    "customer_segment": employer.get("customer_segment"),
+                    "business_model": employer.get("business_model"),
+                    "headquarters": employer.get("headquarters"),
+                    "funding_stage": stage,
+                    "stock_exchange": employer.get("stock_exchange"),
+                    "listing": listed_terms,
+                },
+                max_items=80,
+            )
+        ).lower()
+        return text, {"company": employer.get("company") or company_name, "sources": []}
     for item in _web_company_fact_items(criteria, "company_profiles"):
         if not isinstance(item, dict):
             continue
@@ -5013,7 +5075,7 @@ async def enrich_criteria_with_candidate_company_web_facts(
     )
     user_prompt = (
         f"Recruiting query:\n{original_query}\n\n"
-        f"Extracted structured criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Extracted structured criteria:\n{json.dumps(_criteria_for_prompt(criteria), ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate employer list to verify:\n{json.dumps(company_names, ensure_ascii=False, indent=2)}\n\n"
         "For funding_stage_min, report each company's current funding stage (Seed, Series A..G, growth, PE, Pre-IPO, Public) so the engine can compare it against the stage/max_stage window. "
         "For geography criteria, verify only offices/operations/headquarters in the requested country/region. "
@@ -5037,6 +5099,362 @@ async def enrich_criteria_with_candidate_company_web_facts(
         logger.warning("Candidate company fact web enrichment failed: %s", e)
         return criteria
     return _merge_web_company_facts(criteria, structured if isinstance(structured, dict) else {})
+
+
+def _criteria_for_prompt(criteria: Dict[str, Any]) -> Dict[str, Any]:
+    """Criteria without the per-employer facts map (thousands of entries)."""
+    return {k: v for k, v in criteria.items() if k != "_employer_facts"}
+
+
+def _all_employer_names_in_scope(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> Dict[str, str]:
+    """Every employer the scorer will look at, keyed by normalized name.
+    Unlike _candidate_company_names_for_web there is no top-N cap: an employer
+    left out here can never match, so everyone working there is dropped."""
+    scoped_criteria = [criteria.get(key) for key in EMPLOYMENT_SCOPED_CRITERIA_KEYS if criteria.get(key)]
+    current_only = bool(scoped_criteria) and all(
+        _company_scope_current_only(item if isinstance(item, dict) else {}, "any_employer")
+        for item in scoped_criteria
+    )
+    names: Dict[str, str] = {}
+    for profile in profiles:
+        roles = _profile_roles_with_raw_experience(profile)
+        role_iter = _current_roles({**profile, "roles": roles}) if current_only else roles
+        for role in role_iter:
+            company = str(role.get("company") or "").strip()
+            key = _normalize_company_key(company)
+            if key and key not in names:
+                names[key] = company
+    return names
+
+
+def _load_employer_facts_cache() -> Dict[str, Any]:
+    try:
+        if EMPLOYER_FACTS_CACHE_PATH.exists():
+            with EMPLOYER_FACTS_CACHE_PATH.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Could not load employer facts cache", exc_info=True)
+    return {}
+
+
+def _save_employer_facts_cache(cache: Dict[str, Any]) -> None:
+    try:
+        EMPLOYER_FACTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = EMPLOYER_FACTS_CACHE_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=1, default=str)
+        tmp.replace(EMPLOYER_FACTS_CACHE_PATH)
+    except Exception:
+        logger.warning("Could not save employer facts cache", exc_info=True)
+
+
+def _employer_facts_fresh(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    stamp = _parse_cache_timestamp(entry.get("updated_at"))
+    return bool(stamp) and (datetime.utcnow() - stamp).days < EMPLOYER_FACTS_TTL_DAYS
+
+
+_EMPLOYER_FACTS_SYSTEM_PROMPT = (
+    "You are a company research assistant for a recruiting search engine. For each employer name, "
+    "report company-level facts from your knowledge. Names come from LinkedIn profiles and may be "
+    "spelled loosely (\"Tcs\", \"HCLTech\", \"Byju'S\"); resolve them to the real company. "
+    "Return JSON only: {\"companies\": [{\"name\": <exactly as given>, \"known\": true|false, "
+    "\"publicly_listed\": true|false|null, \"stock_exchange\": <e.g. NSE, BSE, NASDAQ, NYSE or empty>, "
+    "\"funding_stage\": <one of Pre-seed, Seed, Series A..Series J, Growth, Private Equity, Pre-IPO, Public, "
+    "Acquired, Bootstrapped, Private, or empty>, \"parent_company\": <string or empty>, "
+    "\"industry\": <short industry label>, \"product_service\": <one line: what it sells>, "
+    "\"customer_segment\": [<SMB, Mid-Market, Enterprise, Consumer, Government ...>], "
+    "\"business_model\": <B2B SaaS, IT services, marketplace, ...>, \"headquarters\": <city, country>}]}. "
+    "publicly_listed is true when the company's own shares, or its parent's, trade on a stock exchange today "
+    "(a subsidiary of a listed parent counts; set parent_company). "
+    "Set known=false and leave the other fields empty when you do not recognise the company or the name is "
+    "not a company (a job title, 'Self-employed', 'Freelance', 'Confidential'). Never guess. "
+    "Return one entry per input name."
+)
+
+
+async def enrich_criteria_with_employer_facts(
+    criteria: Dict[str, Any],
+    candidate_pool: List[Dict[str, Any]],
+    tracker: TokenCostTracker,
+) -> Dict[str, Any]:
+    """Resolve listed status / funding stage / industry / segment for every
+    employer in scope and attach them as criteria['_employer_facts']."""
+    if not _needs_candidate_company_fact_web_enrichment(criteria):
+        return criteria
+    names = _all_employer_names_in_scope(candidate_pool, criteria)
+    if not names:
+        return criteria
+
+    cache = _load_employer_facts_cache()
+    missing = [original for key, original in names.items() if not _employer_facts_fresh(cache.get(key))]
+    logger.info("SHORTLIST employer_facts employers=%s cached=%s to_classify=%s",
+                len(names), len(names) - len(missing), len(missing))
+
+    if missing:
+        sem = asyncio.Semaphore(EMPLOYER_FACTS_CONCURRENCY)
+        batches = [missing[i:i + EMPLOYER_FACTS_BATCH_SIZE] for i in range(0, len(missing), EMPLOYER_FACTS_BATCH_SIZE)]
+
+        async def classify(batch: List[str]) -> List[Dict[str, Any]]:
+            user_prompt = f"Employer names:\n{json.dumps(batch, ensure_ascii=False)}\n\nReturn JSON only."
+            async with sem:
+                try:
+                    structured = await asyncio.to_thread(
+                        call_openai_json,
+                        _EMPLOYER_FACTS_SYSTEM_PROMPT,
+                        user_prompt,
+                        model=EMPLOYER_FACTS_MODEL,
+                        use_web=False,
+                        temperature=0.0,
+                        timeout=90.0,
+                        response_format={"type": "json_object"},
+                    )
+                    tracker.add_usage(EMPLOYER_FACTS_MODEL, f"{_EMPLOYER_FACTS_SYSTEM_PROMPT}\n\n{user_prompt}",
+                                      json.dumps(structured, default=str), "Employer Facts Classification")
+                except Exception as e:
+                    logger.warning("Employer facts batch failed (%s names): %s", len(batch), e)
+                    return []
+            items = structured.get("companies") if isinstance(structured, dict) else None
+            return [item for item in (items or []) if isinstance(item, dict)]
+
+        results = await asyncio.gather(*(classify(batch) for batch in batches))
+        stamp = datetime.utcnow().isoformat() + "Z"
+        requested = {_normalize_company_key(name): name for name in missing}
+        for item in (entry for batch in results for entry in batch):
+            key = _normalize_company_key(item.get("name"))
+            if key not in requested:
+                continue
+            cache[key] = {**item, "company": requested[key], "updated_at": stamp}
+        _save_employer_facts_cache(cache)
+
+    enriched = dict(criteria)
+    enriched["_employer_facts"] = {key: cache[key] for key in names if isinstance(cache.get(key), dict)}
+    known = sum(1 for item in enriched["_employer_facts"].values() if item.get("known"))
+    listed = sum(1 for item in enriched["_employer_facts"].values() if item.get("known") and item.get("publicly_listed") is True)
+    logger.info("SHORTLIST employer_facts resolved=%s known=%s publicly_listed=%s", len(enriched["_employer_facts"]), known, listed)
+    return enriched
+
+
+# --- Company-first retrieval ---------------------------------------------
+# "Candidates at IPO-listed companies / fintech companies / Freshworks
+# competitors" is a question about employers, not people. Build
+# company -> [candidate ids], let the LLM pick the companies that answer the
+# query, and return every id under them: nobody at a matching employer is lost.
+
+COMPANY_QUERY_MATCH_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("company_query_match_cache.json")
+COMPANY_QUERY_BATCH_SIZE = int(os.getenv("COMPANY_QUERY_BATCH_SIZE", "50"))
+# Judging "is this a fintech / a Freshworks competitor" needs the stronger
+# model: gpt-4o-mini marked Oracle and Google fintech, BrowserStack a CRM rival.
+COMPANY_QUERY_MODEL = os.getenv("COMPANY_QUERY_MODEL", SCREENING_COMPETITOR_JUDGE_MODEL)
+
+
+def build_company_candidate_index(
+    profiles: List[Dict[str, Any]], *, current_only: bool
+) -> Dict[str, Dict[str, Any]]:
+    """normalized company key -> {"name": display name, "ids": [candidate ids]}."""
+    index: Dict[str, Dict[str, Any]] = {}
+    for profile in profiles:
+        roles = _profile_roles_with_raw_experience(profile)
+        role_iter = _current_roles({**profile, "roles": roles}) if current_only else roles
+        for role in role_iter:
+            company = str(role.get("company") or "").strip()
+            key = _normalize_company_key(company)
+            if not key:
+                continue
+            entry = index.setdefault(key, {"name": company, "ids": []})
+            if profile.get("id") not in entry["ids"]:
+                entry["ids"].append(profile.get("id"))
+    return index
+
+
+def _load_json_cache(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Could not load cache %s", path, exc_info=True)
+    return {}
+
+
+def _save_json_cache(path: Path, data: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, default=str)
+        tmp.replace(path)
+    except Exception:
+        logger.warning("Could not save cache %s", path, exc_info=True)
+
+
+_COMPANY_QUERY_SYSTEM_PROMPT = (
+    "You filter employer names for a recruiting search. The recruiter's query describes a kind of company "
+    "(e.g. IPO/publicly listed, fintech, B2B SaaS selling to enterprises, competitors of X). "
+    "For each numbered employer decide whether that company fits the company condition in the query. "
+    "Judge the company only; ignore conditions about the person (title, years, location). "
+    "Be strict. An industry/domain condition matches only when it is the company's PRIMARY business "
+    "(Oracle, Google, MongoDB are not fintech even though they have finance customers or products). "
+    "A competitor condition matches only direct competitors: same primary product category sold to the same "
+    "buyers — never vendors in an adjacent category, platforms the target integrates with, or its customers. "
+    "Different spellings of the same company (Salesforce, Salesforce.com) must get the same answer. "
+    "A listed/IPO condition matches when the company's shares or its parent's trade on a stock exchange today. "
+    "Each line may carry known facts after '|' — use them together with your own knowledge. "
+    "Names come from LinkedIn and may be spelled loosely; resolve them to the real company. "
+    "Exclude names you do not recognise and non-companies (Self-employed, Freelance, Confidential). "
+    "Return JSON only: {\"matches\": [<numbers of the matching employers>]}."
+)
+
+
+_COMPANY_CONDITION_SYSTEM_PROMPT = (
+    "A recruiter's search query describes a kind of employer. Turn it into one precise, self-contained "
+    "company condition that a reviewer can apply to any company name, and list well-known companies that "
+    "clearly satisfy it. For competitors of X: first state what X primarily sells and to whom, then define the "
+    "condition as companies whose primary product competes head-on with that, and list X's direct competitors "
+    "(large vendors included, e.g. multi-product suites that compete in X's category). Ignore conditions about "
+    "the person (title, years, location). Location words ('in Mumbai', 'based in', 'located in', 'from India') "
+    "describe where the PERSON is, never the company, unless the query explicitly says the company is "
+    "headquartered or based there. Return JSON only: "
+    "{\"condition\": <string>, \"examples\": [<company names>], \"not_examples\": [<adjacent companies that do NOT satisfy it>], "
+    "\"exclude\": [<for competitor queries: the target company X itself plus its former names; otherwise empty>]}."
+)
+
+
+async def _company_condition_for_query(query: str, tracker: TokenCostTracker) -> Dict[str, Any]:
+    """One call per query so every batch judges against the same definition;
+    independent batches otherwise drift (Salesforce in, Salesforce.com out)."""
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json, _COMPANY_CONDITION_SYSTEM_PROMPT, f"Recruiter query: {query}\n\nReturn JSON only.",
+            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=60.0,
+            response_format={"type": "json_object"},
+        )
+        tracker.add_usage(COMPANY_QUERY_MODEL, f"{_COMPANY_CONDITION_SYSTEM_PROMPT}\n\n{query}",
+                          json.dumps(structured, default=str), "Company Query Condition")
+    except Exception as e:
+        logger.warning("Company condition step failed for %r: %s", query, e)
+        structured = {}
+    return structured if isinstance(structured, dict) else {}
+
+
+def _company_query_line(idx: int, key: str, name: str, facts: Dict[str, Any]) -> str:
+    item = facts.get(key) if isinstance(facts.get(key), dict) else {}
+    hints = []
+    if item.get("known"):
+        if item.get("publicly_listed") is True:
+            hints.append(f"listed {item.get('stock_exchange') or ''}".strip())
+        elif item.get("funding_stage"):
+            hints.append(str(item.get("funding_stage")))
+        for field in ("industry", "product_service"):
+            if item.get(field):
+                hints.append(str(item.get(field))[:80])
+    return f"{idx}. {name}" + (f" | {'; '.join(hints)}" if hints else "")
+
+
+async def candidate_ids_for_company_query(
+    query: str,
+    *,
+    candidate_ids: Optional[List[int]] = None,
+    current_only: Optional[bool] = None,
+    tracker: Optional[TokenCostTracker] = None,
+) -> Dict[str, Any]:
+    """Every candidate id whose employer matches the company condition in `query`."""
+    if not is_cache_initialized():
+        await asyncio.to_thread(initialize_cache)
+    tracker = tracker or TokenCostTracker()
+    if current_only is None:
+        current_only = _query_signals_current_employer(query)
+    if candidate_ids is None:
+        profiles = [p for p in PROFILES_BY_ID.values() if not p.get("is_archived")]
+    else:
+        profiles = [PROFILES_BY_ID[i] for i in candidate_ids if i in PROFILES_BY_ID]
+
+    index = await asyncio.to_thread(build_company_candidate_index, profiles, current_only=current_only)
+    facts = _load_employer_facts_cache()
+    query_key = re.sub(r"\s+", " ", query.strip().lower())
+    match_cache = _load_json_cache(COMPANY_QUERY_MATCH_CACHE_PATH)
+    decided: Dict[str, Any] = {k: v for k, v in (match_cache.get(query_key) or {}).items() if not k.startswith("_")}
+    pending = [key for key in index if key not in decided]
+    logger.info("COMPANY_QUERY query=%r current_only=%s companies=%s cached=%s to_judge=%s",
+                query, current_only, len(index), len(index) - len(pending), len(pending))
+
+    condition: Dict[str, Any] = {}
+    if pending:
+        sem = asyncio.Semaphore(EMPLOYER_FACTS_CONCURRENCY)
+        condition = await _company_condition_for_query(query, tracker)
+        condition_text = (
+            f"Company condition: {condition.get('condition')}\n"
+            f"Companies that satisfy it: {', '.join(map(str, condition.get('examples') or []))}\n"
+            f"Companies that do NOT satisfy it: {', '.join(map(str, condition.get('not_examples') or []))}\n"
+        ) if condition.get("condition") else ""
+        logger.info("COMPANY_QUERY condition=%s", json.dumps(condition, ensure_ascii=False, default=str))
+
+        async def judge(batch: List[str]) -> Dict[str, bool]:
+            lines = "\n".join(_company_query_line(i, key, index[key]["name"], facts) for i, key in enumerate(batch, 1))
+            user_prompt = f"Recruiter query: {query}\n{condition_text}\nEmployers:\n{lines}\n\nReturn JSON only."
+            structured: Any = None
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        structured = await asyncio.to_thread(
+                            call_openai_json, _COMPANY_QUERY_SYSTEM_PROMPT, user_prompt,
+                            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=90.0,
+                            response_format={"type": "json_object"},
+                        )
+                        tracker.add_usage(COMPANY_QUERY_MODEL, f"{_COMPANY_QUERY_SYSTEM_PROMPT}\n\n{user_prompt}",
+                                          json.dumps(structured, default=str), "Company Query Match")
+                    except Exception as e:
+                        logger.warning("Company query batch failed (%s names, attempt %s): %s", len(batch), attempt + 1, e)
+                        structured = None
+                    if isinstance(structured, dict) and "matches" in structured:
+                        break
+                    await asyncio.sleep(2 * (attempt + 1))
+            if not (isinstance(structured, dict) and "matches" in structured):
+                # Undecided, not "no": left out of the cache so the next call retries it.
+                logger.warning("Company query batch undecided after retries (%s names)", len(batch))
+                return {}
+            picked = set()
+            for value in (structured.get("matches") if isinstance(structured, dict) else None) or []:
+                try:
+                    picked.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return {key: (i in picked) for i, key in enumerate(batch, 1)}
+
+        batches = [pending[i:i + COMPANY_QUERY_BATCH_SIZE] for i in range(0, len(pending), COMPANY_QUERY_BATCH_SIZE)]
+        for result in await asyncio.gather(*(judge(batch) for batch in batches)):
+            decided.update(result)
+        match_cache = _load_json_cache(COMPANY_QUERY_MATCH_CACHE_PATH)
+        match_cache[query_key] = {**(match_cache.get(query_key) or {}), **decided}
+        if condition:
+            match_cache[query_key]["_condition"] = condition
+        _save_json_cache(COMPANY_QUERY_MATCH_CACHE_PATH, match_cache)
+
+    if not condition:
+        # Fully cached query: the exclusion list is stored beside the answers.
+        condition = dict((match_cache.get(query_key) or {}).get("_condition") or {})
+    excluded_targets = [str(name) for name in (condition.get("exclude") or []) if str(name or "").strip()]
+    matched = sorted(
+        ({"company": index[key]["name"], "candidate_ids": index[key]["ids"]} for key in index
+         if decided.get(key) is True
+         and not any(_company_matches(index[key]["name"], target) for target in excluded_targets)),
+        key=lambda item: len(item["candidate_ids"]), reverse=True,
+    )
+    ids = sorted({cid for item in matched for cid in item["candidate_ids"]})
+    return {
+        "query": query,
+        "current_employer_only": current_only,
+        "companies_checked": len(index),
+        "companies_matched": len(matched),
+        "candidate_count": len(ids),
+        "candidate_ids": ids,
+        "companies": matched,
+        "company_condition": condition.get("condition"),
+        "cost": tracker.get_summary(),
+    }
 
 
 def build_fallback_search_concept_pack(original_query: str, criteria: Dict[str, Any], catalog: Dict[str, Any]) -> Dict[str, Any]:
@@ -5572,7 +5990,7 @@ async def evaluate_shortlist_evidence_batch(
     cards = [compact_shortlist_evidence_card(profile) for profile in profiles]
     user_prompt = (
         f"Hiring query:\n{original_query}\n\n"
-        f"Extracted criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Extracted criteria:\n{json.dumps(_criteria_for_prompt(criteria), ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Search concept pack:\n{json.dumps(concept_pack, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Evidence catalog summary:\n{json.dumps(compact_evidence_catalog_for_prompt(catalog), ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Candidate evidence cards:\n{json.dumps(cards, ensure_ascii=False, indent=2, default=str)}\n\n"
@@ -5641,7 +6059,7 @@ async def audit_shortlist_evidence_batch(
     ]
     user_prompt = (
         f"Hiring query:\n{original_query}\n\n"
-        f"Extracted criteria:\n{json.dumps(criteria, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"Extracted criteria:\n{json.dumps(_criteria_for_prompt(criteria), ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Search concept pack:\n{json.dumps(concept_pack, ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Evidence catalog summary:\n{json.dumps(compact_evidence_catalog_for_prompt(catalog), ensure_ascii=False, indent=2, default=str)}\n\n"
         f"Analyst results and evidence cards:\n{json.dumps(cards, ensure_ascii=False, indent=2, default=str)}\n\n"
@@ -5878,6 +6296,60 @@ def _profile_general_text(profile: Dict[str, Any]) -> str:
     ).lower()
 
 
+_SALES_DOMAIN_RE = re.compile(r"\b(?:sales|revenue|business development|commercial|go to market|gtm)\b", re.I)
+_SALES_C_LEVEL_RE = re.compile(r"\b(?:cro|cso|chief revenue officer|chief sales officer)\b", re.I)
+_ACCEPTED_TIERS = {"generic": {"generic", "director", "vp", "c_level"}, "director": {"director"}, "vp": {"vp", "c_level"}, "c_level": {"c_level"}}
+
+
+def _leadership_title_matches(requirement: str, title: str) -> bool:
+    """Seniority tier + sales domain instead of an exact phrase. Only for
+    sales leadership requirements; everything else stays phrase-matched."""
+    requirement_l = _normalize_search_text(requirement)
+    title_l = _normalize_search_text(title)
+    if not _LEADERSHIP_TITLE_RE.search(requirement_l) or not _SALES_DOMAIN_RE.search(requirement_l):
+        return False
+    if not _LEADERSHIP_TITLE_RE.search(title_l):
+        return False
+    if not (_SALES_DOMAIN_RE.search(title_l) or _SALES_C_LEVEL_RE.search(title_l)):
+        return False
+    return _leadership_tier(title_l) in _ACCEPTED_TIERS[_leadership_tier(requirement_l)]
+
+
+_CURRENT_TITLE_FIELD_RE = re.compile(r"^(?:current\s*)?(?:job\s*)?(?:title|designation|position)$", re.I)
+_ANY_TITLE_FIELD_RE = re.compile(r"^(?:current\s*|previous\s*|past\s*)?(?:job\s*)?(?:title|designation|position)(?:[\s._-]*\d+)?$", re.I)
+
+
+def _function_title_evidence(
+    profile: Dict[str, Any], criterion: Any, criteria_context: Dict[str, Any]
+) -> List[Tuple[str, str, Optional[Dict[str, Any]]]]:
+    """(source, title text, role) the function requirement may match: role
+    titles, the headline and uploaded title columns. "Currently working as"
+    limits it to the current role — uploaded sheets keep the current title in
+    "Title" and past ones in "Title.1".."Title.9"."""
+    criterion_obj = criterion if isinstance(criterion, dict) else {}
+    current_only = _company_scope_current_only(criterion_obj, "any_employer") or _query_signals_current_employer(
+        str(criteria_context.get("_screening_query") or "")
+    )
+    evidence: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
+    roles = _current_roles(profile) if current_only else (profile.get("roles") or [])
+    for idx, role in enumerate(roles, start=1):
+        title = _shortlist_clean_text(role.get("title"))
+        if title:
+            evidence.append((f"{'current role' if current_only else f'role {idx}'} title", title, role))
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    field_re = _CURRENT_TITLE_FIELD_RE if current_only else _ANY_TITLE_FIELD_RE
+    for key, value in raw_fields.items():
+        text = _shortlist_clean_text(value)
+        if text and field_re.match(str(key).strip()):
+            evidence.append((f"uploaded fields.{key}", text, None))
+    # The headline is self-description ("Sales Leader in the Making | Senior
+    # SDR"), so it counts only when the profile carries no job title at all.
+    headline = _shortlist_clean_text(profile.get("headline"))
+    if headline and not evidence:
+        evidence.append(("headline", headline, None))
+    return evidence
+
+
 def _strict_presence_result(
     profile: Dict[str, Any],
     criteria_key: str,
@@ -5996,6 +6468,26 @@ def _strict_presence_result(
                 term = next((term for term in terms if _term_matches_text(term, selling_text)), None)
                 if term:
                     found = ("candidate selling record", _evidence_snippet(selling_text, term), None, selling_text)
+        elif criteria_key == "required_functions":
+            # A function is a job title, not a word anywhere in the profile:
+            # matching the About text passed a software engineer as "Sales
+            # Leader" through a recommender's "Sales Development, Synup".
+            title_evidence = _function_title_evidence(profile, criterion, criteria_context or {})
+            for source, text, role in title_evidence:
+                text_l = _normalize_search_text(text)
+                term = next((term for term in terms if _term_matches_text(term, text_l)), None)
+                if term:
+                    found = (source, _evidence_snippet(text, term), role, text)
+                    break
+            if not found:
+                # Phrase matching misses word order: "AVP - Sales", "Head of
+                # Inside Sales" and "Co-Founder and CRO" are all VP Sales.
+                for source, text, role in title_evidence:
+                    if _leadership_title_matches(value, text):
+                        tier = {"vp": "VP-level", "director": "Director-level", "c_level": "C-level"}.get(
+                            _leadership_tier(_normalize_search_text(text)), "leadership")
+                        found = (source, f"{text[:160]} — a {tier} sales leadership title, equivalent to {value}", role, text)
+                        break
         else:
             chunks = build_profile_evidence_chunks(profile)
             for chunk in chunks:
@@ -6571,6 +7063,17 @@ def _requirement_specs(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         if key == "required_companies":
             values = _requirement_values(raw)
+            company_query = criteria.get("_company_query_resolution") if isinstance(criteria.get("_company_query_resolution"), dict) else {}
+            if company_query.get("condition"):
+                current = company_query.get("scope") == "current_employer"
+                specs.append({
+                    "key": key,
+                    "category": "Companies",
+                    "requirement": f"{'Current employer' if current else 'Employer'}: {company_query['condition']}",
+                    "labels": ("companies",),
+                    "terms": values,
+                })
+                continue
             is_competitor = bool(competitor_target) or any(
                 isinstance(v, dict) and str(v.get("source") or "").startswith("competitor_of") for v in (raw.get("values") if isinstance(raw, dict) else raw or [])
             )
@@ -7251,6 +7754,10 @@ async def generate_reasoning_for_profile(
         "a role-company match already establishes employment at that company under the criterion's employment_scope. "
         "Do not add requirements the criteria do not state: never demand tenure, durations, start/end dates, seniority or role titles "
         "unless a criterion asks for them; missing dates or a 0.0 duration are absent data, not disqualifying. "
+        "Job-title requirements are met by seniority-equivalent titles in the same function: AVP, SVP, EVP, "
+        "'Head of <any> Sales' and CRO/CSO satisfy 'VP Sales'; 'Director, Sales' or 'Area Sales Director' satisfies "
+        "'Sales Director'; any Director/VP/Head/Chief sales title satisfies 'Sales Leader'. Do not reject for wording "
+        "differences; reject only for a different function or a lower seniority. "
         "Do not invent missing candidate facts. "
         "If evidence is insufficient, return not_verified and list the unmet requirement in missing_criteria. "
         "Criteria semantics: funding_stage_min without max_stage means the named stage OR ANY LATER stage "
@@ -7332,6 +7839,42 @@ def _observed_company_terms_for_expansion(category: str, *, limit: int = 300) ->
     return [term for term, _count in counts.most_common(limit)]
 
 
+_LEADERSHIP_TITLE_RE = re.compile(
+    r"\b(?:vp|svp|evp|avp|vice\s+president|president|head|director|leader|leadership|chief|cro|cso|cco|gm|general\s+manager)\b",
+    re.I,
+)
+
+
+def _leadership_tier(title: str) -> str:
+    text = _normalize_search_text(title)
+    if re.search(r"\b(?:chief|cro|cso|cco)\b", text) or re.search(r"(?<!vice )\bpresident\b", text):
+        return "c_level"
+    if re.search(r"\b(?:vp|svp|evp|avp|vice president|head)\b", text):
+        return "vp"
+    if re.search(r"\bdirector\b", text):
+        return "director"
+    return "generic"
+
+
+def _same_seniority_titles(originals: List[str], expanded: List[str]) -> List[str]:
+    """The model is told to keep seniority but does not always: "VP Sales"
+    still came back with "Sales Executive". Enforce it: leadership queries keep
+    leadership titles only, individual-contributor queries drop leadership."""
+    if not originals:
+        return expanded
+    leadership = [bool(_LEADERSHIP_TITLE_RE.search(str(v))) for v in originals]
+    if all(leadership):
+        # Keep the tier too: "VP Sales" expanded to Sales Director, which the
+        # auditor then rejected. A generic "Sales Leader" accepts any tier.
+        wanted = {_leadership_tier(str(v)) for v in originals}
+        if "generic" in wanted:
+            return [t for t in expanded if _LEADERSHIP_TITLE_RE.search(str(t))]
+        return [t for t in expanded if _leadership_tier(str(t)) in wanted]
+    if not any(leadership):
+        return [t for t in expanded if not _LEADERSHIP_TITLE_RE.search(str(t))]
+    return expanded
+
+
 async def _expand_keywords_with_llm(values: List[str], category: str, tracker: TokenCostTracker) -> List[str]:
     values = [str(value).strip() for value in values if str(value or "").strip()]
     if not values:
@@ -7356,10 +7899,22 @@ async def _expand_keywords_with_llm(values: List[str], category: str, tracker: T
         category=category,
         observed_terms=json.dumps(observed_terms, ensure_ascii=False),
     )
+    if "title" in category.lower():
+        # "Sales Leader / VP Sales" came back with Sales Executive, SDR,
+        # Sales Associate and Sales Analyst: every junior seller passed.
+        prompt_text += (
+            "\nFor job titles: return only titles a recruiter would accept as the SAME role at the SAME seniority. "
+            "Leadership titles (VP, Head, Director, Leader, Chief) expand only to leadership titles; never add "
+            "Executive, Representative, Associate, Analyst, Specialist, Coordinator, SDR/BDR or individual-contributor "
+            "titles. Individual-contributor titles never expand to Director/VP/Head. Return at most 25 titles.\n"
+        )
     try:
         response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
         tracker.add_usage(llm.model_name, prompt_text, response.content, "Keyword Expansion")
-        return get_list_from_llm_json(safe_json_loads(response.content, []))
+        expanded = get_list_from_llm_json(safe_json_loads(response.content, []))
+        if "title" in category.lower():
+            expanded = _same_seniority_titles(values, expanded)
+        return expanded
     except asyncio.TimeoutError:
         logger.warning("Shortlist %s keyword expansion timed out; using original terms", category)
         return []
@@ -8331,6 +8886,21 @@ def _enforce_explicit_query_requirements(criteria: Dict[str, Any], query: str) -
         function_terms.append("BDR")
     if re.search(r"\bsdrs?\b", query_l):
         function_terms.append("SDR")
+    # Titles the plan model sometimes drops ("VP sales currently at Freshworks
+    # competitors" came back with only competitors_of, so every seniority matched).
+    for pattern, canonical in (
+        (r"\b(?:vp|vps|vice presidents?)\s*(?:of\s+|-\s*|,\s*)?sales\b", "VP Sales"),
+        (r"\bheads? of sales\b", "Head of Sales"),
+        (r"\bsales directors?\b|\bdirectors? of sales\b", "Sales Director"),
+        (r"\bsales leaders?\b", "Sales Leader"),
+        (r"\bchief revenue officers?\b", "Chief Revenue Officer"),
+        (r"\bsales managers?\b", "Sales Manager"),
+        (r"\baccount executives?\b|\baes\b", "Account Executive"),
+        (r"\baccount managers?\b", "Account Manager"),
+        (r"\bcustomer success managers?\b|\bcsms?\b", "Customer Success Manager"),
+    ):
+        if re.search(pattern, query_l):
+            function_terms.append(canonical)
     if function_terms:
         existing = criteria.get("required_functions")
         existing_values = _criteria_values_for_search(criteria, "required_functions")
@@ -8490,6 +9060,64 @@ _FUNDING_OPEN_ENDED_RE = re.compile(
     re.I,
 )
 _PUBLIC_MARKER_RE = re.compile(r"\b(?:public|publicly|ipo|stock|exchange|nse|bse|nasdaq|nyse)\b", re.I)
+
+
+_LISTED_DESCRIPTORS = {
+    "ipo", "ipo listed", "listed", "listed company", "listed companies", "public", "public company",
+    "public companies", "publicly listed", "publicly traded", "publicly listed company", "publicly listed companies",
+    "stock exchange listed", "nse listed", "bse listed", "nasdaq listed", "nyse listed", "post ipo",
+}
+_COMPANY_TYPE_DESCRIPTORS = {
+    "startup", "startups", "start up", "start-up", "unicorn", "unicorns", "mnc", "mncs", "multinational",
+    "enterprise company", "large enterprise", "product company", "product companies", "saas company",
+    "saas companies", "service company", "services company", "it services company",
+}
+_LISTED_QUERY_RE = re.compile(
+    r"(?<!pre[\s-])\bipo\b|\bpublicly\s+(?:listed|traded)\b|\blisted\s+(?:company|companies|firms?|employers?|organi[sz]ations?)\b"
+    r"|\bpublic\s+(?:company|companies|firms?)\b|\bstock\s+exchange\b",
+    re.I,
+)
+
+
+def _repair_descriptor_companies(criteria: Dict[str, Any], query: str) -> None:
+    """The plan model sometimes files a kind of company as a company name:
+    "sales directors at IPO listed companies" came back as
+    required_companies=[{"company": "ipo"}], which no employer can match, so
+    the search returned nobody. Move descriptors to the criterion that
+    expresses them, and add the listed condition when the query states it but
+    the plan dropped it."""
+    listed_scope: Optional[str] = None
+    raw = criteria.get("required_companies")
+    if raw:
+        values = raw.get("values") if isinstance(raw, dict) else raw
+        values = values if isinstance(values, list) else [values]
+        kept: List[Any] = []
+        type_terms: List[str] = []
+        for value in values:
+            name = value.get("company") or value.get("value") if isinstance(value, dict) else value
+            key = _normalize_search_text(name)
+            scope = (value.get("employment_scope") if isinstance(value, dict) else None) or (
+                raw.get("employment_scope") if isinstance(raw, dict) else None)
+            if key in _LISTED_DESCRIPTORS:
+                listed_scope = scope or _query_company_scope(query)
+            elif key in _COMPANY_TYPE_DESCRIPTORS:
+                type_terms.append(str(name))
+            else:
+                kept.append(value)
+        if len(kept) != len(values):
+            logger.info("SHORTLIST moved company descriptors out of required_companies: listed=%s types=%s",
+                        bool(listed_scope), type_terms)
+            if kept:
+                criteria["required_companies"] = {**raw, "values": kept} if isinstance(raw, dict) else kept
+            else:
+                criteria.pop("required_companies", None)
+            if type_terms:
+                existing = _criteria_values_for_search(criteria, "required_company_details")
+                criteria["required_company_details"] = {"operator": "OR", "values": list(dict.fromkeys(existing + type_terms))}
+    if listed_scope is None and not criteria.get("funding_stage_min") and _LISTED_QUERY_RE.search(query or ""):
+        listed_scope = _query_company_scope(query)
+    if listed_scope and not criteria.get("funding_stage_min"):
+        criteria["funding_stage_min"] = {"stage": "Public", "employment_scope": listed_scope}
 
 
 def _apply_explicit_funding_stage_window(criteria: Dict[str, Any], query: str) -> None:
@@ -8704,6 +9332,7 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
         criteria["competitors_of"] = normalized_items
         criteria.pop("competitor_of", None)
 
+    _repair_descriptor_companies(criteria, query)
     if criteria.get("funding_stage_min") and isinstance(criteria["funding_stage_min"], dict):
         criteria["funding_stage_min"].setdefault("employment_scope", _query_company_scope(query))
     _apply_explicit_funding_stage_window(criteria, query)
@@ -9001,6 +9630,26 @@ async def process_query_main(
                 logger.error("Competitor identification failed: %s", e)
                 yield "There was an issue identifying competitors."
 
+            # Company-first pass over every employer we hold: the research/judge
+            # path above only sees the employers it was shown, so real
+            # competitors outside that list (Zoho, HubSpot for Freshworks)
+            # were missing. Additive only.
+            try:
+                yield "Checking every employer in the database against the competitor definition..."
+                company_query = await candidate_ids_for_company_query(
+                    normalized_query,
+                    current_only=_company_scope_current_only({"employment_scope": competitor_scope}),
+                    tracker=tracker,
+                )
+                known_keys = {_normalize_company_key(name) for name in final_competitors}
+                for item in company_query.get("companies") or []:
+                    key = _normalize_company_key(item.get("company"))
+                    if key and key not in known_keys and not _company_matches(item.get("company") or "", target):
+                        final_competitors.append(item["company"])
+                        known_keys.add(key)
+            except Exception as e:
+                logger.warning("Company-first competitor pass failed: %s", e)
+
             if not final_competitors:
                 yield "Could not identify any valid competitors from the database. Halting search."
                 yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -9017,6 +9666,14 @@ async def process_query_main(
                 existing_company_values = existing_companies_criterion
             else:
                 existing_company_values = []
+            # The plan model sometimes also emits required_companies=[target]
+            # for "competitors of X"; people at X itself are not competitors.
+            existing_company_values = [
+                value for value in existing_company_values
+                if not _company_matches(
+                    str((value.get("company") or value.get("value") or "") if isinstance(value, dict) else value), target
+                )
+            ]
             criteria["required_companies"] = {
                 "operator": "OR",
                 "employment_scope": competitor_scope,
@@ -9292,6 +9949,93 @@ async def process_query_main(
     if not initial_candidate_pool:
         yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
         return
+
+    # Company-first retrieval: "at IPO-listed / fintech / B2B SaaS companies" is
+    # a question about employers. Resolve the matching employers once, then
+    # require "works at one of them" — everyone at a matching company is
+    # evaluated, instead of only those whose employer happened to carry a
+    # funding stage or industry in the DB. Other criteria (title, location,
+    # tenure) still apply. Skipped when the query already names companies or
+    # competitors: those are OR lists and this condition must be AND-ed.
+    company_query_keys = [
+        key for key in ("funding_stage_min", "required_industries", "required_company_details") if criteria.get(key)
+    ]
+    if company_query_keys and not criteria.get("required_companies"):
+        await _wait_if_paused()
+        yield "Finding every employer that matches the company condition..."
+        planner_scopes = []
+        for key in company_query_keys:
+            item = criteria.get(key) if isinstance(criteria.get(key), dict) else {}
+            default_scope = "current_employer" if key == "funding_stage_min" else "any_employer"
+            planner_scopes.append(_company_scope_current_only(item, default_scope))
+        company_current_only = _query_signals_current_employer(normalized_query) or all(planner_scopes)
+        # Only the company part of the query: the full text leaks person
+        # conditions into the definition ("sales directors ... located in
+        # Mumbai" became "listed companies headquartered in Mumbai": 264 -> 52).
+        query_values = criteria.get("_query_values") if isinstance(criteria.get("_query_values"), dict) else {}
+        company_parts: List[str] = []
+        if criteria.get("funding_stage_min"):
+            min_stage, min_rank, max_stage, _ = _funding_window(criteria)
+            if min_rank == FUNDING_STAGE_RANKS["public"]:
+                company_parts.append("publicly listed (IPO) companies whose shares trade on a stock exchange")
+            elif max_stage:
+                company_parts.append(f"companies whose current funding stage is between {min_stage} and {max_stage}")
+            else:
+                company_parts.append(f"companies whose current funding stage is {min_stage} or later (including publicly listed)")
+        if criteria.get("required_industries"):
+            values = query_values.get("required_industries") or _requirement_values(criteria["required_industries"])
+            company_parts.append(f"companies whose primary industry is {' or '.join(map(str, values))}")
+        if criteria.get("required_company_details"):
+            values = query_values.get("required_company_details") or _requirement_values(criteria["required_company_details"])
+            company_parts.append(f"companies that are {' or '.join(map(str, values))}")
+        company_query_text = "Employers that are " + "; and also ".join(company_parts)
+        try:
+            company_resolution = await candidate_ids_for_company_query(
+                company_query_text,
+                candidate_ids=[p["id"] for p in initial_candidate_pool],
+                current_only=company_current_only,
+                tracker=tracker,
+            )
+        except Exception as e:
+            logger.warning("Company-first retrieval failed; using attribute matching: %s", e)
+            company_resolution = None
+        if company_resolution and company_resolution.get("companies"):
+            names = [item["company"] for item in company_resolution["companies"]]
+            condition = company_resolution.get("company_condition") or query
+            scope = "current_employer" if company_current_only else "any_employer"
+            for key in company_query_keys:
+                criteria.pop(key, None)
+                original_criteria.pop(key, None)
+                (criteria.get("_query_values") or {}).pop(key, None)
+            criteria["required_companies"] = {
+                "operator": "OR",
+                "employment_scope": scope,
+                "values": [
+                    {"company": name, "employment_scope": scope, "source": f"company_query:{condition}"}
+                    for name in names
+                ],
+            }
+            # The employer condition is settled here for every candidate; the
+            # auditor must not re-judge it. Handing it a truncated company list
+            # made it reject people whose employer was not among the names shown.
+            original_criteria["_employer_condition_verified_by_engine"] = (
+                f"{'Current employer' if company_current_only else 'An employer'} is one of {len(names)} companies "
+                f"resolved as: {condition}. Already verified for this candidate; not a requirement to re-check."
+            )
+            criteria["_company_query_resolution"] = {"condition": condition, "companies": len(names), "scope": scope}
+            matched_ids = set(company_resolution.get("candidate_ids") or [])
+            initial_candidate_pool = [p for p in initial_candidate_pool if p.get("id") in matched_ids]
+            logger.info("SHORTLIST company_query condition=%r companies=%s candidates=%s scope=%s",
+                        condition, len(names), len(initial_candidate_pool), scope)
+            yield f"Matched {len(names)} employers ({condition}); evaluating {len(initial_candidate_pool)} candidates..."
+            if not initial_candidate_pool:
+                yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
+                return
+
+    await _wait_if_paused()
+    if _needs_candidate_company_fact_web_enrichment(criteria):
+        yield "Classifying every employer in scope (listed status, funding, industry, segment)..."
+        criteria = await enrich_criteria_with_employer_facts(criteria, initial_candidate_pool, tracker)
 
     await _wait_if_paused()
     if web_enabled and _needs_candidate_company_fact_web_enrichment(criteria):

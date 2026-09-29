@@ -36,6 +36,7 @@ from backend.pipeline.query import (
     is_cache_initialized,
     initialize_cache,
     count_active_candidates_from_db,
+    candidate_ids_for_company_query,
 )
 from backend.services.candidate_pool import profile_passes_scope, VIEW_SCOPE_MASTER, POOL_SOURCE_RECRUITER_UPLOAD
 
@@ -435,6 +436,22 @@ async def get_candidate(
     elif prof.get("owner_user_id") != current_user.id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return prof
+
+@router.post("/search/by-company")
+async def search_candidates_by_company(request: schemas.SearchRequest, current_user: schemas.User = Depends(deps.get_current_user)):
+    """Company-first search: every candidate whose employer matches the query
+    ("IPO-listed companies", "fintech", "Freshworks competitors"). LLM knowledge
+    only, so it works the same with web search off."""
+    if not is_cache_initialized():
+        await asyncio.to_thread(initialize_cache)
+    scope_ids = None
+    if (current_user.role or "").strip().lower() != "admin":
+        scope_ids = [
+            pid for pid, p in PROFILES_BY_ID.items()
+            if not p.get("is_archived") and p.get("owner_user_id") == current_user.id
+        ]
+    return await candidate_ids_for_company_query(request.query, candidate_ids=scope_ids)
+
 
 @router.post("/search")
 async def search_candidates(request: schemas.SearchRequest, current_user: schemas.User = Depends(deps.get_current_user)):
