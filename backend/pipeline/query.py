@@ -694,6 +694,53 @@ def update_profile_cache(candidate_id: int, data: Dict[str, Any]):
         logger.warning(f"Attempted to update cache for non-existent candidate {candidate_id}")
 
 
+_LEGACY_LINKEDIN_SUFFIX_RE = re.compile(r"_legacy_\d+$")
+
+
+def person_key(profile: Dict[str, Any]) -> str:
+    """One key per real person. The legacy migration appended "_legacy_<id>"
+    to LinkedIn URLs, so the same person re-uploaded later got a second
+    profile (438 pairs) and appeared twice in every shortlist."""
+    linkedin = str(profile.get("normalized_linkedin") or "").strip().lower().rstrip("/")
+    linkedin = _LEGACY_LINKEDIN_SUFFIX_RE.sub("", linkedin)
+    if linkedin:
+        return f"li:{linkedin}"
+    email = str(profile.get("email") or "").strip().lower()
+    if email and "@" in email:
+        return f"em:{email}"
+    return f"id:{profile.get('id')}"
+
+
+def _profile_richness(profile: Dict[str, Any]) -> tuple:
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    filled = sum(1 for v in raw_fields.values() if str(v or "").strip())
+    legacy = bool(_LEGACY_LINKEDIN_SUFFIX_RE.search(str(profile.get("normalized_linkedin") or "")))
+    return (len(profile.get("roles") or []) + filled, not legacy, int(profile.get("id") or 0))
+
+
+def dedupe_profiles_by_person(profiles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the richest profile per person (then non-legacy, then newest),
+    remembering the others so the UI can say the person has another record."""
+    best: Dict[str, Dict[str, Any]] = {}
+    others: Dict[str, List[int]] = {}
+    for profile in profiles:
+        key = person_key(profile)
+        current = best.get(key)
+        if current is None:
+            best[key] = profile
+        elif _profile_richness(profile) > _profile_richness(current):
+            others.setdefault(key, []).append(current.get("id"))
+            best[key] = profile
+        else:
+            others.setdefault(key, []).append(profile.get("id"))
+    result = []
+    for key, profile in best.items():
+        if others.get(key):
+            profile = {**profile, "duplicate_profile_ids": others[key]}
+        result.append(profile)
+    return result
+
+
 def build_candidate_pool(candidate_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     Build a lightweight search pool from the in-memory cache.
@@ -1656,34 +1703,8 @@ def _scoped_duration_role_text(profile: Dict[str, Any], role: Dict[str, Any], di
 
 
 _MARKET_ACTION_PATTERN = re.compile(
-    r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|outbound|inbound|pipeline|quota|revenue|territor(?:y|ies)|regions?|regional|markets?)\b"
+    r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|pipeline|quota|revenue|territor(?:y|ies)|region(?:al)?|market)\b"
 )
-
-
-_COMPANY_BOILERPLATE_RE = re.compile(
-    r"\b(?:head[\s-]?quarter(?:ed|s)?|hq|offices?|founded|based out of|incorporated|subsidiar(?:y|ies)|presence in|"
-    r"customers? (?:in|across)|clients? (?:in|across)|trusted by|serves? (?:customers|clients|brands))\b"
-)
-_CLAUSE_SPLIT_RE = re.compile(r"[.;:\n\u2022|]+|\s-\s")
-
-
-def _geo_term_is_market_experience(term: str, text: str) -> bool:
-    """True when a place named in free text is where the person sold or
-    managed, judged on the clause that contains it."""
-    term_l = _normalize_search_text(term)
-    if not term_l or not text:
-        return False
-    for clause in _CLAUSE_SPLIT_RE.split(text):
-        if not _term_matches_text(term_l, clause):
-            continue
-        if _COMPANY_BOILERPLATE_RE.search(clause):
-            continue
-        if _MARKET_ACTION_PATTERN.search(clause) or re.search(
-            r"\b(?:led|leading|lead|built|building|expan(?:d|ded|ding|sion)|grew|growing|launched|focus(?:ed)?|"
-            r"accounts?|clients?|customers?|deals?|business|sales|partners?|channel)\b", clause
-        ):
-            return True
-    return False
 
 
 def _has_market_action_text(text: str) -> bool:
@@ -5152,8 +5173,8 @@ async def enrich_criteria_with_candidate_company_web_facts(
 
 
 def _criteria_for_prompt(criteria: Dict[str, Any]) -> Dict[str, Any]:
-    """Criteria without the per-employer facts map (thousands of entries)."""
-    return {k: v for k, v in criteria.items() if k != "_employer_facts"}
+    """Criteria without the per-employer facts and matched-title maps (thousands of entries)."""
+    return {k: v for k, v in criteria.items() if k not in ("_employer_facts", "_title_matches", "_team_facts")}
 
 
 def _all_employer_names_in_scope(profiles: List[Dict[str, Any]], criteria: Dict[str, Any]) -> Dict[str, str]:
@@ -5285,6 +5306,157 @@ async def enrich_criteria_with_employer_facts(
     listed = sum(1 for item in enriched["_employer_facts"].values() if item.get("known") and item.get("publicly_listed") is True)
     logger.info("SHORTLIST employer_facts resolved=%s known=%s publicly_listed=%s", len(enriched["_employer_facts"]), known, listed)
     return enriched
+
+
+# --- Team facts ------------------------------------------------------------
+# max_people_managed / years_team_management are recorded for ~1% of
+# candidates. The LLM reads each profile once for the team size it states and
+# the years the person spent managing people, with a quote; cached per
+# candidate (moves to Redis with the other caches).
+TEAM_FACTS_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("team_facts_cache.json")
+TEAM_FACTS_MODEL = os.getenv("TEAM_FACTS_MODEL", SCREENING_COMPETITOR_JUDGE_MODEL)
+_TEAM_FACTS_PROMPT = (
+    "For each candidate profile, extract: team_size — the largest number of people they managed or led as stated "
+    "in the profile (null when no number is stated); team_management_years — total years in roles where they "
+    "managed or led people, from what the profile says and from roles whose responsibilities are clearly people "
+    "management, using the role dates given (null when they never managed people); quote — the exact words from "
+    "the profile that show them managing or leading people (empty when both are null). Owning accounts, "
+    "territories, quota, revenue or projects is not managing people; only return values when the quote shows "
+    "people reporting to them or a team they led. "
+    'Return JSON only: {"results": [{"id": <id>, "team_size": <number|null>, "team_management_years": <number|null>, '
+    '"quote": <string>}]}.'
+)
+
+
+def _team_facts_text(profile: Dict[str, Any]) -> str:
+    parts = [f"Headline: {profile.get('headline') or ''}"]
+    for role in (_profile_roles_with_raw_experience(profile) or [])[:10]:
+        parts.append(
+            f"Role: {role.get('title') or ''} at {role.get('company') or ''} "
+            f"({role.get('start_date') or '?'} to {role.get('end_date') or 'present'}; {role.get('duration_years') or 0} yrs). "
+            f"{str(role.get('details') or '')[:500]}"
+        )
+    parts.append(f"About: {str(profile.get('about') or '')[:800]}")
+    return "\n".join(parts)[:3500]
+
+
+async def attach_team_facts(criteria: Dict[str, Any], pool: List[Dict[str, Any]], tracker: TokenCostTracker) -> None:
+    if criteria.get("min_people_managed") is None and criteria.get("min_team_management_years") is None:
+        return
+    cache = _load_json_cache(TEAM_FACTS_CACHE_PATH)
+    pending = [p for p in pool if str(p.get("id")) not in cache]
+    logger.info("SHORTLIST team_facts pool=%s cached=%s to_extract=%s", len(pool), len(pool) - len(pending), len(pending))
+    if pending:
+        sem = asyncio.Semaphore(EMPLOYER_FACTS_CONCURRENCY)
+
+        async def extract(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+            texts = {str(p.get("id")): _team_facts_text(p) for p in batch}
+            user_prompt = "\n\n".join(f"### Candidate {cid}\n{text}" for cid, text in texts.items())
+            async with sem:
+                try:
+                    structured = await asyncio.to_thread(
+                        call_openai_json, _TEAM_FACTS_PROMPT, user_prompt, model=TEAM_FACTS_MODEL, use_web=False,
+                        temperature=0.0, timeout=90.0, response_format={"type": "json_object"},
+                    )
+                    tracker.add_usage(TEAM_FACTS_MODEL, _TEAM_FACTS_PROMPT + user_prompt, json.dumps(structured, default=str), "Team Facts")
+                except Exception as e:
+                    logger.warning("Team facts batch failed: %s", e)
+                    return {}
+            out = {}
+            for item in (structured.get("results") or []) if isinstance(structured, dict) else []:
+                cid = str(item.get("id"))
+                if cid not in texts:
+                    continue
+                quote = str(item.get("quote") or "").strip()
+                grounded = not quote or _quote_in_text(quote, texts[cid])
+                out[cid] = {
+                    "team_size": item.get("team_size") if grounded else None,
+                    "team_management_years": item.get("team_management_years") if grounded else None,
+                    "quote": quote if grounded else "",
+                }
+            return out
+
+        batches = [pending[i:i + 6] for i in range(0, len(pending), 6)]
+        for result in await asyncio.gather(*(extract(b) for b in batches)):
+            cache.update(result)
+        _save_json_cache(TEAM_FACTS_CACHE_PATH, cache)
+    criteria["_team_facts"] = {str(p.get("id")): cache[str(p.get("id"))] for p in pool if str(p.get("id")) in cache}
+
+
+# --- Title-first matching ------------------------------------------------
+# Same idea as company-first: judge each distinct job title once against the
+# requirement, then match exactly. Replaces title expansions and seniority /
+# leadership word lists, which only covered the phrasings someone wrote down.
+TITLE_MATCH_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("title_match_cache.json")
+TITLE_MATCH_BATCH_SIZE = int(os.getenv("TITLE_MATCH_BATCH_SIZE", "60"))
+_TITLE_MATCH_PROMPT = (
+    "You check job titles against a recruiter's title requirement. A title matches when the person holding it "
+    "does that role, at the stated seniority or above (a more senior version of the same role counts; a "
+    "different role, or a more junior one, does not). Titles are copied from profiles and may be long, "
+    "abbreviated or combine several roles; judge what the person does. "
+    'Return JSON only: {"matches": [<numbers of the matching titles>]}.'
+)
+
+
+async def _classify_titles_for_criteria(
+    criteria: Dict[str, Any], pool: List[Dict[str, Any]], tracker: TokenCostTracker
+) -> None:
+    criterion = criteria.get("required_functions")
+    if not criterion:
+        return
+    values = _criteria_values_for_search(criteria, "required_functions")
+    titles: Dict[str, str] = {}
+    for profile in pool:
+        pc = {**profile, "roles": _profile_roles_with_raw_experience(profile)}
+        for _source, text, _role in _function_title_evidence(pc, criterion, criteria):
+            key = _normalize_search_text(text)
+            if key:
+                titles.setdefault(key, str(text).strip()[:160])
+    requirement_key = " | ".join(sorted(_normalize_search_text(v) for v in values))
+    cache = _load_json_cache(TITLE_MATCH_CACHE_PATH)
+    decided: Dict[str, bool] = dict(cache.get(requirement_key) or {})
+    pending = [k for k in titles if k not in decided]
+    logger.info("SHORTLIST title_match requirement=%r titles=%s cached=%s to_judge=%s",
+                requirement_key, len(titles), len(titles) - len(pending), len(pending))
+    if pending:
+        sem = asyncio.Semaphore(EMPLOYER_FACTS_CONCURRENCY)
+
+        async def judge(batch: List[str]) -> Dict[str, bool]:
+            lines = "\n".join(f"{i}. {titles[k]}" for i, k in enumerate(batch, 1))
+            user_prompt = f"Required title: {' OR '.join(values)}\n\nTitles:\n{lines}\n\nReturn JSON only."
+            structured: Any = None
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        structured = await asyncio.to_thread(
+                            call_openai_json, _TITLE_MATCH_PROMPT, user_prompt, model=COMPANY_QUERY_MODEL,
+                            use_web=False, temperature=0.0, timeout=90.0, response_format={"type": "json_object"},
+                        )
+                        tracker.add_usage(COMPANY_QUERY_MODEL, _TITLE_MATCH_PROMPT + user_prompt, json.dumps(structured, default=str), "Title Match")
+                    except Exception as e:
+                        logger.warning("Title match batch failed (attempt %s): %s", attempt + 1, e)
+                        structured = None
+                    if isinstance(structured, dict) and "matches" in structured:
+                        break
+                    await asyncio.sleep(2 * (attempt + 1))
+            if not (isinstance(structured, dict) and "matches" in structured):
+                return {}
+            picked = set()
+            for value in structured.get("matches") or []:
+                try:
+                    picked.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return {k: (i in picked) for i, k in enumerate(batch, 1)}
+
+        batches = [pending[i:i + TITLE_MATCH_BATCH_SIZE] for i in range(0, len(pending), TITLE_MATCH_BATCH_SIZE)]
+        for result in await asyncio.gather(*(judge(b) for b in batches)):
+            decided.update(result)
+        cache = _load_json_cache(TITLE_MATCH_CACHE_PATH)
+        cache[requirement_key] = {**(cache.get(requirement_key) or {}), **decided}
+        _save_json_cache(TITLE_MATCH_CACHE_PATH, cache)
+    criteria["_title_matches"] = {k for k in titles if decided.get(k) is True}
+    logger.info("SHORTLIST title_match matched_titles=%s of %s", len(criteria["_title_matches"]), len(titles))
 
 
 # --- Company-first retrieval ---------------------------------------------
@@ -6349,25 +6521,6 @@ def _profile_general_text(profile: Dict[str, Any]) -> str:
     ).lower()
 
 
-_SALES_DOMAIN_RE = re.compile(r"\b(?:sales|revenue|business development|commercial|go to market|gtm)\b", re.I)
-_SALES_C_LEVEL_RE = re.compile(r"\b(?:cro|cso|chief revenue officer|chief sales officer)\b", re.I)
-_ACCEPTED_TIERS = {"generic": {"generic", "director", "vp", "c_level"}, "director": {"director"}, "vp": {"vp", "c_level"}, "c_level": {"c_level"}}
-
-
-def _leadership_title_matches(requirement: str, title: str) -> bool:
-    """Seniority tier + sales domain instead of an exact phrase. Only for
-    sales leadership requirements; everything else stays phrase-matched."""
-    requirement_l = _normalize_search_text(requirement)
-    title_l = _normalize_search_text(title)
-    if not _LEADERSHIP_TITLE_RE.search(requirement_l) or not _SALES_DOMAIN_RE.search(requirement_l):
-        return False
-    if not _LEADERSHIP_TITLE_RE.search(title_l):
-        return False
-    if not (_SALES_DOMAIN_RE.search(title_l) or _SALES_C_LEVEL_RE.search(title_l)):
-        return False
-    return _leadership_tier(title_l) in _ACCEPTED_TIERS[_leadership_tier(requirement_l)]
-
-
 _CURRENT_TITLE_FIELD_RE = re.compile(r"^(?:current\s*)?(?:job\s*)?(?:title|designation|position)$", re.I)
 _ANY_TITLE_FIELD_RE = re.compile(r"^(?:current\s*|previous\s*|past\s*)?(?:job\s*)?(?:title|designation|position)(?:[\s._-]*\d+)?$", re.I)
 
@@ -6380,8 +6533,9 @@ def _function_title_evidence(
     limits it to the current role — uploaded sheets keep the current title in
     "Title" and past ones in "Title.1".."Title.9"."""
     criterion_obj = criterion if isinstance(criterion, dict) else {}
-    current_only = _company_scope_current_only(criterion_obj, "any_employer") or _query_signals_current_employer(
-        str(criteria_context.get("_screening_query") or "")
+    current_only = _company_scope_current_only(criterion_obj, "any_employer") or (
+        not criteria_context.get("_plan_verified")
+        and _query_signals_current_employer(str(criteria_context.get("_screening_query") or ""))
     )
     evidence: List[Tuple[str, str, Optional[Dict[str, Any]]]] = []
     roles = _current_roles(profile) if current_only else (profile.get("roles") or [])
@@ -6533,18 +6687,21 @@ def _strict_presence_result(
                 # that appears only in the job description must be the person's
                 # market, not company boilerplate ("headquartered out of
                 # Singapore", "offices in ... Dubai").
+                # Structured text only (title, job location). A place named in a
+                # free-text description may be company boilerplate or the
+                # person's market; that is a judgement for the AI check, which
+                # sees near-misses with the full text, not a word list.
                 direct_text = _strip_territory_labels(_role_geography_text_for_profile(profile, {**role, "details": ""}))
-                details_text = _normalize_search_text(role.get("details") or "")
-                term = next(
-                    (term for term in geo_terms
-                     if _term_matches_text(term, direct_text) or _geo_term_is_market_experience(term, details_text)),
-                    None,
-                )
+                term = next((term for term in geo_terms if _term_matches_text(term, direct_text)), None)
                 if term:
                     found = ("role/company geography", _evidence_snippet(role_text, term), role, role_text)
                     break
             if not found:
-                general_text = _strip_territory_labels(_profile_geography_experience_text(profile))
+                # Headline and uploaded territory fields; the About text is free
+                # text and goes to the AI check like job descriptions.
+                general_text = _strip_territory_labels(
+                    f"headline: {_normalize_search_text(profile.get('headline'))} {_profile_claim_geography_text(profile)}"
+                )
                 geo_terms = _geography_match_terms(value, criterion)
                 term = next((term for term in geo_terms if _term_matches_text(term, general_text)), None)
                 if term:
@@ -6597,25 +6754,20 @@ def _strict_presence_result(
                 if term:
                     found = ("candidate selling record", _evidence_snippet(selling_text, term), None, selling_text)
         elif criteria_key == "required_functions":
-            # A function is a job title, not a word anywhere in the profile:
-            # matching the About text passed a software engineer as "Sales
-            # Leader" through a recommender's "Sales Development, Synup".
+            # A function is a job title, not a word anywhere in the profile.
+            # Which titles satisfy the requirement was judged once per title by
+            # the LLM (_classify_titles_for_criteria); here it is a lookup.
             title_evidence = _function_title_evidence(profile, criterion, criteria_context or {})
+            title_matches = (criteria_context or {}).get("_title_matches")
             for source, text, role in title_evidence:
                 text_l = _normalize_search_text(text)
-                term = next((term for term in terms if _term_matches_text(term, text_l)), None)
-                if term:
-                    found = (source, _evidence_snippet(text, term), role, text)
+                if title_matches is not None:
+                    hit = text_l in title_matches
+                else:
+                    hit = any(_term_matches_text(term, text_l) for term in terms)
+                if hit:
+                    found = (source, text[:180], role, text)
                     break
-            if not found:
-                # Phrase matching misses word order: "AVP - Sales", "Head of
-                # Inside Sales" and "Co-Founder and CRO" are all VP Sales.
-                for source, text, role in title_evidence:
-                    if _leadership_title_matches(value, text):
-                        tier = {"vp": "VP-level", "director": "Director-level", "c_level": "C-level"}.get(
-                            _leadership_tier(_normalize_search_text(text)), "leadership")
-                        found = (source, f"{text[:160]} — a {tier} sales leadership title, equivalent to {value}", role, text)
-                        break
         else:
             chunks = build_profile_evidence_chunks(profile)
             for chunk in chunks:
@@ -7533,54 +7685,6 @@ def _scoped_tenure_summary(calculated: Dict[str, Any]) -> List[Dict[str, Any]]:
     return summaries
 
 
-_PEOPLE_MANAGER_TITLE_RE = re.compile(
-    r"\b(?:head|director|vp|svp|avp|evp|vice president|chief|cro|cso|team lead|team leader|group manager|"
-    r"sales manager|regional manager|area manager|zonal manager|country manager|general manager|"
-    r"manager\s*[,-]?\s*(?:sales|inside sales|business development|sdr|bdr|pre[\s-]?sales))\b",
-    re.I,
-)
-# "Manager" titles that are individual-contributor roles.
-_IC_MANAGER_TITLE_RE = re.compile(
-    r"\b(?:account|key account|product|project|program|customer success|relationship|territory|partner|"
-    r"marketing|content|community|success|client|engagement|alliances?|channel account)\s+manager\b",
-    re.I,
-)
-_TEAM_SIZE_TEXT_RE = re.compile(
-    r"\b(?:team of|managing|managed|leading|led|lead|manage|heading|headed|mentoring|mentored)\s+(?:a\s+)?(?:team\s+of\s+)?"
-    r"(\d{1,3})\+?\s*(?:member|members|people|person|reps?|representatives?|sdrs?|bdrs?|aes?|account executives?|"
-    r"sellers?|sales\s*(?:people|reps?|executives?|professionals?)|direct reports?|reportees?)\b"
-    r"|\b(\d{1,3})\+?\s*direct reports?\b|\bteam size\s*[:\-]?\s*(\d{1,3})\b",
-    re.I,
-)
-
-
-def _people_management_roles(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Roles whose title says the person managed people. Used only when the
-    profile has no recorded team-management tenure (most imported profiles)."""
-    roles = []
-    for role in profile.get("roles") or []:
-        title = str(role.get("title") or "")
-        if _PEOPLE_MANAGER_TITLE_RE.search(title) and not _IC_MANAGER_TITLE_RE.search(title):
-            roles.append(role)
-    return roles
-
-
-def _team_size_from_text(profile: Dict[str, Any]) -> Tuple[int, str]:
-    """Largest team size stated in the person's own text ("managed a team of
-    8 AEs", "5 direct reports"). (0, "") when nothing is stated."""
-    texts = [str(profile.get("about") or ""), str(profile.get("headline") or "")]
-    texts += [f"{role.get('title') or ''} {role.get('details') or ''}" for role in profile.get("roles") or []]
-    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
-    texts += [f"{k}: {v}" for k, v in raw_fields.items() if re.search(r"team|report|manag", str(k), re.I)]
-    best, snippet = 0, ""
-    for text in texts:
-        for match in _TEAM_SIZE_TEXT_RE.finditer(text):
-            size = int(next(g for g in match.groups() if g))
-            if 1 < size < 500 and size > best:
-                best, snippet = size, text[max(0, match.start() - 40): match.end() + 40].strip()
-    return best, snippet
-
-
 def _strict_shortlist_score_candidate(
     profile: Dict[str, Any],
     criteria: Dict[str, Any],
@@ -7656,12 +7760,12 @@ def _strict_shortlist_score_candidate(
         if min_managed_val is not None:
             actual = int(profile_copy.get("max_people_managed") or 0)
             source, snippet = "profile", f"Managed team of {actual} people"
-            if actual < min_managed_val:
-                # The recorded field is empty for most imports; a size the
-                # person states in their own text is the next best evidence.
-                text_size, text_snippet = _team_size_from_text(profile_copy)
-                if text_size > actual:
-                    actual, source, snippet = text_size, "profile text", text_snippet
+            team_fact = ((criteria.get("_team_facts") or {}).get(str(profile_copy.get("id"))) or {})
+            if actual < min_managed_val and (team_fact.get("team_size") or 0) > actual:
+                # The recorded field is empty for most imports; the size the
+                # person states, extracted by the LLM with a quote, stands in.
+                actual = int(team_fact["team_size"])
+                source, snippet = "profile text (AI-extracted)", str(team_fact.get("quote") or "")
             if actual < min_managed_val:
                 reject("min_people_managed")
                 return None
@@ -7686,16 +7790,13 @@ def _strict_shortlist_score_candidate(
             )
             tm_source = "profile"
             tm_snippet = f"{actual_tm_years:g} years of team management experience"
-            if actual_tm_years < min_team_mgmt_years_val:
-                # No recorded tenure: time in people-management titles.
-                manager_roles = _people_management_roles(profile_copy)
-                derived_years = round(calculate_merged_duration_years(manager_roles), 1) if manager_roles else 0.0
-                if derived_years > actual_tm_years:
-                    actual_tm_years = derived_years
-                    tm_source = "role titles"
-                    titles = "; ".join(f"{r.get('title')} at {r.get('company')}" for r in manager_roles[:3])
-                    tm_snippet = f"{derived_years:g} years in people-management roles ({titles})"
-                    contributing_roles.extend(manager_roles)
+            team_fact = ((criteria.get("_team_facts") or {}).get(str(profile_copy.get("id"))) or {})
+            if actual_tm_years < min_team_mgmt_years_val and float(team_fact.get("team_management_years") or 0) > actual_tm_years:
+                # No recorded tenure: the LLM's reading of the profile (roles in
+                # which the person managed people), with a quote.
+                actual_tm_years = float(team_fact["team_management_years"])
+                tm_source = "profile text (AI-extracted)"
+                tm_snippet = str(team_fact.get("quote") or f"{actual_tm_years:g} years managing people")
             if actual_tm_years < min_team_mgmt_years_val:
                 reject("min_team_management_years")
                 return None
@@ -8056,42 +8157,6 @@ def _observed_company_terms_for_expansion(category: str, *, limit: int = 300) ->
     return [term for term, _count in counts.most_common(limit)]
 
 
-_LEADERSHIP_TITLE_RE = re.compile(
-    r"\b(?:vp|svp|evp|avp|vice\s+president|president|head|director|leader|leadership|chief|cro|cso|cco|gm|general\s+manager)\b",
-    re.I,
-)
-
-
-def _leadership_tier(title: str) -> str:
-    text = _normalize_search_text(title)
-    if re.search(r"\b(?:chief|cro|cso|cco)\b", text) or re.search(r"(?<!vice )\bpresident\b", text):
-        return "c_level"
-    if re.search(r"\b(?:vp|svp|evp|avp|vice president|head)\b", text):
-        return "vp"
-    if re.search(r"\bdirector\b", text):
-        return "director"
-    return "generic"
-
-
-def _same_seniority_titles(originals: List[str], expanded: List[str]) -> List[str]:
-    """The model is told to keep seniority but does not always: "VP Sales"
-    still came back with "Sales Executive". Enforce it: leadership queries keep
-    leadership titles only, individual-contributor queries drop leadership."""
-    if not originals:
-        return expanded
-    leadership = [bool(_LEADERSHIP_TITLE_RE.search(str(v))) for v in originals]
-    if all(leadership):
-        # Keep the tier too: "VP Sales" expanded to Sales Director, which the
-        # auditor then rejected. A generic "Sales Leader" accepts any tier.
-        wanted = {_leadership_tier(str(v)) for v in originals}
-        if "generic" in wanted:
-            return [t for t in expanded if _LEADERSHIP_TITLE_RE.search(str(t))]
-        return [t for t in expanded if _leadership_tier(str(t)) in wanted]
-    if not any(leadership):
-        return [t for t in expanded if not _LEADERSHIP_TITLE_RE.search(str(t))]
-    return expanded
-
-
 async def _expand_keywords_with_llm(values: List[str], category: str, tracker: TokenCostTracker) -> List[str]:
     values = [str(value).strip() for value in values if str(value or "").strip()]
     if not values:
@@ -8116,21 +8181,10 @@ async def _expand_keywords_with_llm(values: List[str], category: str, tracker: T
         category=category,
         observed_terms=json.dumps(observed_terms, ensure_ascii=False),
     )
-    if "title" in category.lower():
-        # "Sales Leader / VP Sales" came back with Sales Executive, SDR,
-        # Sales Associate and Sales Analyst: every junior seller passed.
-        prompt_text += (
-            "\nFor job titles: return only titles a recruiter would accept as the SAME role at the SAME seniority. "
-            "Leadership titles (VP, Head, Director, Leader, Chief) expand only to leadership titles; never add "
-            "Executive, Representative, Associate, Analyst, Specialist, Coordinator, SDR/BDR or individual-contributor "
-            "titles. Individual-contributor titles never expand to Director/VP/Head. Return at most 25 titles.\n"
-        )
     try:
         response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
         tracker.add_usage(llm.model_name, prompt_text, response.content, "Keyword Expansion")
         expanded = [t for t in (_clean_expansion_term(x) for x in get_list_from_llm_json(safe_json_loads(response.content, []))) if t]
-        if "title" in category.lower():
-            expanded = _same_seniority_titles(values, expanded)
         return expanded
     except asyncio.TimeoutError:
         logger.warning("Shortlist %s keyword expansion timed out; using original terms", category)
@@ -8752,11 +8806,6 @@ def _query_signals_current_employer(query: str) -> bool:
             r"\bcurrently\s+(?:working|employed)(?:\s+(?:for|at|in|with))?\b",
             r"\bcurrently\s+(?:for|at|with|in)\b",
             r"\b(?:now|today)\s+(?:at|with)\b",
-            # "AEs at Salesforce", "sales directors at Oracle": a job noun
-            # followed by "at" names where they work now. "Experience at X",
-            # "from X", "ex-X" stay career history.
-            r"\b(?:aes?|account\s+executives?|sdrs?|bdrs?|reps?|representatives?|managers?|directors?|leaders?|"
-            r"vps?|heads?|employees|staff|engineers?|consultants?|specialists?|executives?)\s+at\b",
         )
     )
 
@@ -8765,10 +8814,12 @@ def _query_company_scope(query: str) -> str:
     return "current_employer" if _query_signals_current_employer(query) else "any_employer"
 
 
-def _reconcile_company_scope(scope: Any, query: str) -> str:
-    """The plan model's employment_scope is advisory: current_employer is kept
-    only when the query itself says so; anything else is any_employer."""
+def _reconcile_company_scope(scope: Any, query: str, *, verified: bool = False) -> str:
+    """The draft plan's employment_scope is advisory: current_employer is kept
+    only when the query itself says so. A verified plan's scope is final."""
     scope_l = _normalize_search_text(scope or "")
+    if verified and scope_l in ("current_employer", "any_employer"):
+        return scope_l
     if scope_l == "current_employer" and not _query_signals_current_employer(query):
         return "any_employer"
     return scope_l or _query_company_scope(query)
@@ -9042,9 +9093,7 @@ def _clause_window(query_l: str, start: int, end: int, *, back: int = 90, forwar
     left = max(0, start - back)
     right = min(len(query_l), end + forward)
     window_back = query_l[left:start]
-    # A relative clause starts a separate requirement: in "3+ years in B2B
-    # SaaS sales who covered SEA or India" the years belong to SaaS sales.
-    boundaries = (" and ", ",", ";", " who ", " which ", " that ", " whose ", " where ")
+    boundaries = (" and ", ",", ";")
     boundary = max(window_back.rfind(bnd) for bnd in boundaries)
     if boundary != -1:
         window_back = window_back[boundary + 1:]
@@ -9055,22 +9104,11 @@ def _clause_window(query_l: str, start: int, end: int, *, back: int = 90, forwar
     return f"{window_back}{query_l[start:end]}{window_fwd}"
 
 
-_YEARS_OWN_DIMENSION_RE = re.compile(
-    r"\s*(?:of\s+|in\s+)?(?:(?:team|people)\s+(?:management|leadership|handling)|managing\s+(?:a\s+)?(?:team|people)|"
-    r"leading\s+(?:a\s+)?team|total|overall)\b"
-)
-
-
 def _query_years_near_terms(query: str, terms: List[str], context_terms: List[str]) -> Optional[float]:
     query_l = _normalize_search_text(query)
     if not query_l:
         return None
     for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", query_l):
-        # "2+ years of team management experience in SaaS covering APAC": the
-        # years are team-management tenure (its own criterion), not APAC or
-        # SaaS tenure.
-        if _YEARS_OWN_DIMENSION_RE.match(query_l[match.end():]):
-            continue
         window = _clause_window(query_l, match.start(), match.end())
         if terms and not any(_term_matches_text(term, window) for term in terms):
             continue
@@ -9163,12 +9201,7 @@ def _apply_seniority_title_hint(criteria: Dict[str, Any], query: str) -> None:
     """"Senior account executives" means the title says senior. The plan model
     instead demanded 5 years in each of four functions and matched 1 of 115.
     Without a number in the query the seniority lives in the title terms."""
-    if not _SENIORITY_RE.search(query or ""):
-        return
-    # A number in the query only replaces the title's seniority when it is
-    # years in that function ("senior AE with 5 years as AE"); "senior AEs
-    # with 3+ years in SaaS" still means a senior title.
-    if _QUERY_DURATION_SIGNAL_RE.search(query or "") and criteria.get("min_function_years"):
+    if not _SENIORITY_RE.search(query or "") or _QUERY_DURATION_SIGNAL_RE.search(query or ""):
         return
     functions = criteria.get("required_functions")
     values = [str(v).strip() for v in get_values_from_criteria(functions) if str(v or "").strip()] if functions else []
@@ -9618,137 +9651,166 @@ def _apply_explicit_funding_stage_window(criteria: Dict[str, Any], query: str) -
                 criteria.pop("required_company_details", None)
 
 
-_PLAN_REVIEW_KEYS = {
-    "required_functions": "job titles / functions the person must hold",
-    "required_geographies": "sales territories or markets the person covered (regions, countries)",
-    "required_locations": "where the person is based / lives",
-    "required_industries": "industries or domains of the person's employer",
-    "required_segments": "customer segments the person sold to (SMB, mid-market, enterprise...)",
-    "required_company_details": "kinds of employer (startup, product company, B2B SaaS...)",
-    "required_companies": "specific named employers",
-    "competitors_of": "companies whose competitors the person must work/have worked at",
-    "excluded_companies": "specific named employers the person must NOT be at (or have been at)",
-    "funding_stage_min": "employer funding stage or listing (Seed, Series B, Public/IPO-listed...)",
-    "min_people_managed": "minimum team size the person managed (a number)",
-    "min_team_management_years": "minimum years managing a team (a number)",
-    "min_total_experience": "minimum total years of experience (a number)",
+
+def _plan_scope_enum() -> Dict[str, Any]:
+    return {"type": "string", "enum": ["current", "any"]}
+
+
+def _plan_values(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    props = {"values": {"type": "array", "items": {"type": "string"}}}
+    props.update(extra or {})
+    return {"type": "object", "additionalProperties": False, "required": list(props), "properties": props}
+
+
+_NULLABLE_NUMBER = {"type": ["number", "null"]}
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_VERIFIED_PLAN_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "verified_search_plan",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "job_titles", "function_years", "markets_covered", "based_in", "industries", "customer_segments",
+                "company_types", "companies", "excluded_companies", "competitors_of", "funding",
+                "excluded_markets", "excluded_industries", "min_total_experience_years", "min_team_size_managed",
+                "min_team_management_years", "min_years_in_current_role", "keywords",
+            ],
+            "properties": {
+                "job_titles": _plan_values({"employment_scope": _plan_scope_enum()}),
+                "function_years": {"type": "array", "items": {
+                    "type": "object", "additionalProperties": False, "required": ["function", "min_years"],
+                    "properties": {"function": {"type": "string"}, "min_years": {"type": "number"}}}},
+                "markets_covered": _plan_values({"min_years": _NULLABLE_NUMBER}),
+                "based_in": _plan_values(),
+                "industries": _plan_values({"employment_scope": _plan_scope_enum(), "min_years": _NULLABLE_NUMBER}),
+                "customer_segments": _plan_values({"min_years": _NULLABLE_NUMBER}),
+                "company_types": _plan_values({"employment_scope": _plan_scope_enum()}),
+                "companies": _plan_values({"employment_scope": _plan_scope_enum(), "min_years": _NULLABLE_NUMBER}),
+                "excluded_companies": _plan_values({"employment_scope": _plan_scope_enum()}),
+                "competitors_of": _plan_values({"employment_scope": _plan_scope_enum()}),
+                "funding": {"type": "object", "additionalProperties": False,
+                            "required": ["stage", "max_stage", "employment_scope"],
+                            "properties": {"stage": _NULLABLE_STRING, "max_stage": _NULLABLE_STRING,
+                                           "employment_scope": _plan_scope_enum()}},
+                "excluded_markets": _plan_values(),
+                "excluded_industries": _plan_values(),
+                "min_total_experience_years": _NULLABLE_NUMBER,
+                "min_team_size_managed": _NULLABLE_NUMBER,
+                "min_team_management_years": _NULLABLE_NUMBER,
+                "min_years_in_current_role": _NULLABLE_NUMBER,
+                "keywords": _plan_values(),
+            },
+        },
+    },
 }
-_PLAN_REVIEW_NUMERIC_KEYS = ("min_people_managed", "min_team_management_years", "min_total_experience")
-_PLAN_REVIEW_SYSTEM_PROMPT = (
-    "You check a recruiting search's parsed filters against the recruiter's query. Report only problems:\n"
-    "1) missing: a requirement the query states plainly that no filter expresses (e.g. the query names a job title, "
-    "region, industry, segment, company or competitor target that is absent). Do not invent requirements, do not "
-    "restate ones already present in any spelling. A region the query names that the filters replaced with some "
-    "of its countries is missing (report the region itself). Of numeric requirements report only team size, "
-    "team-management years and total experience (value = the number); other durations are handled elsewhere.\n"
-    "2) misplaced: a value filed under required_companies that is not a company name but a description "
-    "(e.g. 'ipo', 'listed', 'startups', 'fintech'), with the filter it belongs to.\n"
-    "Abbreviations recruiters use count as stated requirements (AE, SDR, VP, ME = Middle East, SEA = Southeast Asia, "
-    "MEA, GCC, ANZ, DACH). Filters: " + json.dumps(_PLAN_REVIEW_KEYS) + ". "
-    "Return JSON only: {\"missing\": [{\"key\": <filter>, \"values\": [<strings>]}], "
-    "\"misplaced\": [{\"value\": <string>, \"key\": <filter>, \"as\": <canonical value, e.g. 'Public'>}]}. "
-    "Write every value as its full canonical name, never an abbreviation: 'Middle East' not 'ME', "
-    "'Southeast Asia' not 'SEA', 'Account Executive' not 'AE' — abbreviations are expanded later. "
-    "Empty lists when the filters are complete."
+_VERIFY_PLAN_PROMPT = (
+    "You turn a recruiter's candidate-search query into structured filters. A draft parse of the same query is "
+    "given; it is often wrong, so rely on the query. Include only what the query states — every requirement it "
+    "states, nothing it does not. Read the whole sentence the way a recruiter means it:\n"
+    "- job_titles: the roles the person must hold, written as the recruiter means them including any seniority; "
+    "employment_scope current when the query means their present role, otherwise any.\n"
+    "- markets_covered: regions or countries the person sold into, handled, covered or worked on as a market. "
+    "based_in: only where the person lives or is based, when the query says so. A place is one or the other, "
+    "decided by what the query means.\n"
+    "- Every number belongs to exactly the one requirement it describes (years in a function, in an industry, "
+    "covering a market, at companies, managing a team, total career, in the current role; or a team size). "
+    "Never copy one number onto another requirement.\n"
+    "- companies: specific named employers. company_types: kinds of employer (startup, product company, B2B "
+    "SaaS). industries: employer industries or domains. funding: employer funding stage or public listing "
+    "(stage 'Public' for listed/IPO companies). competitors_of: companies whose competitors the person must be "
+    "at. excluded_*: things the query rules out. keywords: any other specific skill, method, tool or term the "
+    "profile must mention that fits none of the other filters.\n"
+    "- employment_scope: decide from tense and meaning. A present-tense description of the person's role or "
+    "employer means current; wording about the past or about experience in general means any.\n"
+    "- Keep each job title to the role itself; segment, industry, region or product words that qualify it go "
+    "in their own filters (a segment word in front of a title is a customer segment requirement).\n"
+    "- Write every value in full standard form, resolving abbreviations from context (a region abbreviation to "
+    "the region's full name, a title abbreviation to the full title). Empty list / null when not stated."
 )
 
 
-async def _review_filter_plan(criteria: Dict[str, Any], query: str, tracker: TokenCostTracker) -> Dict[str, Any]:
-    """One generic check that the parsed filters say everything the query
-    says. The plan model sometimes drops a stated requirement ("AEs at
-    Salesforce handling ME & SEA" lost ME; "VP sales at Freshworks
-    competitors" lost the title) or files a description as a company name
-    ("ipo"). Rules per title/region/word do not generalise; this does."""
-    visible = {k: v for k, v in criteria.items() if not str(k).startswith("_")}
+def _apply_verified_plan(criteria: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    """The verified plan is authoritative for everything it covers; keys it
+    leaves empty are removed (the draft invented them or put them elsewhere)."""
+    scope_of = lambda item: "current_employer" if (item or {}).get("employment_scope") == "current" else "any_employer"
+    out = {k: v for k, v in criteria.items() if k.startswith("_") or k in ("top_n", "avg_tenure_in_last_n_roles")}
+
+    def values(key: str) -> List[str]:
+        item = plan.get(key) if isinstance(plan.get(key), dict) else {}
+        return [str(v).strip() for v in item.get("values") or [] if str(v or "").strip()]
+
+    def put(key: str, vals: List[str], **extra: Any) -> None:
+        if vals:
+            criterion = {"operator": "OR", "values": vals}
+            criterion.update({k: v for k, v in extra.items() if v not in (None, "", 0)})
+            out[key] = criterion
+
+    put("required_functions", values("job_titles"), employment_scope=scope_of(plan.get("job_titles")))
+    put("required_geographies", values("markets_covered"), min_years=(plan.get("markets_covered") or {}).get("min_years"))
+    put("required_locations", values("based_in"))
+    put("required_industries", values("industries"), employment_scope=scope_of(plan.get("industries")),
+        min_years=(plan.get("industries") or {}).get("min_years"))
+    put("required_segments", values("customer_segments"), min_years=(plan.get("customer_segments") or {}).get("min_years"))
+    put("required_company_details", values("company_types"), employment_scope=scope_of(plan.get("company_types")))
+    put("excluded_geographies", values("excluded_markets"))
+    put("excluded_industries", values("excluded_industries"))
+    put("required_keywords", values("keywords"))
+    for key, target in (("companies", "required_companies"), ("excluded_companies", "excluded_companies")):
+        names = values(key)
+        if names:
+            scope = scope_of(plan.get(key))
+            out[target] = {"operator": "OR", "employment_scope": scope,
+                           "values": [{"company": n, "employment_scope": scope} for n in names]}
+            if key == "companies" and (plan.get(key) or {}).get("min_years"):
+                out[target]["min_years"] = plan[key]["min_years"]
+    targets = values("competitors_of")
+    if targets:
+        scope = scope_of(plan.get("competitors_of"))
+        out["competitors_of"] = [{"target": t, "employment_scope": scope} for t in targets]
+    funding = plan.get("funding") if isinstance(plan.get("funding"), dict) else {}
+    if funding.get("stage"):
+        out["funding_stage_min"] = {"stage": funding["stage"], "employment_scope": scope_of(funding)}
+        if funding.get("max_stage"):
+            out["funding_stage_min"]["max_stage"] = funding["max_stage"]
+    function_years = [
+        {"function": str(i.get("function")), "min_years": float(i.get("min_years")), "aliases": []}
+        for i in plan.get("function_years") or [] if isinstance(i, dict) and i.get("function") and i.get("min_years")
+    ]
+    if function_years:
+        out["min_function_years"] = function_years
+    for plan_key, key in (("min_total_experience_years", "min_total_experience"), ("min_team_size_managed", "min_people_managed"),
+                          ("min_team_management_years", "min_team_management_years"), ("min_years_in_current_role", "min_tenure_in_latest_role")):
+        if plan.get(plan_key):
+            out[key] = float(plan[plan_key])
+    out["_plan_verified"] = True
+    return out
+
+
+async def _verify_filter_plan(criteria: Dict[str, Any], query: str, tracker: TokenCostTracker) -> Dict[str, Any]:
+    """Language understanding lives here, not in phrase rules: whether a place
+    is where someone lives or a market they covered, which requirement each
+    number belongs to, current vs past employer, seniority, exclusions."""
+    draft = {k: v for k, v in criteria.items() if not str(k).startswith("_")}
     try:
-        review = await asyncio.to_thread(
-            call_openai_json, _PLAN_REVIEW_SYSTEM_PROMPT,
-            f"Query: {query}\n\nParsed filters:\n{json.dumps(visible, ensure_ascii=False, default=str)}\n\nReturn JSON only.",
-            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=45.0,
-            response_format={"type": "json_object"},
+        plan = await asyncio.to_thread(
+            call_openai_json, _VERIFY_PLAN_PROMPT,
+            f"Query: {query}\n\nDraft parse:\n{json.dumps(draft, ensure_ascii=False, default=str)}",
+            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=60.0,
+            response_format=_VERIFIED_PLAN_SCHEMA,
         )
-        tracker.add_usage(COMPANY_QUERY_MODEL, _PLAN_REVIEW_SYSTEM_PROMPT + query, json.dumps(review, default=str), "Filter Plan Review")
+        tracker.add_usage(COMPANY_QUERY_MODEL, _VERIFY_PLAN_PROMPT + query, json.dumps(plan, default=str), "Plan Verification")
     except Exception as e:
-        logger.warning("Filter plan review failed: %s", e)
+        logger.warning("Plan verification failed; using the draft plan: %s", e)
         return criteria
-    if not isinstance(review, dict):
+    if not isinstance(plan, dict) or "job_titles" not in plan:
+        logger.warning("Plan verification returned no plan; using the draft plan")
         return criteria
-    scope = _query_company_scope(query)
-    changes: List[str] = []
-
-    for item in review.get("misplaced") or []:
-        if not isinstance(item, dict):
-            continue
-        value_key = _normalize_search_text(item.get("value"))
-        target_key = str(item.get("key") or "")
-        raw = criteria.get("required_companies")
-        values = (raw.get("values") if isinstance(raw, dict) else raw) or []
-        kept = [v for v in values if _normalize_search_text(v.get("company") if isinstance(v, dict) else v) != value_key]
-        if len(kept) == len(values) or target_key not in _PLAN_REVIEW_KEYS or target_key == "required_companies":
-            continue
-        if kept:
-            criteria["required_companies"] = {**raw, "values": kept} if isinstance(raw, dict) else kept
-        else:
-            criteria.pop("required_companies", None)
-        _merge_review_value(criteria, target_key, [str(item.get("as") or item.get("value"))], scope)
-        changes.append(f"moved {item.get('value')!r} to {target_key}")
-
-    for item in review.get("missing") or []:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "")
-        values = [str(v).strip() for v in (item.get("values") or []) if str(v or "").strip()]
-        if key not in _PLAN_REVIEW_KEYS or not values:
-            continue
-        present = (
-            {_normalize_search_text(v) for v in _criteria_values_for_search(criteria, key)}
-            if key not in ("competitors_of", "funding_stage_min", *_PLAN_REVIEW_NUMERIC_KEYS) else set()
-        )
-        values = [v for v in values if _normalize_search_text(v) not in present]
-        if values:
-            _merge_review_value(criteria, key, values, scope)
-            changes.append(f"added {key}={values}")
-
-    if changes:
-        logger.info("SHORTLIST filter_plan_review %s", "; ".join(changes))
-    return criteria
-
-
-def _merge_review_value(criteria: Dict[str, Any], key: str, values: List[str], scope: str) -> None:
-    if key in _PLAN_REVIEW_NUMERIC_KEYS:
-        number = next((n for n in (_coerce_positive_float(v) for v in values) if n is not None), None)
-        if number is not None and criteria.get(key) in (None, "", 0):
-            criteria[key] = number
-        return
-    if key == "funding_stage_min":
-        if not criteria.get("funding_stage_min") and values:
-            criteria["funding_stage_min"] = {"stage": values[0], "employment_scope": scope}
-        return
-    if key == "competitors_of":
-        existing = _criteria_objects(criteria.get("competitors_of") or criteria.get("competitor_of"))
-        known = {_normalize_company_key(i.get("target") or i.get("value") or "") for i in existing if isinstance(i, dict)}
-        existing += [{"target": v, "employment_scope": scope} for v in values if _normalize_company_key(v) not in known]
-        criteria["competitors_of"] = existing
-        criteria.pop("competitor_of", None)
-        return
-    if key == "excluded_companies":
-        raw = criteria.get(key)
-        current = (raw.get("values") if isinstance(raw, dict) else raw) or []
-        criteria[key] = {"operator": "OR", "values": list(current) + [{"company": v, "employment_scope": scope} for v in values]}
-        return
-    if key == "required_companies":
-        raw = criteria.get("required_companies")
-        current = (raw.get("values") if isinstance(raw, dict) else raw) or []
-        criteria["required_companies"] = {
-            "operator": "OR", "employment_scope": scope,
-            "values": list(current) + [{"company": v, "employment_scope": scope} for v in values],
-        }
-        return
-    existing = criteria.get(key)
-    merged = copy.deepcopy(existing) if isinstance(existing, dict) else {}
-    merged["operator"] = merged.get("operator") or "OR"
-    merged["values"] = list(dict.fromkeys(_criteria_values_for_search(criteria, key) + values))
-    criteria[key] = merged
+    verified = _apply_verified_plan(criteria, plan)
+    logger.info("SHORTLIST verified_plan=%s", json.dumps({k: v for k, v in verified.items() if not k.startswith("_")}, ensure_ascii=False, default=str))
+    return verified
 
 
 def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
@@ -10052,6 +10114,21 @@ _SEMANTIC_KEY_GUIDANCE = {
 }
 
 
+def _known_place_terms() -> Set[str]:
+    """Every place / territory name the engine knows: countries from the
+    region map, cached region expansions and the territory glossary."""
+    terms = {_normalize_search_text(c) for c in GEOGRAPHY_COUNTRY_TO_REGION_MAP}
+    terms |= {_normalize_search_text(r) for r in GEOGRAPHY_COUNTRY_TO_REGION_MAP.values()}
+    for values in _load_json_cache(GEOGRAPHY_EXPANSION_CACHE_PATH).values():
+        terms |= {_normalize_search_text(v) for v in values or []}
+    terms |= {
+        _normalize_search_text(token)
+        for token, entry in _load_json_cache(TERRITORY_GLOSSARY_CACHE_PATH).items()
+        if isinstance(entry, dict) and entry.get("spelled_out")  # real territories only, not "FINS"
+    }
+    return {t for t in terms if t}
+
+
 def _semantic_evidence_text(profile: Dict[str, Any], max_chars: int = 3000) -> str:
     parts = [f"Headline: {profile.get('headline') or ''}", f"Location: {profile.get('location') or ''}"]
     for role in (profile.get("roles") or [])[:8]:
@@ -10127,9 +10204,10 @@ async def _semantic_verify_near_misses(
             "industries, products or job functions is not a place. For each candidate return meets (true/false), "
             "quote: the exact words copied from their profile that prove it (empty when meets is false), and "
             "place: the place or territory exactly as written in the quote (for segments: the segment name), and "
-            "place_countries: the standard English names of every country that place covers (empty for segments). "
+            "place_countries: the standard English names of every country that place covers (empty for segments), and "
+            "years: how many years the profile shows them working in that market or segment (0 when not stated). "
             'Return JSON only: {"results": [{"id": <id>, "meets": <bool>, "quote": <string>, "place": <string>, '
-            '"place_countries": [<string>]}]}.'
+            '"place_countries": [<string>], "years": <number>}]}.'
         )
         # What the answer must fall inside: the requirement's own expanded
         # terms (countries, cities, verified territory acronyms / segment
@@ -10153,12 +10231,15 @@ async def _semantic_verify_near_misses(
                 logger.warning("Semantic near-miss check failed (%s candidates): %s", len(group), e)
                 return
         by_id = {str(r.get("id")): r for r in (structured.get("results") or []) if isinstance(r, dict)} if isinstance(structured, dict) else {}
+        required_years = _coerce_positive_float((criteria.get(key) or {}).get("min_years")) if isinstance(criteria.get(key), dict) else None
         for profile, relaxed_scored in group:
             cid = str(profile.get("id"))
             result = by_id.get(cid) or {}
             quote = str(result.get("quote") or "").strip()
             place = _normalize_search_text(result.get("place"))
-            known_countries = glossary_countries.get(place)
+            known_countries = glossary_countries.get(place) or (
+                await _expand_geographies_with_llm([place], tracker) if key == "required_geographies" and place else None
+            )
             place_countries = {
                 _normalize_search_text(c)
                 for c in (known_countries if known_countries else (result.get("place_countries") or []))
@@ -10187,7 +10268,16 @@ async def _semantic_verify_near_misses(
             if place_ok:
                 place_ok = _term_matches_text(place, quote_l) or any(_term_matches_text(t, quote_l) for t in allowed_terms)
             if place_ok and len(place.replace(" ", "")) <= 2:
-                place_ok = re.search(r"\b(?:geo|geography|region|territor(?:y|ies)|market|focus)\b", quote_l) is not None
+                # A two-letter place is only a place when the quote lists other
+                # places with it ("India, ME, US"), not industries ("Fins,
+                # HRE, ME & HiTech"). Known places come from our own data.
+                known = _known_place_terms()
+                place_ok = any(
+                    _term_matches_text(term, quote_l) for term in known if term != place and len(term) >= 3
+                )
+            if place_ok and required_years:
+                # The requirement has a duration: the rescue must show it too.
+                place_ok = float(result.get("years") or 0) >= required_years
             if result.get("meets") is True and _quote_in_text(quote, texts[cid]) and place_ok:
                 accepted.append(_attach_semantic_evidence(relaxed_scored, key, values, quote, criteria))
             elif result.get("meets") is True:
@@ -10235,9 +10325,7 @@ async def process_query_main(
         terminology_pack = _build_terminology_pack()
         raw_filter_plan = await _generate_schema_aware_filter_plan(normalized_query, schema_manifest, terminology_pack, tracker)
         criteria = _coerce_filter_plan_to_criteria(raw_filter_plan, normalized_query)
-        criteria = await _review_filter_plan(criteria, normalized_query, tracker)
-        # The review may add the title the plan dropped; seniority applies to it too.
-        _apply_seniority_title_hint(criteria, normalized_query)
+        criteria = await _verify_filter_plan(criteria, normalized_query, tracker)
         await _canonicalize_geography_criteria(criteria, normalized_query, tracker)
         logger.info("SHORTLIST schema_manifest_summary=%s", json.dumps({
             "source": schema_manifest.get("db_catalog", {}).get("source"),
@@ -10279,7 +10367,8 @@ async def process_query_main(
             if isinstance(competitor_item, dict):
                 item_target = str(competitor_item.get("target") or competitor_item.get("company") or competitor_item.get("value") or "").strip()
                 item_scope = _reconcile_company_scope(
-                    competitor_item.get("employment_scope") or competitor_item.get("scope") or item_scope, normalized_query
+                    competitor_item.get("employment_scope") or competitor_item.get("scope") or item_scope, normalized_query,
+                    verified=bool(criteria.get("_plan_verified")),
                 )
             else:
                 item_target = str(competitor_item or "").strip()
@@ -10516,7 +10605,7 @@ async def process_query_main(
                 values + base_expanded + dynamic_expanded + unknown_industries,
             )
 
-        if criteria.get("required_functions"):
+        if criteria.get("required_functions") and not criteria.get("_plan_verified"):
             values = _criteria_values_for_search(criteria, "required_functions")
             expanded: List[str] = []
             unknown: List[str] = []
@@ -10753,7 +10842,9 @@ async def process_query_main(
             item = criteria.get(key) if isinstance(criteria.get(key), dict) else {}
             default_scope = "current_employer" if key == "funding_stage_min" else "any_employer"
             planner_scopes.append(_company_scope_current_only(item, default_scope))
-        company_current_only = _query_signals_current_employer(normalized_query) or all(planner_scopes)
+        company_current_only = all(planner_scopes) if criteria.get("_plan_verified") else (
+            _query_signals_current_employer(normalized_query) or all(planner_scopes)
+        )
         # Only the company part of the query: the full text leaks person
         # conditions into the definition ("sales directors ... located in
         # Mumbai" became "listed companies headquartered in Mumbai": 264 -> 52).
@@ -10825,6 +10916,16 @@ async def process_query_main(
             if not initial_candidate_pool:
                 yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
                 return
+
+    if criteria.get("min_people_managed") is not None or criteria.get("min_team_management_years") is not None:
+        await _wait_if_paused()
+        yield "Reading team size and team-management experience from profiles..."
+        await attach_team_facts(criteria, initial_candidate_pool, tracker)
+
+    if criteria.get("_plan_verified") and criteria.get("required_functions"):
+        await _wait_if_paused()
+        yield "Checking which job titles in scope match the required role..."
+        await _classify_titles_for_criteria(criteria, initial_candidate_pool, tracker)
 
     await _wait_if_paused()
     if _needs_candidate_company_fact_web_enrichment(criteria):
@@ -11001,6 +11102,8 @@ async def process_query_main(
                         logger.warning("Shortlist reasoning task failed: %s", e)
 
             near_misses: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+            seen_person_keys: Set[str] = set()
+            duplicate_counts: Dict[str, int] = {}
 
             def _score_batch(batch: List[Dict[str, Any]]) -> tuple:
                 passed: List[Dict[str, Any]] = []
@@ -11027,6 +11130,18 @@ async def process_query_main(
                 batch = initial_candidate_pool[batch_start: batch_start + SCORING_BATCH_SIZE]
 
                 passed_batch, batch_reasons, batch_misses = await asyncio.to_thread(_score_batch, batch)
+                # One result per person: every copy is scored (the legacy and
+                # the re-uploaded profile hold different facts), the first
+                # copy that matches is kept, later copies never reach the LLM.
+                unique_batch = []
+                for scored in passed_batch:
+                    key = person_key(scored)
+                    if key in seen_person_keys:
+                        duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+                        continue
+                    seen_person_keys.add(key)
+                    unique_batch.append(scored)
+                passed_batch = unique_batch
                 near_misses.extend(batch_misses)
 
                 final_candidates.extend(passed_batch)
@@ -11078,6 +11193,13 @@ async def process_query_main(
                 if top_n not in (None, 0) and len(final_candidates) >= int(top_n):
                     break
                 
+            unique_misses = []
+            for miss in near_misses:
+                key = person_key(miss[0])
+                if key not in seen_person_keys:
+                    seen_person_keys.add(key)
+                    unique_misses.append(miss)
+            near_misses = unique_misses
             if near_misses and (top_n in (None, 0) or len(final_candidates) < int(top_n)):
                 await _wait_if_paused()
                 await output_queue.put(f"AI-checking {len(near_misses)} candidates who match everything except the territory/segment wording...")
