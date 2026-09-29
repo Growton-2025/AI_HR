@@ -7,6 +7,7 @@ import hashlib
 import redis
 import tiktoken
 import copy
+import functools
 from backend.services.profile_experience import (
     employer_names_from_profiles,
     function_years_for,
@@ -1640,7 +1641,7 @@ def _scoped_duration_role_text(profile: Dict[str, Any], role: Dict[str, Any], di
 
 
 _MARKET_ACTION_PATTERN = re.compile(
-    r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|pipeline|quota|revenue|territor(?:y|ies)|region(?:al)?|market)\b"
+    r"\b(sold|selling|sell|covered|covering|coverage|owned|owning|managed|handled|generated|prospect(?:ed|ing)?|outreach|outbound|inbound|pipeline|quota|revenue|territor(?:y|ies)|regions?|regional|markets?)\b"
 )
 
 
@@ -6387,6 +6388,71 @@ def _function_title_evidence(
     return evidence
 
 
+_TERRITORY_LABEL_CACHE: Dict[str, Any] = {}
+
+
+_TERRITORY_LABEL_HINT_RE = re.compile(r"\b[a-z]{2,6}\s*[-–—:/]\s*[a-z]|\([a-z]{2,6}\)")
+
+
+
+
+def _strip_territory_labels(text: str) -> str:
+    # Cheap pre-check first: most texts carry no "ACR - definition" label.
+    if not text or not _TERRITORY_LABEL_HINT_RE.search(text):
+        return text
+    return _strip_territory_labels_cached(text)
+
+
+@functools.lru_cache(maxsize=65536)
+def _strip_territory_labels_cached(text: str) -> str:
+    # Cheap pre-check first: most texts carry no "ACR - definition" label.
+    if not text or not _TERRITORY_LABEL_HINT_RE.search(text):
+        return text
+    return _strip_territory_labels_cached(text)
+
+
+@functools.lru_cache(maxsize=65536)
+def _strip_territory_labels_cached(text: str) -> str:
+    """Form answers label each option with its definition: "EMEA - Europe,
+    Middle East & Africa, APAC - Asia-Pacific". The definition is not
+    territory the person covered — an EMEA seller would otherwise match a
+    Middle East search. Keep the acronym, drop its spelled-out label, for
+    every territory in the glossary built from our data."""
+    if not text:
+        return text
+    stamp = TERRITORY_GLOSSARY_CACHE_PATH.stat().st_mtime if TERRITORY_GLOSSARY_CACHE_PATH.exists() else 0
+    if _TERRITORY_LABEL_CACHE.get("stamp") != stamp:
+        glossary = _load_json_cache(TERRITORY_GLOSSARY_CACHE_PATH)
+        patterns = []
+        for acronym, entry in glossary.items():
+            spelled = _normalize_search_text((entry or {}).get("spelled_out") if isinstance(entry, dict) else entry)
+            if not spelled:
+                continue
+            # Tolerate "&"/"and", commas and hyphens in how the label is written.
+            words = [re.escape(w) for w in re.split(r"[\s,&/-]+|\band\b", spelled) if w]
+            if words:
+                body = r"[\s,&/-]*(?:and\s+)?".join(words)
+                patterns.append(rf"\b({re.escape(acronym.lower())})\s*[-–—:/]\s*{body}")
+        _TERRITORY_LABEL_CACHE.update(stamp=stamp, regex=re.compile("|".join(patterns)) if patterns else None)
+    regex = _TERRITORY_LABEL_CACHE.get("regex")
+    if regex is not None:
+        text = regex.sub(lambda m: next(g for g in m.groups() if g), text)
+    return _drop_inline_defined_acronyms(text)
+
+
+def _drop_inline_defined_acronyms(text: str) -> str:
+    """"Global Capability Center (GCC)": the words before the parenthesis
+    define the acronym, so the acronym adds nothing and must not match the
+    Gulf Cooperation Council. The defining words stay and match on their own."""
+    def repl(match: "re.Match[str]") -> str:
+        acronym = match.group(2)
+        words = re.findall(r"[a-z]+", match.group(1))[-len(acronym):]
+        if len(words) == len(acronym) and "".join(w[0] for w in words) == acronym:
+            return match.group(1)
+        return match.group(0)
+    return re.sub(r"((?:[a-z]+[\s-]+){2,6})\(([a-z]{2,6})\)", repl, text)
+
+
 def _strict_presence_result(
     profile: Dict[str, Any],
     criteria_key: str,
@@ -6447,12 +6513,12 @@ def _strict_presence_result(
         elif criteria_key == "required_geographies":
             geo_terms = _geography_match_terms(value, criterion)
             for role in profile.get("roles") or []:
-                role_text = _role_geography_text_for_profile(profile, role)
+                role_text = _strip_territory_labels(_role_geography_text_for_profile(profile, role))
                 # Title, location and inferred location count directly; a place
                 # that appears only in the job description must be the person's
                 # market, not company boilerplate ("headquartered out of
                 # Singapore", "offices in ... Dubai").
-                direct_text = _role_geography_text_for_profile(profile, {**role, "details": ""})
+                direct_text = _strip_territory_labels(_role_geography_text_for_profile(profile, {**role, "details": ""}))
                 details_text = _normalize_search_text(role.get("details") or "")
                 term = next(
                     (term for term in geo_terms
@@ -6463,7 +6529,7 @@ def _strict_presence_result(
                     found = ("role/company geography", _evidence_snippet(role_text, term), role, role_text)
                     break
             if not found:
-                general_text = _profile_geography_experience_text(profile)
+                general_text = _strip_territory_labels(_profile_geography_experience_text(profile))
                 geo_terms = _geography_match_terms(value, criterion)
                 term = next((term for term in geo_terms if _term_matches_text(term, general_text)), None)
                 if term:
@@ -9974,9 +10040,10 @@ async def _semantic_verify_near_misses(
             "business terms, and read every abbreviation in its context: an abbreviation inside a list of "
             "industries, products or job functions is not a place. For each candidate return meets (true/false), "
             "quote: the exact words copied from their profile that prove it (empty when meets is false), and "
-            "place: the standard English name of the country, city, region or territory the quote shows they "
-            "worked in (for segments: the segment name). "
-            'Return JSON only: {"results": [{"id": <id>, "meets": <bool>, "quote": <string>, "place": <string>}]}.'
+            "place: the place or territory exactly as written in the quote (for segments: the segment name), and "
+            "place_countries: the standard English names of every country that place covers (empty for segments). "
+            'Return JSON only: {"results": [{"id": <id>, "meets": <bool>, "quote": <string>, "place": <string>, '
+            '"place_countries": [<string>]}]}.'
         )
         # What the answer must fall inside: the requirement's own expanded
         # terms (countries, cities, verified territory acronyms / segment
@@ -10005,15 +10072,31 @@ async def _semantic_verify_near_misses(
             result = by_id.get(cid) or {}
             quote = str(result.get("quote") or "").strip()
             place = _normalize_search_text(result.get("place"))
-            place_ok = bool(place) and any(
-                _term_matches_text(term, place) or _term_matches_text(place, term) for term in allowed_terms
+            place_countries = {_normalize_search_text(c) for c in (result.get("place_countries") or []) if str(c or "").strip()}
+            place_ok = bool(place) and (
+                any(_term_matches_text(term, place) or _term_matches_text(place, term) for term in allowed_terms)
+                # A name the lists miss ("the Gulf") counts when the countries it
+                # covers lie inside the requirement; "APAC" does not for
+                # Southeast Asia because it also covers Japan and Australia.
+                # Mostly-inside, not all: two definitions of one region differ
+                # at the edges (Cyprus, Egypt in "ME"), APAC is far below.
+                or (key == "required_geographies" and bool(place_countries)
+                    and sum(any(_term_matches_text(term, c) for term in allowed_terms) for c in place_countries)
+                    >= 0.75 * len(place_countries))
             )
             # A quote whose only place word is a short abbreviation ("ME") must
             # sit in an explicitly geographic field; "Industries: Fins, ME &
             # HiTech" is Media & Entertainment.
-            quote_l = _normalize_search_text(quote)
-            if place_ok and not any(_term_matches_text(term, quote_l) for term in allowed_terms):
-                place_ok = bool(re.search(r"\b(?:geo|geography|region|territor(?:y|ies)|market|focus|coverage|covering|covered)\b", quote_l))
+            # The place must be written in the quote itself (read with form
+            # labels removed: "EMEA - Europe, Middle East & Africa" is an EMEA
+            # answer), so the model cannot turn "APAC" into "Southeast Asia".
+            # A two-letter place ("ME") only counts inside a geography field:
+            # "Industries: Fins, ME & HiTech" is Media & Entertainment.
+            quote_l = _strip_territory_labels(_normalize_search_text(quote))
+            if place_ok:
+                place_ok = _term_matches_text(place, quote_l) or any(_term_matches_text(t, quote_l) for t in allowed_terms)
+            if place_ok and len(place.replace(" ", "")) <= 2:
+                place_ok = re.search(r"\b(?:geo|geography|region|territor(?:y|ies)|market|focus)\b", quote_l) is not None
             if result.get("meets") is True and _quote_in_text(quote, texts[cid]) and place_ok:
                 accepted.append(_attach_semantic_evidence(relaxed_scored, key, values, quote, criteria))
             elif result.get("meets") is True:
