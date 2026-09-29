@@ -1644,6 +1644,32 @@ _MARKET_ACTION_PATTERN = re.compile(
 )
 
 
+_COMPANY_BOILERPLATE_RE = re.compile(
+    r"\b(?:head[\s-]?quarter(?:ed|s)?|hq|offices?|founded|based out of|incorporated|subsidiar(?:y|ies)|presence in|"
+    r"customers? (?:in|across)|clients? (?:in|across)|trusted by|serves? (?:customers|clients|brands))\b"
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[.;:\n\u2022|]+|\s-\s")
+
+
+def _geo_term_is_market_experience(term: str, text: str) -> bool:
+    """True when a place named in free text is where the person sold or
+    managed, judged on the clause that contains it."""
+    term_l = _normalize_search_text(term)
+    if not term_l or not text:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if not _term_matches_text(term_l, clause):
+            continue
+        if _COMPANY_BOILERPLATE_RE.search(clause):
+            continue
+        if _MARKET_ACTION_PATTERN.search(clause) or re.search(
+            r"\b(?:led|leading|lead|built|building|expan(?:d|ded|ding|sion)|grew|growing|launched|focus(?:ed)?|"
+            r"accounts?|clients?|customers?|deals?|business|sales|partners?|channel)\b", clause
+        ):
+            return True
+    return False
+
+
 def _has_market_action_text(text: str) -> bool:
     normalized = _normalize_search_text(text)
     return bool(_MARKET_ACTION_PATTERN.search(normalized))
@@ -2110,20 +2136,26 @@ def _normalize_search_text(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").lower()).strip()
 
 
+def _bounded_in(term_l: str, text: str) -> bool:
+    """Whole-word match, plural endings allowed. A bare substring test made
+    "oman" match "woman", "aden" match "broadening", "iran" match "irani"."""
+    if term_l not in text:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(term_l)}(?:e?s)?(?![a-z0-9])", text) is not None
+
+
 def _term_matches_text(term: str, text: str) -> bool:
     term_l = _normalize_search_text(term)
-    if not term_l:
+    if not term_l or not text:
         return False
-    if len(term_l) <= 3:
-        return re.search(rf"\b{re.escape(term_l)}\b", text) is not None
-    if term_l in text:
+    if _bounded_in(term_l, text):
         return True
     # "mid-market" must find "Mid Market" and "midmarket" headlines.
     if "-" in term_l or " " in term_l:
         spaced = re.sub(r"[-\s]+", " ", term_l)
         joined = spaced.replace(" ", "")
         hyphenated = spaced.replace(" ", "-")
-        return spaced in text or hyphenated in text or (len(joined) >= 6 and joined in text)
+        return _bounded_in(spaced, text) or _bounded_in(hyphenated, text) or (len(joined) >= 6 and _bounded_in(joined, text))
     return False
 
 
@@ -2627,7 +2659,9 @@ def _geography_match_terms(value: str, criterion: Any = None) -> List[str]:
             raw = item.get(key)
             if isinstance(raw, list):
                 terms.update(_normalize_search_text(term) for term in raw if str(term or "").strip())
-    return sorted(term for term in terms if term)
+    # Two-letter codes collide with ordinary words ("me", "sa", "in"): a
+    # "ME" value matched the pronoun in every About section.
+    return sorted(term for term in terms if term and (len(term) >= 3 or term in _SHORT_GEO_CODES))
 
 
 def _role_company_geo_text(role: Dict[str, Any]) -> str:
@@ -5319,7 +5353,9 @@ _COMPANY_CONDITION_SYSTEM_PROMPT = (
     "describe where the PERSON is, never the company, unless the query explicitly says the company is "
     "headquartered or based there. Return JSON only: "
     "{\"condition\": <string>, \"examples\": [<company names>], \"not_examples\": [<adjacent companies that do NOT satisfy it>], "
-    "\"exclude\": [<for competitor queries: the target company X itself plus its former names; otherwise empty>]}."
+    "\"exclude\": [<for competitor queries: EVERY name the target company is or was known by — full legal name, "
+    "short brand (the name without a product/category suffix, e.g. a company branded 'AcmePay' that is also "
+    "called 'Acme'), former names and rebrands; otherwise empty>]}."
 )
 
 
@@ -5453,6 +5489,7 @@ async def candidate_ids_for_company_query(
         "candidate_ids": ids,
         "companies": matched,
         "company_condition": condition.get("condition"),
+        "target_names": [str(n) for n in (condition.get("exclude") or []) if str(n or "").strip()],
         "cost": tracker.get_summary(),
     }
 
@@ -6408,10 +6445,20 @@ def _strict_presence_result(
             if term:
                 found = ("candidate location", _evidence_snippet(location_text, term), None, location_text)
         elif criteria_key == "required_geographies":
+            geo_terms = _geography_match_terms(value, criterion)
             for role in profile.get("roles") or []:
                 role_text = _role_geography_text_for_profile(profile, role)
-                geo_terms = _geography_match_terms(value, criterion)
-                term = next((term for term in geo_terms if _term_matches_text(term, role_text)), None)
+                # Title, location and inferred location count directly; a place
+                # that appears only in the job description must be the person's
+                # market, not company boilerplate ("headquartered out of
+                # Singapore", "offices in ... Dubai").
+                direct_text = _role_geography_text_for_profile(profile, {**role, "details": ""})
+                details_text = _normalize_search_text(role.get("details") or "")
+                term = next(
+                    (term for term in geo_terms
+                     if _term_matches_text(term, direct_text) or _geo_term_is_market_experience(term, details_text)),
+                    None,
+                )
                 if term:
                     found = ("role/company geography", _evidence_snippet(role_text, term), role, role_text)
                     break
@@ -7405,6 +7452,54 @@ def _scoped_tenure_summary(calculated: Dict[str, Any]) -> List[Dict[str, Any]]:
     return summaries
 
 
+_PEOPLE_MANAGER_TITLE_RE = re.compile(
+    r"\b(?:head|director|vp|svp|avp|evp|vice president|chief|cro|cso|team lead|team leader|group manager|"
+    r"sales manager|regional manager|area manager|zonal manager|country manager|general manager|"
+    r"manager\s*[,-]?\s*(?:sales|inside sales|business development|sdr|bdr|pre[\s-]?sales))\b",
+    re.I,
+)
+# "Manager" titles that are individual-contributor roles.
+_IC_MANAGER_TITLE_RE = re.compile(
+    r"\b(?:account|key account|product|project|program|customer success|relationship|territory|partner|"
+    r"marketing|content|community|success|client|engagement|alliances?|channel account)\s+manager\b",
+    re.I,
+)
+_TEAM_SIZE_TEXT_RE = re.compile(
+    r"\b(?:team of|managing|managed|leading|led|lead|manage|heading|headed|mentoring|mentored)\s+(?:a\s+)?(?:team\s+of\s+)?"
+    r"(\d{1,3})\+?\s*(?:member|members|people|person|reps?|representatives?|sdrs?|bdrs?|aes?|account executives?|"
+    r"sellers?|sales\s*(?:people|reps?|executives?|professionals?)|direct reports?|reportees?)\b"
+    r"|\b(\d{1,3})\+?\s*direct reports?\b|\bteam size\s*[:\-]?\s*(\d{1,3})\b",
+    re.I,
+)
+
+
+def _people_management_roles(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Roles whose title says the person managed people. Used only when the
+    profile has no recorded team-management tenure (most imported profiles)."""
+    roles = []
+    for role in profile.get("roles") or []:
+        title = str(role.get("title") or "")
+        if _PEOPLE_MANAGER_TITLE_RE.search(title) and not _IC_MANAGER_TITLE_RE.search(title):
+            roles.append(role)
+    return roles
+
+
+def _team_size_from_text(profile: Dict[str, Any]) -> Tuple[int, str]:
+    """Largest team size stated in the person's own text ("managed a team of
+    8 AEs", "5 direct reports"). (0, "") when nothing is stated."""
+    texts = [str(profile.get("about") or ""), str(profile.get("headline") or "")]
+    texts += [f"{role.get('title') or ''} {role.get('details') or ''}" for role in profile.get("roles") or []]
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    texts += [f"{k}: {v}" for k, v in raw_fields.items() if re.search(r"team|report|manag", str(k), re.I)]
+    best, snippet = 0, ""
+    for text in texts:
+        for match in _TEAM_SIZE_TEXT_RE.finditer(text):
+            size = int(next(g for g in match.groups() if g))
+            if 1 < size < 500 and size > best:
+                best, snippet = size, text[max(0, match.start() - 40): match.end() + 40].strip()
+    return best, snippet
+
+
 def _strict_shortlist_score_candidate(
     profile: Dict[str, Any],
     criteria: Dict[str, Any],
@@ -7479,6 +7574,13 @@ def _strict_shortlist_score_candidate(
         min_managed_val = _coerce_scalar_threshold(min_managed)
         if min_managed_val is not None:
             actual = int(profile_copy.get("max_people_managed") or 0)
+            source, snippet = "profile", f"Managed team of {actual} people"
+            if actual < min_managed_val:
+                # The recorded field is empty for most imports; a size the
+                # person states in their own text is the next best evidence.
+                text_size, text_snippet = _team_size_from_text(profile_copy)
+                if text_size > actual:
+                    actual, source, snippet = text_size, "profile text", text_snippet
             if actual < min_managed_val:
                 reject("min_people_managed")
                 return None
@@ -7487,9 +7589,9 @@ def _strict_shortlist_score_candidate(
             evidence_log.append({
                 "criterion": "People managed",
                 "value": str(min_managed_val),
-                "source": "profile",
-                "snippet": f"Managed team of {actual} people",
-                "source_text": f"Managed team of {actual} people",
+                "source": source,
+                "snippet": snippet,
+                "source_text": snippet,
             })
 
     min_team_mgmt_years = criteria.get("min_team_management_years")
@@ -7501,6 +7603,18 @@ def _strict_shortlist_score_candidate(
                 or (profile_copy.get("raw_fields") or {}).get("years_team_management")
                 or 0
             )
+            tm_source = "profile"
+            tm_snippet = f"{actual_tm_years:g} years of team management experience"
+            if actual_tm_years < min_team_mgmt_years_val:
+                # No recorded tenure: time in people-management titles.
+                manager_roles = _people_management_roles(profile_copy)
+                derived_years = round(calculate_merged_duration_years(manager_roles), 1) if manager_roles else 0.0
+                if derived_years > actual_tm_years:
+                    actual_tm_years = derived_years
+                    tm_source = "role titles"
+                    titles = "; ".join(f"{r.get('title')} at {r.get('company')}" for r in manager_roles[:3])
+                    tm_snippet = f"{derived_years:g} years in people-management roles ({titles})"
+                    contributing_roles.extend(manager_roles)
             if actual_tm_years < min_team_mgmt_years_val:
                 reject("min_team_management_years")
                 return None
@@ -7509,9 +7623,9 @@ def _strict_shortlist_score_candidate(
             evidence_log.append({
                 "criterion": "Team management tenure",
                 "value": str(min_team_mgmt_years_val),
-                "source": "profile",
-                "snippet": f"{actual_tm_years:g} years of team management experience",
-                "source_text": f"{actual_tm_years:g} years of team management experience",
+                "source": tm_source,
+                "snippet": tm_snippet,
+                "source_text": tm_snippet,
             })
 
     if not check_excluded_geography_presence(profile_copy, criteria):
@@ -7614,6 +7728,25 @@ def _strict_shortlist_score_candidate(
         )
         evidence_log.extend(result["evidence"])
         contributing_roles.extend(result.get("roles") or [])
+
+        if key == "required_companies" and isinstance(criterion, dict) and _coerce_positive_float(criterion.get("min_years")):
+            # "3+ years in SaaS" resolved to SaaS employers: the years are the
+            # merged time across every role at any of those employers.
+            company_min_years = float(criterion["min_years"])
+            company_items = _company_criteria_items(criterion)
+            company_roles = [
+                role for role in _roles_for_employment_scope(profile_copy, criterion, str(criterion.get("employment_scope") or "any_employer"))
+                if any(_company_matches(str(role.get("company") or ""), term) for item in company_items for term in _company_match_terms(item))
+            ]
+            company_years = calculate_merged_duration_years(company_roles)
+            calculated_experience[key] = {
+                "duration": company_years, "roles": company_roles, "label": config["label"],
+                "required": company_min_years, "dimension": "company", "evidence_ids": [],
+            }
+            if company_years < company_min_years:
+                reject(f"{key}_duration")
+                return None
+            contributing_roles.extend(company_roles)
 
         calc_map = {
             "required_functions": "function",
@@ -7911,7 +8044,7 @@ async def _expand_keywords_with_llm(values: List[str], category: str, tracker: T
     try:
         response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
         tracker.add_usage(llm.model_name, prompt_text, response.content, "Keyword Expansion")
-        expanded = get_list_from_llm_json(safe_json_loads(response.content, []))
+        expanded = [t for t in (_clean_expansion_term(x) for x in get_list_from_llm_json(safe_json_loads(response.content, []))) if t]
         if "title" in category.lower():
             expanded = _same_seniority_titles(values, expanded)
         return expanded
@@ -8013,28 +8146,267 @@ async def _expand_locations_with_llm(values: List[str], tracker: TokenCostTracke
         return []
 
 
+_SHORT_GEO_CODES = {"us", "uk", "eu"}
+
+
+def _clean_expansion_term(term: Any) -> str:
+    """LLM expansions annotate terms: "Dubai (UAE)", "Doha (business hub)",
+    "SaaS - Software as a Service". The annotation never appears in a
+    profile, so the annotated term matched nothing."""
+    text = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", str(term or ""))
+    text = re.split(r"\s+[-–—:]\s+", text)[0]
+    return re.sub(r"\s+", " ", text).strip(" .,;")
+
+
+def _flatten_geography_terms(payload: Any) -> List[str]:
+    """Every place name in the expansion, however it is nested. The model
+    answers {"geographies": [{"region": .., "countries": [{"name": ..,
+    "major_business_hubs": [..]}]}]}; the flat-list parser returned [] for
+    that, so no geography query was ever expanded beyond its literal name."""
+    terms: List[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            text = value.strip()
+            # Two-letter ISO codes ("SA", "QA") match ordinary words.
+            text = _clean_expansion_term(text)
+            # Long official names ("India, Middle East, and Africa") get split
+            # on commas downstream and leak their parts ("India").
+            if "," in text:
+                return
+            if len(text) >= 3 or text.lower() in _SHORT_GEO_CODES:
+                terms.append(text)
+
+    walk(payload)
+    return list(dict.fromkeys(terms))
+
+
+GEOGRAPHY_EXPANSION_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("geography_expansion_cache.json")
+
+
 async def _expand_geographies_with_llm(values: List[str], tracker: TokenCostTracker) -> List[str]:
+    """Expanded per value and cached, so a region always expands the same way
+    ("Middle East" gained or lost MEA between runs and so did the results)."""
     values = [str(value).strip() for value in values if str(value or "").strip()]
     if not values:
         return []
-    prompt = PromptTemplate(
-        input_variables=["geographies"],
-        template="""
-        You are a geography and business market expert. Expand the given market regions or countries into a JSON object with key "geographies" and a list of constituent countries, abbreviations, and major business hubs.
-        When expanding APAC, exclude China unless China is explicitly requested.
+    cache = _load_json_cache(GEOGRAPHY_EXPANSION_CACHE_PATH)
+    expanded: List[str] = []
+    for value in values:
+        key = _normalize_search_text(value)
+        if key not in cache:
+            cache[key] = await _expand_one_geography_with_llm(value, tracker)
+            _save_json_cache(GEOGRAPHY_EXPANSION_CACHE_PATH, cache)
+        expanded.extend(cache.get(key) or [])
+    # Old/new city names the model lists only one of (Bengaluru/Bangalore).
+    expanded.extend(_location_alias_terms(expanded))
+    return list(dict.fromkeys(expanded))
 
-        Initial Geographies: {geographies}
-        JSON Output:
-        """
-    )
-    prompt_text = prompt.format(geographies=json.dumps(values))
+
+_GEOGRAPHY_EXPANSION_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "geography_expansion",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["places", "territory_names", "combined_territories"],
+            "properties": {
+                "places": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["name", "other_names", "major_cities"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "other_names": {"type": "array", "items": {"type": "string"}},
+                            "major_cities": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+                "territory_names": {"type": "array", "items": {"type": "string"}},
+                "combined_territories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["acronym", "spelled_out"],
+                        "properties": {"acronym": {"type": "string"}, "spelled_out": {"type": "string"}},
+                    },
+                },
+            },
+        },
+    },
+}
+_GEOGRAPHY_EXPANSION_PROMPT = (
+    "You expand a sales geography named by a recruiter into the place names a candidate's profile might use for "
+    "it. The input may be a region, sub-region, country, state or city anywhere in the world. Return:\n"
+    "- places: every country the geography covers. For a single country, just that country. For a geography "
+    "smaller than a country (a state, province, coast or metro area), list its states/provinces instead and never "
+    "the whole country, since the country also covers places outside it. For each place: name (standard English "
+    "name), other_names (official name, common abbreviations and local spellings), major_cities (the main "
+    "business cities, one name per entry, listing old and new names of a city as separate entries).\n"
+    "- territory_names: names and acronyms sales teams use for exactly this geography.\n"
+    "- combined_territories: every standard sales-territory acronym covering this geography together with other "
+    "areas, each with its full spelled-out name. List all you know; they are filtered afterwards.\n"
+    "One name per string, no descriptions or labels. When expanding APAC, exclude China unless China is "
+    "explicitly requested."
+)
+
+
+_ABBREVIATION_CASE_CACHE: Dict[str, bool] = {}
+
+
+def _is_close_territory(spelled_out: str) -> bool:
+    """Recruiter policy: a combined territory counts for one of its parts only
+    when it has at most two parts ("Middle East and Africa" yes; "Europe,
+    Middle East and Africa" no — many EMEA sellers never covered the Gulf)."""
+    parts = [p for p in re.split(r",|\band\b|&|/", str(spelled_out or ""), flags=re.I) if p.strip()]
+    return 1 <= len(parts) <= 2
+
+
+def _abbreviation_is_ambiguous(term: str) -> bool:
+    """An all-caps abbreviation that is also an everyday word ("CAR" for the
+    Central African Republic) would match ordinary prose once text is
+    lower-cased. Decided from our own profiles: keep it only when the word
+    appears there mostly in capitals (UAE, KSA, SEA) — no word list needed."""
+    text = str(term or "").strip()
+    if not (text.isupper() and text.isalpha() and len(text) <= 5):
+        return False
+    key = text.lower()
+    if key in _SHORT_GEO_CODES:
+        return False
+    if key not in _ABBREVIATION_CASE_CACHE:
+        upper = lower = 0
+        pattern = re.compile(rf"\b{re.escape(key)}\b", re.I)
+        for profile in PROFILES_BY_ID.values():
+            blob = " ".join(str(profile.get(k) or "") for k in ("headline", "about"))
+            blob += " " + " ".join(f"{r.get('title') or ''} {r.get('details') or ''}" for r in profile.get("roles") or [])
+            for match in pattern.finditer(blob):
+                word = match.group(0)
+                if word.isupper():
+                    upper += 1
+                elif word.islower():
+                    lower += 1
+        _ABBREVIATION_CASE_CACHE[key] = lower > upper
+    return _ABBREVIATION_CASE_CACHE[key]
+
+
+TERRITORY_GLOSSARY_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("territory_glossary.json")
+_TERRITORY_TOKEN_RE = re.compile(r"\b[A-Z]{3,6}\b")
+
+
+def _candidate_territory_tokens(limit: int = 300) -> List[str]:
+    """All-caps tokens candidates use in titles, headlines and territory
+    fields (MEA, APMEA, IMEA, SAARC ...): the acronyms that actually occur."""
+    counts: Counter = Counter()
+    for profile in PROFILES_BY_ID.values():
+        texts = [str(profile.get("headline") or "")]
+        texts += [f"{r.get('title') or ''} {r.get('location') or ''}" for r in profile.get("roles") or []]
+        raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+        texts += [str(v) for k, v in raw_fields.items() if re.search(r"geo|region|territor|market|title", str(k), re.I)]
+        counts.update(set(_TERRITORY_TOKEN_RE.findall(" ".join(texts))))
+    return [token for token, n in counts.most_common(limit) if n >= 2]
+
+
+async def _territory_glossary(tracker: TokenCostTracker) -> Dict[str, Dict[str, Any]]:
+    """acronym -> {spelled_out, countries} for the tokens in our data, resolved
+    once by the model and cached. Non-geographic tokens are dropped."""
+    cache = _load_json_cache(TERRITORY_GLOSSARY_CACHE_PATH)
+    tokens = [t for t in _candidate_territory_tokens() if t not in cache]
+    if tokens:
+        try:
+            structured = await asyncio.to_thread(
+                call_openai_json,
+                "For each token decide whether it is a geographic sales territory or region acronym. If it is, give "
+                "its full spelled-out name and the standard English names of all its member countries. Company "
+                "names, products and job or business acronyms (SaaS, CRM, B2B, SDR) are not territories. "
+                "Return JSON only: {\"territories\": {<token>: {\"spelled_out\": <string or empty>, "
+                "\"countries\": [<country names>]}}}.",
+                json.dumps(tokens), model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=120.0,
+                response_format={"type": "json_object"},
+            )
+            tracker.add_usage(COMPANY_QUERY_MODEL, json.dumps(tokens), json.dumps(structured, default=str), "Territory Glossary")
+            resolved = structured.get("territories") if isinstance(structured, dict) else None
+            if isinstance(resolved, dict):
+                for token in tokens:
+                    item = resolved.get(token) if isinstance(resolved.get(token), dict) else {}
+                    cache[token] = {
+                        "spelled_out": str(item.get("spelled_out") or ""),
+                        "countries": [str(c) for c in (item.get("countries") or []) if str(c or "").strip()],
+                    }
+                _save_json_cache(TERRITORY_GLOSSARY_CACHE_PATH, cache)
+        except Exception as e:
+            logger.warning("Territory glossary failed: %s", e)
+    return {t: v for t, v in cache.items() if isinstance(v, dict) and v.get("spelled_out")}
+
+
+async def _expand_one_geography_with_llm(value: str, tracker: TokenCostTracker) -> List[str]:
+    """Any geography, worldwide, through one fixed schema: free-form answers
+    came back as "Brunei, Bandar Seri Begawan", "Sales Territory: SAARC", or
+    nested three levels deep, and matched nothing."""
     try:
-        response = await asyncio.wait_for(llm.ainvoke(prompt_text), timeout=30.0)
-        tracker.add_usage(llm.model_name, prompt_text, response.content, "Geography Expansion")
-        return get_list_from_llm_json(safe_json_loads(response.content, {}))
-    except asyncio.TimeoutError:
-        logger.warning("Shortlist geography expansion timed out; using original geographies")
+        structured = await asyncio.to_thread(
+            call_openai_json, _GEOGRAPHY_EXPANSION_PROMPT, f"Geography: {value}",
+            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=45.0,
+            response_format=_GEOGRAPHY_EXPANSION_SCHEMA,
+        )
+        tracker.add_usage(COMPANY_QUERY_MODEL, _GEOGRAPHY_EXPANSION_PROMPT + value, json.dumps(structured, default=str), "Geography Expansion")
+    except Exception as e:
+        logger.warning("Geography expansion failed for %r: %s", value, e)
         return []
+    if not isinstance(structured, dict):
+        return []
+    terms: List[str] = []
+    for place in structured.get("places") or []:
+        if isinstance(place, dict):
+            terms.append(place.get("name"))
+            terms.extend(place.get("other_names") or [])
+            terms.extend(place.get("major_cities") or [])
+    terms.extend(structured.get("territory_names") or [])
+    # A combined territory counts only when its spelled-out name actually
+    # names this geography (verified here, not trusted): "MEA - Middle East
+    # and Africa" is Middle East experience, "APAC - Asia-Pacific" is not
+    # Southeast Asia experience.
+    own_names = {_normalize_search_text(value)} | {
+        _normalize_search_text(t) for t in (structured.get("territory_names") or []) if len(str(t or "")) > 4
+    }
+    for item in structured.get("combined_territories") or []:
+        if not isinstance(item, dict):
+            continue
+        spelled = _normalize_search_text(item.get("spelled_out"))
+        if spelled and _is_close_territory(item.get("spelled_out")) and any(
+            name and _term_matches_text(name, spelled) for name in own_names
+        ):
+            terms.extend([item.get("acronym"), item.get("spelled_out")])
+    # Countries of the searched geography, for sub-territory containment.
+    geography_countries = {
+        _normalize_search_text(n)
+        for place in structured.get("places") or [] if isinstance(place, dict)
+        for n in [place.get("name"), *(place.get("other_names") or [])] if n
+    }
+    for acronym, entry in (await _territory_glossary(tracker)).items():
+        spelled = entry.get("spelled_out") or ""
+        spelled_l = _normalize_search_text(spelled)
+        members = {_normalize_search_text(c) for c in entry.get("countries") or []}
+        # A territory inside the searched geography (GCC in the Middle East,
+        # DACH in Europe) is experience there; a close combined territory
+        # that names it (MEA) is too.
+        contained = bool(members) and bool(geography_countries) and members <= geography_countries
+        names_it = _is_close_territory(spelled) and any(name and _term_matches_text(name, spelled_l) for name in own_names)
+        if contained or names_it:
+            terms.append(acronym)
+            if "," not in spelled:
+                terms.append(spelled)
+    return [t for t in _flatten_geography_terms(terms) if not _abbreviation_is_ambiguous(t)]
 
 
 def _sort_strict_shortlist_candidates(candidates: List[Dict[str, Any]], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -8258,6 +8630,11 @@ def _query_signals_current_employer(query: str) -> bool:
             r"\bcurrently\s+(?:working|employed)(?:\s+(?:for|at|in|with))?\b",
             r"\bcurrently\s+(?:for|at|with|in)\b",
             r"\b(?:now|today)\s+(?:at|with)\b",
+            # "AEs at Salesforce", "sales directors at Oracle": a job noun
+            # followed by "at" names where they work now. "Experience at X",
+            # "from X", "ex-X" stay career history.
+            r"\b(?:aes?|account\s+executives?|sdrs?|bdrs?|reps?|representatives?|managers?|directors?|leaders?|"
+            r"vps?|heads?|employees|staff|engineers?|consultants?|specialists?|executives?)\s+at\b",
         )
     )
 
@@ -8543,11 +8920,14 @@ def _clause_window(query_l: str, start: int, end: int, *, back: int = 90, forwar
     left = max(0, start - back)
     right = min(len(query_l), end + forward)
     window_back = query_l[left:start]
-    boundary = max(window_back.rfind(bnd) for bnd in (" and ", ",", ";"))
+    # A relative clause starts a separate requirement: in "3+ years in B2B
+    # SaaS sales who covered SEA or India" the years belong to SaaS sales.
+    boundaries = (" and ", ",", ";", " who ", " which ", " that ", " whose ", " where ")
+    boundary = max(window_back.rfind(bnd) for bnd in boundaries)
     if boundary != -1:
         window_back = window_back[boundary + 1:]
     window_fwd = query_l[end:right]
-    cut = min((idx for idx in (window_fwd.find(bnd) for bnd in (" and ", ",", ";")) if idx != -1), default=-1)
+    cut = min((idx for idx in (window_fwd.find(bnd) for bnd in boundaries) if idx != -1), default=-1)
     if cut != -1:
         window_fwd = window_fwd[:cut]
     return f"{window_back}{query_l[start:end]}{window_fwd}"
@@ -8886,21 +9266,6 @@ def _enforce_explicit_query_requirements(criteria: Dict[str, Any], query: str) -
         function_terms.append("BDR")
     if re.search(r"\bsdrs?\b", query_l):
         function_terms.append("SDR")
-    # Titles the plan model sometimes drops ("VP sales currently at Freshworks
-    # competitors" came back with only competitors_of, so every seniority matched).
-    for pattern, canonical in (
-        (r"\b(?:vp|vps|vice presidents?)\s*(?:of\s+|-\s*|,\s*)?sales\b", "VP Sales"),
-        (r"\bheads? of sales\b", "Head of Sales"),
-        (r"\bsales directors?\b|\bdirectors? of sales\b", "Sales Director"),
-        (r"\bsales leaders?\b", "Sales Leader"),
-        (r"\bchief revenue officers?\b", "Chief Revenue Officer"),
-        (r"\bsales managers?\b", "Sales Manager"),
-        (r"\baccount executives?\b|\baes\b", "Account Executive"),
-        (r"\baccount managers?\b", "Account Manager"),
-        (r"\bcustomer success managers?\b|\bcsms?\b", "Customer Success Manager"),
-    ):
-        if re.search(pattern, query_l):
-            function_terms.append(canonical)
     if function_terms:
         existing = criteria.get("required_functions")
         existing_values = _criteria_values_for_search(criteria, "required_functions")
@@ -9062,64 +9427,6 @@ _FUNDING_OPEN_ENDED_RE = re.compile(
 _PUBLIC_MARKER_RE = re.compile(r"\b(?:public|publicly|ipo|stock|exchange|nse|bse|nasdaq|nyse)\b", re.I)
 
 
-_LISTED_DESCRIPTORS = {
-    "ipo", "ipo listed", "listed", "listed company", "listed companies", "public", "public company",
-    "public companies", "publicly listed", "publicly traded", "publicly listed company", "publicly listed companies",
-    "stock exchange listed", "nse listed", "bse listed", "nasdaq listed", "nyse listed", "post ipo",
-}
-_COMPANY_TYPE_DESCRIPTORS = {
-    "startup", "startups", "start up", "start-up", "unicorn", "unicorns", "mnc", "mncs", "multinational",
-    "enterprise company", "large enterprise", "product company", "product companies", "saas company",
-    "saas companies", "service company", "services company", "it services company",
-}
-_LISTED_QUERY_RE = re.compile(
-    r"(?<!pre[\s-])\bipo\b|\bpublicly\s+(?:listed|traded)\b|\blisted\s+(?:company|companies|firms?|employers?|organi[sz]ations?)\b"
-    r"|\bpublic\s+(?:company|companies|firms?)\b|\bstock\s+exchange\b",
-    re.I,
-)
-
-
-def _repair_descriptor_companies(criteria: Dict[str, Any], query: str) -> None:
-    """The plan model sometimes files a kind of company as a company name:
-    "sales directors at IPO listed companies" came back as
-    required_companies=[{"company": "ipo"}], which no employer can match, so
-    the search returned nobody. Move descriptors to the criterion that
-    expresses them, and add the listed condition when the query states it but
-    the plan dropped it."""
-    listed_scope: Optional[str] = None
-    raw = criteria.get("required_companies")
-    if raw:
-        values = raw.get("values") if isinstance(raw, dict) else raw
-        values = values if isinstance(values, list) else [values]
-        kept: List[Any] = []
-        type_terms: List[str] = []
-        for value in values:
-            name = value.get("company") or value.get("value") if isinstance(value, dict) else value
-            key = _normalize_search_text(name)
-            scope = (value.get("employment_scope") if isinstance(value, dict) else None) or (
-                raw.get("employment_scope") if isinstance(raw, dict) else None)
-            if key in _LISTED_DESCRIPTORS:
-                listed_scope = scope or _query_company_scope(query)
-            elif key in _COMPANY_TYPE_DESCRIPTORS:
-                type_terms.append(str(name))
-            else:
-                kept.append(value)
-        if len(kept) != len(values):
-            logger.info("SHORTLIST moved company descriptors out of required_companies: listed=%s types=%s",
-                        bool(listed_scope), type_terms)
-            if kept:
-                criteria["required_companies"] = {**raw, "values": kept} if isinstance(raw, dict) else kept
-            else:
-                criteria.pop("required_companies", None)
-            if type_terms:
-                existing = _criteria_values_for_search(criteria, "required_company_details")
-                criteria["required_company_details"] = {"operator": "OR", "values": list(dict.fromkeys(existing + type_terms))}
-    if listed_scope is None and not criteria.get("funding_stage_min") and _LISTED_QUERY_RE.search(query or ""):
-        listed_scope = _query_company_scope(query)
-    if listed_scope and not criteria.get("funding_stage_min"):
-        criteria["funding_stage_min"] = {"stage": "Public", "employment_scope": listed_scope}
-
-
 def _apply_explicit_funding_stage_window(criteria: Dict[str, Any], query: str) -> None:
     """Pin the funding window to the stages the recruiter actually named.
 
@@ -9171,6 +9478,133 @@ def _apply_explicit_funding_stage_window(criteria: Dict[str, Any], query: str) -
                 details["values"] = kept
             else:
                 criteria.pop("required_company_details", None)
+
+
+_PLAN_REVIEW_KEYS = {
+    "required_functions": "job titles / functions the person must hold",
+    "required_geographies": "sales territories or markets the person covered (regions, countries)",
+    "required_locations": "where the person is based / lives",
+    "required_industries": "industries or domains of the person's employer",
+    "required_segments": "customer segments the person sold to (SMB, mid-market, enterprise...)",
+    "required_company_details": "kinds of employer (startup, product company, B2B SaaS...)",
+    "required_companies": "specific named employers",
+    "competitors_of": "companies whose competitors the person must work/have worked at",
+    "funding_stage_min": "employer funding stage or listing (Seed, Series B, Public/IPO-listed...)",
+    "min_people_managed": "minimum team size the person managed (a number)",
+    "min_team_management_years": "minimum years managing a team (a number)",
+    "min_total_experience": "minimum total years of experience (a number)",
+}
+_PLAN_REVIEW_NUMERIC_KEYS = ("min_people_managed", "min_team_management_years", "min_total_experience")
+_PLAN_REVIEW_SYSTEM_PROMPT = (
+    "You check a recruiting search's parsed filters against the recruiter's query. Report only problems:\n"
+    "1) missing: a requirement the query states plainly that no filter expresses (e.g. the query names a job title, "
+    "region, industry, segment, company or competitor target that is absent). Do not invent requirements, do not "
+    "restate ones already present in any spelling. A region the query names that the filters replaced with some "
+    "of its countries is missing (report the region itself). Of numeric requirements report only team size, "
+    "team-management years and total experience (value = the number); other durations are handled elsewhere.\n"
+    "2) misplaced: a value filed under required_companies that is not a company name but a description "
+    "(e.g. 'ipo', 'listed', 'startups', 'fintech'), with the filter it belongs to.\n"
+    "Abbreviations recruiters use count as stated requirements (AE, SDR, VP, ME = Middle East, SEA = Southeast Asia, "
+    "MEA, GCC, ANZ, DACH). Filters: " + json.dumps(_PLAN_REVIEW_KEYS) + ". "
+    "Return JSON only: {\"missing\": [{\"key\": <filter>, \"values\": [<strings>]}], "
+    "\"misplaced\": [{\"value\": <string>, \"key\": <filter>, \"as\": <canonical value, e.g. 'Public'>}]}. "
+    "Write every value as its full canonical name, never an abbreviation: 'Middle East' not 'ME', "
+    "'Southeast Asia' not 'SEA', 'Account Executive' not 'AE' — abbreviations are expanded later. "
+    "Empty lists when the filters are complete."
+)
+
+
+async def _review_filter_plan(criteria: Dict[str, Any], query: str, tracker: TokenCostTracker) -> Dict[str, Any]:
+    """One generic check that the parsed filters say everything the query
+    says. The plan model sometimes drops a stated requirement ("AEs at
+    Salesforce handling ME & SEA" lost ME; "VP sales at Freshworks
+    competitors" lost the title) or files a description as a company name
+    ("ipo"). Rules per title/region/word do not generalise; this does."""
+    visible = {k: v for k, v in criteria.items() if not str(k).startswith("_")}
+    try:
+        review = await asyncio.to_thread(
+            call_openai_json, _PLAN_REVIEW_SYSTEM_PROMPT,
+            f"Query: {query}\n\nParsed filters:\n{json.dumps(visible, ensure_ascii=False, default=str)}\n\nReturn JSON only.",
+            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=45.0,
+            response_format={"type": "json_object"},
+        )
+        tracker.add_usage(COMPANY_QUERY_MODEL, _PLAN_REVIEW_SYSTEM_PROMPT + query, json.dumps(review, default=str), "Filter Plan Review")
+    except Exception as e:
+        logger.warning("Filter plan review failed: %s", e)
+        return criteria
+    if not isinstance(review, dict):
+        return criteria
+    scope = _query_company_scope(query)
+    changes: List[str] = []
+
+    for item in review.get("misplaced") or []:
+        if not isinstance(item, dict):
+            continue
+        value_key = _normalize_search_text(item.get("value"))
+        target_key = str(item.get("key") or "")
+        raw = criteria.get("required_companies")
+        values = (raw.get("values") if isinstance(raw, dict) else raw) or []
+        kept = [v for v in values if _normalize_search_text(v.get("company") if isinstance(v, dict) else v) != value_key]
+        if len(kept) == len(values) or target_key not in _PLAN_REVIEW_KEYS or target_key == "required_companies":
+            continue
+        if kept:
+            criteria["required_companies"] = {**raw, "values": kept} if isinstance(raw, dict) else kept
+        else:
+            criteria.pop("required_companies", None)
+        _merge_review_value(criteria, target_key, [str(item.get("as") or item.get("value"))], scope)
+        changes.append(f"moved {item.get('value')!r} to {target_key}")
+
+    for item in review.get("missing") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        values = [str(v).strip() for v in (item.get("values") or []) if str(v or "").strip()]
+        if key not in _PLAN_REVIEW_KEYS or not values:
+            continue
+        present = (
+            {_normalize_search_text(v) for v in _criteria_values_for_search(criteria, key)}
+            if key not in ("competitors_of", "funding_stage_min", *_PLAN_REVIEW_NUMERIC_KEYS) else set()
+        )
+        values = [v for v in values if _normalize_search_text(v) not in present]
+        if values:
+            _merge_review_value(criteria, key, values, scope)
+            changes.append(f"added {key}={values}")
+
+    if changes:
+        logger.info("SHORTLIST filter_plan_review %s", "; ".join(changes))
+    return criteria
+
+
+def _merge_review_value(criteria: Dict[str, Any], key: str, values: List[str], scope: str) -> None:
+    if key in _PLAN_REVIEW_NUMERIC_KEYS:
+        number = next((n for n in (_coerce_positive_float(v) for v in values) if n is not None), None)
+        if number is not None and criteria.get(key) in (None, "", 0):
+            criteria[key] = number
+        return
+    if key == "funding_stage_min":
+        if not criteria.get("funding_stage_min") and values:
+            criteria["funding_stage_min"] = {"stage": values[0], "employment_scope": scope}
+        return
+    if key == "competitors_of":
+        existing = _criteria_objects(criteria.get("competitors_of") or criteria.get("competitor_of"))
+        known = {_normalize_company_key(i.get("target") or i.get("value") or "") for i in existing if isinstance(i, dict)}
+        existing += [{"target": v, "employment_scope": scope} for v in values if _normalize_company_key(v) not in known]
+        criteria["competitors_of"] = existing
+        criteria.pop("competitor_of", None)
+        return
+    if key == "required_companies":
+        raw = criteria.get("required_companies")
+        current = (raw.get("values") if isinstance(raw, dict) else raw) or []
+        criteria["required_companies"] = {
+            "operator": "OR", "employment_scope": scope,
+            "values": list(current) + [{"company": v, "employment_scope": scope} for v in values],
+        }
+        return
+    existing = criteria.get(key)
+    merged = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    merged["operator"] = merged.get("operator") or "OR"
+    merged["values"] = list(dict.fromkeys(_criteria_values_for_search(criteria, key) + values))
+    criteria[key] = merged
 
 
 def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[str, Any]:
@@ -9332,7 +9766,6 @@ def _coerce_filter_plan_to_criteria(plan: Dict[str, Any], query: str) -> Dict[st
         criteria["competitors_of"] = normalized_items
         criteria.pop("competitor_of", None)
 
-    _repair_descriptor_companies(criteria, query)
     if criteria.get("funding_stage_min") and isinstance(criteria["funding_stage_min"], dict):
         criteria["funding_stage_min"].setdefault("employment_scope", _query_company_scope(query))
     _apply_explicit_funding_stage_window(criteria, query)
@@ -9404,6 +9837,7 @@ Rules:
 - Current/base location filters (required_locations) are for phrases like "candidates in X", "based in X", "located in X" — this applies to ANY location granularity (city, state, country, e.g. "in the US", "in India"), not only states/cities. You MUST populate hard_filters.required_locations with the literal value(s) whenever such a phrase appears; geography_policy.use_current_location is only a policy note and must never be the sole representation of a location filter — never leave hard_filters empty because you set that flag instead.
 - Market/geography experience filters for phrases like "X experience", "X market", "worked in X", "sold into X", "covered X".
 - APAC/EMEA/etc. are market regions. Expand them through geography policy; do not treat them as candidate current location.
+- Write every geography, region and location exactly as the recruiter named it ("Southeast Asia", "Middle East", "DACH"). Never replace a region with a list of its countries or cities — the engine expands regions itself, and a partial country list loses the region's own name and acronyms.
 - A country query can match explicit region evidence when the country belongs to that region.
 - Company geography can be inferred only from headquarters/offices/operations/location fields for companies the candidate worked at. Never infer from subsidiaries, customer presence, revenue, or broad company assumptions. Generic company-description boilerplate (e.g. "founded with offices in India, UK, USA" as part of a copied company blurb) is weak evidence and must not by itself satisfy a specific market/geography tenure requirement unless the candidate's own role text ties their work to that market.
 - "working for/at/in COMPANY" means current_employer. "worked at/from/ex COMPANY" means any_employer.
@@ -9454,6 +9888,150 @@ JSON:
     return structured if isinstance(structured, dict) else {}
 
 
+# Criteria whose meaning outruns any term list: a territory can be written
+# a hundred ways ("Gulf markets", "KL + Jakarta", "MEA ex-SA"). Candidates
+# who pass everything else and fail only one of these get an LLM check.
+SEMANTIC_VERIFY_KEYS = ("required_geographies", "required_segments")
+SEMANTIC_VERIFY_MODEL = os.getenv("SEMANTIC_VERIFY_MODEL", COMPANY_QUERY_MODEL)
+SEMANTIC_VERIFY_BATCH_SIZE = int(os.getenv("SEMANTIC_VERIFY_BATCH_SIZE", "4"))
+_SEMANTIC_KEY_GUIDANCE = {
+    "required_geographies": (
+        "The person must have sold into, covered, managed or worked in this market themselves (a territory, "
+        "region they handled, or being based and working there). Their employer's headquarters, offices or "
+        "customer list does not count. A broad territory that merely includes the market (a continent-wide or "
+        "three-region territory) counts only when the profile shows work in this market specifically."
+    ),
+    "required_segments": (
+        "The person must have sold to / handled customers of this segment themselves (in a title, territory "
+        "or described in their own work)."
+    ),
+}
+
+
+def _semantic_evidence_text(profile: Dict[str, Any], max_chars: int = 3000) -> str:
+    parts = [f"Headline: {profile.get('headline') or ''}", f"Location: {profile.get('location') or ''}"]
+    for role in (profile.get("roles") or [])[:8]:
+        parts.append(
+            f"Role: {role.get('title') or ''} at {role.get('company') or ''}"
+            f"{' (' + str(role.get('location')) + ')' if role.get('location') else ''}. {str(role.get('details') or '')[:600]}"
+        )
+    raw_fields = profile.get("raw_fields") if isinstance(profile.get("raw_fields"), dict) else {}
+    for key, value in raw_fields.items():
+        if re.search(r"geo|region|territor|market|segment|focus", str(key), re.I) and str(value or "").strip():
+            parts.append(f"{key}: {value}")
+    parts.append(f"About: {str(profile.get('about') or '')[:900]}")
+    return "\n".join(parts)[:max_chars]
+
+
+def _quote_in_text(quote: str, text: str) -> bool:
+    squash = lambda value: re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    q = squash(quote)
+    return len(q) >= 3 and q in squash(text)
+
+
+def _attach_semantic_evidence(scored: Dict[str, Any], key: str, values: List[str], quote: str, criteria: Dict[str, Any]) -> Dict[str, Any]:
+    label = TEXT_CRITERIA_CONFIG.get(key, {}).get("label", key)
+    scored = dict(scored)
+    scored["matched_criteria"] = list(scored.get("matched_criteria") or []) + [{"criterion": label, "value": ", ".join(values)}]
+    entry = {
+        "criterion": label, "value": ", ".join(values), "source": "AI-verified profile text",
+        "snippet": quote, "source_text": quote,
+    }
+    evidence_log = _assign_evidence_ids(
+        _add_friendly_evidence_text(_dedupe_evidence_log(list(scored.get("evidence_log") or []) + [entry]), scored)
+    )
+    scored["evidence_log"] = evidence_log
+    breakdown = _build_requirement_breakdown(
+        criteria, matched_criteria=scored["matched_criteria"], missing_criteria=[],
+        evidence_log=evidence_log, calculated_experience=scored.get("calculated_experience") or {},
+    )
+    scored["requirement_breakdown"] = breakdown
+    scored["decision_narrative"] = _build_decision_narrative(criteria, breakdown)
+    scored["semantic_verified"] = key
+    return scored
+
+
+async def _semantic_verify_near_misses(
+    near_misses: List[Tuple[Dict[str, Any], str, Dict[str, Any]]],
+    criteria: Dict[str, Any],
+    query: str,
+    tracker: TokenCostTracker,
+) -> List[Dict[str, Any]]:
+    """LLM judgement for candidates that failed only one meaning-based
+    criterion. A pass needs an exact quote from the profile, checked here —
+    the model cannot pass anyone on text that is not there."""
+    query_values = criteria.get("_query_values") if isinstance(criteria.get("_query_values"), dict) else {}
+    sem = asyncio.Semaphore(8)
+    accepted: List[Dict[str, Any]] = []
+
+    async def verify(key: str, group: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
+        values = [str(v) for v in (query_values.get(key) or _requirement_values(criteria.get(key)))]
+        texts = {str(p.get("id")): _semantic_evidence_text(p) for p, _ in group}
+        system_prompt = (
+            "You check recruiting candidates against one requirement, using only the profile text given. "
+            f"Requirement: {TEXT_CRITERIA_CONFIG.get(key, {}).get('label', key)} = {' OR '.join(values)}. "
+            f"{_SEMANTIC_KEY_GUIDANCE.get(key, '')} Use your knowledge of places, territory acronyms and "
+            "business terms, and read every abbreviation in its context: an abbreviation inside a list of "
+            "industries, products or job functions is not a place. For each candidate return meets (true/false), "
+            "quote: the exact words copied from their profile that prove it (empty when meets is false), and "
+            "place: the standard English name of the country, city, region or territory the quote shows they "
+            "worked in (for segments: the segment name). "
+            'Return JSON only: {"results": [{"id": <id>, "meets": <bool>, "quote": <string>, "place": <string>}]}.'
+        )
+        # What the answer must fall inside: the requirement's own expanded
+        # terms (countries, cities, verified territory acronyms / segment
+        # synonyms). The model extracts; membership is checked here, so a
+        # confident "Sri Lanka is Southeast Asia" does not pass.
+        allowed_terms = {
+            _normalize_search_text(t)
+            for v in _criteria_values_for_search(criteria, key)
+            for t in ([v] + (_geography_match_terms(v, criteria.get(key)) if key == "required_geographies" else []))
+            if len(_normalize_search_text(t)) >= 3
+        }
+        user_prompt = f"Recruiter query: {query}\n\n" + "\n\n".join(f"### Candidate {cid}\n{text}" for cid, text in texts.items())
+        async with sem:
+            try:
+                structured = await asyncio.to_thread(
+                    call_openai_json, system_prompt, user_prompt, model=SEMANTIC_VERIFY_MODEL, use_web=False,
+                    temperature=0.0, timeout=90.0, response_format={"type": "json_object"},
+                )
+                tracker.add_usage(SEMANTIC_VERIFY_MODEL, system_prompt + user_prompt, json.dumps(structured, default=str), "Semantic Near-miss Check")
+            except Exception as e:
+                logger.warning("Semantic near-miss check failed (%s candidates): %s", len(group), e)
+                return
+        by_id = {str(r.get("id")): r for r in (structured.get("results") or []) if isinstance(r, dict)} if isinstance(structured, dict) else {}
+        for profile, relaxed_scored in group:
+            cid = str(profile.get("id"))
+            result = by_id.get(cid) or {}
+            quote = str(result.get("quote") or "").strip()
+            place = _normalize_search_text(result.get("place"))
+            place_ok = bool(place) and any(
+                _term_matches_text(term, place) or _term_matches_text(place, term) for term in allowed_terms
+            )
+            # A quote whose only place word is a short abbreviation ("ME") must
+            # sit in an explicitly geographic field; "Industries: Fins, ME &
+            # HiTech" is Media & Entertainment.
+            quote_l = _normalize_search_text(quote)
+            if place_ok and not any(_term_matches_text(term, quote_l) for term in allowed_terms):
+                place_ok = bool(re.search(r"\b(?:geo|geography|region|territor(?:y|ies)|market|focus|coverage|covering|covered)\b", quote_l))
+            if result.get("meets") is True and _quote_in_text(quote, texts[cid]) and place_ok:
+                accepted.append(_attach_semantic_evidence(relaxed_scored, key, values, quote, criteria))
+            elif result.get("meets") is True:
+                logger.info("SHORTLIST semantic check rejected candidate=%s place=%r in_scope=%s quote=%r",
+                            cid, place, place_ok, quote[:120])
+
+    grouped: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    for profile, key, relaxed_scored in near_misses:
+        grouped.setdefault(key, []).append((profile, relaxed_scored))
+    await asyncio.gather(*(
+        verify(key, group[i:i + SEMANTIC_VERIFY_BATCH_SIZE])
+        for key, group in grouped.items()
+        for i in range(0, len(group), SEMANTIC_VERIFY_BATCH_SIZE)
+    ))
+    logger.info("SHORTLIST semantic near-miss check checked=%s accepted=%s", len(near_misses), len(accepted))
+    return accepted
+
+
 async def process_query_main(
     query: str,
     session_id: str,
@@ -9483,6 +10061,7 @@ async def process_query_main(
         terminology_pack = _build_terminology_pack()
         raw_filter_plan = await _generate_schema_aware_filter_plan(normalized_query, schema_manifest, terminology_pack, tracker)
         criteria = _coerce_filter_plan_to_criteria(raw_filter_plan, normalized_query)
+        criteria = await _review_filter_plan(criteria, normalized_query, tracker)
         logger.info("SHORTLIST schema_manifest_summary=%s", json.dumps({
             "source": schema_manifest.get("db_catalog", {}).get("source"),
             "candidate_count_in_scope": schema_manifest.get("candidate_count_in_scope"),
@@ -9514,19 +10093,29 @@ async def process_query_main(
     competitor_entries: List[Dict[str, Any]] = []
     competitor_values = criteria.get("competitors_of") or criteria.get("competitor_of")
     if competitor_values:
-        competitor_items = _criteria_objects(competitor_values)
-        target = ""
-        competitor_scope = _query_company_scope(normalized_query)
-        first_item = competitor_items[0] if competitor_items else None
-        if isinstance(first_item, dict):
-            target = str(first_item.get("target") or first_item.get("company") or first_item.get("value") or "").strip()
-            competitor_scope = _reconcile_company_scope(
-                first_item.get("employment_scope") or first_item.get("scope") or competitor_scope, normalized_query
-            )
-        else:
-            target = str(first_item or "").strip()
+        # "Competitors of Zoho or Freshworks": every target is resolved, not
+        # just the first, and each list excludes only its own target (a
+        # Freshworks employee does work at a Zoho competitor).
+        competitor_targets: List[Tuple[str, str]] = []
+        for competitor_item in _criteria_objects(competitor_values) or [competitor_values]:
+            item_scope = _query_company_scope(normalized_query)
+            if isinstance(competitor_item, dict):
+                item_target = str(competitor_item.get("target") or competitor_item.get("company") or competitor_item.get("value") or "").strip()
+                item_scope = _reconcile_company_scope(
+                    competitor_item.get("employment_scope") or competitor_item.get("scope") or item_scope, normalized_query
+                )
+            else:
+                item_target = str(competitor_item or "").strip()
+            if item_target and not any(_company_matches(item_target, t) for t, _ in competitor_targets):
+                competitor_targets.append((item_target, item_scope))
 
-        if target:
+        competitor_source: Dict[str, str] = {}
+        all_competitor_entries: List[Dict[str, Any]] = []
+        competitor_scope = competitor_targets[0][1] if competitor_targets else _query_company_scope(normalized_query)
+        for target, competitor_scope in competitor_targets:
+            final_competitors: List[str] = []
+            competitor_entries = []
+            target_names: List[str] = [target]
             task = "identify all direct competitors for the given company"
             if "top" in normalized_query_lower and criteria.get("top_n"):
                 task = f"identify the top {criteria['top_n']} direct competitors for the given company"
@@ -9637,19 +10226,35 @@ async def process_query_main(
             try:
                 yield "Checking every employer in the database against the competitor definition..."
                 company_query = await candidate_ids_for_company_query(
-                    normalized_query,
+                    f"employers that are direct competitors of {target}",
                     current_only=_company_scope_current_only({"employment_scope": competitor_scope}),
                     tracker=tracker,
                 )
+                target_names = [target, *company_query.get("target_names", [])]
                 known_keys = {_normalize_company_key(name) for name in final_competitors}
                 for item in company_query.get("companies") or []:
                     key = _normalize_company_key(item.get("company"))
-                    if key and key not in known_keys and not _company_matches(item.get("company") or "", target):
+                    if key and key not in known_keys:
                         final_competitors.append(item["company"])
                         known_keys.add(key)
             except Exception as e:
                 logger.warning("Company-first competitor pass failed: %s", e)
 
+            # Never the target itself under any of its names (short brand,
+            # rebrand, legal name): "Clear" is ClearTax.
+            final_competitors = [
+                name for name in final_competitors
+                if not any(_company_matches(name, alias) for alias in target_names if alias)
+            ]
+            for name in final_competitors:
+                competitor_source.setdefault(name, target)
+            all_competitor_entries.extend(
+                entry for entry in competitor_entries if entry.get("company") in final_competitors
+            )
+
+        final_competitors = list(competitor_source)
+        targets_label = " / ".join(t for t, _ in competitor_targets)
+        if competitor_targets:
             if not final_competitors:
                 yield "Could not identify any valid competitors from the database. Halting search."
                 yield {"type": "complete", "data": [], "summary": tracker.get_summary()}
@@ -9670,25 +10275,28 @@ async def process_query_main(
             # for "competitors of X"; people at X itself are not competitors.
             existing_company_values = [
                 value for value in existing_company_values
-                if not _company_matches(
-                    str((value.get("company") or value.get("value") or "") if isinstance(value, dict) else value), target
+                if not any(
+                    _company_matches(
+                        str((value.get("company") or value.get("value") or "") if isinstance(value, dict) else value), t
+                    )
+                    for t, _ in competitor_targets
                 )
             ]
             criteria["required_companies"] = {
                 "operator": "OR",
                 "employment_scope": competitor_scope,
                 "values": list(existing_company_values) + [
-                    {"company": company, "employment_scope": competitor_scope, "source": f"competitor_of:{target}"}
+                    {"company": company, "employment_scope": competitor_scope, "source": f"competitor_of:{competitor_source[company]}"}
                     for company in final_competitors
                 ],
             }
-            if competitor_entries:
-                alias_by_company = {entry["company"]: entry.get("aliases") or [] for entry in competitor_entries}
+            if all_competitor_entries:
+                alias_by_company = {entry["company"]: entry.get("aliases") or [] for entry in all_competitor_entries}
                 for item in criteria["required_companies"]["values"]:
                     if isinstance(item, dict) and alias_by_company.get(item.get("company")):
                         item["aliases"] = alias_by_company[item["company"]]
             criteria["_competitor_resolution"] = {
-                "target": target,
+                "target": targets_label,
                 "validated_companies": final_competitors,
                 "employment_scope": competitor_scope,
             }
@@ -10003,6 +10611,13 @@ async def process_query_main(
             names = [item["company"] for item in company_resolution["companies"]]
             condition = company_resolution.get("company_condition") or query
             scope = "current_employer" if company_current_only else "any_employer"
+            # A duration on the converted criterion ("3+ years in SaaS") now
+            # applies to time at the matched employers instead of being dropped.
+            company_min_years = max(
+                (_coerce_positive_float(criteria[key].get("min_years")) or 0.0
+                 for key in company_query_keys if isinstance(criteria.get(key), dict)),
+                default=0.0,
+            )
             for key in company_query_keys:
                 criteria.pop(key, None)
                 original_criteria.pop(key, None)
@@ -10015,6 +10630,8 @@ async def process_query_main(
                     for name in names
                 ],
             }
+            if company_min_years:
+                criteria["required_companies"]["min_years"] = company_min_years
             # The employer condition is settled here for every candidate; the
             # auditor must not re-judge it. Handing it a truncated company list
             # made it reject people whose employer was not among the names shown.
@@ -10206,23 +10823,34 @@ async def process_query_main(
                     except Exception as e:
                         logger.warning("Shortlist reasoning task failed: %s", e)
 
+            near_misses: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
+
             def _score_batch(batch: List[Dict[str, Any]]) -> tuple:
                 passed: List[Dict[str, Any]] = []
                 batch_reasons: List[str] = []
+                misses: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
                 for profile in batch:
                     reasons: List[str] = []
                     scored = _strict_shortlist_score_candidate(profile, criteria, reasons)
                     if scored:
                         passed.append(scored)
-                    else:
-                        batch_reasons.extend(reasons or ["unknown"])
-                return passed, batch_reasons
+                        continue
+                    batch_reasons.extend(reasons or ["unknown"])
+                    failed = reasons[-1] if reasons else ""
+                    if failed in SEMANTIC_VERIFY_KEYS and criteria.get(failed):
+                        # Near-miss: passes every other requirement without it.
+                        relaxed = {k: v for k, v in criteria.items() if k != failed}
+                        relaxed_scored = _strict_shortlist_score_candidate(profile, relaxed, [])
+                        if relaxed_scored:
+                            misses.append((profile, failed, relaxed_scored))
+                return passed, batch_reasons, misses
 
             for batch_start in range(0, len(initial_candidate_pool), SCORING_BATCH_SIZE):
                 await _wait_if_paused()
                 batch = initial_candidate_pool[batch_start: batch_start + SCORING_BATCH_SIZE]
 
-                passed_batch, batch_reasons = await asyncio.to_thread(_score_batch, batch)
+                passed_batch, batch_reasons, batch_misses = await asyncio.to_thread(_score_batch, batch)
+                near_misses.extend(batch_misses)
 
                 final_candidates.extend(passed_batch)
                 reject_reasons.update(batch_reasons)
@@ -10273,6 +10901,29 @@ async def process_query_main(
                 if top_n not in (None, 0) and len(final_candidates) >= int(top_n):
                     break
                 
+            if near_misses and (top_n in (None, 0) or len(final_candidates) < int(top_n)):
+                await _wait_if_paused()
+                await output_queue.put(f"AI-checking {len(near_misses)} candidates who match everything except the territory/segment wording...")
+                rescued = await _semantic_verify_near_misses(near_misses, criteria, query, tracker)
+                if top_n not in (None, 0):
+                    rescued = rescued[: max(0, int(top_n) - len(final_candidates))]
+                if rescued:
+                    final_candidates.extend(rescued)
+                    for profile in rescued:
+                        original_order[str(profile.get("id"))] = len(original_order)
+                        pending_tasks.add(asyncio.create_task(process_one(profile)))
+                    await output_queue.put({
+                        "type": "candidate_batch",
+                        "phase": "scoring",
+                        "data": [
+                            {**{k: v for k, v in p.items() if k != "embedding"}, "shortlist_status": "pending_reasoning", "is_verified_match": False}
+                            for p in rescued
+                        ],
+                        "reviewed": reviewed_count,
+                        "passed": len(final_candidates),
+                        "total_pool": len(initial_candidate_pool),
+                    })
+
             if pending_tasks:
                 await output_queue.put({"type": "progress_start", "total": len(final_candidates), "total_considered": selected_candidate_count})
                 await output_queue.put("Generating match reasoning...")
