@@ -2051,12 +2051,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
 
     if (activeCall?.state === 'invite_received' || voipStatus === 'invite_received') {
       setCallState('invite_received');
-      return;
     }
-
-    if (!activeCall && voipStatus === 'registered' && callState === 'connecting') {
-      setCallState('waiting_for_invite');
-    }
+    // No "connecting -> waiting_for_invite" here: while the microphone check
+    // and the initiate API run there is no SDK call yet, and moving to
+    // "Ringing" early let the watchdog below declare the call failed after 2s
+    // ("Call could not connect" + the log screen) before it rang. triggerCall
+    // moves to waiting_for_invite itself once the dial is confirmed.
   }, [activeCall, callState, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipErrorNeedsUser, voipStatus]);
 
   useEffect(() => {
@@ -2222,6 +2222,9 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   // an active SDK call in a ringing state is the end of the attempt.
   useEffect(() => {
     if (!['waiting_for_invite', 'invite_received'].includes(callState) || activeCall) return undefined;
+    // Only a call this modal actually placed can "drop": before the dial the
+    // SDK has no call to lose.
+    if (!ownDialSeenRef.current) return undefined;
     const timer = window.setTimeout(() => {
       const event = { at: Date.now(), type: 'failed', origin: 'local', reasonText: 'the call ended before it connected', raw: null };
       const nextMeta = buildCallWrapUpMeta(event, call.candidate_name);
