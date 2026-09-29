@@ -7,6 +7,7 @@ import hashlib
 import redis
 import tiktoken
 import copy
+import time
 import functools
 from backend.services.profile_experience import (
     employer_names_from_profiles,
@@ -3093,24 +3094,11 @@ def _shortlist_company_cache_key(value: Any) -> str:
 
 
 def _load_shortlist_company_fact_cache() -> Dict[str, Any]:
-    try:
-        if not SHORTLIST_COMPANY_FACT_CACHE_PATH.exists():
-            return {}
-        with SHORTLIST_COMPANY_FACT_CACHE_PATH.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.warning("Could not load shortlist company fact cache", exc_info=True)
-        return {}
+    return _load_json_cache(SHORTLIST_COMPANY_FACT_CACHE_PATH)
 
 
 def _save_shortlist_company_fact_cache(cache: Dict[str, Any]) -> None:
-    try:
-        SHORTLIST_COMPANY_FACT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with SHORTLIST_COMPANY_FACT_CACHE_PATH.open("w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        logger.warning("Could not save shortlist company fact cache", exc_info=True)
+    _save_json_cache(SHORTLIST_COMPANY_FACT_CACHE_PATH, cache)
 
 
 def _company_fact_targets(criteria: Dict[str, Any]) -> List[str]:
@@ -5199,25 +5187,11 @@ def _all_employer_names_in_scope(profiles: List[Dict[str, Any]], criteria: Dict[
 
 
 def _load_employer_facts_cache() -> Dict[str, Any]:
-    try:
-        if EMPLOYER_FACTS_CACHE_PATH.exists():
-            with EMPLOYER_FACTS_CACHE_PATH.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.warning("Could not load employer facts cache", exc_info=True)
-    return {}
+    return _load_json_cache(EMPLOYER_FACTS_CACHE_PATH)
 
 
 def _save_employer_facts_cache(cache: Dict[str, Any]) -> None:
-    try:
-        EMPLOYER_FACTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = EMPLOYER_FACTS_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(cache, fh, ensure_ascii=False, indent=1, default=str)
-        tmp.replace(EMPLOYER_FACTS_CACHE_PATH)
-    except Exception:
-        logger.warning("Could not save employer facts cache", exc_info=True)
+    _save_json_cache(EMPLOYER_FACTS_CACHE_PATH, cache)
 
 
 def _employer_facts_fresh(entry: Any) -> bool:
@@ -5491,7 +5465,16 @@ def build_company_candidate_index(
     return index
 
 
-def _load_json_cache(path: Path) -> Dict[str, Any]:
+_CACHE_MEMO: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CACHE_MEMO_TTL_SECONDS = float(os.getenv("CACHE_MEMO_TTL_SECONDS", "60"))
+CACHE_VERSION: Dict[str, int] = {}
+
+
+def _cache_redis_key(path: Path) -> str:
+    return f"hayasa:cache:{path.stem}"
+
+
+def _read_cache_file(path: Path) -> Dict[str, Any]:
     try:
         if path.exists():
             with path.open("r", encoding="utf-8") as fh:
@@ -5502,7 +5485,7 @@ def _load_json_cache(path: Path) -> Dict[str, Any]:
     return {}
 
 
-def _save_json_cache(path: Path, data: Dict[str, Any]) -> None:
+def _write_cache_file(path: Path, data: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -5511,6 +5494,67 @@ def _save_json_cache(path: Path, data: Dict[str, Any]) -> None:
         tmp.replace(path)
     except Exception:
         logger.warning("Could not save cache %s", path, exc_info=True)
+
+
+def _load_json_cache(path: Path) -> Dict[str, Any]:
+    """LLM-derived caches (employer facts, title / company matches, region
+    expansions, team facts ...) live in Redis so every server instance shares
+    them and a redeploy does not throw them away. One hash per cache, one
+    field per entry. The local JSON file is the fallback when Redis is down
+    and seeds Redis the first time."""
+    key = _cache_redis_key(path)
+    memo = _CACHE_MEMO.get(key)
+    if memo and time.time() - memo[0] < _CACHE_MEMO_TTL_SECONDS:
+        return dict(memo[1])
+    data: Optional[Dict[str, Any]] = None
+    if redis_client is not None:
+        try:
+            raw = redis_client.hgetall(key)
+            if raw:
+                data = {}
+                for field, value in raw.items():
+                    try:
+                        data[field] = json.loads(value)
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                seed = _read_cache_file(path)
+                if seed:
+                    _redis_write_entries(key, seed)
+                    logger.info("Seeded Redis cache %s with %s entries from %s", key, len(seed), path.name)
+                data = seed
+        except Exception as e:
+            logger.warning("Redis cache read failed for %s, using local file: %s", key, e)
+            data = None
+    if data is None:
+        data = _read_cache_file(path)
+    _CACHE_MEMO[key] = (time.time(), data)
+    return dict(data)
+
+
+def _redis_write_entries(key: str, entries: Dict[str, Any]) -> None:
+    items = [(str(k), json.dumps(v, ensure_ascii=False, default=str)) for k, v in entries.items()]
+    pipe = redis_client.pipeline(transaction=False)
+    for i in range(0, len(items), 500):
+        pipe.hset(key, mapping=dict(items[i:i + 500]))
+    pipe.execute()
+
+
+def _save_json_cache(path: Path, data: Dict[str, Any]) -> None:
+    """Writes only entries that changed since the last read, so two instances
+    filling different entries of one cache do not overwrite each other."""
+    key = _cache_redis_key(path)
+    previous = (_CACHE_MEMO.get(key) or (0, {}))[1]
+    changed = {k: v for k, v in data.items() if k not in previous or previous[k] != v}
+    if redis_client is not None and changed:
+        try:
+            _redis_write_entries(key, changed)
+        except Exception as e:
+            logger.warning("Redis cache write failed for %s, keeping local file only: %s", key, e)
+    merged = {**previous, **data}
+    _CACHE_MEMO[key] = (time.time(), merged)
+    CACHE_VERSION[key] = CACHE_VERSION.get(key, 0) + 1
+    _write_cache_file(path, merged)
 
 
 _COMPANY_QUERY_SYSTEM_PROMPT = (
@@ -6589,9 +6633,9 @@ def _strip_territory_labels_cached(text: str) -> str:
     every territory in the glossary built from our data."""
     if not text:
         return text
-    stamp = TERRITORY_GLOSSARY_CACHE_PATH.stat().st_mtime if TERRITORY_GLOSSARY_CACHE_PATH.exists() else 0
+    glossary = _load_json_cache(TERRITORY_GLOSSARY_CACHE_PATH)
+    stamp = (CACHE_VERSION.get(_cache_redis_key(TERRITORY_GLOSSARY_CACHE_PATH), 0), len(glossary))
     if _TERRITORY_LABEL_CACHE.get("stamp") != stamp:
-        glossary = _load_json_cache(TERRITORY_GLOSSARY_CACHE_PATH)
         patterns = []
         for acronym, entry in glossary.items():
             spelled = _normalize_search_text((entry or {}).get("spelled_out") if isinstance(entry, dict) else entry)

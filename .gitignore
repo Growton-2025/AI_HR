@@ -132,3 +132,12 @@ data/plivo_inbound_state.json
 
 # Local backups of pre-env_key Plivo state files (contain another environment's app ids)
 data/_env_backup/
+
+# LLM-derived caches: shared through Redis (hayasa:cache:*); local copies are fallbacks
+data/cache/employer_facts_cache.json
+data/cache/company_query_match_cache.json
+data/cache/title_match_cache.json
+data/cache/team_facts_cache.json
+data/cache/geography_expansion_cache.json
+data/cache/territory_glossary.json
+data/cache/*.tmp
