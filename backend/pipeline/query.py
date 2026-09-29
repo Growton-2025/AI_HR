@@ -1131,6 +1131,21 @@ def check_excluded_geography_presence(profile: Dict[str, Any], criteria: Dict[st
     return True
 
 
+def check_excluded_company_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """False when the person is (or, for any_employer scope, was) at an
+    excluded employer. "Excluding people currently at Freshworks" was parsed
+    but never enforced — the key did not exist."""
+    raw = criteria.get("excluded_companies")
+    if not raw:
+        return True
+    default_scope = str(raw.get("employment_scope") or "any_employer") if isinstance(raw, dict) else "any_employer"
+    for item in _company_criteria_items(raw):
+        for role in _roles_for_employment_scope(profile, item, str(item.get("employment_scope") or default_scope)):
+            if any(_company_matches(str(role.get("company") or ""), term) for term in _company_match_terms(item)):
+                return False
+    return True
+
+
 def check_excluded_industry_presence(profile: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
     criteria_obj = criteria.get("excluded_industries")
     if not criteria_obj: return True
@@ -7700,6 +7715,9 @@ def _strict_shortlist_score_candidate(
     if not check_excluded_industry_presence(profile_copy, criteria):
         reject("excluded_industry")
         return None
+    if not check_excluded_company_presence(profile_copy, criteria):
+        reject("excluded_companies")
+        return None
     if not check_tenure_in_latest_role(profile_copy, criteria):
         reject("min_tenure_in_latest_role")
         return None
@@ -8256,6 +8274,43 @@ def _flatten_geography_terms(payload: Any) -> List[str]:
 GEOGRAPHY_EXPANSION_CACHE_PATH = EMPLOYER_FACTS_CACHE_PATH.with_name("geography_expansion_cache.json")
 
 
+async def _canonicalize_geography_criteria(criteria: Dict[str, Any], query: str, tracker: TokenCostTracker) -> None:
+    """Abbreviations mean different places in different queries: "covering ME
+    or SEA" is Middle East / Southeast Asia, but expanded on its own "ME" became
+    Maine and "SEA" Seattle. Resolve short values against the query first;
+    the full name is then expanded (and cached) unambiguously."""
+    keys = [k for k in ("required_geographies", "excluded_geographies") if criteria.get(k)]
+    short = sorted({
+        v for k in keys for v in _criteria_values_for_search(criteria, k)
+        if len(re.sub(r"[^a-z]", "", v.lower())) <= 4
+    })
+    if not short:
+        return
+    try:
+        structured = await asyncio.to_thread(
+            call_openai_json,
+            "A recruiter's query uses these abbreviations for sales geographies. Using the query as context, give the "
+            "full standard name of the region, country or territory each one means. Return JSON only: "
+            '{"names": {<abbreviation>: <full name>}}.',
+            f"Query: {query}\nAbbreviations: {json.dumps(short)}",
+            model=COMPANY_QUERY_MODEL, use_web=False, temperature=0.0, timeout=30.0,
+            response_format={"type": "json_object"},
+        )
+        tracker.add_usage(COMPANY_QUERY_MODEL, query + json.dumps(short), json.dumps(structured, default=str), "Geography Abbreviations")
+    except Exception as e:
+        logger.warning("Geography abbreviation resolution failed: %s", e)
+        return
+    names = structured.get("names") if isinstance(structured, dict) else None
+    if not isinstance(names, dict):
+        return
+    for key in keys:
+        # Replace, not append: expanded on its own the abbreviation is the
+        # wrong place; the full name's expansion carries its acronyms.
+        values = [str(names.get(v) or v).strip() for v in _criteria_values_for_search(criteria, key)]
+        _set_criteria_values(criteria, key, list(dict.fromkeys(v for v in values if v)))
+    logger.info("SHORTLIST geography abbreviations resolved %s", {k: names.get(k) for k in short})
+
+
 async def _expand_geographies_with_llm(values: List[str], tracker: TokenCostTracker) -> List[str]:
     """Expanded per value and cached, so a region always expands the same way
     ("Middle East" gained or lost MEA between runs and so did the results)."""
@@ -8544,6 +8599,7 @@ FILTER_PLAN_CRITERIA_KEYS = {
     "required_geographies",
     "excluded_geographies",
     "excluded_industries",
+    "excluded_companies",
     "required_company_details",
     "required_culture_type",
     "required_keywords",
@@ -8999,11 +9055,22 @@ def _clause_window(query_l: str, start: int, end: int, *, back: int = 90, forwar
     return f"{window_back}{query_l[start:end]}{window_fwd}"
 
 
+_YEARS_OWN_DIMENSION_RE = re.compile(
+    r"\s*(?:of\s+|in\s+)?(?:(?:team|people)\s+(?:management|leadership|handling)|managing\s+(?:a\s+)?(?:team|people)|"
+    r"leading\s+(?:a\s+)?team|total|overall)\b"
+)
+
+
 def _query_years_near_terms(query: str, terms: List[str], context_terms: List[str]) -> Optional[float]:
     query_l = _normalize_search_text(query)
     if not query_l:
         return None
     for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", query_l):
+        # "2+ years of team management experience in SaaS covering APAC": the
+        # years are team-management tenure (its own criterion), not APAC or
+        # SaaS tenure.
+        if _YEARS_OWN_DIMENSION_RE.match(query_l[match.end():]):
+            continue
         window = _clause_window(query_l, match.start(), match.end())
         if terms and not any(_term_matches_text(term, window) for term in terms):
             continue
@@ -9096,7 +9163,12 @@ def _apply_seniority_title_hint(criteria: Dict[str, Any], query: str) -> None:
     """"Senior account executives" means the title says senior. The plan model
     instead demanded 5 years in each of four functions and matched 1 of 115.
     Without a number in the query the seniority lives in the title terms."""
-    if not _SENIORITY_RE.search(query or "") or _QUERY_DURATION_SIGNAL_RE.search(query or ""):
+    if not _SENIORITY_RE.search(query or ""):
+        return
+    # A number in the query only replaces the title's seniority when it is
+    # years in that function ("senior AE with 5 years as AE"); "senior AEs
+    # with 3+ years in SaaS" still means a senior title.
+    if _QUERY_DURATION_SIGNAL_RE.search(query or "") and criteria.get("min_function_years"):
         return
     functions = criteria.get("required_functions")
     values = [str(v).strip() for v in get_values_from_criteria(functions) if str(v or "").strip()] if functions else []
@@ -9555,6 +9627,7 @@ _PLAN_REVIEW_KEYS = {
     "required_company_details": "kinds of employer (startup, product company, B2B SaaS...)",
     "required_companies": "specific named employers",
     "competitors_of": "companies whose competitors the person must work/have worked at",
+    "excluded_companies": "specific named employers the person must NOT be at (or have been at)",
     "funding_stage_min": "employer funding stage or listing (Seed, Series B, Public/IPO-listed...)",
     "min_people_managed": "minimum team size the person managed (a number)",
     "min_team_management_years": "minimum years managing a team (a number)",
@@ -9657,6 +9730,11 @@ def _merge_review_value(criteria: Dict[str, Any], key: str, values: List[str], s
         existing += [{"target": v, "employment_scope": scope} for v in values if _normalize_company_key(v) not in known]
         criteria["competitors_of"] = existing
         criteria.pop("competitor_of", None)
+        return
+    if key == "excluded_companies":
+        raw = criteria.get(key)
+        current = (raw.get("values") if isinstance(raw, dict) else raw) or []
+        criteria[key] = {"operator": "OR", "values": list(current) + [{"company": v, "employment_scope": scope} for v in values]}
         return
     if key == "required_companies":
         raw = criteria.get("required_companies")
@@ -9898,7 +9976,7 @@ Terminology pack:
 
 Rules:
 - Return JSON only.
-- Use only these executable criteria keys when possible: required_companies, competitors_of, required_functions, min_function_years, required_industries, required_segments, required_company_details, required_culture_type, required_geographies, required_locations, excluded_geographies, excluded_industries, funding_stage_min, min_total_experience, min_people_managed, min_team_management_years, min_tenure_in_latest_role, avg_tenure_in_last_n_roles, required_keywords, top_n.
+- Use only these executable criteria keys when possible: required_companies, competitors_of, required_functions, min_function_years, required_industries, required_segments, required_company_details, required_culture_type, required_geographies, required_locations, excluded_geographies, excluded_industries, excluded_companies (objects with company and employment_scope), funding_stage_min, min_total_experience, min_people_managed, min_team_management_years, min_tenure_in_latest_role, avg_tenure_in_last_n_roles, required_keywords, top_n.
 - In hard_filters, emit only executable values such as operator, values, min_years, stage, and employment_scope. Never copy schema-reference metadata keys such as shape, value_shape, evidence, meaning, comparison, or supports_* into hard_filters.
 - Current/base location filters (required_locations) are for phrases like "candidates in X", "based in X", "located in X" — this applies to ANY location granularity (city, state, country, e.g. "in the US", "in India"), not only states/cities. You MUST populate hard_filters.required_locations with the literal value(s) whenever such a phrase appears; geography_policy.use_current_location is only a policy note and must never be the sole representation of a location filter — never leave hard_filters empty because you set that flag instead.
 - Market/geography experience filters for phrases like "X experience", "X market", "worked in X", "sold into X", "covered X".
@@ -10029,6 +10107,14 @@ async def _semantic_verify_near_misses(
     query_values = criteria.get("_query_values") if isinstance(criteria.get("_query_values"), dict) else {}
     sem = asyncio.Semaphore(8)
     accepted: List[Dict[str, Any]] = []
+    # Countries of known territories come from our glossary, not the model:
+    # asked about "region APAC" for a Southeast Asia search, the model listed
+    # only the Southeast Asian countries and the containment check passed.
+    glossary_countries = {
+        _normalize_search_text(acronym): [str(c) for c in entry.get("countries") or []]
+        for acronym, entry in (await _territory_glossary(tracker)).items()
+        if entry.get("countries")
+    }
 
     async def verify(key: str, group: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
         values = [str(v) for v in (query_values.get(key) or _requirement_values(criteria.get(key)))]
@@ -10072,7 +10158,12 @@ async def _semantic_verify_near_misses(
             result = by_id.get(cid) or {}
             quote = str(result.get("quote") or "").strip()
             place = _normalize_search_text(result.get("place"))
-            place_countries = {_normalize_search_text(c) for c in (result.get("place_countries") or []) if str(c or "").strip()}
+            known_countries = glossary_countries.get(place)
+            place_countries = {
+                _normalize_search_text(c)
+                for c in (known_countries if known_countries else (result.get("place_countries") or []))
+                if str(c or "").strip()
+            }
             place_ok = bool(place) and (
                 any(_term_matches_text(term, place) or _term_matches_text(place, term) for term in allowed_terms)
                 # A name the lists miss ("the Gulf") counts when the countries it
@@ -10145,6 +10236,9 @@ async def process_query_main(
         raw_filter_plan = await _generate_schema_aware_filter_plan(normalized_query, schema_manifest, terminology_pack, tracker)
         criteria = _coerce_filter_plan_to_criteria(raw_filter_plan, normalized_query)
         criteria = await _review_filter_plan(criteria, normalized_query, tracker)
+        # The review may add the title the plan dropped; seniority applies to it too.
+        _apply_seniority_title_hint(criteria, normalized_query)
+        await _canonicalize_geography_criteria(criteria, normalized_query, tracker)
         logger.info("SHORTLIST schema_manifest_summary=%s", json.dumps({
             "source": schema_manifest.get("db_catalog", {}).get("source"),
             "candidate_count_in_scope": schema_manifest.get("candidate_count_in_scope"),
