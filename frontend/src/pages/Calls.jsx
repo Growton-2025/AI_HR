@@ -1872,6 +1872,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   const effectiveActionLabel = initiationActionLabel || voipActionLabel || '';
   const effectiveActionUrl = initiationActionUrl || voipActionUrl || '';
   const hasBlockingVoipError = voipStatus === 'error' || callState === 'error';
+  // A VoIP error with a code or an action ("another tab took over", "use this
+  // tab", account setup) needs the recruiter. One without is the softphone
+  // still signing in / re-registering: before this call dials, that is
+  // "Connecting…", not an error screen — it used to flash the error, then the
+  // softphone recovered and the call rang anyway.
+  const voipErrorNeedsUser = voipStatus === 'error' && Boolean(voipErrorCode || voipActionLabel || voipActionUrl);
   const displayedAgentEmail = agentEmail || voipMeta?.agent_email || call?.recruiter_email || 'Loading...';
 
   const triggerCall = useCallback(async () => {
@@ -1997,7 +2003,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       return;
     }
 
-    if (voipStatus === 'error') {
+    if (voipErrorNeedsUser) {
       setInitiationError(voipError || 'Browser VoIP is unavailable.');
       setInitiationErrorCode(voipErrorCode || '');
       setInitiationActionLabel(voipActionLabel || '');
@@ -2012,12 +2018,17 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     }
 
     triggerCall();
-  }, [alreadyConnected, triggerCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
+  }, [alreadyConnected, triggerCall, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipErrorNeedsUser, voipStatus]);
 
   useEffect(() => {
     if (callState === 'review') return;
+    // Before this modal dials, the softphone's call states belong to an
+    // earlier call: a leftover "connected" jumped the new modal to Active,
+    // then (no live call) to the ended / call-log screen, and then it rang.
+    const started = isInitiated.current;
 
     if (voipStatus === 'error') {
+      if (!started && !voipErrorNeedsUser) return;
       setInitiationError(voipError || 'Browser VoIP failed.');
       setInitiationErrorCode(voipErrorCode || '');
       setInitiationActionLabel(voipActionLabel || '');
@@ -2025,6 +2036,8 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       setCallState('error');
       return;
     }
+
+    if (!started) return;
 
     if (activeCall?.state === 'connected' || voipStatus === 'connected') {
       setCallState('active');
@@ -2041,10 +2054,10 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       return;
     }
 
-    if (isInitiated.current && !activeCall && voipStatus === 'registered' && callState === 'connecting') {
+    if (!activeCall && voipStatus === 'registered' && callState === 'connecting') {
       setCallState('waiting_for_invite');
     }
-  }, [activeCall, callState, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus]);
+  }, [activeCall, callState, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipErrorNeedsUser, voipStatus]);
 
   useEffect(() => {
     const recovered = ['registered', 'answer_required', 'invite_received', 'connected'].includes(voipStatus);
@@ -2084,13 +2097,16 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
 
   useEffect(() => {
     if (callState !== 'preparing_softphone' || isInitiated.current) return undefined;
-    if (['registered', 'answer_required', 'invite_received', 'connected', 'error'].includes(voipStatus)) {
+    // A transient softphone error keeps waiting here (with one automatic
+    // retry) instead of flashing an error; only if it does not recover in
+    // time does the error screen appear.
+    if (['registered', 'answer_required', 'invite_received', 'connected'].includes(voipStatus) || voipErrorNeedsUser) {
       return undefined;
     }
 
     const timeoutId = window.setTimeout(() => {
       if (isInitiated.current) return;
-      if (['registered', 'answer_required', 'invite_received', 'connected', 'error'].includes(voipStatus)) {
+      if (['registered', 'answer_required', 'invite_received', 'connected'].includes(voipStatus) || voipErrorNeedsUser) {
         return;
       }
 
@@ -2103,6 +2119,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
 
       const exhausted = Boolean(voipConnectionEvent?.maxRetriesReached);
       const message = voipConnectionEvent?.error
+        || (voipStatus === 'error' && voipError)
         || (exhausted ? 'Plivo softphone registration failed' : 'Plivo softphone registration timed out');
       setInitiationError(message);
       setInitiationErrorCode(exhausted ? 'softphone_registration_failed' : 'softphone_registration_timeout');
@@ -2110,7 +2127,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     }, softphoneRecoveryAttempt > 0 ? SOFTPHONE_FIRST_CLICK_RECOVERY_MS : SOFTPHONE_PREPARING_TIMEOUT_MS);
 
     return () => window.clearTimeout(timeoutId);
-  }, [callState, retryVoip, softphoneRecoveryAttempt, voipConnectionEvent, voipStatus]);
+  }, [callState, retryVoip, softphoneRecoveryAttempt, voipConnectionEvent, voipError, voipErrorNeedsUser, voipStatus]);
 
   useEffect(() => {
     if ((callState === 'answer_required' || callState === 'invite_received' || callState === 'active') && !activeCall) {
