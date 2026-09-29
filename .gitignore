@@ -141,3 +141,6 @@ data/cache/team_facts_cache.json
 data/cache/geography_expansion_cache.json
 data/cache/territory_glossary.json
 data/cache/*.tmp
+
+# Reports with candidate personal data (e.g. duplicate merge dry runs)
+data/_reports/
