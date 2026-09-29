@@ -11,7 +11,7 @@ import Pagination, { pageWindow } from '../components/Pagination';
 import CandidateConversationModal from '../components/CandidateConversationModal';
 import PersonTimeline from '../components/PersonTimeline';
 import { SelectFilter } from '../components/FilterComponents';
-import { TranscriptView } from '../components/TranscriptView';
+import { TranscriptView, recruiterDisplayName } from '../components/TranscriptView';
 import {
   RANGE_OPTIONS, RANGE_DROPDOWN_OPTIONS, OUTCOME_GROUP_OPTIONS,
   rangeScopeLabel, buildSlicerParams, isSlicerDefault, formatHeaderDate,

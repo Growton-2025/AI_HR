@@ -32,7 +32,7 @@ const prettifyEmailName = (email) => {
     .join(' ');
 };
 
-const recruiterDisplayName = (call) => {
+export const recruiterDisplayName = (call) => {
   if (!call) return 'Recruiter';
   return (
     prettifyEmailName(call.plivo_recruiter_email) ||
