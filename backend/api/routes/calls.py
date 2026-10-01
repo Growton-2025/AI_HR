@@ -59,6 +59,11 @@ FOLLOWUP_TASK_TITLE = "Follow-up Call"
 # A one-off re-dial of a finished call. Not a cadence step, so a failed outcome
 # on it does not start a new attempt ladder.
 MANUAL_CALL_TASK_TITLE = "Manual call"
+# Task minted for a callback when the candidate had no open task of ours.
+INBOUND_CALLBACK_TASK_TITLE = "Inbound callback"
+# A dial that was placed but closed without a log. It still happened, so it
+# counts as a completed call; it belongs to no outcome group.
+NOT_LOGGED_OUTCOME = "Not logged"
 WRONG_NUMBER_OUTCOME = "Wrong Number"
 NOT_INTERESTED_OUTCOME = "Connected - Not Interested"
 # Must match the RECRUITMENT_STAGES value in frontend/src/components/StatusDropdown.jsx.
@@ -2449,7 +2454,7 @@ def create_callback_task(
                     ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
                     RETURNING id
                     """,
-                    (candidate_id, list_id, "Inbound callback"),
+                    (candidate_id, list_id, INBOUND_CALLBACK_TASK_TITLE),
                 )
                 row = cur.fetchone()
                 if row:
@@ -3315,10 +3320,93 @@ def initiate_call(
         },
         "call": updated_call,
         # True when this dial got a brand-new row (the requested one was
-        # already completed). The modal logs against call.id from here on and
-        # discards the row if the attempt never connects.
+        # already completed). The modal logs against call.id from here on.
         "spawned_call": spawned_call,
     }
+
+
+class CloseUnloggedRequest(BaseModel):
+    duration: Optional[int] = None
+    # An answered inbound call: there was no dial, so the row has no
+    # dial_token, but the conversation still counts as a call.
+    inbound: bool = False
+
+
+@router.post("/{call_id}/close-unlogged")
+def close_unlogged_call(
+    call_id: int,
+    request: Optional[CloseUnloggedRequest] = None,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Record a dial that was closed without a log as a completed call.
+
+    Every placed call counts towards Completed, wherever it was dialled from.
+    Without this, only calls whose log was saved moved the counter. The
+    dialled row keeps its recording and Plivo ids (webhooks still find it) and
+    is completed as "Not logged"; the task itself is re-created as pending on
+    the same date and step so the cadence does not move on unlogged work. A
+    one-off manual re-dial has no task behind it, so nothing is re-created.
+
+    Answered inbound calls count the same way. Their row is the one
+    callback-task handed out: a fresh "Inbound callback" task is not
+    re-created (the callback is done), but a cadence task the inbound call
+    was attached to is.
+    """
+    ensure_calls_schema_ready()
+    owner = get_call_list_owner(current_user)
+    duration = request.duration if request else None
+    inbound = bool(request and request.inbound)
+    conn = get_calls_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE calls
+                   SET status = 'completed',
+                       outcome = %s,
+                       duration = COALESCE(%s, duration),
+                       completed_at = NOW(),
+                       updated_at = NOW()
+                 WHERE id = %s
+                   AND status IN ('pending', 'in_progress')
+                   AND (%s OR dial_token IS NOT NULL)
+                   AND list_id IN (
+                       SELECT id FROM call_lists
+                       WHERE LOWER(COALESCE(created_by, '')) = %s
+                   )
+                RETURNING candidate_id, list_id, task_title, due_date, due_time
+                """,
+                (NOT_LOGGED_OUTCOME, duration, call_id, inbound, owner),
+            )
+            row = cur.fetchone()
+            if not row:
+                # Already logged, never dialled, or not ours: nothing to record.
+                conn.rollback()
+                return {"success": True, "closed": False}
+
+            candidate_id, list_id, task_title, due_date, due_time = row
+            if task_title not in (MANUAL_CALL_TASK_TITLE, INBOUND_CALLBACK_TASK_TITLE):
+                cur.execute(
+                    f"""
+                    INSERT INTO calls (candidate_id, list_id, status, due_date, due_time, task_title)
+                    SELECT %s, %s, 'pending', %s, %s, %s
+                      FROM candidates
+                     WHERE id = %s AND NOT {terminal_candidate_status_sql('status')}
+                    ON CONFLICT (candidate_id, list_id) WHERE status = 'pending' DO NOTHING
+                    """,
+                    (candidate_id, list_id, due_date, due_time, task_title, candidate_id),
+                )
+        conn.commit()
+        invalidate_calls_cache()
+        return {"success": True, "closed": True}
+    except Exception as e:
+        conn.rollback()
+        logger.exception("Failed to close unlogged call %s", call_id)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        return_db_connection(conn)
 
 
 @router.post("/{call_id}/sync-recording", response_model=CallResponse)

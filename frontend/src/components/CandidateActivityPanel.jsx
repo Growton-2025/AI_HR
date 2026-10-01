@@ -40,6 +40,7 @@ const ACTIVITY_OUTCOME_META = {
   'Connected - Follow-up': { tone: 'accent', icon: CalendarClock },
   'Wrong Number': { tone: 'accent', icon: PhoneOff },
   'Unreachable': { tone: 'neutral', icon: PhoneOff },
+  'Not logged': { tone: 'neutral', icon: PhoneOff },
 };
 const DEFAULT_ACTIVITY_OUTCOME_META = { tone: 'neutral', icon: PhoneIncoming };
 const TRANSCRIPT_TOGGLE_STYLE = {

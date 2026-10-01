@@ -1830,7 +1830,11 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   // (so the Completed count goes up and the old call's record is kept), and
   // everything after initiation must follow that id.
   const [callId, setCallId] = useState(call.id);
-  const spawnedCallRef = useRef(false);
+  // A dial actually went out (initiate succeeded) or an inbound call was
+  // answered. Closing without a log then
+  // still records the attempt, so the Completed count reflects every call
+  // placed, wherever it was dialled from.
+  const dialPlacedRef = useRef(false);
   const logSavedRef = useRef(false);
   const autoRetriedSoftphoneRef = useRef(false);
   // Timing diagnostics: when the modal opened and what the softphone status
@@ -1951,13 +1955,13 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       const dialToken = res?.data?.plivo_data?.dial_token || '';
       lastDialTokenRef.current = dialToken;
 
+      dialPlacedRef.current = true;
       const dialedCall = res?.data?.call;
       if (dialedCall?.id && dialedCall.id !== callId) {
         setCallId(dialedCall.id);
         // Otherwise the review screen shows the previous call's recording and
         // never waits for this one's.
         setReviewCallData(dialedCall);
-        spawnedCallRef.current = Boolean(res.data.spawned_call);
       }
 
       let dialStartedAt = 0;
@@ -2015,6 +2019,8 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     // candidate while we are talking to them.
     if (alreadyConnected) {
       isInitiated.current = true;
+      // Answered inbound: a real conversation, so it counts like a dial.
+      dialPlacedRef.current = true;
       setCallState('active');
       return;
     }
@@ -2443,19 +2449,23 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     if (isLiveCallState || activeCall || isInitiated.current) {
       await rejectCall();
     }
-    // A re-dial row that never connected and was never logged is not a call —
-    // drop it so it does not linger in Due Today as a phantom task.
-    if (spawnedCallRef.current && !logSavedRef.current && connectedAtRef.current === null) {
-      spawnedCallRef.current = false;
+    // A placed call closed without a log still happened: record it as
+    // completed ("Not logged") so the counter moves. The task stays in Due
+    // Today for its real attempt.
+    if (dialPlacedRef.current && !logSavedRef.current) {
+      dialPlacedRef.current = false;
+      const duration = (connectedAtRef.current && endedAtRef.current)
+        ? Math.max(0, Math.round((endedAtRef.current - connectedAtRef.current) / 1000))
+        : 0;
       try {
-        await axios.delete(`${API_BASE}/calls/${callId}`);
+        await axios.post(`${API_BASE}/calls/${callId}/close-unlogged`, { duration, inbound: alreadyConnected });
         onRefresh?.();
       } catch (_) {
         // Harmless if it fails: the row just stays as a pending task.
       }
     }
     onClose();
-  }, [activeCall, callId, isLiveCallState, onClose, onRefresh, rejectCall]);
+  }, [activeCall, alreadyConnected, callId, isLiveCallState, onClose, onRefresh, rejectCall]);
 
   return (
     <div className="call-modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>

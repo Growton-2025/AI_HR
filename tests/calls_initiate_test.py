@@ -226,6 +226,67 @@ def test_initiate_call_on_completed_row_reuses_open_task_in_same_list(monkeypatc
     assert not any("INSERT INTO calls" in q for q, _p in first_cursor.executed)
 
 
+def _run_close_unlogged(monkeypatch, fetchone_results, inbound=False):
+    cursor = _FakeCursor(fetchone_results=fetchone_results)
+    conn = _FakeConnection(cursor)
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_calls_db_connection", lambda: conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda *args, **kwargs: None)
+    result = calls.close_unlogged_call(
+        42, calls.CloseUnloggedRequest(duration=12, inbound=inbound), current_user=_build_user(),
+    )
+    return result, cursor, conn
+
+
+def test_close_unlogged_counts_the_dial_and_keeps_the_task(monkeypatch):
+    # A dial closed without a log still counts as a completed call, and the
+    # cadence task comes back as pending on the same date and step.
+    result, cursor, conn = _run_close_unlogged(monkeypatch, [
+        (2519, 77, "Call 2 - Day 2", date(2026, 10, 1), time(15, 30)),
+    ])
+
+    assert result == {"success": True, "closed": True}
+    update_sql, update_params = cursor.executed[0]
+    assert "status = 'completed'" in update_sql
+    assert "dial_token IS NOT NULL" in update_sql
+    assert update_params[:3] == (calls.NOT_LOGGED_OUTCOME, 12, 42)
+    insert_sql, insert_params = cursor.executed[1]
+    assert "INSERT INTO calls" in insert_sql
+    assert insert_params[:5] == (2519, 77, date(2026, 10, 1), time(15, 30), "Call 2 - Day 2")
+    assert conn.commits == 1
+
+
+def test_close_unlogged_manual_redial_recreates_nothing(monkeypatch):
+    result, cursor, _ = _run_close_unlogged(monkeypatch, [
+        (2519, 77, calls.MANUAL_CALL_TASK_TITLE, date(2026, 10, 1), None),
+    ])
+
+    assert result["closed"] is True
+    assert not any("INSERT INTO calls" in q for q, _p in cursor.executed)
+
+
+def test_close_unlogged_counts_answered_inbound_call(monkeypatch):
+    # An answered inbound call has no dial_token but still counts; its fresh
+    # "Inbound callback" task is done, so no new pending task is made.
+    result, cursor, _ = _run_close_unlogged(monkeypatch, [
+        (2519, 77, calls.INBOUND_CALLBACK_TASK_TITLE, date(2026, 10, 1), None),
+    ], inbound=True)
+
+    assert result["closed"] is True
+    _sql, update_params = cursor.executed[0]
+    assert update_params[3] is True
+    assert not any("INSERT INTO calls" in q for q, _p in cursor.executed)
+
+
+def test_close_unlogged_ignores_already_logged_call(monkeypatch):
+    result, cursor, conn = _run_close_unlogged(monkeypatch, [None])
+
+    assert result == {"success": True, "closed": False}
+    assert len(cursor.executed) == 1
+    assert conn.commits == 0
+
+
 def test_add_candidates_duplicate_returns_400_without_wrapping(monkeypatch):
     # Single combined statement returns
     # (list_found, duplicate_count, inserted_count, requested_count,
