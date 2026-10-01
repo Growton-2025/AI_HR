@@ -484,5 +484,339 @@
     "similar_companies": [],
     "sources": [],
     "last_verified_at": "2026-09-25T15:51:16Z"
+  },
+  "rocketum": {
+    "target": "rocketum",
+    "competitors": [
+      {
+        "name": "Rocketium",
+        "aliases": []
+      },
+      {
+        "name": "InVideo",
+        "aliases": []
+      },
+      {
+        "name": "Canva",
+        "aliases": []
+      },
+      {
+        "name": "Lumen5",
+        "aliases": []
+      },
+      {
+        "name": "Animoto",
+        "aliases": []
+      },
+      {
+        "name": "Shakr Media Co., Ltd.",
+        "aliases": []
+      },
+      {
+        "name": "Hippo Video",
+        "aliases": []
+      },
+      {
+        "name": "WeVideo",
+        "aliases": []
+      },
+      {
+        "name": "Moovly",
+        "aliases": []
+      },
+      {
+        "name": "Biteable",
+        "aliases": []
+      },
+      {
+        "name": "Magisto",
+        "aliases": []
+      },
+      {
+        "name": "Movavi",
+        "aliases": []
+      },
+      {
+        "name": "Videolicious",
+        "aliases": []
+      },
+      {
+        "name": "Idomoo",
+        "aliases": []
+      },
+      {
+        "name": "Kaltura",
+        "aliases": []
+      },
+      {
+        "name": "Blender",
+        "aliases": []
+      },
+      {
+        "name": "Piksel Limited",
+        "aliases": []
+      },
+      {
+        "name": "Jivox",
+        "aliases": []
+      },
+      {
+        "name": "Haivision",
+        "aliases": []
+      },
+      {
+        "name": "Storyvine",
+        "aliases": []
+      },
+      {
+        "name": "SundaySky",
+        "aliases": []
+      },
+      {
+        "name": "Kollective",
+        "aliases": []
+      },
+      {
+        "name": "Giphy",
+        "aliases": []
+      },
+      {
+        "name": "SmartStory Technologies",
+        "aliases": []
+      },
+      {
+        "name": "Cluster",
+        "aliases": []
+      },
+      {
+        "name": "Wistia",
+        "aliases": []
+      },
+      {
+        "name": "GoPop",
+        "aliases": []
+      },
+      {
+        "name": "Vidyard",
+        "aliases": []
+      },
+      {
+        "name": "Wowza",
+        "aliases": []
+      }
+    ],
+    "prompt_version": 3,
+    "similar_companies": [],
+    "sources": [],
+    "last_verified_at": "2026-09-29T09:57:29Z"
+  },
+  "salesforce": {
+    "target": "salesforce",
+    "competitors": [
+      {
+        "name": "Microsoft",
+        "aliases": []
+      },
+      {
+        "name": "Oracle",
+        "aliases": []
+      },
+      {
+        "name": "HubSpot",
+        "aliases": []
+      },
+      {
+        "name": "Zoho",
+        "aliases": []
+      },
+      {
+        "name": "Pipedrive",
+        "aliases": []
+      },
+      {
+        "name": "Freshworks",
+        "aliases": []
+      },
+      {
+        "name": "ServiceNow",
+        "aliases": []
+      },
+      {
+        "name": "Zendesk",
+        "aliases": []
+      },
+      {
+        "name": "SugarCRM",
+        "aliases": []
+      },
+      {
+        "name": "Creatio",
+        "aliases": []
+      },
+      {
+        "name": "SAP",
+        "aliases": []
+      },
+      {
+        "name": "NetSuite",
+        "aliases": []
+      },
+      {
+        "name": "Monday.com",
+        "aliases": []
+      },
+      {
+        "name": "Close",
+        "aliases": []
+      },
+      {
+        "name": "Attio",
+        "aliases": []
+      },
+      {
+        "name": "GoHighLevel",
+        "aliases": []
+      },
+      {
+        "name": "Vtiger",
+        "aliases": []
+      },
+      {
+        "name": "Insightly",
+        "aliases": []
+      },
+      {
+        "name": "Bitrix24",
+        "aliases": []
+      },
+      {
+        "name": "Odoo",
+        "aliases": []
+      },
+      {
+        "name": "Keap",
+        "aliases": []
+      },
+      {
+        "name": "Kustomer",
+        "aliases": []
+      },
+      {
+        "name": "Sage CRM",
+        "aliases": []
+      },
+      {
+        "name": "Copper",
+        "aliases": []
+      },
+      {
+        "name": "Khoros",
+        "aliases": []
+      },
+      {
+        "name": "Freshdesk",
+        "aliases": []
+      },
+      {
+        "name": "Zoho CRM Plus",
+        "aliases": []
+      },
+      {
+        "name": "Microsoft Corporation",
+        "aliases": []
+      },
+      {
+        "name": "Oracle Corporation",
+        "aliases": []
+      },
+      {
+        "name": "Zoho Corporation",
+        "aliases": []
+      },
+      {
+        "name": "Freshworks Inc.",
+        "aliases": []
+      },
+      {
+        "name": "ServiceNow Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Zendesk Inc.",
+        "aliases": []
+      },
+      {
+        "name": "SugarCRM Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Creatio Inc.",
+        "aliases": []
+      },
+      {
+        "name": "SAP SE",
+        "aliases": []
+      },
+      {
+        "name": "Oracle NetSuite",
+        "aliases": []
+      },
+      {
+        "name": "Monday.com Ltd.",
+        "aliases": []
+      },
+      {
+        "name": "Close.io",
+        "aliases": []
+      },
+      {
+        "name": "GoHighLevel Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Vtiger Systems",
+        "aliases": []
+      },
+      {
+        "name": "Insightly Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Bitrix24 Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Odoo S.A.",
+        "aliases": []
+      },
+      {
+        "name": "Keap Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Kustomer Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Sage Group",
+        "aliases": []
+      },
+      {
+        "name": "Copper CRM",
+        "aliases": []
+      },
+      {
+        "name": "Khoros Inc.",
+        "aliases": []
+      },
+      {
+        "name": "Freshdesk Inc.",
+        "aliases": []
+      }
+    ],
+    "prompt_version": 3,
+    "similar_companies": [],
+    "sources": [],
+    "last_verified_at": "2026-09-29T10:02:13Z"
   }
 }

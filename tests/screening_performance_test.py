@@ -1832,7 +1832,60 @@ def test_requirement_breakdown_maps_competitor_requirement_to_competitor_categor
     assert len(breakdown) == 1
     assert breakdown[0]["category"] == "Competitor"
     assert breakdown[0]["status"] == "qualified"
-    assert set(breakdown[0]["profile_evidence"][0]["matched_terms"]) == {"Amplitude", "Mixpanel"}
+    # Only what the candidate's record matched — never the full competitor
+    # list, and never the target company the search is relative to.
+    assert breakdown[0]["profile_evidence"][0]["matched_terms"] == ["Amplitude"]
+    assert breakdown[0]["not_counted"] == []
+
+
+def test_requirement_breakdown_says_why_an_employer_counts_as_a_competitor():
+    criteria = {
+        "competitor_of": [{"company": "Testsigma"}],
+        "required_companies": {"operator": "OR", "values": [
+            {"company": "TestMu AI", "aliases": ["LambdaTest"], "source": "competitor_of:Testsigma"},
+        ]},
+        "_competitor_resolution": {
+            "target": "Testsigma",
+            "validated_companies": ["TestMu AI"],
+            "basis": {"TestMu AI": {
+                "method": "saved_web_research",
+                "detail": "Listed as a direct competitor of Testsigma by web research citing 1 page.",
+                "sources": [{"url": "https://www.gartner.com/reviews/product/testsigma/alternatives", "title": "Gartner"}],
+                "as_of": "2026-09-25T15:21:28Z",
+            }},
+        },
+    }
+    evidence_log = query._assign_evidence_ids(query._add_friendly_evidence_text([
+        {
+            "criterion": "Companies",
+            "value": "LambdaTest",
+            "source": "role company",
+            "snippet": "Account Executive at LambdaTest",
+            "source_text": "Account Executive at LambdaTest",
+        }
+    ]))
+
+    breakdown = query._build_requirement_breakdown(
+        criteria, matched_criteria=[], missing_criteria=[], evidence_log=evidence_log,
+    )
+
+    competitor = next(item for item in breakdown if item["category"] == "Competitor")
+    basis = competitor["profile_evidence"][0]["match_basis"]
+    # The card says LambdaTest; the basis is TestMu AI's (its rebrand).
+    assert basis["company"] == "TestMu AI"
+    assert basis["method_label"] == "Saved web research"
+    assert basis["sources"][0]["url"].startswith("https://www.gartner.com/")
+    assert basis["as_of"] == "2026-09-25T15:21:28Z"
+
+
+def test_requirement_breakdown_has_no_basis_for_companies_the_recruiter_named():
+    criteria = {"required_companies": {"operator": "OR", "values": ["Freshworks"]}}
+    evidence_log = query._assign_evidence_ids(query._add_friendly_evidence_text([
+        {"criterion": "Companies", "value": "Freshworks", "source": "role company",
+         "snippet": "AE at Freshworks", "source_text": "AE at Freshworks"}
+    ]))
+    breakdown = query._build_requirement_breakdown(criteria, matched_criteria=[], missing_criteria=[], evidence_log=evidence_log)
+    assert "match_basis" not in breakdown[0]["profile_evidence"][0]
 
 
 def test_process_query_returns_only_shortlisted_matches(monkeypatch):

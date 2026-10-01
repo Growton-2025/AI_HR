@@ -319,6 +319,57 @@ function RequirementRow({ item, claimText }) {
     )
 }
 
+// Case/punctuation-insensitive key so "Work history" and "work history",
+// or a quote of just “BrowserStack” and the BrowserStack chip, count as one.
+const sameText = (value) => stripEvidenceIds(String(value || '')).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+const formatBasisDate = (value) => {
+    const date = value ? new Date(value) : null
+    return date && !Number.isNaN(date.getTime())
+        ? date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+        : ''
+}
+
+const hostOf = (url) => {
+    try { return new URL(url).hostname.replace(/^www\./, '') } catch { return '' }
+}
+
+// Why an employer satisfies a requirement the engine resolved itself
+// ("competitor of Testsigma", "IPO-listed") — the candidate's record only
+// shows they worked there; this says how we know the company qualifies.
+function MatchBasis({ basis }) {
+    const web = basis.method === 'web_research' || basis.method === 'saved_web_research'
+    const asOf = formatBasisDate(basis.as_of)
+    const sources = basis.sources || []
+    return (
+        <div style={{
+            marginTop: 2, padding: '8px 10px', borderRadius: 10,
+            background: web ? '#fff7ed' : '#f8fafc', border: `1px solid ${web ? '#fed7aa' : '#e2e8f0'}`,
+            display: 'grid', gap: 5,
+        }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 10.5, fontWeight: 800, color: web ? '#c2410c' : '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                {web ? <Globe size={11} /> : <Sparkles size={11} />}
+                Why {stripEvidenceIds(basis.company)} counts · {basis.method_label}{asOf ? ` · verified ${asOf}` : ''}
+            </div>
+            {basis.detail && <div style={{ fontSize: 12, color: '#334155', lineHeight: 1.5 }}>{stripEvidenceIds(basis.detail)}</div>}
+            {sources.length > 0 && (
+                <div style={{ display: 'grid', gap: 3 }}>
+                    {sources.map((src, index) => (
+                        <a key={`${src.url}-${index}`} href={src.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
+                            title={src.note || src.url}
+                            style={{ fontSize: 11.5, color: '#2563eb', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+                            <ExternalLink size={11} style={{ flexShrink: 0 }} />
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {src.title || hostOf(src.url)}{src.title && hostOf(src.url) ? ` — ${hostOf(src.url)}` : ''}
+                            </span>
+                        </a>
+                    ))}
+                </div>
+            )}
+        </div>
+    )
+}
+
 function RequirementDetails({ breakdown }) {
     return (
         <div style={{ display: 'grid', gap: 12, marginTop: 12, paddingTop: 12, borderTop: '1px solid rgba(99,102,241,0.15)' }}>
@@ -327,7 +378,16 @@ function RequirementDetails({ breakdown }) {
                     <div style={{ fontSize: 11, fontWeight: 800, color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                         {stripEvidenceIds(item.requirement)} · {item.status === 'qualified' ? 'met' : 'not verified'}
                     </div>
-                    {(item.profile_evidence || []).map((group, index) => (
+                    {(item.profile_evidence || []).map((group, index) => {
+                        const title = sameText(group.display_title)
+                        const showSubtitle = group.display_subtitle && sameText(group.display_subtitle) !== title
+                        const showChip = sameText(group.where || 'Profile data') !== title || (group.sources || []).some(s => s && s.url)
+                        const terms = (group.matched_terms || []).filter(term => sameText(term) !== title)
+                        const quoteKey = sameText(group.quote)
+                        // A quote that is only the matched name (or the title)
+                        // repeats the chip right above it.
+                        const showQuote = quoteKey && quoteKey !== title && !terms.some(term => sameText(term) === quoteKey)
+                        return (
                         <div key={`${item.key}-${index}`} style={{
                             display: 'grid', gap: 6, padding: '10px 12px', borderRadius: 12,
                             background: '#ffffff', border: '1px solid #e2e8f0',
@@ -335,27 +395,32 @@ function RequirementDetails({ breakdown }) {
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
                                 <div style={{ minWidth: 0 }}>
                                     <div style={{ fontSize: 13, fontWeight: 800, color: '#0f172a' }}>{stripEvidenceIds(group.display_title)}</div>
-                                    <div style={{ fontSize: 11.5, color: '#64748b' }}>{stripEvidenceIds(group.display_subtitle)}</div>
+                                    {showSubtitle && <div style={{ fontSize: 11.5, color: '#64748b' }}>{stripEvidenceIds(group.display_subtitle)}</div>}
                                 </div>
-                                <ProvenanceChip provenance={group.provenance} where={group.where} sources={group.sources} />
+                                {showChip && <ProvenanceChip provenance={group.provenance} where={group.where} sources={group.sources} />}
                             </div>
-                            {group.matched_terms?.length > 0 && (
+                            {terms.length > 0 && (
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                                    {group.matched_terms.map((term) => (
+                                    {terms.map((term) => (
                                         <span key={term} style={{ fontSize: 10.5, fontWeight: 700, padding: '2px 8px', borderRadius: 999, background: '#eef2ff', color: '#4338ca', border: '1px solid #c7d2fe' }}>
                                             {stripEvidenceIds(term)}
                                         </span>
                                     ))}
                                 </div>
                             )}
-                            {group.quote && (
+                            {showQuote && (
                                 <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.55 }}>
                                     <EvidenceText value={stripEvidenceIds(group.quote)} />
                                 </div>
                             )}
+                            {group.match_basis && <MatchBasis basis={group.match_basis} />}
                         </div>
-                    ))}
-                    {item.cross_check?.length > 0 && (
+                        )
+                    })}
+                    {/* cross_check is the same evidence as the cards above, rewritten
+                        as sentences ("Tushar worked at BrowserStack, which matches…").
+                        Only show it when there are no cards to read instead. */}
+                    {!item.profile_evidence?.length && item.cross_check?.length > 0 && (
                         <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: '#334155', lineHeight: 1.55, display: 'grid', gap: 3 }}>
                             {item.cross_check.slice(0, 4).map((line, index) => <li key={index}>{stripEvidenceIds(line)}</li>)}
                         </ul>

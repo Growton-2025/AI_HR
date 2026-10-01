@@ -3163,6 +3163,7 @@ def _cached_company_facts_for_criteria(criteria: Dict[str, Any]) -> Dict[str, An
                 "target": target_name,
                 "companies": comps,
                 "sources": cached.get("sources") or [],
+                "last_verified_at": verified_raw,
                 "product_service": cached.get("product_service"),
                 "customer_segment": cached.get("customer_segment"),
                 "customer_presence": cached.get("customer_presence"),
@@ -3298,7 +3299,12 @@ def _reverse_competitors_from_cache(target: str) -> List[Dict[str, Any]]:
         for entry in cached.get("competitors") or []:
             name = _company_entry_name(entry)
             if name and (_company_matches(name, target) or any(_company_matches(a, target) for a in _company_entry_aliases(entry))):
-                out.append({"name": other, "aliases": [], "source": "reverse"})
+                out.append({"name": other, "aliases": [], "source": "reverse", "basis": {
+                    "method": "saved_web_research",
+                    "detail": f"{other}'s own researched competitor list names {target}, and competition runs both ways.",
+                    "sources": [src for src in (cached.get("sources") or []) if isinstance(src, dict)],
+                    "as_of": cached.get("last_verified_at") or cached.get("cached_at"),
+                }})
                 break
     return out
 
@@ -3336,7 +3342,10 @@ def _validate_competitor_entries(entries: List[Any], *, exclude: Optional[str] =
         keep = [name, *db_names[1:]]
         keep += [a for a in aliases if any(_company_matches(a, d) for d in db_names) or _normalize_company_key(a) in rebrands]
         extra = {a for a in keep if _normalize_company_key(a) != key and not _generic_company_name(a)}
-        validated.append({"company": primary, "aliases": sorted(extra, key=str.lower)})
+        item = {"company": primary, "aliases": sorted(extra, key=str.lower)}
+        if isinstance(entry, dict) and isinstance(entry.get("basis"), dict):
+            item["basis"] = entry["basis"]
+        validated.append(item)
     return validated
 
 
@@ -3418,6 +3427,43 @@ async def _web_competitor_names_fallback(target: str, query: str, tracker: Token
     return names
 
 
+def _web_search_basis(target: str) -> Dict[str, Any]:
+    return {
+        "method": "web_research",
+        "detail": f"A live web search listed it as a direct competitor of {target}; the search returned no page links.",
+        "sources": [],
+    }
+
+
+def _employer_facts_summary(name: str, facts: Optional[Dict[str, Any]] = None) -> str:
+    """What the stored employer facts say about one company, in a line."""
+    facts = facts if facts is not None else _load_employer_facts_cache()
+    item = facts.get(_normalize_company_key(name))
+    if not isinstance(item, dict) or not item.get("known"):
+        return ""
+    bits = []
+    if item.get("industry"):
+        bits.append(str(item["industry"]))
+    if item.get("product_service"):
+        bits.append(str(item["product_service"]))
+    if item.get("publicly_listed") is True:
+        bits.append(f"listed on {item.get('stock_exchange') or 'a stock exchange'}"
+                    + (f" via {item['parent_company']}" if item.get("parent_company") else ""))
+    elif item.get("funding_stage"):
+        bits.append(f"{item['funding_stage']} stage")
+    return " · ".join(bits)
+
+
+def _employer_scan_basis(name: str, condition: str, facts_cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    facts = _employer_facts_summary(name, facts_cache)
+    return {
+        "method": "employer_scan",
+        "detail": f"The AI model checked {name} against \"{condition}\""
+                  + (f" using what it knows about the company: {facts}." if facts else "."),
+        "sources": [],
+    }
+
+
 async def _judge_competitors(
     target: str,
     product_service: Any,
@@ -3472,6 +3518,7 @@ async def _judge_competitors(
     # run and kept it on the next, so it never removes a web entry. It adds
     # employers from the role's own candidates it is confident about.
     accepted: Dict[str, str] = {}
+    reasons: Dict[str, str] = {}
     for item in structured.get("competitors") or []:
         if not isinstance(item, dict):
             continue
@@ -3481,6 +3528,7 @@ async def _judge_competitors(
         # already in the role is worth showing (the recruiter sees the list).
         if key and not _company_matches(name, target) and str(item.get("confidence") or "high").strip().lower() in {"high", "medium"}:
             accepted[key] = name
+            reasons[key] = str(item.get("reason") or "").strip()
     # Never removes a web entry. A web-researched competitor that is also an
     # employer in our data has two signals behind it, and the model's idea
     # of "direct competitor" is narrower than a recruiter's: gpt-4o rejected
@@ -3492,7 +3540,14 @@ async def _judge_competitors(
     rebrands = _rebrand_aliases_from_employers()
     for key, original in listed.items():
         if key in accepted and key not in by_key:
-            kept.append({"company": original, "aliases": sorted(rebrands.get(key, set()), key=str.lower), "source": "scope"})
+            kept.append({
+                "company": original, "aliases": sorted(rebrands.get(key, set()), key=str.lower), "source": "scope",
+                "basis": {
+                    "method": "ai_judgement",
+                    "detail": reasons.get(key) or f"Judged a direct competitor of {target}.",
+                    "sources": [],
+                },
+            })
     dropped: List[str] = []
     logger.info("SHORTLIST competitor_judge target=%s kept=%s dropped_web=%s added_scope=%s",
                 target, [e["company"] for e in kept], dropped, [e["company"] for e in kept if e.get("source") == "scope"])
@@ -7492,6 +7547,10 @@ def _profile_evidence_item(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         display_title = where
         display_subtitle = _PROVENANCE_LABEL.get(prov, "Profile data")
+    # "Work history" / "Work history" under a "Work history" chip says the
+    # same thing three times.
+    if _normalize_search_text(display_subtitle) == _normalize_search_text(display_title):
+        display_subtitle = ""
     return {
         "display_title": display_title,
         "display_subtitle": display_subtitle,
@@ -7502,6 +7561,63 @@ def _profile_evidence_item(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         "evidence_ids": [str(e.get("id")) for e in entries if e.get("id")],
         "sources": sources,
     }
+
+
+_BASIS_METHOD_LABEL = {
+    "web_research": "Live web research",
+    "saved_web_research": "Saved web research",
+    "ai_judgement": "AI judgement (no website checked)",
+    "ai_knowledge": "AI model knowledge (no website checked)",
+    "employer_scan": "AI employer classification (no website checked)",
+}
+
+
+def _company_basis_lookup(criteria: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """{company: basis} for requirements satisfied by an employer the engine
+    resolved (competitor of X, IPO-listed, fintech...). Empty when the
+    recruiter named the companies — there is nothing to justify."""
+    if spec["category"] == "Competitor":
+        resolution = criteria.get("_competitor_resolution")
+    elif spec["key"] == "required_companies":
+        resolution = criteria.get("_company_query_resolution")
+    else:
+        return {}
+    basis = resolution.get("basis") if isinstance(resolution, dict) else None
+    return basis if isinstance(basis, dict) else {}
+
+
+def _basis_for_evidence_group(group: Dict[str, Any], basis_by_company: Dict[str, Dict[str, Any]], criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not basis_by_company:
+        return None
+    names = [str(t) for t in group.get("matched_terms") or []] + [str(group.get("display_title") or "")]
+    # A card that says "LambdaTest" is matched through TestMu AI's aliases.
+    companies = criteria.get("required_companies")
+    values = companies.get("values") if isinstance(companies, dict) else companies if isinstance(companies, list) else []
+    alias_owner: Dict[str, str] = {}
+    for value in values or []:
+        if isinstance(value, dict) and value.get("company"):
+            for alias in value.get("aliases") or []:
+                alias_owner[_normalize_company_key(alias)] = str(value["company"])
+    for name in names:
+        if not name.strip():
+            continue
+        owner = alias_owner.get(_normalize_company_key(name))
+        for company, basis in basis_by_company.items():
+            if not isinstance(basis, dict):
+                continue
+            if _company_matches(name, company) or (owner and _company_matches(owner, company)):
+                return {
+                    "company": company,
+                    "method": basis.get("method") or "",
+                    "method_label": _BASIS_METHOD_LABEL.get(basis.get("method"), "Search engine"),
+                    "detail": _clean_visible_evidence_ids(str(basis.get("detail") or "")),
+                    "as_of": basis.get("as_of"),
+                    "sources": [
+                        {k: src.get(k) for k in ("url", "title", "note") if src.get(k)}
+                        for src in (basis.get("sources") or []) if isinstance(src, dict) and src.get("url")
+                    ][:5],
+                }
+    return None
 
 
 def _build_requirement_breakdown(
@@ -7536,16 +7652,16 @@ def _build_requirement_breakdown(
         for e in linked:
             groups.setdefault(_profile_evidence_group_key(e), []).append(e)
         profile_evidence = [_profile_evidence_item(entries) for entries in list(groups.values())[:4]]
+        basis_by_company = _company_basis_lookup(criteria, spec)
+        for item in profile_evidence:
+            basis = _basis_for_evidence_group(item, basis_by_company, criteria)
+            if basis:
+                item["match_basis"] = basis
         exact_texts: List[str] = []
         for item in profile_evidence:
             lowered = _readable_exact_text(item["quote"])
             if lowered and lowered not in exact_texts:
                 exact_texts.append(lowered)
-        for item in profile_evidence:
-            if spec["category"] == "Competitor":
-                for t in spec.get("terms") or []:
-                    if t and t not in item["matched_terms"]:
-                        item["matched_terms"].append(t)
         sources: List[Dict[str, Any]] = []
         for e in linked:
             for src in e.get("sources") or []:
@@ -7567,7 +7683,12 @@ def _build_requirement_breakdown(
             text = e.get("friendly_text") or ""
             if text and text not in cross_check:
                 cross_check.append(text)
-        not_counted = list(_NOT_COUNTED_BY_CATEGORY.get(spec["category"], []))
+        # The category notes are rules for what could NOT satisfy a
+        # requirement. On a met requirement they read as though the matching
+        # evidence itself was thrown out ("Not counted: The target company
+        # itself" under BrowserStack for a Testsigma-competitor search), so
+        # they only explain a requirement that was not verified.
+        not_counted = [] if status == "qualified" else list(_NOT_COUNTED_BY_CATEGORY.get(spec["category"], []))
         if status == "qualified":
             if linked:
                 first_where = linked[0].get("where") or ""
@@ -10420,6 +10541,10 @@ async def process_query_main(
                 competitor_targets.append((item_target, item_scope))
 
         competitor_source: Dict[str, str] = {}
+        # Why each employer counts as a competitor and where that came from
+        # (web page, saved research, AI judgement, AI knowledge) — shown to
+        # the recruiter next to the evidence. Keyed by normalized company.
+        competitor_basis: Dict[str, Dict[str, Any]] = {}
         all_competitor_entries: List[Dict[str, Any]] = []
         competitor_scope = competitor_targets[0][1] if competitor_targets else _query_company_scope(normalized_query)
         for target, competitor_scope in competitor_targets:
@@ -10461,7 +10586,11 @@ async def process_query_main(
                             # Older cache entries hold stringified per-company dicts.
                             name = _company_entry_name(item)
                             if name:
-                                web_competitor_names.append(name)
+                                web_competitor_names.append({"name": name, "aliases": [], "basis": {
+                                    "method": "saved_web_research",
+                                    "detail": f"Listed as a competitor of {target} in earlier web research.",
+                                    "sources": [],
+                                }})
                             continue
                         if not isinstance(item, dict):
                             continue
@@ -10475,7 +10604,21 @@ async def process_query_main(
                             # Per-company entry ({'name': 'MoEngage', ...}) rather
                             # than a grouped {target, companies} entry.
                             raw_names = [item.get("name")]
-                        web_competitor_names.extend(entry for entry in (_company_entry(raw) for raw in raw_names) if entry)
+                        web_sources = [src for src in (item.get("sources") or []) if isinstance(src, dict)]
+                        verified_at = item.get("last_verified_at")
+                        item_basis = {
+                            # Cached research carries its verification date;
+                            # a fresh answer from this search does not.
+                            "method": "saved_web_research" if verified_at or not web_enabled else "web_research",
+                            "detail": f"Listed as a direct competitor of {target} by web research"
+                                      + (f" citing {len(web_sources)} page{'s' if len(web_sources) != 1 else ''}." if web_sources else "."),
+                            "sources": web_sources,
+                            "as_of": verified_at,
+                        }
+                        for entry in (_company_entry(raw) for raw in raw_names):
+                            if entry:
+                                entry["basis"] = item_basis
+                                web_competitor_names.append(entry)
                     web_competitor_names.extend(_reverse_competitors_from_cache(target))
                     competitor_entries = _validate_competitor_entries(web_competitor_names, exclude=target)
                     if not competitor_entries and web_enabled:
@@ -10483,7 +10626,9 @@ async def process_query_main(
                         # JSON at all (Hevo, 2026-09-25). A plain "list the
                         # competitors of X" web call is the second attempt.
                         fallback_names = await _web_competitor_names_fallback(target, normalized_query, tracker)
-                        competitor_entries = _validate_competitor_entries([{"name": n} for n in fallback_names], exclude=target)
+                        competitor_entries = _validate_competitor_entries(
+                            [{"name": n, "basis": _web_search_basis(target)} for n in fallback_names], exclude=target
+                        )
                         if competitor_entries:
                             _cache_company_facts_from_structured(
                                 company_fact_criteria,
@@ -10504,10 +10649,15 @@ async def process_query_main(
                         target, target_profile.get("product_service"), competitor_entries, scope_employers, tracker
                     )
                     final_competitors = [entry["company"] for entry in competitor_entries]
+                    for entry in competitor_entries:
+                        if isinstance(entry.get("basis"), dict):
+                            competitor_basis.setdefault(_normalize_company_key(entry["company"]), entry["basis"])
 
                 if web_enabled and not final_competitors:
                     fallback_names = await _web_competitor_names_fallback(target, normalized_query, tracker)
                     final_competitors = _validate_company_names_against_db(fallback_names, exclude=target)
+                    for name in final_competitors:
+                        competitor_basis.setdefault(_normalize_company_key(name), _web_search_basis(target))
 
                 if not final_competitors:
                     competitor_prompt = PromptTemplate(
@@ -10525,6 +10675,12 @@ async def process_query_main(
                     tracker.add_usage(specialist_llm.model_name, competitor_prompt_text, response.content, "Competitor Identification")
                     llm_competitors = get_list_from_llm_json(safe_json_loads(response.content, response.content))
                     final_competitors = _validate_company_names_against_db(llm_competitors, exclude=target)
+                    for name in final_competitors:
+                        competitor_basis.setdefault(_normalize_company_key(name), {
+                            "method": "ai_knowledge",
+                            "detail": f"Named as a competitor of {target} by the AI model from its own training knowledge; no website was checked.",
+                            "sources": [],
+                        })
             except Exception as e:
                 logger.error("Competitor identification failed: %s", e)
                 yield "There was an issue identifying competitors."
@@ -10547,6 +10703,9 @@ async def process_query_main(
                     if key and key not in known_keys:
                         final_competitors.append(item["company"])
                         known_keys.add(key)
+                        competitor_basis.setdefault(key, _employer_scan_basis(
+                            item["company"], company_query.get("company_condition") or f"direct competitor of {target}"
+                        ))
             except Exception as e:
                 logger.warning("Company-first competitor pass failed: %s", e)
 
@@ -10609,6 +10768,10 @@ async def process_query_main(
                 "target": targets_label,
                 "validated_companies": final_competitors,
                 "employment_scope": competitor_scope,
+                "basis": {
+                    name: competitor_basis[_normalize_company_key(name)]
+                    for name in final_competitors if _normalize_company_key(name) in competitor_basis
+                },
             }
             logger.info("SHORTLIST competitor_validation=%s", json.dumps(criteria["_competitor_resolution"], ensure_ascii=False, default=str))
             criteria.pop("competitors_of", None)
@@ -10951,7 +11114,12 @@ async def process_query_main(
                 f"{'Current employer' if company_current_only else 'An employer'} is one of {len(names)} companies "
                 f"resolved as: {condition}. Already verified for this candidate; not a requirement to re-check."
             )
-            criteria["_company_query_resolution"] = {"condition": condition, "companies": len(names), "scope": scope}
+            criteria["_company_query_resolution"] = {
+                "condition": condition, "companies": len(names), "scope": scope,
+                "basis": (lambda facts_cache: {
+                    name: _employer_scan_basis(name, condition, facts_cache) for name in names
+                })(_load_employer_facts_cache()),
+            }
             matched_ids = set(company_resolution.get("candidate_ids") or [])
             initial_candidate_pool = [p for p in initial_candidate_pool if p.get("id") in matched_ids]
             logger.info("SHORTLIST company_query condition=%r companies=%s candidates=%s scope=%s",
