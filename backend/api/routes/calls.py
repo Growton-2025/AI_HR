@@ -56,6 +56,9 @@ TERMINAL_CALL_OUTCOMES = {
 }
 FOLLOWUP_CALL_OUTCOMES = {"Connected - Follow-up", "Connected - Follow up later"}
 FOLLOWUP_TASK_TITLE = "Follow-up Call"
+# A one-off re-dial of a finished call. Not a cadence step, so a failed outcome
+# on it does not start a new attempt ladder.
+MANUAL_CALL_TASK_TITLE = "Manual call"
 WRONG_NUMBER_OUTCOME = "Wrong Number"
 NOT_INTERESTED_OUTCOME = "Connected - Not Interested"
 # Must match the RECRUITMENT_STAGES value in frontend/src/components/StatusDropdown.jsx.
@@ -3099,6 +3102,7 @@ def initiate_call(
     candidate_id = None
     recruiter_email = None
     transaction_id = None
+    spawned_call = False
     endpoint_username = (request.plivo_username or "").strip()
     configured_recruiter_email = (current_user.email or "").strip()
 
@@ -3109,7 +3113,7 @@ def initiate_call(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT candidate_id, list_id, plivo_recruiter_email, plivo_transaction_id
+                    SELECT candidate_id, list_id, plivo_recruiter_email, plivo_transaction_id, status
                     FROM calls
                     WHERE id = %s
                     """,
@@ -3136,6 +3140,45 @@ def initiate_call(
                 list_row = cur.fetchone()
                 if not list_row:
                     raise HTTPException(status_code=404, detail="Call task not found")
+
+                if call_row[4] == "completed":
+                    # Dialled again from the Completed view (or any other entry
+                    # point that hands us a finished row). Every call is its own
+                    # row: re-using the finished one meant the new attempt's
+                    # outcome, recording and transcript overwrote the old ones,
+                    # and the Completed counter never moved because the row was
+                    # already completed. Prefer the candidate's open task in
+                    # this list so real cadence work is closed out; otherwise
+                    # start a fresh one-off row.
+                    cur.execute(
+                        """
+                        SELECT id FROM calls
+                        WHERE candidate_id = %s AND list_id = %s AND status = 'pending'
+                        LIMIT 1
+                        """,
+                        (candidate_id, list_id),
+                    )
+                    open_row = cur.fetchone()
+                    if open_row:
+                        call_id = open_row[0]
+                    else:
+                        cur.execute(
+                            f"""
+                            INSERT INTO calls (candidate_id, list_id, status, due_date, task_title)
+                            VALUES (%s, %s, 'pending', {SQL_IST_TODAY}, %s)
+                            RETURNING id
+                            """,
+                            (candidate_id, list_id, MANUAL_CALL_TASK_TITLE),
+                        )
+                        call_id = cur.fetchone()[0]
+                        spawned_call = True
+                    cur.execute(
+                        "SELECT plivo_recruiter_email, plivo_transaction_id FROM calls WHERE id = %s",
+                        (call_id,),
+                    )
+                    target_row = cur.fetchone()
+                    recruiter_email = (target_row[0] or "").strip()
+                    transaction_id = (target_row[1] or "").strip() or f"call:{call_id}"
 
                 list_owner = (list_row[0] or "").strip()
                 recruiter_email = recruiter_email or configured_recruiter_email or list_owner
@@ -3271,6 +3314,10 @@ def initiate_call(
             "dial_token": dial_token,
         },
         "call": updated_call,
+        # True when this dial got a brand-new row (the requested one was
+        # already completed). The modal logs against call.id from here on and
+        # discards the row if the attempt never connects.
+        "spawned_call": spawned_call,
     }
 
 

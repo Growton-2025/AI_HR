@@ -123,7 +123,7 @@ def test_initiate_call_returns_structured_error_on_db_failure(monkeypatch):
 def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
     first_cursor = _FakeCursor(
         fetchone_results=[
-            (2519, 77, "", ""),
+            (2519, 77, "", "", "pending"),
             ("owner@example.com",),
             ("Candidate Name", "+918088116167"),
         ]
@@ -162,6 +162,68 @@ def test_initiate_call_uses_split_lookup_queries_and_updates_call(monkeypatch):
     assert "FROM calls" in first_queries[0]
     assert "FROM call_lists" in first_queries[1]
     assert "FROM candidates" in first_queries[2]
+
+
+def _run_redial_of_completed_call(monkeypatch, fetchone_results):
+    first_cursor = _FakeCursor(fetchone_results=fetchone_results)
+    first_conn = _FakeConnection(first_cursor)
+    second_cursor = _FakeCursor()
+    second_conn = _FakeConnection(second_cursor)
+
+    monkeypatch.setattr(calls, "ensure_calls_schema_ready", lambda: None)
+    monkeypatch.setattr(calls, "get_db_connection_context", lambda **kwargs: _FakeConnectionContext(first_conn))
+    monkeypatch.setattr(calls, "get_calls_db_connection", lambda: second_conn)
+    monkeypatch.setattr(calls, "return_db_connection", lambda conn: None)
+    monkeypatch.setattr(calls, "invalidate_calls_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(calls, "refresh_call_caches_async", lambda: None)
+    monkeypatch.setattr(
+        calls,
+        "fetch_call_by_id",
+        lambda cur, call_id, owner=None: {"id": call_id, "plivo_status": "pending", "candidate_id": 2519},
+    )
+
+    result = calls.initiate_call(
+        calls.CallInitiateRequest(call_id=42, dial_mode="voip", plivo_username="endpoint-user"),
+        current_user=_build_user(),
+    )
+    return result, first_cursor, second_cursor
+
+
+def test_initiate_call_on_completed_row_dials_through_a_new_row(monkeypatch):
+    # Re-dialling from Completed must not reuse the finished row: its outcome
+    # and recording would be overwritten and the Completed count would not move.
+    result, first_cursor, second_cursor = _run_redial_of_completed_call(monkeypatch, [
+        (2519, 77, "owner@example.com", "call:42", "completed"),
+        ("owner@example.com",),
+        None,                      # no open task in this list
+        (901,),                    # fresh row
+        (None, None),              # fresh row has no Plivo ids yet
+        ("Candidate Name", "+918088116167"),
+    ])
+
+    assert result["call"]["id"] == 901
+    assert result["spawned_call"] is True
+    assert result["plivo_data"]["transaction_id"] == "call:901"
+    insert_sql, insert_params = next(
+        (q, p) for q, p in first_cursor.executed if "INSERT INTO calls" in q
+    )
+    assert insert_params == (2519, 77, calls.MANUAL_CALL_TASK_TITLE)
+    # The dial is stamped on the new row, never the completed one.
+    assert all(params[-1] == 901 for q, params in second_cursor.executed if "UPDATE calls" in q)
+
+
+def test_initiate_call_on_completed_row_reuses_open_task_in_same_list(monkeypatch):
+    result, first_cursor, _ = _run_redial_of_completed_call(monkeypatch, [
+        (2519, 77, "", "", "completed"),
+        ("owner@example.com",),
+        (555,),                    # pending cadence task already exists
+        ("", ""),
+        ("Candidate Name", "+918088116167"),
+    ])
+
+    assert result["call"]["id"] == 555
+    assert result["spawned_call"] is False
+    assert not any("INSERT INTO calls" in q for q, _p in first_cursor.executed)
 
 
 def test_add_candidates_duplicate_returns_400_without_wrapping(monkeypatch):

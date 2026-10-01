@@ -1825,6 +1825,13 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
   // Token of the attempt currently being dialled, so a failure can be looked
   // up on the backend for Plivo's hangup reason.
   const lastDialTokenRef = useRef('');
+  // The row this attempt is logged against. Starts as the clicked row, but
+  // dialling an already-completed call makes the backend start a fresh row
+  // (so the Completed count goes up and the old call's record is kept), and
+  // everything after initiation must follow that id.
+  const [callId, setCallId] = useState(call.id);
+  const spawnedCallRef = useRef(false);
+  const logSavedRef = useRef(false);
   const autoRetriedSoftphoneRef = useRef(false);
   // Timing diagnostics: when the modal opened and what the softphone status
   // was at that moment, so the wait-for-registration leg is measurable.
@@ -1921,7 +1928,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       }
 
       const initiateStart = performance.now();
-      const res = await initiateCall(call.id, { plivoUsername: endpointUsername });
+      const res = await initiateCall(callId, { plivoUsername: endpointUsername });
       reportTiming('initiate_api', performance.now() - initiateStart);
       if (!res.success) {
         const message = res.error || 'Failed to start browser VoIP call';
@@ -1943,6 +1950,15 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       // recruiter's call. See docs/call-attribution-plan.md.
       const dialToken = res?.data?.plivo_data?.dial_token || '';
       lastDialTokenRef.current = dialToken;
+
+      const dialedCall = res?.data?.call;
+      if (dialedCall?.id && dialedCall.id !== callId) {
+        setCallId(dialedCall.id);
+        // Otherwise the review screen shows the previous call's recording and
+        // never waits for this one's.
+        setReviewCallData(dialedCall);
+        spawnedCallRef.current = Boolean(res.data.spawned_call);
+      }
 
       let dialStartedAt = 0;
       if (placeCall && call.candidate_phone) {
@@ -1981,7 +1997,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       setCallState('error');
       toast.error(message);
     }
-  }, [call.id, endpointUsername, ensureMicrophonePermission, initiateCall, onClose, onRefresh, placeCall, startDialTone, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
+  }, [callId, endpointUsername, ensureMicrophonePermission, initiateCall, onClose, onRefresh, placeCall, startDialTone, waitForPlivoDial, voipActionLabel, voipActionUrl, voipError, voipErrorCode, voipStatus, call.candidate_phone]);
 
   // Kill the local dialing tone the moment the call reaches any state where
   // it should not ring: connected, ended, errored, or an incoming-answer ask.
@@ -2251,8 +2267,8 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
          try {
            // Keep syncing until recording, transcript, and summary are all healthy.
            if (needsPostCallArtifacts(reviewCallData)) {
-             console.log('Proactively syncing call artifacts for Call', call.id);
-             await syncCallRecording(call.id);
+             console.log('Proactively syncing call artifacts for Call', callId);
+             await syncCallRecording(callId);
            }
 
            // background: refresh only this modal's data — never disturb the
@@ -2260,7 +2276,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
            // stale until a manual refresh).
            const res = await fetchCalls({ list_id: call.list_id }, { background: true });
            if (res.success && res.data) {
-             const updated = res.data.find(c => c.id === call.id);
+             const updated = res.data.find(c => c.id === callId);
              if (updated) setReviewCallData(updated);
            }
          } catch(e) {}
@@ -2273,7 +2289,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
       fetchReviewData(); // Run immediately on enter
     }
     return () => clearInterval(t);
-  }, [callState, call.id, call.list_id, fetchCalls, syncCallRecording, reviewCallData]);
+  }, [callState, callId, call.list_id, fetchCalls, syncCallRecording, reviewCallData]);
 
   const handleAnswer = async () => {
     setIsAnswering(true);
@@ -2353,11 +2369,12 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
         payload.due_time = followupDueTime;
       }
 
-      const res = await updateCall(call.id, payload);
+      const res = await updateCall(callId, payload);
       if (!res?.success) {
         toast.error(res?.error || 'Failed to save log');
         return;
       }
+      logSavedRef.current = true;
 
       // Save the edited notes back to the candidate profile so they're visible
       // in Manage Roles and Talent Pool.
@@ -2426,8 +2443,19 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
     if (isLiveCallState || activeCall || isInitiated.current) {
       await rejectCall();
     }
+    // A re-dial row that never connected and was never logged is not a call —
+    // drop it so it does not linger in Due Today as a phantom task.
+    if (spawnedCallRef.current && !logSavedRef.current && connectedAtRef.current === null) {
+      spawnedCallRef.current = false;
+      try {
+        await axios.delete(`${API_BASE}/calls/${callId}`);
+        onRefresh?.();
+      } catch (_) {
+        // Harmless if it fails: the row just stays as a pending task.
+      }
+    }
     onClose();
-  }, [activeCall, isLiveCallState, onClose, rejectCall]);
+  }, [activeCall, callId, isLiveCallState, onClose, onRefresh, rejectCall]);
 
   return (
     <div className="call-modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
@@ -2911,7 +2939,7 @@ export function CallingModal({ call, onClose, onRefresh, alreadyConnected = fals
                         <div style={{ padding: '24px', textAlign: 'center', background: '#fff', borderRadius: '12px', border: '1px dashed #cbd5e1', color: '#94a3b8', fontSize: '13px' }}>
                           <div style={{ marginBottom: '12px' }}>Analysis didn't complete for this call.</div>
                           <button
-                            onClick={() => syncCallRecording(call.id)}
+                            onClick={() => syncCallRecording(callId)}
                             style={{ padding: '8px 16px', borderRadius: '10px', border: '1px solid #cbd5e1', background: '#fff', color: '#334155', fontSize: '12px', fontWeight: 700, cursor: 'pointer' }}
                           >
                             Retry sync
