@@ -12,6 +12,7 @@ import DegradedCallingBanner from './components/DegradedCallingBanner'
 const Screening = lazy(() => import('./pages/Screening'))
 const Roles = lazy(() => import('./pages/Roles'))
 const Login = lazy(() => import('./pages/Login'))
+const Privacy = lazy(() => import('./pages/Privacy'))
 const UserManagement = lazy(() => import('./pages/UserManagement'))
 const TalentPool = lazy(() => import('./pages/TalentPool'))
 const Dashboard = lazy(() => import('./pages/Dashboard'))
@@ -269,6 +270,15 @@ function App() {
     }
 
     // Show nothing while initializing auth
+    // Public page: must render with or without a session (Google's consent screen links to it).
+    if (location.pathname === '/privacy') {
+        return (
+            <Suspense fallback={null}>
+                <Privacy />
+            </Suspense>
+        )
+    }
+
     if (!isReady && isAuthenticated) {
         return (
             <AppLoadingShell
