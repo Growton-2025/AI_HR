@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import { API_BASE, useAppStore } from '../store/useAppStore'
-import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus, Play, Edit2, ExternalLink } from 'lucide-react'
+import { Plus, Trash2, Folder, Linkedin, ArrowLeft, User, Loader2, Mail, Copy, RefreshCcw, FileUp, FileSpreadsheet, Settings2, PowerOff, Filter, Briefcase, Building2, MapPin, BarChart2, X, ChevronDown, ChevronUp, MessageSquare, Phone, Check, Search, UserPlus, Play, Edit2, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown'
 import BulkStatusActions from '../components/BulkStatusActions'
@@ -10,6 +10,7 @@ import BulkStatusActions from '../components/BulkStatusActions'
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
 import LinkedInImportModal from '../components/LinkedInImportModal'
+import GoogleSheetImportModal from '../components/GoogleSheetImportModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
 import RoleCreateModal from '../components/RoleCreateModal'
 import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents'
@@ -182,6 +183,7 @@ function Roles() {
     const [uploadRole, setUploadRole] = useState(null)
     const [uploadFile, setUploadFile] = useState(null)
     const [linkedinImportRole, setLinkedinImportRole] = useState(null)
+    const [sheetImportRole, setSheetImportRole] = useState(null)
     const [linkedinImportBusy, setLinkedinImportBusy] = useState(false)
     const [linkedinImportProgress, setLinkedinImportProgress] = useState(null)
     const [uploadHeaders, setUploadHeaders] = useState([])
@@ -1708,6 +1710,22 @@ function Roles() {
                 onCancel={() => { if (!linkedinImportBusy) setLinkedinImportRole(null) }}
                 onImport={importLinkedInToRole}
             />
+            <GoogleSheetImportModal
+                open={Boolean(sheetImportRole)}
+                roleId={sheetImportRole?.id || null}
+                roleName={sheetImportRole?.name || ''}
+                onClose={() => setSheetImportRole(null)}
+                onDone={async () => {
+                    const role = sheetImportRole
+                    invalidateTalentPoolCaches()
+                    await fetchRoles({ force: true })
+                    fetchTalentPoolSummary({ force: true, freshnessMs: 0 })
+                    fetchAnalytics({ force: true })
+                    if (role?.name && viewingRole?.name === role.name) {
+                        await fetchRoleDetails(role.name, { force: true })
+                    }
+                }}
+            />
         </>
     )
 
@@ -1797,6 +1815,12 @@ function Roles() {
                         disabled={linkedinImportBusy}
                     >
                         <Linkedin size={16} /> {linkedinImportBusy ? 'Importing...' : 'Import from LinkedIn'}
+                    </button>
+                    <button
+                        className="btn btn-secondary"
+                        onClick={() => setSheetImportRole(viewingRole)}
+                    >
+                        <FileSpreadsheet size={16} /> Import from Google Sheet
                     </button>
                 </div>
                 {uploadUi}
@@ -2827,6 +2851,14 @@ function Roles() {
                                 style={{ color: '#0a66c2' }}
                             >
                                 <Linkedin size={16} />
+                            </button>
+                            <button
+                                className="role-delete-btn"
+                                onClick={(event) => { event.stopPropagation(); setSheetImportRole(role) }}
+                                title="Import a Google Sheet into role"
+                                style={{ color: '#16a34a' }}
+                            >
+                                <FileSpreadsheet size={16} />
                             </button>
                         </div>
                     ))

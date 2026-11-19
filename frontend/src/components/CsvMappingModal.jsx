@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Check, AlertTriangle, Loader2, Search, Wand2 } from 'lucide-react';
+import { Check, AlertTriangle, Loader2, Search, Wand2, X } from 'lucide-react';
 
 const DEFAULT_OPTIONS = [
   'ignore',
@@ -65,6 +65,8 @@ export default function CsvMappingModal({
   progress = null,
   enrichmentMode = 'none',
   busy = false,
+  extraPanel = null,
+  importLabel = 'Import',
   onEnrichmentModeChange,
   onChange,
   onCancel,
@@ -88,6 +90,7 @@ export default function CsvMappingModal({
   const hasProgress = Boolean(progress?.upload_id || progressStatus);
   const isFailed = progressStatus === 'failed';
   const isComplete = ['completed', 'completed_with_errors'].includes(progressStatus);
+  const closeBlocked = busy && !isComplete && !isFailed;
   const totalRows = Number(progress?.row_count || rowCount || 0);
   const processedRows = Math.min(Number(progress?.processed_count || 0), totalRows || Number(progress?.processed_count || 0));
   const progressPercent = totalRows > 0 ? Math.max(3, Math.min(100, Math.round((processedRows / totalRows) * 100))) : 6;
@@ -144,15 +147,25 @@ export default function CsvMappingModal({
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.65)', zIndex: 10002, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
-      <div style={{ background: '#fff', borderRadius: 18, maxWidth: 980, width: '100%', maxHeight: '90vh', overflow: 'hidden', boxShadow: '0 25px 50px rgba(0,0,0,0.22)', border: '1px solid #e2e8f0' }}>
-        <div style={{ padding: '20px 24px', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 16, alignItems: 'flex-start', justifyContent: 'space-between' }}>
-          <div>
+      <div style={{ background: '#fff', borderRadius: 18, maxWidth: 980, width: '100%', maxHeight: '90vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 25px 50px rgba(0,0,0,0.22)', border: '1px solid #e2e8f0' }}>
+        <div style={{ padding: '20px 24px', borderBottom: '1px solid #e2e8f0', display: 'flex', gap: 16, alignItems: 'flex-start', justifyContent: 'space-between', flexShrink: 0 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
             <h3 style={{ margin: '0 0 6px', fontSize: 20, fontWeight: 800, color: '#0f172a' }}>{title}</h3>
             <p style={{ margin: 0, color: '#64748b', fontSize: 13, lineHeight: 1.5 }}>{subtitle}</p>
           </div>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 10, background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa', fontSize: 12, fontWeight: 800, whiteSpace: 'nowrap' }}>
             <Wand2 size={14} /> Smart match
           </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={closeBlocked}
+            aria-label="Close"
+            title={closeBlocked ? 'Import in progress' : 'Close'}
+            style={{ flexShrink: 0, width: 34, height: 34, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', color: '#475569', cursor: closeBlocked ? 'not-allowed' : 'pointer', opacity: closeBlocked ? 0.5 : 1 }}
+          >
+            <X size={17} />
+          </button>
         </div>
 
         {!hasProgress && missingRequired.length > 0 && (
@@ -161,6 +174,8 @@ export default function CsvMappingModal({
             Map required fields: {missingRequired.map(t => LABELS[t] || t).join(', ')}
           </div>
         )}
+
+        {!hasProgress && extraPanel}
 
         {!hasProgress && (
           <div style={{ margin: '14px 24px 0', padding: 12, borderRadius: 12, background: '#f8fafc', border: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
@@ -230,8 +245,8 @@ export default function CsvMappingModal({
             </div>
           </div>
         ) : (
-        <div style={{ padding: '14px 24px 4px', overflow: 'auto', maxHeight: '58vh' }}>
-          <div style={{ position: 'sticky', top: -14, zIndex: 3, padding: '10px 0 12px', background: '#fff' }}>
+        <div style={{ padding: '0 24px 4px', overflow: 'auto', flex: '1 1 auto', minHeight: 0 }}>
+          <div style={{ position: 'sticky', top: 0, zIndex: 3, padding: '10px 0 12px', background: '#fff' }}>
             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
               <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 7 }}>
                 {(requiredTargets || []).map(target => {
@@ -287,7 +302,7 @@ export default function CsvMappingModal({
             )}
             {groupedColumns.map(([group, groupHeaders]) => (
               <React.Fragment key={group}>
-                <div style={{ position: 'sticky', top: 91, zIndex: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 12px', background: '#eef2f7', borderBottom: '1px solid #dbe3ee', color: '#334155', fontSize: 12, fontWeight: 900 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '9px 12px', background: '#eef2f7', borderBottom: '1px solid #dbe3ee', color: '#334155', fontSize: 12, fontWeight: 900 }}>
                   <span>{group}</span>
                   <span>{groupHeaders.length} column{groupHeaders.length === 1 ? '' : 's'}</span>
                 </div>
@@ -345,7 +360,7 @@ export default function CsvMappingModal({
         </div>
         )}
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '16px 24px 22px', borderTop: '1px solid #e2e8f0', background: '#fff' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '16px 24px 22px', borderTop: '1px solid #e2e8f0', background: '#fff', flexShrink: 0 }}>
           <div style={{ fontSize: 12, color: '#64748b' }}>
             {hasProgress
               ? `${totalRows || processedRows} spreadsheet row${(totalRows || processedRows) === 1 ? '' : 's'} in this import`
@@ -355,7 +370,7 @@ export default function CsvMappingModal({
             <button type="button" onClick={onCancel} disabled={busy && !isComplete && !isFailed} style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', fontWeight: 800, cursor: busy && !isComplete && !isFailed ? 'not-allowed' : 'pointer', color: '#334155' }}>{hasProgress ? 'Close' : 'Cancel'}</button>
             {!hasProgress && (
               <button type="button" disabled={busy || missingRequired.length > 0} onClick={onImport} style={{ padding: '10px 16px', borderRadius: 10, border: 'none', background: busy || missingRequired.length > 0 ? '#cbd5e1' : '#f97316', color: '#fff', fontWeight: 800, cursor: busy || missingRequired.length > 0 ? 'not-allowed' : 'pointer' }}>
-                {busy ? 'Importing...' : 'Import'}
+                {busy ? 'Importing...' : importLabel}
               </button>
             )}
           </div>

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from backend.db.connection import get_db_connection, return_db_connection
 from backend.services.apify_scrape import ApifyScrapeError, scrape_profiles
 from backend.services.candidate_pool import POOL_SOURCE_LEGACY_MASTER, POOL_SOURCE_RECRUITER_UPLOAD
+from backend.services.imported_fields import IMPORTED_EXTRA_FIELDS_KEY
 from backend.services.linkedin_normalize import normalize_linkedin
 from backend.services.profile_mapper import map_scraped_profile
 from backend.services.profile_persist import persist_mapped_profile
@@ -220,16 +221,69 @@ def _row_index(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return index
 
 
+def _batch_size() -> int:
+    try:
+        return max(1, int(os.getenv("APIFY_MAX_PROFILES_PER_REQUEST", "50") or 50))
+    except ValueError:
+        return 50
+
+
+def apply_row_extras(tables: Dict[str, Any], extras: Optional[Dict[str, Any]]) -> None:
+    """Lay one source-sheet row over a scraped profile, in place.
+
+    LinkedIn stays the source for profile fields. The sheet wins for contact
+    details and notes, and its custom columns are kept in ``raw_fields`` (under
+    ``imported_extra_fields``, same as a spreadsheet upload) so AI columns can read them.
+    """
+    if not extras:
+        return
+    cand = tables.get("candidates")
+    if not isinstance(cand, dict):
+        return
+    for field in ("email", "phone", "notes"):
+        value = extras.get(field)
+        if value not in (None, ""):
+            cand[field] = value
+    raw_extra = extras.get("raw") or {}
+    if raw_extra:
+        raw_fields = dict(cand.get("raw_fields") or {})
+        existing_block = raw_fields.get(IMPORTED_EXTRA_FIELDS_KEY)
+        incoming_block = raw_extra.get(IMPORTED_EXTRA_FIELDS_KEY)
+        for key, value in raw_extra.items():
+            # never let a sheet column replace a scraped LinkedIn key
+            if key != IMPORTED_EXTRA_FIELDS_KEY and key not in raw_fields:
+                raw_fields[key] = value
+        if isinstance(incoming_block, dict):
+            merged = dict(existing_block) if isinstance(existing_block, dict) else {}
+            merged.update(incoming_block)
+            raw_fields[IMPORTED_EXTRA_FIELDS_KEY] = merged
+        cand["raw_fields"] = raw_fields
+
+
 def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: int,
                         role_id: Optional[int] = None, duplicate_policy: str = DUPLICATE_SKIP,
-                        use_llm: bool = True, use_web: bool = True) -> Dict[str, Any]:
+                        use_llm: bool = True, use_web: bool = True,
+                        row_extras: Optional[Dict[str, Dict[str, Any]]] = None,
+                        defer_missing: bool = False, finalize: bool = True,
+                        quiet_duplicates: bool = False) -> Dict[str, Any]:
     """Scrape, map and persist every URL; returns the final counts. Never raises for a
-    single bad profile - those become ``errors`` lines and ``skipped`` counts."""
+    single bad profile - those become ``errors`` lines and ``skipped`` counts.
+
+    ``row_extras`` maps a normalized LinkedIn key to the source-sheet row for that
+    person (see ``apply_row_extras``). With ``defer_missing`` the profiles Apify could
+    not return, or that failed to map, are not counted here; they come back in
+    ``deferred`` so the caller can load them from its own data instead. With
+    ``finalize=False`` the upload row is left open for the caller's next phase.
+    ``quiet_duplicates`` drops the per-row "already in your pool" line, for re-syncs
+    where most rows are expected to exist already.
+    """
     duplicate_policy = normalize_duplicate_policy(duplicate_policy)
+    row_extras = row_extras or {}
     inserted = replaced = skipped = assigned = processed = 0
     errors: List[str] = []
     touched: List[int] = []
     results: List[Dict[str, Any]] = []
+    deferred: List[str] = []
 
     # Apify bills per returned profile, so decide duplicates before scraping and
     # only send the URLs that will actually be loaded.
@@ -242,18 +296,36 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
             continue
         to_scrape.append(url)
 
-    scraped: Dict[str, Any] = {"rows": [], "failed": [], "requested": 0}
-    if to_scrape:
+    # One actor run per chunk: the actor caps profiles per request.
+    rows: List[Dict[str, Any]] = []
+    apify_failed: List[str] = []
+    apify_requested = 0
+    not_scraped: Dict[str, str] = {}
+    size = _batch_size()
+    chunks = [to_scrape[i:i + size] for i in range(0, len(to_scrape), size)]
+    for index, chunk in enumerate(chunks):
         try:
             write_progress(upload_id, status="scraping")
-            scraped = scrape_profiles(to_scrape)
+            scraped = scrape_profiles(chunk)
         except ApifyScrapeError as exc:
-            write_progress(upload_id, status="failed", completed_at=datetime.now(timezone.utc),
-                           error_message=f"apify: {exc}"[:8000])
-            return {"status": "failed", "error": str(exc), "inserted": 0, "updated": 0,
-                    "skipped": len(urls), "results": []}
+            if index == 0:
+                write_progress(upload_id, status="failed", completed_at=datetime.now(timezone.utc),
+                               error_message=f"apify: {exc}"[:8000])
+                return {"status": "failed", "error": str(exc), "inserted": 0, "updated": 0,
+                        "skipped": len(urls), "processed": 0, "role_assigned_count": 0,
+                        "errors": [f"apify: {exc}"], "results": [], "deferred": []}
+            # Keep what earlier chunks already returned (and were billed for); the
+            # rest is reported per row so a later sync can pick it up.
+            logger.exception("apify chunk %s of %s failed", index + 1, len(chunks))
+            for rest in chunks[index:]:
+                for url in rest:
+                    not_scraped[normalize_linkedin(url)] = str(exc)
+            break
+        rows += scraped["rows"]
+        apify_failed += scraped["failed"]
+        apify_requested += scraped["requested"]
 
-    by_key = _row_index(scraped["rows"])
+    by_key = _row_index(rows)
     write_progress(upload_id, status="enriching")
 
     for url in urls:
@@ -261,21 +333,38 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
         raw = by_key.get(key)
         dupes = dupes_by_key.get(key, [])
         outcome: Dict[str, Any] = {"url": url}
+        counted = True
         try:
             if dupes and duplicate_policy == DUPLICATE_SKIP:
                 skipped += 1
-                errors.append(f"{url}: already in your pool as candidate {dupes[0]['id']} (skipped, not scraped)")
+                if not quiet_duplicates:
+                    errors.append(f"{url}: already in your pool as candidate {dupes[0]['id']} (skipped, not scraped)")
                 outcome.update(status="duplicate", candidate_id=dupes[0]["id"])
+                # The person is still wanted in this role even though nothing was re-imported.
+                if assign_role(role_id, dupes[0]["id"]):
+                    assigned += 1
+                continue
+
+            if key in not_scraped:
+                skipped += 1
+                errors.append(f"{url}: not scraped, Apify failed ({not_scraped[key]})"[:500])
+                outcome["status"] = "not_scraped"
                 continue
 
             if raw is None:
-                skipped += 1
-                errors.append(f"{url}: no profile returned by Apify (private, removed, or blocked)")
                 outcome["status"] = "not_found"
+                if defer_missing:
+                    counted = False
+                    deferred.append(url)
+                    errors.append(f"{url}: no profile returned by Apify; loaded from the sheet values instead")
+                else:
+                    skipped += 1
+                    errors.append(f"{url}: no profile returned by Apify (private, removed, or blocked)")
                 continue
 
             tables = map_scraped_profile(raw, use_llm=use_llm, use_web=use_web,
                                          known_companies=known_companies(_company_names(raw)))
+            apply_row_extras(tables, row_extras.get(key))
             if dupes:
                 delete_candidates([d["id"] for d in dupes])
             saved = persist_mapped_profile(
@@ -295,25 +384,32 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
                            counts=saved["counts"], coverage=tables.get("coverage"))
         except Exception as exc:  # one profile must not sink the batch
             logger.exception("linkedin import failed for %s", url)
-            skipped += 1
-            errors.append(f"{url}: {exc}"[:500])
             outcome.update(status="error", error=str(exc))
+            if defer_missing and not dupes:
+                counted = False
+                deferred.append(url)
+                errors.append(f"{url}: LinkedIn enrichment failed ({exc}); loaded from the sheet values instead"[:500])
+            else:
+                skipped += 1
+                errors.append(f"{url}: {exc}"[:500])
         finally:
-            processed += 1
+            if counted:
+                processed += 1
             results.append(outcome)
             write_progress(upload_id, processed_count=processed, inserted_count=inserted,
                            updated_count=replaced, skipped_count=skipped, role_assigned_count=assigned,
                            error_message="\n".join(errors)[:8000] or None)
 
     status = "completed_with_errors" if errors else "completed"
-    write_progress(upload_id, status=status, completed_at=datetime.now(timezone.utc))
+    if finalize:
+        write_progress(upload_id, status=status, completed_at=datetime.now(timezone.utc))
     if touched:
         refresh_caches(touched)
-    logger.info("linkedin import upload_id=%s inserted=%s replaced=%s skipped=%s", upload_id, inserted,
-                replaced, skipped)
+    logger.info("linkedin import upload_id=%s inserted=%s replaced=%s skipped=%s deferred=%s", upload_id,
+                inserted, replaced, skipped, len(deferred))
     return {"status": status, "inserted": inserted, "updated": replaced, "skipped": skipped,
-            "role_assigned_count": assigned, "errors": errors, "results": results,
-            "apify_requested": scraped["requested"], "apify_failed": scraped["failed"]}
+            "processed": processed, "role_assigned_count": assigned, "errors": errors, "results": results,
+            "deferred": deferred, "apify_requested": apify_requested, "apify_failed": apify_failed}
 
 
 def start_linkedin_import(*, urls: Sequence[str], owner_user_id: int, role_id: Optional[int] = None,

@@ -394,6 +394,8 @@ app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(roles.router, prefix="/api/roles", tags=["roles"])
 app.include_router(browse.router, prefix="/api", tags=["browse"])
 app.include_router(candidate_imports.router, prefix="/api", tags=["imports"])
+from backend.api.routes import google_sheets
+app.include_router(google_sheets.router, prefix="/api", tags=["google-sheets"])
 from backend.api.routes import resumes
 app.include_router(resumes.router, prefix="/api", tags=["resumes"])
 app.include_router(candidates.router, prefix="/api", tags=["candidates"])

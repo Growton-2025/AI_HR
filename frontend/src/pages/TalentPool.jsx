@@ -10,7 +10,7 @@ import {
   SlidersHorizontal, RefreshCw, UserPlus, X, ChevronDown,
   Activity, MessageSquareMore, Users, Plus, Edit2, Check, Download, Trash2,
   Mail, Phone, MessageSquare, Linkedin, Send,
-  FileUp, Play, Folder,
+  FileUp, FileSpreadsheet, Play, Folder,
 } from 'lucide-react';
 import StatusDropdown, { RECRUITMENT_STAGES, STATUS_STYLES } from '../components/StatusDropdown';
 import AiColumnConfigModal from '../components/AiColumnConfigModal';
@@ -19,6 +19,7 @@ import Select, { components } from 'react-select';
 import { TagFilterInput, SelectFilter, RangeSlider, uniqueSortedOptions } from '../components/FilterComponents';
 import CsvMappingModal from '../components/CsvMappingModal';
 import LinkedInImportModal from '../components/LinkedInImportModal';
+import GoogleSheetImportModal from '../components/GoogleSheetImportModal';
 import HayasaBrand from '../components/HayasaBrand';
 import AddToListModal from '../components/AddToListModal'
 import BulkStatusActions from '../components/BulkStatusActions';
@@ -1687,6 +1688,7 @@ export default function TalentPool() {
   const didInitRef = useRef(false);
   const uploadFileRef = useRef(null);
   const [linkedinImportOpen, setLinkedinImportOpen] = useState(false);
+  const [sheetImportOpen, setSheetImportOpen] = useState(false);
   const [linkedinImportBusy, setLinkedinImportBusy] = useState(false);
   const [linkedinImportProgress, setLinkedinImportProgress] = useState(null);
   const resumeFileRef = useRef(null);
@@ -3190,6 +3192,17 @@ export default function TalentPool() {
                 >
                   <Linkedin size={14} color="#0a66c2" /> {linkedinImportBusy ? 'Importing…' : 'Import from LinkedIn'}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setSheetImportOpen(true)}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '8px 14px', borderRadius: 12, border: '1px solid #e2e8f0',
+                    background: '#fff', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                  }}
+                >
+                  <FileSpreadsheet size={14} color="#16a34a" /> Import from Google Sheet
+                </button>
               </>
             )}
 
@@ -4109,6 +4122,15 @@ export default function TalentPool() {
         progress={linkedinImportProgress}
         onCancel={() => { if (!linkedinImportBusy) setLinkedinImportOpen(false); }}
         onImport={importLinkedInProfiles}
+      />
+
+      <GoogleSheetImportModal
+        open={sheetImportOpen}
+        onClose={() => setSheetImportOpen(false)}
+        onDone={() => {
+          invalidateTalentPoolCaches();
+          fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+        }}
       />
 
       {showAssignModal && (

@@ -30,3 +30,6 @@ phonenumbers
 # Decodes Plivo's stereo recordings so each call leg can be transcribed
 # separately. Wheels bundle FFmpeg, so no system package is needed on Azure.
 av>=12,<16
+# Google Sheet import: encrypted per-user Google tokens, Sheets REST calls
+cryptography>=42.0.0
+httpx>=0.27.0

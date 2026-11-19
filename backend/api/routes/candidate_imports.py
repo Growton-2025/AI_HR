@@ -506,13 +506,19 @@ async def _model_mapping(headers: List[str], sample_rows: List[Dict[str, Any]]) 
 
 
 async def build_upload_preview_response(file: UploadFile, use_llm: bool = False) -> Dict[str, Any]:
-    preview_started = perf_counter()
     raw = await file.read()
     try:
         df = _read_frame(raw, file.filename or "upload.csv")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return await build_preview_from_frame(df, filename=file.filename, use_llm=use_llm)
 
+
+async def build_preview_from_frame(
+    df: pd.DataFrame, *, filename: Optional[str], use_llm: bool = False
+) -> Dict[str, Any]:
+    """Mapping preview for any tabular source (uploaded file or Google Sheet tab)."""
+    preview_started = perf_counter()
     headers = [str(c) for c in df.columns.tolist()]
     sample = df.head(8).fillna("").to_dict(orient="records")
     deterministic = suggest_header_mapping(headers)
@@ -635,14 +641,14 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
     used_targets = {v for v in suggested.values() if v and v != "ignore"}
     logger.info(
         "candidate upload preview filename=%s rows=%s columns=%s duration_ms=%s groups=%s",
-        file.filename,
+        filename,
         len(df.index),
         len(headers),
         round((perf_counter() - preview_started) * 1000),
         {group: len(items) for group, items in field_groups.items()},
     )
     return {
-        "filename": file.filename,
+        "filename": filename,
         "row_count": int(len(df.index)),
         "headers": headers,
         "sample_rows": sample,
@@ -1160,10 +1166,20 @@ def _process_upload_rows(
     role_id: Optional[int],
     enrichment_mode: str = "none",
     duplicate_policy: str = UPSERT_EXISTING_POLICY,
+    base_counts: Optional[Dict[str, int]] = None,
+    base_errors: Optional[List[str]] = None,
 ) -> None:
-    inserted = updated = skipped = role_assigned_count = 0
-    processed_count = 0
-    errors: List[str] = []
+    """``base_counts`` / ``base_errors`` carry totals from an earlier phase that
+    reported into the same upload row (Google Sheet import: LinkedIn rows first),
+    so this phase adds to them instead of overwriting."""
+    base = base_counts or {}
+    inserted = int(base.get("inserted") or 0)
+    updated = int(base.get("updated") or 0)
+    skipped = int(base.get("skipped") or 0)
+    role_assigned_count = int(base.get("role_assigned") or 0)
+    base_processed = int(base.get("processed") or 0)
+    processed_count = base_processed
+    errors: List[str] = list(base_errors or [])
     enrichment_errors: List[str] = []
     touched_ids: List[int] = []
     batch_size = 10
@@ -1384,7 +1400,7 @@ def _process_upload_rows(
                             errors.append(f"row {prepared['source_index']}: {row_exc}")
                             skipped += 1
 
-                if sequence % batch_size == 0 or sequence == len(prepared_rows):
+                if sequence % batch_size == 0 or sequence == base_processed + len(prepared_rows):
                     _write_upload_progress(
                         cur,
                         upload_id,
@@ -1599,21 +1615,37 @@ async def commit_upload_file(
         raise HTTPException(status_code=400, detail="Invalid mapping JSON")
 
     mapping = _validate_mapping(mapping)
-    enrichment_mode = "verified_profile" if _is_verified_enrichment_mode(enrichment_mode) else "none"
-    duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
 
-    parse_started = perf_counter()
     raw = await file.read()
     try:
         df = _read_frame(raw, file.filename or "upload.csv")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    return start_upload_from_frame(
+        df,
+        filename=file.filename or "upload",
+        mapping=mapping,
+        enrichment_mode=enrichment_mode,
+        duplicate_policy=duplicate_policy,
+        current_user=current_user,
+        role_id=role_id,
+    )
+
+
+def create_upload_record(
+    *,
+    owner_user_id: int,
+    filename: str,
+    headers: List[str],
+    mapping: Dict[str, Any],
+    row_count: int,
+    role_id: Optional[int],
+) -> int:
+    """Insert the ``candidate_uploads`` tracking row every import source reports into."""
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
-
-    row_count_total = int(len(df.index))
     try:
         conn.rollback()
         with conn.cursor() as cur:
@@ -1626,17 +1658,17 @@ async def commit_upload_file(
                 RETURNING id
                 """,
                 (
-                    current_user.id,
-                    file.filename or "upload",
-                    json.dumps(list(df.columns)),
+                    owner_user_id,
+                    filename,
+                    json.dumps(headers),
                     json.dumps(mapping),
-                    len(df.index),
+                    row_count,
                     role_id,
                 ),
             )
-            upload_row = cur.fetchone()
-            upload_id = upload_row[0]
+            upload_id = cur.fetchone()[0]
             conn.commit()
+            return int(upload_id)
     except HTTPException:
         conn.rollback()
         raise
@@ -1646,6 +1678,33 @@ async def commit_upload_file(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         return_db_connection(conn)
+
+
+def start_upload_from_frame(
+    df: pd.DataFrame,
+    *,
+    filename: str,
+    mapping: Dict[str, str],
+    enrichment_mode: str = "none",
+    duplicate_policy: str = UPSERT_EXISTING_POLICY,
+    current_user: schemas.User,
+    role_id: Optional[int] = None,
+    owner_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Start the background import for an already-parsed table with a validated mapping."""
+    enrichment_mode = "verified_profile" if _is_verified_enrichment_mode(enrichment_mode) else "none"
+    duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
+    parse_started = perf_counter()
+    owner_id = int(owner_user_id if owner_user_id is not None else current_user.id)
+    row_count_total = int(len(df.index))
+    upload_id = create_upload_record(
+        owner_user_id=owner_id,
+        filename=filename,
+        headers=[str(c) for c in df.columns],
+        mapping=mapping,
+        row_count=row_count_total,
+        role_id=role_id,
+    )
 
     logger.info(
         "candidate upload accepted upload_id=%s rows=%s parse_ms=%s",
@@ -1657,7 +1716,7 @@ async def commit_upload_file(
         upload_id=upload_id,
         df=df,
         mapping=mapping,
-        owner_user_id=int(current_user.id),
+        owner_user_id=owner_id,
         user_role=(current_user.role or "").strip().lower(),
         role_id=role_id,
         enrichment_mode=enrichment_mode,
