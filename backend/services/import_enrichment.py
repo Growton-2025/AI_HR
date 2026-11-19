@@ -551,11 +551,11 @@ def parse_education_from_raw(raw_fields: Dict[str, Any]) -> List[ParsedEducation
             idx = int(match.group(1)) + 1
             field = match.group(2).lower()
             group = apify_groups.setdefault(idx, {})
-            if "title" in field:
-                group["college"] = clean_value
-            elif "subtitle" in field:
+            if "subtitle" in field:
                 group["degree"] = clean_value
                 group["details"] = clean_value
+            elif "title" in field:
+                group["college"] = clean_value
             elif "start" in field:
                 group["start_raw"] = clean_value
             elif "end" in field:

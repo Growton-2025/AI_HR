@@ -18,6 +18,7 @@ import AiColumnCellDrawer from '../components/AiColumnCellDrawer';
 import Select, { components } from 'react-select';
 import { TagFilterInput, SelectFilter, RangeSlider, uniqueSortedOptions } from '../components/FilterComponents';
 import CsvMappingModal from '../components/CsvMappingModal';
+import LinkedInImportModal from '../components/LinkedInImportModal';
 import HayasaBrand from '../components/HayasaBrand';
 import AddToListModal from '../components/AddToListModal'
 import BulkStatusActions from '../components/BulkStatusActions';
@@ -1685,6 +1686,9 @@ export default function TalentPool() {
   const heyreachCampaignId = useAppStore(state => state.heyreachCampaignId);
   const didInitRef = useRef(false);
   const uploadFileRef = useRef(null);
+  const [linkedinImportOpen, setLinkedinImportOpen] = useState(false);
+  const [linkedinImportBusy, setLinkedinImportBusy] = useState(false);
+  const [linkedinImportProgress, setLinkedinImportProgress] = useState(null);
   const resumeFileRef = useRef(null);
   const pendingResumeCandidateIdRef = useRef(null);
   const talentPoolRequestSeqRef = useRef(0);
@@ -2588,6 +2592,52 @@ export default function TalentPool() {
     throw new Error('Upload is still running. Check recent uploads for its status.');
   };
 
+  const importLinkedInProfiles = async (urls, duplicatePolicy) => {
+    if (!urls?.length) return;
+    setLinkedinImportBusy(true);
+    setLinkedinImportProgress({ status: 'processing', processed_count: 0, row_count: urls.length });
+    try {
+      const res = await axios.post(`${API_BASE}/candidates/import/linkedin`, {
+        linkedin_urls: urls,
+        duplicate_policy: duplicatePolicy || 'skip',
+      }, { timeout: 60000 });
+      const uploadId = res.data?.upload_id;
+      let d = res.data || {};
+      for (let attempt = 0; attempt < 1800; attempt += 1) {
+        const poll = await axios.get(`${API_BASE}/candidates/uploads/${uploadId}`, { timeout: 60000 });
+        d = poll.data || {};
+        setLinkedinImportProgress(d);
+        if (['completed', 'completed_with_errors', 'failed'].includes(String(d.status || '').toLowerCase())) break;
+        await new Promise(resolve => window.setTimeout(resolve, 1000));
+      }
+      if (String(d.status || '').toLowerCase() === 'failed') {
+        toast.error(d.error_message || 'LinkedIn import failed');
+        return;
+      }
+      const ins = Number(d.inserted) || 0;
+      const rep = Number(d.updated) || 0;
+      const skp = Number(d.skipped) || 0;
+      const parts = [];
+      if (ins > 0) parts.push(`${ins} new added to your pool`);
+      if (rep > 0) parts.push(`${rep} replaced with a fresh profile`);
+      if (skp > 0) parts.push(`${skp} skipped`);
+      toast.success(parts.length ? `LinkedIn import complete: ${parts.join('. ')}.` : 'LinkedIn import complete.');
+      const errs = Array.isArray(d.errors) ? d.errors : [];
+      if (errs.length > 0) {
+        const preview = errs.slice(0, 3).join(' ');
+        toast.warning(preview.length > 300 ? `${preview.slice(0, 297)}…` : preview);
+      }
+      invalidateTalentPoolCaches();
+      fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+      setLinkedinImportOpen(false);
+    } catch (err) {
+      toast.error(getRequestErrorMessage(err, 'LinkedIn import failed'));
+    } finally {
+      setLinkedinImportBusy(false);
+      setLinkedinImportProgress(null);
+    }
+  };
+
   const commitUpload = async () => {
     if (!uploadFile) return;
     const req = new Set(uploadRequiredTargets?.length ? uploadRequiredTargets : ['first_name', 'last_name', 'linkedin', 'city', 'title']);
@@ -3127,6 +3177,18 @@ export default function TalentPool() {
                   }}
                 >
                   <FileUp size={14} /> {uploadPreviewBusy ? 'Reading…' : 'Upload CSV / Excel'}
+                </button>
+                <button
+                  type="button"
+                  disabled={linkedinImportBusy}
+                  onClick={() => setLinkedinImportOpen(true)}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '8px 14px', borderRadius: 12, border: '1px solid #e2e8f0',
+                    background: '#fff', fontSize: 12, fontWeight: 700, cursor: linkedinImportBusy ? 'wait' : 'pointer',
+                  }}
+                >
+                  <Linkedin size={14} color="#0a66c2" /> {linkedinImportBusy ? 'Importing…' : 'Import from LinkedIn'}
                 </button>
               </>
             )}
@@ -4040,6 +4102,14 @@ export default function TalentPool() {
           onImport={commitUpload}
         />
       )}
+
+      <LinkedInImportModal
+        open={linkedinImportOpen}
+        busy={linkedinImportBusy}
+        progress={linkedinImportProgress}
+        onCancel={() => { if (!linkedinImportBusy) setLinkedinImportOpen(false); }}
+        onImport={importLinkedInProfiles}
+      />
 
       {showAssignModal && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.65)', zIndex: 10002, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>

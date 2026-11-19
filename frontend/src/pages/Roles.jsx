@@ -9,6 +9,7 @@ import BulkStatusActions from '../components/BulkStatusActions'
 
 import { useShallow } from 'zustand/react/shallow'
 import CsvMappingModal from '../components/CsvMappingModal'
+import LinkedInImportModal from '../components/LinkedInImportModal'
 import RoleEmailSendModal from '../components/RoleEmailSendModal'
 import RoleCreateModal from '../components/RoleCreateModal'
 import { TagFilterInput, SelectFilter, RangeSlider } from '../components/FilterComponents'
@@ -180,6 +181,9 @@ function Roles() {
     const [activationRole, setActivationRole] = useState(null)
     const [uploadRole, setUploadRole] = useState(null)
     const [uploadFile, setUploadFile] = useState(null)
+    const [linkedinImportRole, setLinkedinImportRole] = useState(null)
+    const [linkedinImportBusy, setLinkedinImportBusy] = useState(false)
+    const [linkedinImportProgress, setLinkedinImportProgress] = useState(null)
     const [uploadHeaders, setUploadHeaders] = useState([])
     const [uploadMapping, setUploadMapping] = useState({})
     const [uploadMappingDetails, setUploadMappingDetails] = useState({})
@@ -1567,6 +1571,55 @@ function Roles() {
         throw new Error('Upload is still running. Check recent uploads for its status.')
     }
 
+    const importLinkedInToRole = async (urls, duplicatePolicy) => {
+        const role = linkedinImportRole
+        if (!role?.name || !urls?.length) return
+        setLinkedinImportBusy(true)
+        setLinkedinImportProgress({ status: 'processing', processed_count: 0, row_count: urls.length })
+        try {
+            const params = role.id ? { role_id: role.id } : {}
+            const res = await axios.post(`${API_BASE}/roles/${encodeURIComponent(role.name)}/import/linkedin`, {
+                linkedin_urls: urls,
+                duplicate_policy: duplicatePolicy || 'skip',
+            }, { params, timeout: 60000 })
+            const uploadId = res.data?.upload_id
+            let d = res.data || {}
+            for (let attempt = 0; attempt < 1800; attempt += 1) {
+                const poll = await axios.get(`${API_BASE}/candidates/uploads/${uploadId}`, { timeout: 60000 })
+                d = poll.data || {}
+                setLinkedinImportProgress(d)
+                if (['completed', 'completed_with_errors', 'failed'].includes(String(d.status || '').toLowerCase())) break
+                await new Promise(resolve => window.setTimeout(resolve, 1000))
+            }
+            if (String(d.status || '').toLowerCase() === 'failed') {
+                toast.error(d.error_message || 'LinkedIn import failed')
+                return
+            }
+            const ins = Number(d.inserted) || 0
+            const rep = Number(d.updated) || 0
+            const skp = Number(d.skipped) || 0
+            const assigned = Number(d.role_assigned_count) || 0
+            toast.success(`LinkedIn import complete: ${ins} new, ${rep} replaced, ${skp} skipped, ${assigned} added to ${role.name}.`)
+            if (Array.isArray(d.errors) && d.errors.length > 0) {
+                toast.warning(d.errors.slice(0, 3).join(' '))
+            }
+            invalidateTalentPoolCaches()
+            await fetchRoles({ force: true })
+            fetchTalentPoolSummary({ force: true, freshnessMs: 0 })
+            fetchAnalytics({ force: true })
+            if (viewingRole?.name === role.name) {
+                await fetchRoleDetails(role.name, { force: true })
+            }
+            setLinkedinImportRole(null)
+        } catch (e) {
+            const detail = e.response?.data?.detail
+            toast.error((typeof detail === 'string' ? detail : detail?.message) || e.message || 'LinkedIn import failed')
+        } finally {
+            setLinkedinImportBusy(false)
+            setLinkedinImportProgress(null)
+        }
+    }
+
     const commitRoleUpload = async () => {
         if (!uploadRole?.name || !uploadFile) return
         const fd = new FormData()
@@ -1647,6 +1700,14 @@ function Roles() {
                     onImport={commitRoleUpload}
                 />
             )}
+            <LinkedInImportModal
+                open={Boolean(linkedinImportRole)}
+                roleName={linkedinImportRole?.name || ''}
+                busy={linkedinImportBusy}
+                progress={linkedinImportProgress}
+                onCancel={() => { if (!linkedinImportBusy) setLinkedinImportRole(null) }}
+                onImport={importLinkedInToRole}
+            />
         </>
     )
 
@@ -1729,6 +1790,13 @@ function Roles() {
                         disabled={uploadPreviewBusy === viewingRole.name}
                     >
                         <FileUp size={16} /> {uploadPreviewBusy === viewingRole.name ? 'Reading...' : 'Upload CSV'}
+                    </button>
+                    <button
+                        className="btn btn-secondary"
+                        onClick={() => setLinkedinImportRole(viewingRole)}
+                        disabled={linkedinImportBusy}
+                    >
+                        <Linkedin size={16} /> {linkedinImportBusy ? 'Importing...' : 'Import from LinkedIn'}
                     </button>
                 </div>
                 {uploadUi}
@@ -2750,6 +2818,15 @@ function Roles() {
                                 style={{ color: '#0f766e' }}
                             >
                                 {uploadPreviewBusy === role.name ? <Loader2 size={16} className="animate-spin" /> : <FileUp size={16} />}
+                            </button>
+                            <button
+                                className="role-delete-btn"
+                                onClick={(event) => { event.stopPropagation(); setLinkedinImportRole(role) }}
+                                title="Import LinkedIn profiles into role"
+                                disabled={linkedinImportBusy}
+                                style={{ color: '#0a66c2' }}
+                            >
+                                <Linkedin size={16} />
                             </button>
                         </div>
                     ))

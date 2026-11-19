@@ -30,6 +30,7 @@ from backend.services.candidate_pool import (
 from backend.services.imported_fields import merge_imported_extra_fields
 from backend.services.import_enrichment import repair_company_title_value
 from backend.services.linkedin_normalize import normalize_linkedin, canonical_email
+from backend.services import linkedin_import
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -43,6 +44,12 @@ UPSERT_EXISTING_POLICY = "upsert_existing"
 
 class SuggestMappingBody(BaseModel):
     headers: List[str] = Field(default_factory=list)
+
+
+class LinkedInImportBody(BaseModel):
+    linkedin_urls: List[str] = Field(default_factory=list)
+    role_id: Optional[int] = None
+    duplicate_policy: str = linkedin_import.DUPLICATE_SKIP
 
 
 def _clean(val: Any) -> Optional[str]:
@@ -1689,6 +1696,59 @@ async def upload_commit(
         duplicate_policy=duplicate_policy,
         current_user=current_user,
     )
+
+
+@router.post("/candidates/import/linkedin")
+async def import_linkedin_profiles(
+    body: LinkedInImportBody,
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Scrape LinkedIn profile URLs through Apify, map them onto the candidate schema,
+    and load them into the caller's pool. Runs in the background; poll
+    ``GET /candidates/uploads/{upload_id}`` for progress (same shape as a CSV upload)."""
+    if current_user.role == "admin":
+        raise HTTPException(status_code=403, detail="Recruiter only")
+
+    try:
+        urls = linkedin_import.prepare_import_urls(body.linkedin_urls)
+    except linkedin_import.LinkedInImportError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail)
+
+    role_id = body.role_id
+    if role_id is not None:
+        conn = get_db_connection(validate=False, register_pgvector=False)
+        if not conn:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM recruitment_roles WHERE id = %s AND user_id = %s",
+                            (role_id, current_user.id))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Role not found")
+        finally:
+            return_db_connection(conn)
+
+    duplicate_policy = linkedin_import.normalize_duplicate_policy(body.duplicate_policy)
+    try:
+        upload_id = linkedin_import.start_linkedin_import(
+            urls=urls, owner_user_id=int(current_user.id), role_id=role_id, duplicate_policy=duplicate_policy,
+        )
+    except Exception as exc:
+        logger.exception("linkedin import could not start")
+        raise HTTPException(status_code=500, detail=str(exc))
+    logger.info("linkedin import accepted upload_id=%s urls=%s user=%s", upload_id, len(urls), current_user.id)
+    return {
+        "upload_id": upload_id,
+        "row_count": len(urls),
+        "processed_count": 0,
+        "inserted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "role_assigned_count": 0,
+        "status": "processing",
+        "duplicate_policy": duplicate_policy,
+        "errors": [],
+    }
 
 
 @router.get("/candidates/uploads")

@@ -6,7 +6,8 @@ from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from backend.api import schemas, deps
 from backend.db.connection import get_db_connection, return_db_connection
-from backend.api.routes.candidate_imports import build_upload_preview_response, commit_upload_file
+from backend.api.routes.candidate_imports import LinkedInImportBody, build_upload_preview_response, commit_upload_file
+from backend.services import linkedin_import
 from backend.services.role_activation import (
     activate_role,
     fetch_role_activation,
@@ -959,6 +960,60 @@ async def role_upload_preview(
     finally:
         return_db_connection(conn)
     return await build_upload_preview_response(file, use_llm=use_llm)
+
+
+@router.post("/{role_name}/import/linkedin")
+async def role_import_linkedin(
+    role_name: str,
+    body: LinkedInImportBody,
+    role_id: Optional[int] = Query(None),
+    current_user: schemas.User = Depends(deps.get_current_user),
+):
+    """Scrape LinkedIn profile URLs through Apify, enrich them and add them to this role.
+
+    Mirrors the CSV role upload: admins may target any role, recruiters only their
+    own. The candidate is owned by the role's recruiter so it shows in their pool.
+    Poll ``GET /api/candidates/uploads/{upload_id}`` for progress."""
+    try:
+        urls = linkedin_import.prepare_import_urls(body.linkedin_urls)
+    except linkedin_import.LinkedInImportError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail)
+
+    conn = get_db_connection(validate=False, register_pgvector=False)
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            role = _resolve_role(cur, current_user, role_name=role_name, role_id=role_id)
+            if not role:
+                raise HTTPException(status_code=404, detail="Role not found")
+            resolved_role_id, resolved_role_name, role_owner_id = role[0], role[1], role[2]
+    finally:
+        return_db_connection(conn)
+
+    owner_user_id = int(role_owner_id) if _is_admin(current_user) and role_owner_id else int(current_user.id)
+    duplicate_policy = linkedin_import.normalize_duplicate_policy(body.duplicate_policy)
+    try:
+        upload_id = linkedin_import.start_linkedin_import(
+            urls=urls, owner_user_id=owner_user_id, role_id=resolved_role_id, duplicate_policy=duplicate_policy,
+        )
+    except Exception as exc:
+        logger.exception("role linkedin import could not start")
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "upload_id": upload_id,
+        "row_count": len(urls),
+        "processed_count": 0,
+        "inserted": 0,
+        "updated": 0,
+        "skipped": 0,
+        "role_assigned_count": 0,
+        "status": "processing",
+        "duplicate_policy": duplicate_policy,
+        "errors": [],
+        "role_id": resolved_role_id,
+        "role_name": resolved_role_name,
+    }
 
 
 @router.post("/{role_name}/upload/commit")
