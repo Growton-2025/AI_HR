@@ -1689,6 +1689,15 @@ export default function TalentPool() {
   const uploadFileRef = useRef(null);
   const [linkedinImportOpen, setLinkedinImportOpen] = useState(false);
   const [sheetImportOpen, setSheetImportOpen] = useState(false);
+  // Sheet imports finish in the background; refresh when the store reports one done.
+  const importFinishedTick = useAppStore(state => state.importFinishedTick);
+  const seenImportTickRef = useRef(importFinishedTick);
+  useEffect(() => {
+    if (importFinishedTick === seenImportTickRef.current) return;
+    seenImportTickRef.current = importFinishedTick;
+    invalidateTalentPoolCaches();
+    fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
+  }, [importFinishedTick]); // eslint-disable-line react-hooks/exhaustive-deps
   const [linkedinImportBusy, setLinkedinImportBusy] = useState(false);
   const [linkedinImportProgress, setLinkedinImportProgress] = useState(null);
   const resumeFileRef = useRef(null);
@@ -4127,10 +4136,6 @@ export default function TalentPool() {
       <GoogleSheetImportModal
         open={sheetImportOpen}
         onClose={() => setSheetImportOpen(false)}
-        onDone={() => {
-          invalidateTalentPoolCaches();
-          fetchTalentPoolSummary({ force: true, freshnessMs: 0 });
-        }}
       />
 
       {showAssignModal && (

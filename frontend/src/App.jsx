@@ -8,6 +8,7 @@ import ComingSoon from './pages/ComingSoon'
 import { VoIPProvider } from './context/VoIPContext'
 import IncomingCallBanner from './components/IncomingCallBanner'
 import DegradedCallingBanner from './components/DegradedCallingBanner'
+import ImportProgressDock from './components/ImportProgressDock'
 
 const Screening = lazy(() => import('./pages/Screening'))
 const Roles = lazy(() => import('./pages/Roles'))
@@ -333,6 +334,7 @@ function App() {
             <IncomingCallBanner />
             <Suspense fallback={null}><InboundCallModal /></Suspense>
             <DegradedCallingBanner />
+            <ImportProgressDock />
             <Sidebar />
             <main
                 className="main-content"

@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import axios from 'axios'
 import { toast } from 'sonner'
 
+const IMPORT_DONE_STATUSES = ['completed', 'completed_with_errors', 'failed']
+
 const REQUEST_TIMEOUT_MS = 15000
 const SEARCH_REQUEST_TIMEOUT_MS = 120000
 const CALL_REQUEST_TIMEOUT_MS = 15000
@@ -854,6 +856,93 @@ export const useAppStore = create(persist((set, get) => ({
             console.error('Failed to lookup campaign:', e)
             return { success: false, error: e.response?.data?.detail || 'Lookup failed' }
         }
+    },
+
+    // Background imports. The poll loop lives here, not in the import window, so the
+    // window can be closed (or the page changed) while a sheet import keeps running.
+    activeImports: {},            // uploadId -> { uploadId, label, roleId, roleName, progress, finished }
+    importFinishedTick: 0,        // bumped once per finished import; pages refresh their lists on it
+    lastFinishedImport: null,
+    trackImport: (uploadId, meta = {}, first = null) => {
+        const id = Number(uploadId)
+        if (!id) return
+        const existing = get().activeImports[id]
+        if (existing && !existing.finished) return
+        const patch = (changes) => set(state => ({
+            activeImports: { ...state.activeImports, [id]: { ...(state.activeImports[id] || {}), ...changes } },
+        }))
+        patch({ uploadId: id, label: meta.label || 'Import', roleId: meta.roleId ?? null, roleName: meta.roleName || '',
+            progress: first || { status: 'processing', processed_count: 0, row_count: 0 }, finished: false })
+        const isDone = (d) => IMPORT_DONE_STATUSES.includes(String(d?.status || '').toLowerCase())
+        const run = async () => {
+            let d = first || {}
+            let failures = 0
+            while (!isDone(d)) {
+                await new Promise(resolve => window.setTimeout(resolve, 1500))
+                if (!get().token) return                      // signed out: stop quietly
+                try {
+                    const res = await axios.get(`${API_BASE}/candidates/uploads/${id}`, { timeout: 60000 })
+                    d = res.data || {}
+                    failures = 0
+                    patch({ progress: d })
+                } catch {
+                    failures += 1
+                    if (failures >= 20) {
+                        d = { ...d, status: 'failed', error_message: 'Lost contact with the server while importing. The import may still finish; check the list in a few minutes.' }
+                        patch({ progress: d })
+                    }
+                }
+            }
+            const entry = { ...(get().activeImports[id] || {}), progress: d, finished: true }
+            set(state => {
+                const next = { ...state.activeImports, [id]: entry }
+                if (entry.hidden) delete next[id]
+                return { activeImports: next, importFinishedTick: state.importFinishedTick + 1, lastFinishedImport: entry }
+            })
+            get().invalidateTalentPoolCaches?.()
+            if (String(d.status || '').toLowerCase() === 'failed') {
+                toast.error(d.error_message || `${entry.label} failed`)
+                return
+            }
+            const parts = []
+            if (Number(d.inserted) > 0) parts.push(`${Number(d.inserted)} new`)
+            if (Number(d.updated) > 0) parts.push(`${Number(d.updated)} updated`)
+            if (Number(d.skipped) > 0) parts.push(`${Number(d.skipped)} skipped`)
+            if (Number(d.role_assigned_count) > 0) parts.push(`${Number(d.role_assigned_count)} added to ${entry.roleName || 'the role'}`)
+            toast.success(parts.length ? `${entry.label} complete: ${parts.join(', ')}.` : `${entry.label} complete: nothing new.`)
+            const errs = Array.isArray(d.errors) ? d.errors : []
+            if (errs.length > 0) {
+                const text = errs.slice(0, 3).join(' ')
+                toast.warning(text.length > 300 ? `${text.slice(0, 297)}…` : text)
+            }
+        }
+        void run()
+    },
+    // A finished import is forgotten; a running one is only hidden (it keeps polling
+    // so the finish toast and the list refresh still happen).
+    dismissImport: (uploadId) => set(state => {
+        const id = Number(uploadId)
+        const entry = state.activeImports[id]
+        if (!entry) return {}
+        const next = { ...state.activeImports }
+        if (entry.finished) delete next[id]
+        else next[id] = { ...entry, hidden: true }
+        return { activeImports: next }
+    }),
+    // After a page reload, pick up sheet imports that are still running on the server.
+    resumeRunningImports: async () => {
+        try {
+            const res = await axios.get(`${API_BASE}/candidates/uploads`, { params: { limit: 20 }, timeout: 60000 })
+            const recent = Date.now() - 3 * 60 * 60 * 1000       // a crashed run must not haunt the dock forever
+            for (const u of res.data?.uploads || []) {
+                const status = String(u.status || '').toLowerCase()
+                const started = u.created_at ? new Date(`${u.created_at}Z`).getTime() : 0
+                if (!String(u.filename || '').startsWith('gsheet:')) continue
+                if (!['processing', 'scraping', 'enriching', 'refreshing'].includes(status) || started < recent) continue
+                get().trackImport(u.id, { label: 'Google Sheet import', roleId: u.role_id ?? null },
+                    { upload_id: u.id, status, row_count: u.row_count || 0, processed_count: u.processed_count || 0 })
+            }
+        } catch { /* the dock is a convenience; nothing to resume is fine */ }
     },
 
     // Sidebar State

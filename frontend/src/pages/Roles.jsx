@@ -184,6 +184,26 @@ function Roles() {
     const [uploadFile, setUploadFile] = useState(null)
     const [linkedinImportRole, setLinkedinImportRole] = useState(null)
     const [sheetImportRole, setSheetImportRole] = useState(null)
+    // Sheet imports run in the background (the window may already be closed), so the
+    // lists refresh when the store reports one finished, not from the window itself.
+    const importFinishedTick = useAppStore(state => state.importFinishedTick)
+    const seenImportTickRef = useRef(importFinishedTick)
+    useEffect(() => {
+        if (importFinishedTick === seenImportTickRef.current) return
+        seenImportTickRef.current = importFinishedTick
+        const finished = useAppStore.getState().lastFinishedImport
+        const refresh = async () => {
+            invalidateTalentPoolCaches()
+            await fetchRoles({ force: true })
+            fetchTalentPoolSummary({ force: true, freshnessMs: 0 })
+            fetchAnalytics({ force: true })
+            const open = useAppStore.getState().viewingRole
+            if (open?.name && (!finished?.roleId || finished.roleId === open.id)) {
+                await fetchRoleDetails(open.name, { force: true })
+            }
+        }
+        void refresh()
+    }, [importFinishedTick]) // eslint-disable-line react-hooks/exhaustive-deps
     const [linkedinImportBusy, setLinkedinImportBusy] = useState(false)
     const [linkedinImportProgress, setLinkedinImportProgress] = useState(null)
     const [uploadHeaders, setUploadHeaders] = useState([])
@@ -1715,16 +1735,6 @@ function Roles() {
                 roleId={sheetImportRole?.id || null}
                 roleName={sheetImportRole?.name || ''}
                 onClose={() => setSheetImportRole(null)}
-                onDone={async () => {
-                    const role = sheetImportRole
-                    invalidateTalentPoolCaches()
-                    await fetchRoles({ force: true })
-                    fetchTalentPoolSummary({ force: true, freshnessMs: 0 })
-                    fetchAnalytics({ force: true })
-                    if (role?.name && viewingRole?.name === role.name) {
-                        await fetchRoleDetails(role.name, { force: true })
-                    }
-                }}
             />
         </>
     )

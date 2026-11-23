@@ -563,3 +563,65 @@ def test_upload_status_payload_includes_progress_and_errors():
     assert payload["processed_count"] == 37
     assert payload["role_assigned_count"] == 9
     assert payload["errors"] == ["row 8: bad url", "row 9: missing name"]
+
+
+def test_row_values_join_several_notes_columns_instead_of_keeping_the_last():
+    import pandas as pd
+
+    row = pd.Series({"Availability": "Immediately", "Expected CTC": "30 LPA", "Remarks": None, "Mail": "a@b.co"})
+    mapping = {"Availability": "notes", "Expected CTC": "notes", "Remarks": "notes", "Mail": "email"}
+
+    vals, _raw = candidate_imports._row_values(row, mapping)
+
+    assert vals["notes"] == "Availability: Immediately\nExpected CTC: 30 LPA"
+    assert vals["email"] == "a@b.co"
+    # one Notes column stays exactly as written; an empty one stays empty
+    assert candidate_imports._row_values(row, {"Availability": "notes"})[0]["notes"] == "Immediately"
+    assert candidate_imports._row_values(row, {"Remarks": "notes"})[0]["notes"] is None
+
+
+def test_row_values_blank_second_column_does_not_wipe_the_first():
+    import pandas as pd
+
+    row = pd.Series({"Profile": "https://linkedin.com/in/ada", "Share a LinkedIn ad": None})
+    vals, _raw = candidate_imports._row_values(row, {"Profile": "linkedin", "Share a LinkedIn ad": "linkedin"})
+    assert vals["linkedin"] == "https://linkedin.com/in/ada"
+
+
+def test_preview_gives_a_field_to_one_column_when_the_model_repeats_it(monkeypatch):
+    async def model_mapping(_headers, _sample_rows):
+        return {
+            "Given": {"target": "first_name", "confidence": 0.9, "reason": "First name."},
+            "Preferred name": {"target": "first_name", "confidence": 0.6, "reason": "Also a name."},
+            "Empty name": {"target": "first_name", "confidence": 0.5, "reason": "Also a name."},
+            "Availability": {"target": "notes", "confidence": 0.7, "reason": "Free text."},
+            "Remarks": {"target": "notes", "confidence": 0.7, "reason": "Free text."},
+        }
+
+    monkeypatch.setattr(candidate_imports, "_model_mapping", model_mapping)
+    result = asyncio.run(
+        candidate_imports.build_upload_preview_response(
+            _upload_file("Given,Preferred name,Empty name,Availability,Remarks\nGrace,Gracie,,Now,Met at expo\n"),
+            use_llm=True,
+        )
+    )
+
+    mapping = result["suggested_mapping"]
+    assert mapping["Given"] == "first_name"
+    assert mapping["Preferred name"] == "custom"      # value kept as extra data
+    assert mapping["Empty name"] == "ignore"
+    assert mapping["Availability"] == "notes" and mapping["Remarks"] == "notes"   # notes are joined
+    assert "Preferred name" in result["field_groups"]["Other Fields"]
+
+
+def test_header_suggestions_prefer_the_tighter_match_for_one_field():
+    from backend.services.candidate_pool import suggest_header_mapping
+
+    mapping = suggest_header_mapping([
+        "Your Linkedin profile link",
+        "Share one long-form and one short-form content piece (email, LinkedIn ads)",
+        "Profile Link", "Person Linkedin Url",
+    ])
+    assert "Share one long-form and one short-form content piece (email, LinkedIn ads)" not in mapping
+    # exact aliases are equally good and both stay
+    assert mapping["Profile Link"] == "linkedin" and mapping["Person Linkedin Url"] == "linkedin"

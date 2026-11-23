@@ -8,7 +8,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -86,6 +86,7 @@ def _row_values(
 ) -> tuple[Dict[str, Optional[str]], Dict[str, Any]]:
     out: Dict[str, Optional[str]] = {}
     raw: Dict[str, Any] = {}
+    note_parts: List[tuple[str, str]] = []
     for src, tgt in mapping.items():
         if src not in row.index:
             continue
@@ -103,11 +104,24 @@ def _row_values(
             if clean_val is not None:
                 raw[src] = clean_val
             continue
+        if tgt == "notes":
+            # Notes is free text, so several columns may feed it; they are joined below.
+            out.setdefault("notes", None)
+            if clean_val is not None:
+                note_parts.append((" ".join(str(src).split()), clean_val))
+            continue
+        # Two columns mapped to one field: a blank cell must not wipe the other column's value.
+        if clean_val is None and out.get(tgt) is not None:
+            continue
         out[tgt] = clean_val
         if tgt == "title" and _normalized_header_key(src) == "headline" and clean_val is not None:
             out.setdefault("headline", clean_val)
         if tgt == "city" and _is_full_location_header(src) and clean_val is not None:
             out.setdefault("location", clean_val)
+    if len(note_parts) == 1:
+        out["notes"] = note_parts[0][1]
+    elif note_parts:
+        out["notes"] = "\n".join(f"{label}: {value}" for label, value in note_parts)
     company_for_title = (
         out.get("company_name")
         or raw.get("experiences/0/companyName")
@@ -514,6 +528,54 @@ async def build_upload_preview_response(file: UploadFile, use_llm: bool = False)
     return await build_preview_from_frame(df, filename=file.filename, use_llm=use_llm)
 
 
+# Targets that may take values from several columns (notes are joined) or are not fields at all.
+_MULTI_COLUMN_TARGETS = frozenset({"notes", "custom", "ignore"})
+
+
+def _keep_one_header_per_model_target(
+    suggested: Dict[str, str],
+    mapping_details: Dict[str, Dict[str, Any]],
+    field_groups: Dict[str, List[str]],
+) -> None:
+    """A field holds one value per row. When the model hands the same field to several
+    columns, the most confident column keeps it and the rest become custom columns, so
+    their values are kept as extra data instead of overwriting each other. Columns
+    matched by a header alias are left alone (two exact LinkedIn columns are legitimate)."""
+    by_target: Dict[str, List[str]] = {}
+    for header, target in suggested.items():
+        if target and target not in _MULTI_COLUMN_TARGETS:
+            by_target.setdefault(target, []).append(header)
+    for target, headers in by_target.items():
+        model_headers = [h for h in headers if mapping_details.get(h, {}).get("source") == "model"]
+        if len(headers) < 2 or not model_headers:
+            continue
+        aliased = [h for h in headers if h not in model_headers]
+        keeper = None if aliased else max(
+            model_headers, key=lambda h: float(mapping_details.get(h, {}).get("confidence") or 0))
+        for header in model_headers:
+            if header == keeper:
+                continue
+            detail = mapping_details.get(header, {})
+            has_value = any(detail.get("sample_values") or [])
+            new_target = "custom" if has_value else "ignore"
+            suggested[header] = new_target
+            for group_headers in field_groups.values():
+                if header in group_headers:
+                    group_headers.remove(header)
+            # A guess already flagged for review stays flagged, with its original reason.
+            flagged = detail.get("category") == "Needs Review"
+            category = "Needs Review" if flagged else "Other Fields"
+            note = (f"Another column is already mapped to {target}; kept as extra data"
+                    if has_value else "Another column is already mapped to this field")
+            detail.update({
+                "target": new_target, "source": "custom" if has_value else "manual", "category": category,
+                "reason": f"{detail.get('reason')}. {note}" if flagged and detail.get("reason") else note,
+                "preserve_reason": "Preserved as imported extra data" if has_value else "",
+            })
+            mapping_details[header] = detail
+            field_groups.setdefault(category, []).append(header)
+
+
 async def build_preview_from_frame(
     df: pd.DataFrame, *, filename: Optional[str], use_llm: bool = False
 ) -> Dict[str, Any]:
@@ -614,6 +676,8 @@ async def build_preview_from_frame(
             "detected_pattern": meta.get("detected_pattern") or "",
         }
         field_groups.setdefault(mapping_details[header]["category"], []).append(header)
+
+    _keep_one_header_per_model_target(suggested, mapping_details, field_groups)
 
     used_targets = {v for v in suggested.values() if v and v != "ignore"}
     if "title" not in used_targets:
@@ -1168,10 +1232,21 @@ def _process_upload_rows(
     duplicate_policy: str = UPSERT_EXISTING_POLICY,
     base_counts: Optional[Dict[str, int]] = None,
     base_errors: Optional[List[str]] = None,
+    progress_sink: Optional[Callable[..., None]] = None,
 ) -> None:
     """``base_counts`` / ``base_errors`` carry totals from an earlier phase that
-    reported into the same upload row (Google Sheet import: LinkedIn rows first),
-    so this phase adds to them instead of overwriting."""
+    reported into the same upload row, so this phase adds to them instead of
+    overwriting. ``progress_sink`` receives every progress update (counts, status,
+    errors, failure) instead of the upload row, for a caller that runs this next to
+    another phase and merges the two (Google Sheet import)."""
+    if progress_sink is not None:
+        def write_progress(_cur, _upload_id: int, **updates: Any) -> None:
+            progress_sink(**updates)
+
+        def mark_failed(_upload_id: int, message: str) -> None:
+            progress_sink(status="failed", error_message=message)
+    else:
+        write_progress, mark_failed = _write_upload_progress, _mark_upload_failed
     base = base_counts or {}
     inserted = int(base.get("inserted") or 0)
     updated = int(base.get("updated") or 0)
@@ -1187,7 +1262,7 @@ def _process_upload_rows(
     duplicate_policy = _normalize_duplicate_policy(duplicate_policy)
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
-        _mark_upload_failed(upload_id, "Database connection failed")
+        mark_failed(upload_id, "Database connection failed")
         return
 
     try:
@@ -1254,7 +1329,7 @@ def _process_upload_rows(
                     role_assigned_count += fast_role_count
                     touched_ids.extend(fast_master_ids)
                     touched_ids.extend(fast_candidate_ids)
-                    _write_upload_progress(
+                    write_progress(
                         cur,
                         upload_id,
                         processed_count=processed_count,
@@ -1401,7 +1476,7 @@ def _process_upload_rows(
                             skipped += 1
 
                 if sequence % batch_size == 0 or sequence == base_processed + len(prepared_rows):
-                    _write_upload_progress(
+                    write_progress(
                         cur,
                         upload_id,
                         processed_count=processed_count,
@@ -1414,7 +1489,7 @@ def _process_upload_rows(
                     conn.commit()
 
             with conn.cursor() as cur:
-                _write_upload_progress(
+                write_progress(
                     cur,
                     upload_id,
                     processed_count=processed_count,
@@ -1438,7 +1513,7 @@ def _process_upload_rows(
     except Exception as exc:
         conn.rollback()
         logger.exception("candidate upload worker failed upload_id=%s", upload_id)
-        _mark_upload_failed(upload_id, str(exc))
+        mark_failed(upload_id, str(exc))
         return
     finally:
         return_db_connection(conn)
@@ -1449,7 +1524,7 @@ def _process_upload_rows(
         if conn:
             try:
                 with conn.cursor() as cur:
-                    _write_upload_progress(
+                    write_progress(
                         cur,
                         upload_id,
                         status="enriching",
@@ -1487,11 +1562,11 @@ def _process_upload_rows(
         final_status = "completed_with_errors"
     conn = get_db_connection(validate=False, register_pgvector=False)
     if not conn:
-        _mark_upload_failed(upload_id, "Database connection failed while finalizing import")
+        mark_failed(upload_id, "Database connection failed while finalizing import")
         return
     try:
         with conn.cursor() as cur:
-            _write_upload_progress(
+            write_progress(
                 cur,
                 upload_id,
                 processed_count=processed_count,

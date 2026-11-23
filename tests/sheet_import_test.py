@@ -42,7 +42,8 @@ def fake_li(monkeypatch):
     """In-memory stand-ins for every LinkedIn-import DB helper."""
     state: Dict[str, Any] = {"progress": [], "existing": {}, "persisted": [], "roles": [], "scrapes": []}
     monkeypatch.setattr(li, "write_progress", lambda upload_id, **u: state["progress"].append(u))
-    monkeypatch.setattr(li, "existing_candidates", lambda key, owner: state["existing"].get(key, []))
+    monkeypatch.setattr(li, "existing_candidates_bulk",
+                        lambda keys, owner: {k: state["existing"].get(k, []) for k in keys})
     monkeypatch.setattr(li, "delete_candidates", lambda ids: len(ids))
     monkeypatch.setattr(li, "known_companies", lambda names: {})
     monkeypatch.setattr(li, "assign_role", lambda role_id, cid: state["roles"].append((role_id, cid)) or bool(role_id))
@@ -132,12 +133,23 @@ def test_duplicate_is_attached_to_the_role_and_can_be_quiet(fake_li, monkeypatch
 
 
 # -------------------------------------------------------------------- orchestration
+def _fake_sheet_rows(calls: List[Dict[str, Any]]):
+    """Stand-in for the sheet-values import: every row is inserted and reported to the sink."""
+    def run(**kw):
+        calls.append(kw)
+        n = len(kw["df"].index)
+        kw["progress_sink"](processed_count=n, inserted_count=n, updated_count=0, skipped_count=0,
+                            role_assigned_count=n if kw.get("role_id") else 0, status="completed",
+                            completed_at="early")       # a phase ending must not close the upload
+    return run
+
+
 def test_run_sheet_import_enriches_profiles_and_loads_the_rest_from_the_sheet(fake_li, monkeypatch):
     # Apify returns Ada but not Alan -> Alan falls back to the sheet values.
     monkeypatch.setattr(li, "scrape_profiles", lambda urls: fake_li["scrapes"].append(list(urls)) or {
         "rows": [_row(ADA, "Ada Lovelace")], "failed": [ALAN], "requested": len(urls)})
-    phase2: Dict[str, Any] = {}
-    monkeypatch.setattr(ci, "_process_upload_rows", lambda **kw: phase2.update(kw))
+    calls: List[Dict[str, Any]] = []
+    monkeypatch.setattr(ci, "_process_upload_rows", _fake_sheet_rows(calls))
 
     result = si.run_sheet_import(upload_id=9, df=_frame(), mapping=MAPPING, owner_user_id=28,
                                  user_role="recruiter", role_id=5, enrich_linkedin=True,
@@ -148,17 +160,67 @@ def test_run_sheet_import_enriches_profiles_and_loads_the_rest_from_the_sheet(fa
     assert saved["name"] == "Ada Lovelace"
     assert saved["email"] == "ada@example.com" and saved["phone"] == "111" and saved["notes"] == "met at expo"
     assert saved["raw_fields"]["Expected CTC"] == "30 LPA"
-    assert fake_li["roles"] == [(5, 101)]
+    assert (5, 101) in fake_li["roles"]
 
-    # phase 2 gets the no-URL row, the company-page row, and Alan (deferred), in sheet order
-    assert list(phase2["df"]["First"]) == ["Noli", "Alan", "Company row"]
-    assert phase2["enrichment_mode"] == "verified_profile" and phase2["role_id"] == 5
-    assert phase2["base_counts"] == {"inserted": 1, "updated": 0, "skipped": 1, "role_assigned": 1, "processed": 2}
-    assert any("loaded from the sheet values" in e for e in phase2["base_errors"])
-    assert any("repeat a LinkedIn profile" in e for e in phase2["base_errors"])
-    # phase 1 must leave the upload open for phase 2
-    assert not any(u.get("status") in {"completed", "completed_with_errors"} for u in fake_li["progress"])
+    # the rows with no profile URL load on their own; Alan (not returned by Apify) falls back afterwards
+    assert [list(c["df"]["First"]) for c in calls] == [["Noli", "Company row"], ["Alan"]]
+    assert all(c["enrichment_mode"] == "verified_profile" and c["role_id"] == 5 for c in calls)
+
+    # one upload row, the sum of every phase: Ada + the repeated Ada row + 2 sheet rows + Alan
+    final = fake_li["progress"][-1]
+    assert final["processed_count"] == 5 and final["inserted_count"] == 4 and final["skipped_count"] == 1
+    assert final["role_assigned_count"] == 4
+    assert final["status"] == "completed_with_errors" and final["completed_at"] != "early"
+    assert "loaded from the sheet values" in final["error_message"]
+    assert "repeat a LinkedIn profile" in final["error_message"]
+    closing = [u for u in fake_li["progress"] if u.get("status") in {"completed", "completed_with_errors"}]
+    assert closing == [final]                               # closed once, at the very end
+    counts = [u["processed_count"] for u in fake_li["progress"] if "processed_count" in u]
+    assert counts == sorted(counts)                         # the bar never goes backwards
     assert result["linkedin_rows"] == 2 and result["sheet_rows"] == 3 and result["repeated_rows"] == 1
+
+
+def test_sheet_only_rows_load_while_linkedin_rows_are_still_enriching(fake_li, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(li, "scrape_profiles", lambda urls: {
+        "rows": [_row(u, u) for u in urls], "failed": [], "requested": len(urls)})
+    sheet_rows_loaded = threading.Event()
+    seen = {"sheet_done_before_linkedin_saved": False}
+    calls: List[Dict[str, Any]] = []
+    load = _fake_sheet_rows(calls)
+
+    def sheet_rows(**kw):
+        load(**kw)
+        sheet_rows_loaded.set()
+
+    def slow_map(raw, **kw):
+        seen["sheet_done_before_linkedin_saved"] = sheet_rows_loaded.wait(timeout=5)
+        return {"candidates": {"name": raw["fullName"], "raw_fields": dict(raw)}, "coverage": {}}
+
+    monkeypatch.setattr(ci, "_process_upload_rows", sheet_rows)
+    monkeypatch.setattr(li, "map_scraped_profile", slow_map)
+    si.run_sheet_import(upload_id=9, df=_frame(), mapping=MAPPING, owner_user_id=28, user_role="recruiter",
+                        role_id=None)
+
+    assert seen["sheet_done_before_linkedin_saved"]
+    final = fake_li["progress"][-1]
+    assert final["processed_count"] == 5 and final["status"] == "completed_with_errors"   # the repeat line
+
+
+def test_a_crash_in_the_sheet_rows_is_reported_without_losing_the_linkedin_rows(fake_li, monkeypatch):
+    monkeypatch.setattr(li, "scrape_profiles", lambda urls: {
+        "rows": [_row(u, u) for u in urls], "failed": [], "requested": len(urls)})
+
+    def crash(**kw):
+        kw["progress_sink"](status="failed", error_message="Database connection failed")
+
+    monkeypatch.setattr(ci, "_process_upload_rows", crash)
+    si.run_sheet_import(upload_id=9, df=_frame(), mapping=MAPPING, owner_user_id=28, user_role="recruiter",
+                        role_id=None)
+    final = fake_li["progress"][-1]
+    assert final["status"] == "failed" and "Database connection failed" in final["error_message"]
+    assert final["inserted_count"] == 2                      # Ada and Alan were still loaded and counted
 
 
 def test_run_sheet_import_finalizes_itself_when_every_row_was_enriched(fake_li, monkeypatch):

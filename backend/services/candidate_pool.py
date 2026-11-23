@@ -78,6 +78,9 @@ def suggest_header_mapping(headers: List[str]) -> Dict[str, str]:
        known computed/combined column (e.g. fullName, fullname).
     """
     out: Dict[str, str] = {}
+    # How tightly each header matched its alias: 1.0 for an exact alias, else the
+    # share of the header the alias covers. Used to settle two headers claiming one target.
+    fit: Dict[str, float] = {}
     for orig in headers:
         if not orig or not str(orig).strip():
             continue
@@ -114,10 +117,12 @@ def suggest_header_mapping(headers: List[str]) -> Dict[str, str]:
         is_computed = key in _COMPUTED_HEADER_KEYS
 
         matched = None
+        score = 0.0
         # Pass 1: exact alias match (always attempted, even for computed columns)
         for target, aliases in HEADER_ALIASES.items():
             if key in aliases:
                 matched = target
+                score = 1.0
                 break
 
         # Pass 2: substring match — skip for computed/combined columns
@@ -128,11 +133,24 @@ def suggest_header_mapping(headers: List[str]) -> Dict[str, str]:
                         matched = target
                         break
                 if matched:
+                    score = max(
+                        min(len(a), len(key)) / max(len(a), len(key))
+                        for a in HEADER_ALIASES[matched]
+                        if len(a) > 2 and (a in key or key in a)
+                    )
                     break
 
         if matched:
             out[orig] = matched
-    return out
+            fit[orig] = score
+
+    # A loose match gives way to a tighter one for the same target: a long form question
+    # that merely mentions "LinkedIn" must not sit beside the real "LinkedIn profile link"
+    # column and overwrite it. Equally good matches (two exact aliases) are both kept.
+    best: Dict[str, float] = {}
+    for orig, target in out.items():
+        best[target] = max(best.get(target, 0.0), fit[orig])
+    return {orig: target for orig, target in out.items() if fit[orig] >= best[target]}
 
 
 def profile_passes_scope(

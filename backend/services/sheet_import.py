@@ -117,57 +117,146 @@ def split_rows(df: pd.DataFrame, mapping: Dict[str, str]) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------ the run
+class UploadLedger:
+    """Running totals for one upload whose phases work at the same time.
+
+    Each phase (LinkedIn rows, sheet-only rows, fallback rows) reports its own counts
+    here; the upload row always shows their sum. Only ``finish`` closes the upload, so
+    a phase that ends early cannot mark the whole import as done.
+    """
+
+    COUNTS = ("processed_count", "inserted_count", "updated_count", "skipped_count", "role_assigned_count")
+    LIVE_STATUSES = ("scraping", "enriching")
+
+    def __init__(self, upload_id: int):
+        self.upload_id = upload_id
+        self._lock = threading.Lock()
+        self._phases: Dict[str, Dict[str, Any]] = {}
+        self._status: Optional[str] = None
+
+    def _phase(self, name: str) -> Dict[str, Any]:
+        return self._phases.setdefault(name, {**{c: 0 for c in self.COUNTS}, "errors": [], "failed": False})
+
+    def _totals(self) -> Dict[str, Any]:
+        totals: Dict[str, Any] = {c: sum(p[c] for p in self._phases.values()) for c in self.COUNTS}
+        totals["error_message"] = "\n".join(self.errors())[:8000] or None
+        return totals
+
+    def errors(self) -> List[str]:
+        return [line for phase in self._phases.values() for line in phase["errors"]]
+
+    def failed(self, name: str) -> bool:
+        return bool(self._phases.get(name, {}).get("failed"))
+
+    def sink(self, name: str, *, shows_status: bool = False):
+        """A progress writer for one phase. ``shows_status`` lets that phase drive the
+        stage the user sees (scraping / enriching) while the import runs."""
+        def write(**updates: Any) -> None:
+            with self._lock:      # held across the write so sums reach the row in order
+                phase = self._phase(name)
+                for count in self.COUNTS:
+                    if count in updates:
+                        phase[count] = int(updates[count] or 0)
+                if "error_message" in updates:
+                    phase["errors"] = [line for line in str(updates["error_message"] or "").splitlines() if line]
+                status = updates.get("status")
+                if status == "failed":
+                    phase["failed"] = True
+                row = self._totals()
+                if shows_status and status in self.LIVE_STATUSES and status != self._status:
+                    self._status = row["status"] = status
+                linkedin_import.write_progress(self.upload_id, **row)
+        return write
+
+    def add(self, name: str, *, errors: Optional[List[str]] = None, **counts: int) -> None:
+        with self._lock:
+            phase = self._phase(name)
+            for count, amount in counts.items():
+                phase[count] += int(amount)
+            phase["errors"] += list(errors or [])
+
+    def finish(self) -> str:
+        """Write the final totals and close the upload. Returns the final status."""
+        with self._lock:
+            row = self._totals()
+            if any(p["failed"] for p in self._phases.values()):
+                status = "failed"
+            else:
+                status = "completed_with_errors" if row["error_message"] else "completed"
+            linkedin_import.write_progress(self.upload_id, **row, status=status,
+                                           completed_at=datetime.now(timezone.utc))
+        return status
+
+
 def run_sheet_import(*, upload_id: int, df: pd.DataFrame, mapping: Dict[str, str], owner_user_id: int,
                      user_role: str, role_id: Optional[int], enrich_linkedin: bool = True,
                      enrichment_mode: str = "none") -> Dict[str, Any]:
-    """Run both phases for one tab. Returns the phase-1 result plus the phase split."""
+    """Run one tab. Rows with a LinkedIn profile are scraped and enriched; rows without
+    one load from their sheet values at the same time; rows Apify could not return fall
+    back to their sheet values at the end. Returns the LinkedIn result plus the split."""
+    plain = dict(upload_id=upload_id, mapping=mapping, owner_user_id=owner_user_id, user_role=user_role,
+                 role_id=role_id, enrichment_mode=enrichment_mode)
     if not enrich_linkedin:
-        ci._process_upload_rows(upload_id=upload_id, df=df, mapping=mapping, owner_user_id=owner_user_id,
-                                user_role=user_role, role_id=role_id, enrichment_mode=enrichment_mode)
+        ci._process_upload_rows(df=df, **plain)
         return {"linkedin_rows": 0, "sheet_rows": int(len(df.index)), "repeated_rows": 0}
 
     split = split_rows(df, mapping)
-    phase1: Dict[str, Any] = {"inserted": 0, "updated": 0, "skipped": 0, "processed": 0,
-                              "role_assigned_count": 0, "errors": [], "deferred": [], "status": "completed"}
-    if split["urls"]:
-        phase1 = linkedin_import.run_linkedin_import(
-            upload_id=upload_id, urls=split["urls"], owner_user_id=owner_user_id, role_id=role_id,
-            duplicate_policy=linkedin_import.DUPLICATE_SKIP, row_extras=split["extras"],
-            defer_missing=True, finalize=False, quiet_duplicates=True,
-        )
-        if phase1.get("status") == "failed":
-            return {**phase1, "linkedin_rows": len(split["urls"]), "sheet_rows": 0,
-                    "repeated_rows": len(split["repeated"])}
+    if not split["urls"]:      # nothing to enrich: it is a plain spreadsheet import
+        ci._process_upload_rows(df=df.iloc[sorted(split["sheet_only"])], **plain)
+        return {"inserted": 0, "updated": 0, "skipped": 0, "processed": 0, "role_assigned_count": 0,
+                "errors": [], "deferred": [], "status": "completed", "linkedin_rows": 0,
+                "sheet_rows": len(split["sheet_only"]), "repeated_rows": 0}
 
-    deferred_positions = [split["position_by_key"][normalize_linkedin(u)] for u in phase1.get("deferred") or []
-                          if normalize_linkedin(u) in split["position_by_key"]]
-    phase2_positions = sorted(set(split["sheet_only"]) | set(deferred_positions))
+    ledger = UploadLedger(upload_id)
+    linkedin_sink = ledger.sink("linkedin", shows_status=True)
+    sheet_thread: Optional[threading.Thread] = None
+
+    def load_sheet_only() -> None:
+        try:
+            ci._process_upload_rows(df=df.iloc[sorted(split["sheet_only"])], progress_sink=ledger.sink("sheet"),
+                                    **plain)
+        except Exception as exc:
+            logger.exception("sheet-only rows crashed upload_id=%s", upload_id)
+            ledger.add("sheet", errors=[f"sheet rows: {exc}"[:500]])
+
+    def report(**updates: Any) -> None:
+        # The sheet-only rows start once Apify has answered (status moves to enriching):
+        # if Apify is down the import fails as a whole and nothing is half-loaded.
+        nonlocal sheet_thread
+        linkedin_sink(**updates)
+        if updates.get("status") == "enriching" and sheet_thread is None and split["sheet_only"]:
+            sheet_thread = threading.Thread(target=load_sheet_only, daemon=True,
+                                            name=f"sheet-import-{upload_id}-rows")
+            sheet_thread.start()
+
+    phase1 = linkedin_import.run_linkedin_import(
+        upload_id=upload_id, urls=split["urls"], owner_user_id=owner_user_id, role_id=role_id,
+        duplicate_policy=linkedin_import.DUPLICATE_SKIP, row_extras=split["extras"],
+        defer_missing=True, finalize=False, quiet_duplicates=True, report=report,
+    )
+    if sheet_thread is not None:
+        sheet_thread.join()
     repeated = len(split["repeated"])
-    errors = list(phase1.get("errors") or [])
-    if repeated:
-        errors.append(f"{repeated} row(s) repeat a LinkedIn profile already listed earlier in the sheet (skipped)")
-    base = {
-        "inserted": phase1["inserted"],
-        "updated": phase1["updated"],
-        "skipped": phase1["skipped"] + repeated,
-        "role_assigned": phase1["role_assigned_count"],
-        "processed": phase1["processed"] + repeated,
-    }
+    if phase1.get("status") == "failed":
+        ledger.finish()
+        return {**phase1, "linkedin_rows": len(split["urls"]), "sheet_rows": 0, "repeated_rows": repeated}
 
-    if phase2_positions:
-        ci._process_upload_rows(
-            upload_id=upload_id, df=df.iloc[phase2_positions], mapping=mapping, owner_user_id=owner_user_id,
-            user_role=user_role, role_id=role_id, enrichment_mode=enrichment_mode,
-            base_counts=base, base_errors=errors,
-        )
-    else:
-        linkedin_import.write_progress(
-            upload_id, processed_count=base["processed"], skipped_count=base["skipped"],
-            status="completed_with_errors" if errors else "completed",
-            completed_at=datetime.now(timezone.utc), error_message="\n".join(errors)[:8000] or None,
-        )
-    return {**phase1, "linkedin_rows": len(split["urls"]), "sheet_rows": len(phase2_positions),
-            "repeated_rows": repeated}
+    if repeated:
+        ledger.add("linkedin", processed_count=repeated, skipped_count=repeated, errors=[
+            f"{repeated} row(s) repeat a LinkedIn profile already listed earlier in the sheet (skipped)"])
+
+    # Profiles Apify could not return still get loaded, from what the sheet says about them.
+    fallback = sorted(split["position_by_key"][normalize_linkedin(u)] for u in phase1.get("deferred") or []
+                      if normalize_linkedin(u) in split["position_by_key"])
+    if fallback:
+        try:
+            ci._process_upload_rows(df=df.iloc[fallback], progress_sink=ledger.sink("fallback"), **plain)
+        except Exception as exc:
+            logger.exception("fallback rows crashed upload_id=%s", upload_id)
+            ledger.add("fallback", errors=[f"fallback rows: {exc}"[:500]])
+    status = ledger.finish()
+    return {**phase1, "status": status, "linkedin_rows": len(split["urls"]),
+            "sheet_rows": len(split["sheet_only"]) + len(fallback), "repeated_rows": repeated}
 
 
 def start_sheet_import(*, df: pd.DataFrame, mapping: Dict[str, str], owner_user_id: int, user_role: str,

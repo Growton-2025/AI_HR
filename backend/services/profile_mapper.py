@@ -20,8 +20,10 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from backend.services import import_enrichment as ie
 from backend.services.linkedin_normalize import normalize_linkedin
@@ -79,10 +81,21 @@ def _json_object(text: str) -> Dict[str, Any]:
     return json.loads(snippet)
 
 
-def _client():
-    from openai import OpenAI
+_openai_client = None
+_openai_client_lock = threading.Lock()
 
-    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def _client():
+    """One shared client: it is thread-safe, keeps connections open between calls, and
+    backs off and retries when several profiles hit a rate limit at the same time."""
+    global _openai_client
+    if _openai_client is None:
+        with _openai_client_lock:
+            if _openai_client is None:
+                from openai import OpenAI
+
+                _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), max_retries=5)
+    return _openai_client
 
 
 # ------------------------------------------------------------ deterministic: gaps
@@ -132,6 +145,38 @@ def industry_gaps(roles: Sequence[ie.ParsedRole]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------- web: companies
+# Model and web calls made while mapping one profile wait on the network, not the CPU,
+# so they share this pool and run side by side (employer research, the embedding).
+_IO_POOL = ThreadPoolExecutor(max_workers=int(os.getenv("PROFILE_MAPPER_IO_WORKERS", "24") or 24),
+                              thread_name_prefix="profile-map-io")
+
+
+class CompanyCache:
+    """Employers already researched during one import run, shared by every profile in it.
+
+    The first profile that needs an employer researches it; others asking for the same
+    employer meanwhile wait for that one answer instead of paying for the web search again.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: Dict[str, Future] = {}
+
+    def get(self, name: str, build: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+        key = name.strip().lower()
+        with self._lock:
+            job = self._jobs.get(key)
+            owner = job is None
+            if owner:
+                job = self._jobs[key] = Future()
+        if owner:
+            try:
+                job.set_result(build())
+            except BaseException as exc:
+                job.set_exception(exc)
+        return dict(job.result())
+
+
 def research_company(name: str, hint: str = "") -> Dict[str, Any]:
     """Web-search one employer for the companies-table columns. Values the model
     cannot support from sources are returned as null, never guessed."""
@@ -230,9 +275,11 @@ def embed(text: str) -> List[float]:
 
 # ---------------------------------------------------------------------- the mapper
 def map_scraped_profile(raw: Dict[str, Any], *, use_llm: bool = True, use_web: bool = True,
-                        known_companies: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+                        known_companies: Optional[Dict[str, Dict[str, Any]]] = None,
+                        company_cache: Optional[CompanyCache] = None) -> Dict[str, Any]:
     """``known_companies`` maps lower-case name -> existing companies row; those are
-    reused instead of re-researched (saves a web call and never overwrites data)."""
+    reused instead of re-researched (saves a web call and never overwrites data).
+    ``company_cache`` shares employer research between the profiles of one import run."""
     known_companies = known_companies or {}
     cand_in = {"id": 0, "raw_fields": raw, "name": raw.get("fullName"),
                "headline": raw.get("headline"), "about": raw.get("about")}
@@ -241,24 +288,35 @@ def map_scraped_profile(raw: Dict[str, Any], *, use_llm: bool = True, use_web: b
     metrics = ie.calculate_tenure_metrics(roles, raw_total_exp_years=None)
 
     # companies: classify locally, then web-research anything not already stored
-    companies: Dict[str, Dict[str, Any]] = {}
     contexts = ie._company_contexts_by_norm([cand_in], {0: roles})
-    for name in sorted({r.company for r in roles if _txt(r.company)}):
+
+    def company_row(name: str) -> Dict[str, Any]:
         existing = known_companies.get(name.lower())
         if existing and existing.get("funding_stage") and existing.get("product_service"):
-            companies[name] = {**existing, "name": name, "_source": "db"}
-            continue
-        classified = ie.classify_company(
-            name, role_texts=contexts.get(ie.normalize_company_name(name), []),
-            db_details=existing, allow_web=use_web)
-        researched: Dict[str, Any] = {}
-        if use_web:
-            try:
-                researched = research_company(name, f"Website: {next((r.source_website for r in roles if r.company == name and r.source_website), '')}")
-            except Exception as exc:  # one bad company must not sink the profile
-                logger.warning("company research failed for %s: %s", name, exc)
-        companies[name] = {**build_company_row(name, classified, researched), "_source": "web" if researched else "local",
-                           "_classified": classified}
+            return {**existing, "name": name, "_source": "db"}
+
+        def build() -> Dict[str, Any]:
+            classified = ie.classify_company(
+                name, role_texts=contexts.get(ie.normalize_company_name(name), []),
+                db_details=existing, allow_web=use_web)
+            researched: Dict[str, Any] = {}
+            if use_web:
+                try:
+                    researched = research_company(name, f"Website: {next((r.source_website for r in roles if r.company == name and r.source_website), '')}")
+                except Exception as exc:  # one bad company must not sink the profile
+                    logger.warning("company research failed for %s: %s", name, exc)
+            return {**build_company_row(name, classified, researched),
+                    "_source": "web" if researched else "local", "_classified": classified}
+
+        row = company_cache.get(name, build) if company_cache is not None else build()
+        return {**row, "name": name}
+
+    names = sorted({r.company for r in roles if _txt(r.company)})
+    # Employers are independent lookups, so one profile's unknown employers run together.
+    company_jobs = [(name, _IO_POOL.submit(company_row, name)) for name in names[1:]]
+    companies: Dict[str, Dict[str, Any]] = {names[0]: company_row(names[0])} if names else {}
+    for name, job in company_jobs:
+        companies[name] = job.result()
     for r in roles:
         c = companies.get(r.company, {}).get("_classified", {})
         r.product_service = c.get("product_service") if isinstance(c.get("product_service"), str) else (companies.get(r.company, {}).get("product_service") or "Unknown")
@@ -299,6 +357,8 @@ def map_scraped_profile(raw: Dict[str, Any], *, use_llm: bool = True, use_web: b
     scores: Dict[str, Any] = {}
     if use_llm:
         tenure = {c["company"]: c["years"] for c in metrics.get("company_years", [])}
+        # The embedding text does not depend on the scores, so it is fetched while the model scores.
+        embedding_job = _IO_POOL.submit(embed, embedding_text(cand, roles))
         scores = score_candidate({
             "headline": cand["headline"], "about": cand["about"], "location": loc,
             "roles": [{"title": r.title, "company": r.company, "details": r.details,
@@ -315,7 +375,7 @@ def map_scraped_profile(raw: Dict[str, Any], *, use_llm: bool = True, use_web: b
         tm = scores.get("team_management") or {}
         cand["max_people_managed"] = tm.get("max_people_managed")
         cand["years_team_management"] = tm.get("years_team_management")
-        cand["embedding"] = embed(embedding_text(cand, roles))
+        cand["embedding"] = embedding_job.result()
 
     def exp_table(key: str, child: str) -> Optional[Dict[str, Any]]:
         block = scores.get(key)

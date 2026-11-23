@@ -67,6 +67,9 @@ export default function CsvMappingModal({
   busy = false,
   extraPanel = null,
   importLabel = 'Import',
+  onSmartMatch = null,          // when given, the Smart match badge becomes a button that runs the AI mapping
+  smartMatching = false,
+  runsInBackground = false,     // the import keeps going after this window closes, so Close is never blocked
   onEnrichmentModeChange,
   onChange,
   onCancel,
@@ -90,7 +93,8 @@ export default function CsvMappingModal({
   const hasProgress = Boolean(progress?.upload_id || progressStatus);
   const isFailed = progressStatus === 'failed';
   const isComplete = ['completed', 'completed_with_errors'].includes(progressStatus);
-  const closeBlocked = busy && !isComplete && !isFailed;
+  const closeBlocked = busy && !isComplete && !isFailed && !runsInBackground;
+  const inFlight = hasProgress && !isComplete && !isFailed;
   const totalRows = Number(progress?.row_count || rowCount || 0);
   const processedRows = Math.min(Number(progress?.processed_count || 0), totalRows || Number(progress?.processed_count || 0));
   const progressPercent = totalRows > 0 ? Math.max(3, Math.min(100, Math.round((processedRows / totalRows) * 100))) : 6;
@@ -153,9 +157,24 @@ export default function CsvMappingModal({
             <h3 style={{ margin: '0 0 6px', fontSize: 20, fontWeight: 800, color: '#0f172a' }}>{title}</h3>
             <p style={{ margin: 0, color: '#64748b', fontSize: 13, lineHeight: 1.5 }}>{subtitle}</p>
           </div>
-          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 10, background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa', fontSize: 12, fontWeight: 800, whiteSpace: 'nowrap' }}>
-            <Wand2 size={14} /> Smart match
-          </div>
+          {onSmartMatch ? (
+            !hasProgress && (
+              <button
+                type="button"
+                onClick={onSmartMatch}
+                disabled={busy || smartMatching}
+                title="Let AI suggest the mapping for columns the rules could not place"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 10, background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa', fontSize: 12, fontWeight: 800, whiteSpace: 'nowrap', cursor: busy || smartMatching ? 'not-allowed' : 'pointer', opacity: busy || smartMatching ? 0.7 : 1 }}
+              >
+                {smartMatching ? <Loader2 size={14} style={{ animation: 'csvUploadSpin 1s linear infinite' }} /> : <Wand2 size={14} />}
+                {smartMatching ? 'Matching…' : 'Smart match'}
+              </button>
+            )
+          ) : (
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 10, background: '#fff7ed', color: '#9a3412', border: '1px solid #fed7aa', fontSize: 12, fontWeight: 800, whiteSpace: 'nowrap' }}>
+              <Wand2 size={14} /> Smart match
+            </div>
+          )}
           <button
             type="button"
             onClick={onCancel}
@@ -216,6 +235,10 @@ export default function CsvMappingModal({
                         ? 'Import complete'
                         : progressStatus === 'refreshing'
                           ? 'Finalizing imported profiles'
+                          : progressStatus === 'scraping'
+                            ? 'Reading LinkedIn profiles'
+                          : progressStatus === 'enriching' && totalRows > 0
+                            ? `Enriching profile ${Math.min(processedRows + 1, totalRows)} of ${totalRows}`
                           : totalRows > 0
                             ? `Processing profile ${processedRows} of ${totalRows}`
                             : 'Processing uploaded profiles'}
@@ -225,9 +248,12 @@ export default function CsvMappingModal({
                       ? (progress?.error_message || 'The upload stopped before it could finish.')
                       : isComplete
                         ? (summaryBits.length ? summaryBits.join(' | ') : `${processedRows || totalRows} spreadsheet rows processed`)
+                        : progressStatus === 'scraping'
+                          ? 'Fetching the profiles from LinkedIn. This step takes about 15 seconds, however many rows there are.'
                         : progressStatus === 'enriching'
                           ? 'Work history, tenure, education, and company context are being verified.'
                         : 'Rows are checked, matched, and written as they finish.'}
+                    {runsInBackground && inFlight ? ' You can close this window; the import keeps running and you will be notified when it finishes.' : ''}
                   </div>
                 </div>
               </div>
@@ -367,7 +393,7 @@ export default function CsvMappingModal({
               : `${headers.length} column${headers.length === 1 ? '' : 's'} found`}
           </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
-            <button type="button" onClick={onCancel} disabled={busy && !isComplete && !isFailed} style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', fontWeight: 800, cursor: busy && !isComplete && !isFailed ? 'not-allowed' : 'pointer', color: '#334155' }}>{hasProgress ? 'Close' : 'Cancel'}</button>
+            <button type="button" onClick={onCancel} disabled={closeBlocked} style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #e2e8f0', background: '#fff', fontWeight: 800, cursor: closeBlocked ? 'not-allowed' : 'pointer', color: '#334155' }}>{runsInBackground && inFlight ? 'Keep running in background' : hasProgress ? 'Close' : 'Cancel'}</button>
             {!hasProgress && (
               <button type="button" disabled={busy || missingRequired.length > 0} onClick={onImport} style={{ padding: '10px 16px', borderRadius: 10, border: 'none', background: busy || missingRequired.length > 0 ? '#cbd5e1' : '#f97316', color: '#fff', fontWeight: 800, cursor: busy || missingRequired.length > 0 ? 'not-allowed' : 'pointer' }}>
                 {busy ? 'Importing...' : importLabel}

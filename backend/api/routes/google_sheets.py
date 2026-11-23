@@ -150,9 +150,15 @@ async def gsheet_preview(body: SheetPreviewBody, current_user: schemas.User = De
     preview = await ci.build_preview_from_frame(
         frame, filename=f"{loaded['sheet_title']} / {loaded['tab']['title']}", use_llm=body.use_llm)
     counts = sheet_import.linkedin_url_counts(frame)
-    # A column full of profile URLs is the LinkedIn column, whatever its header says.
-    if counts and "linkedin" not in set(preview["suggested_mapping"].values()):
-        best = max(counts, key=counts.get)
+    # The column that holds the profile URLs is the LinkedIn column, whatever the headers
+    # say; a header that only mentions LinkedIn gives the field up.
+    best = max(counts, key=counts.get) if counts else None
+    if best and preview["suggested_mapping"].get(best) != "linkedin":
+        for header, target in list(preview["suggested_mapping"].items()):
+            if target == "linkedin":
+                has_values = any(preview["mapping_details"].get(header, {}).get("sample_values") or [])
+                preview["suggested_mapping"][header] = "custom" if has_values else "ignore"
+                preview["mapping_details"].setdefault(header, {})["target"] = preview["suggested_mapping"][header]
         preview["suggested_mapping"][best] = "linkedin"
         detail = preview["mapping_details"].get(best) or {}
         detail.update({"target": "linkedin", "source": "alias", "confidence": 0.95,

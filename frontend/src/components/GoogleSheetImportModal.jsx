@@ -1,12 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
-import { FileSpreadsheet, Linkedin, Loader2, RefreshCw, Trash2, X } from 'lucide-react';
-import { API_BASE } from '../store/useAppStore';
+import { FileSpreadsheet, Linkedin, Loader2, RefreshCw, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
+import { API_BASE, useAppStore } from '../store/useAppStore';
 import { loadGoogleIdentity } from '../utils/googleIdentity';
 import CsvMappingModal from './CsvMappingModal';
-
-const DONE = ['completed', 'completed_with_errors', 'failed'];
 
 const errText = (err, fallback) => {
   const detail = err?.response?.data?.detail;
@@ -25,9 +24,17 @@ const primaryBtn = (enabled) => ({ padding: '10px 16px', borderRadius: 10, borde
  * Import candidates from a Google Sheet: connect Google, paste the link, pick the
  * tab, confirm the column mapping (same screen as a spreadsheet upload), then
  * import. Rows with a LinkedIn profile URL are scraped and enriched through Apify.
- * Saved sheets can be re-run with "Sync now". `onDone` fires after any finished run.
+ * Saved sheets can be re-run with "Sync now", or reopened with their saved mapping.
+ *
+ * The import itself is tracked by the app store (`trackImport`), so this window can be
+ * closed while it runs; pages refresh their lists on the store's `importFinishedTick`.
  */
-export default function GoogleSheetImportModal({ open, roleId = null, roleName = '', onClose, onDone }) {
+export default function GoogleSheetImportModal({ open, roleId = null, roleName = '', onClose }) {
+  const { activeImports, trackImport, importFinishedTick } = useAppStore(useShallow(state => ({
+    activeImports: state.activeImports,
+    trackImport: state.trackImport,
+    importFinishedTick: state.importFinishedTick,
+  })));
   const [google, setGoogle] = useState(null);          // { configured, connected, google_email, client_id, scope }
   const [connecting, setConnecting] = useState(false);
   const [sheetUrl, setSheetUrl] = useState('');
@@ -38,10 +45,13 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
   const [mapping, setMapping] = useState({});
   const [enrichLinkedin, setEnrichLinkedin] = useState(true);
   const [enrichmentMode, setEnrichmentMode] = useState('none');
-  const [progress, setProgress] = useState(null);
+  const [uploadId, setUploadId] = useState(null);       // the import started from this window, if any
+  const [starting, setStarting] = useState(false);      // true only while the start request is in flight
   const [busy, setBusy] = useState(false);
+  const [smartMatching, setSmartMatching] = useState(false);
   const [connections, setConnections] = useState([]);
   const [syncingId, setSyncingId] = useState(null);
+  const urlTouchedRef = useRef(false);
   const codeClientRef = useRef(null);
   const aliveRef = useRef(false);
 
@@ -55,8 +65,10 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
   useEffect(() => {
     if (!open) return undefined;
     aliveRef.current = true;
-    setSheetUrl(''); setTabs(null); setTab(''); setPreview(null); setMapping({}); setProgress(null);
-    setBusy(false); setSyncingId(null); setEnrichLinkedin(true); setEnrichmentMode('none');
+    setSheetUrl(''); setTabs(null); setTab(''); setPreview(null); setMapping({}); setUploadId(null);
+    setStarting(false); setBusy(false); setSmartMatching(false); setSyncingId(null);
+    setEnrichLinkedin(true); setEnrichmentMode('none');
+    urlTouchedRef.current = false;
     axios.get(`${API_BASE}/integrations/google/status`, { timeout: 60000 })
       .then(res => { if (aliveRef.current) setGoogle(res.data || {}); })
       .catch(err => { if (aliveRef.current) { setGoogle({ configured: false, connected: false }); toast.error(errText(err, 'Could not check the Google connection')); } });
@@ -114,20 +126,50 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
     toast.error(errText(err, fallback));
   };
 
-  const loadPreview = async (tabTitle) => {
+  // `saved` is a remembered connection: its confirmed mapping is laid over the fresh
+  // suggestions, for the columns that still exist in the sheet.
+  const loadPreview = async (tabTitle, { url = sheetUrl, saved = null } = {}) => {
     setLoading(true);
     try {
-      const res = await axios.post(`${API_BASE}/import/gsheet/preview`, { sheet_url: sheetUrl.trim(), tab: tabTitle || null, role_id: roleId, use_llm: Boolean(roleId) }, { timeout: 180000 });
+      const res = await axios.post(`${API_BASE}/import/gsheet/preview`, { sheet_url: url.trim(), tab: tabTitle || null, role_id: roleId, use_llm: false }, { timeout: 180000 });
       const data = res.data || {};
       const counts = data.linkedin_url_counts || {};
+      const suggested = data.suggested_mapping || {};
+      const remembered = {};
+      Object.entries(saved?.mapping || {}).forEach(([header, target]) => {
+        if (typeof target === 'string' && header in suggested) remembered[header] = target;
+      });
       setPreview(data);
-      setMapping(data.suggested_mapping || {});
-      setEnrichLinkedin(Object.keys(counts).length > 0);
+      setMapping({ ...suggested, ...remembered });
+      setEnrichLinkedin(saved ? Boolean(saved.enrich_linkedin) && Object.keys(counts).length > 0 : Object.keys(counts).length > 0);
+      if (saved?.enrichment_mode) setEnrichmentMode(saved.enrichment_mode);
     } catch (err) {
       handleError(err, 'Could not read the sheet');
     } finally {
       setLoading(false);
     }
+  };
+
+  // The mapping screen opens on the instant rule-based suggestions; the AI pass runs only on request.
+  const smartMatch = async () => {
+    setSmartMatching(true);
+    try {
+      const res = await axios.post(`${API_BASE}/import/gsheet/preview`, { sheet_url: sheetUrl.trim(), tab: preview?.tab || tab || null, role_id: roleId, use_llm: true }, { timeout: 180000 });
+      const data = res.data || {};
+      setPreview(data);
+      setMapping(data.suggested_mapping || {});
+      toast.success('Smart match updated the suggestions. Review them before importing.');
+    } catch (err) {
+      handleError(err, 'Smart match failed');
+    } finally {
+      setSmartMatching(false);
+    }
+  };
+
+  const reviewConnection = async (connection) => {
+    urlTouchedRef.current = true;
+    setSheetUrl(connection.sheet_url);
+    await loadPreview(connection.tab_title, { url: connection.sheet_url, saved: connection });
   };
 
   const loadSheet = async () => {
@@ -149,78 +191,59 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
     }
   };
 
-  const pollUpload = async (uploadId, first) => {
-    let d = first || {};
-    for (let attempt = 0; attempt < 3600; attempt += 1) {
-      if (!aliveRef.current) return d;
-      const poll = await axios.get(`${API_BASE}/candidates/uploads/${uploadId}`, { timeout: 60000 });
-      d = poll.data || {};
-      setProgress(d);
-      if (DONE.includes(String(d.status || '').toLowerCase())) break;
-      await new Promise(resolve => window.setTimeout(resolve, 1500));
-    }
-    return d;
-  };
-
-  const report = (d) => {
-    if (String(d.status || '').toLowerCase() === 'failed') {
-      toast.error(d.error_message || 'Google Sheet import failed');
-      return;
-    }
-    const parts = [];
-    if (Number(d.inserted) > 0) parts.push(`${Number(d.inserted)} new`);
-    if (Number(d.updated) > 0) parts.push(`${Number(d.updated)} updated`);
-    if (Number(d.skipped) > 0) parts.push(`${Number(d.skipped)} skipped`);
-    if (Number(d.role_assigned_count) > 0) parts.push(`${Number(d.role_assigned_count)} added to ${roleName || 'the role'}`);
-    toast.success(parts.length ? `Google Sheet import complete: ${parts.join(', ')}.` : 'Google Sheet import complete: nothing new.');
-    const errs = Array.isArray(d.errors) ? d.errors : [];
-    if (errs.length > 0) {
-      const text = errs.slice(0, 3).join(' ');
-      toast.warning(text.length > 300 ? `${text.slice(0, 297)}…` : text);
-    }
-    onDone?.(d);
-  };
-
   const linkedinHeader = useMemo(() => Object.keys(mapping).find(h => mapping[h] === 'linkedin') || '', [mapping]);
   const linkedinRows = Number(preview?.linkedin_url_counts?.[linkedinHeader]) || 0;
   const totalRows = Number(preview?.row_count) || 0;
 
+  const importLabel = roleName ? 'Google Sheet import' : 'Google Sheet import to your pool';
+
   const commit = async () => {
     setBusy(true);
-    setProgress({ status: 'processing', processed_count: 0, row_count: totalRows });
+    setStarting(true);
     try {
       const res = await axios.post(`${API_BASE}/import/gsheet/commit`, {
         sheet_url: sheetUrl.trim(), tab: preview?.tab || tab || null, role_id: roleId, mapping,
         enrich_linkedin: enrichLinkedin && linkedinRows > 0, enrichment_mode: enrichmentMode,
       }, { timeout: 180000 });
-      setProgress(res.data || {});
-      const d = await pollUpload(res.data?.upload_id, res.data);
-      report(d);
-      loadConnections();
+      trackImport(res.data?.upload_id, { label: importLabel, roleId, roleName }, res.data || null);
+      setUploadId(res.data?.upload_id || null);
     } catch (err) {
-      setProgress(null);
       handleError(err, 'Google Sheet import failed');
     } finally {
+      setStarting(false);
       setBusy(false);
     }
   };
 
   const syncNow = async (connection) => {
     setSyncingId(connection.id);
-    setProgress({ status: 'processing', processed_count: 0, row_count: 0 });
     try {
       const res = await axios.post(`${API_BASE}/import/gsheet/connections/${connection.id}/sync`, {}, { timeout: 180000 });
-      setProgress(res.data || {});
-      const d = await pollUpload(res.data?.upload_id, res.data);
-      report(d);
+      trackImport(res.data?.upload_id, { label: 'Google Sheet sync', roleId, roleName }, res.data || null);
+      toast.success('Sync started. You can close this window; you will be notified when it finishes.');
       loadConnections();
     } catch (err) {
       handleError(err, 'Sync failed');
     } finally {
       setSyncingId(null);
-      setProgress(null);
     }
   };
+
+  // Saved sheets show their new "last synced" time once any import finishes.
+  useEffect(() => { if (open && importFinishedTick > 0) loadConnections(); }, [open, importFinishedTick, loadConnections]);
+
+  // The most recently used sheet is offered as the starting link.
+  useEffect(() => {
+    if (!open || urlTouchedRef.current || sheetUrl || connections.length === 0) return;
+    setSheetUrl(connections[0].sheet_url || '');
+  }, [open, connections, sheetUrl]);
+
+  // Imports still running for this role (or the pool), whichever window started them.
+  const running = Object.values(activeImports || {}).filter(item => !item.finished && (item.roleId ?? null) === (roleId ?? null));
+  const tracked = uploadId ? activeImports?.[uploadId] : null;
+  const progress = starting
+    ? { status: 'processing', processed_count: 0, row_count: Number(preview?.row_count) || 0 }
+    : (tracked?.progress || null);
 
   const removeConnection = async (connection) => {
     try {
@@ -233,7 +256,6 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
 
   // ---- step 2: the shared column-mapping screen
   if (preview) {
-    const finished = DONE.includes(String(progress?.status || '').toLowerCase());
     const extraPanel = (
       <div style={{ margin: '14px 24px 0', padding: 12, borderRadius: 12, background: linkedinRows > 0 ? '#eff6ff' : '#f8fafc', border: `1px solid ${linkedinRows > 0 ? '#bfdbfe' : '#e2e8f0'}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
@@ -268,11 +290,14 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
         progress={progress}
         enrichmentMode={enrichmentMode}
         busy={busy}
+        runsInBackground
+        onSmartMatch={smartMatch}
+        smartMatching={smartMatching}
         extraPanel={extraPanel}
         importLabel={`Import ${totalRows} row${totalRows === 1 ? '' : 's'}`}
         onEnrichmentModeChange={setEnrichmentMode}
         onChange={(header, value) => setMapping(prev => ({ ...prev, [header]: value }))}
-        onCancel={() => { if (finished || !busy) { if (finished) onClose?.(); else { setPreview(null); setProgress(null); } } }}
+        onCancel={() => { if (progress) onClose?.(); else if (!busy) setPreview(null); }}
         onImport={commit}
       />
     );
@@ -280,7 +305,6 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
 
   // ---- step 1: connect, link, tab, saved sheets
   const working = loading || Boolean(syncingId);
-  const syncStage = String(progress?.status || '');
   return (
     <div style={overlay}>
       <div style={card}>
@@ -297,6 +321,22 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
             <X size={18} />
           </button>
         </div>
+
+        {running.length > 0 && (
+          <div style={{ marginTop: 16, padding: '10px 12px', borderRadius: 12, background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', fontSize: 12, fontWeight: 700 }}>
+            {running.map(item => {
+              const stage = String(item.progress?.status || '');
+              const total = Number(item.progress?.row_count) || 0;
+              return (
+                <div key={item.uploadId} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Loader2 size={13} style={{ animation: 'gsheetSpin 1s linear infinite', flexShrink: 0 }} />
+                  {item.label} is running: {stage === 'scraping' ? 'reading LinkedIn profiles' : stage === 'enriching' ? 'enriching and saving' : 'reading the sheet'}
+                  {total > 0 ? ` (${Number(item.progress?.processed_count) || 0} / ${total})` : ''}. You can close this window.
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {google === null && (
           <div style={{ marginTop: 20, display: 'flex', alignItems: 'center', gap: 8, color: '#64748b', fontSize: 13 }}>
@@ -334,7 +374,7 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
               <input
                 value={sheetUrl}
                 disabled={working}
-                onChange={e => { setSheetUrl(e.target.value); setTabs(null); setTab(''); }}
+                onChange={e => { urlTouchedRef.current = true; setSheetUrl(e.target.value); setTabs(null); setTab(''); }}
                 onKeyDown={e => { if (e.key === 'Enter' && sheetUrl.trim() && !working) (tabs ? loadPreview(tab) : loadSheet()); }}
                 placeholder="https://docs.google.com/spreadsheets/d/…"
                 style={{ width: '100%', marginTop: 6, padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', fontSize: 13, fontWeight: 500, boxSizing: 'border-box' }}
@@ -377,9 +417,12 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
                       </div>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                      <button type="button" disabled={working} onClick={() => reviewConnection(c)} title="Open this sheet with its saved column mapping, to check or change it before importing" style={{ ...ghostBtn(working), padding: '7px 11px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <SlidersHorizontal size={13} /> Review mapping
+                      </button>
                       <button type="button" disabled={working} onClick={() => syncNow(c)} title="Read the sheet again and import only people not already in the pool" style={{ ...ghostBtn(working), padding: '7px 11px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                         <RefreshCw size={13} style={syncingId === c.id ? { animation: 'gsheetSpin 1s linear infinite' } : undefined} />
-                        {syncingId === c.id ? 'Syncing…' : 'Sync now'}
+                        {syncingId === c.id ? 'Starting…' : 'Sync now'}
                       </button>
                       <button type="button" disabled={working} onClick={() => removeConnection(c)} aria-label="Remove saved sheet" title="Remove this saved sheet (imported candidates stay)" style={{ border: 'none', background: 'transparent', color: '#94a3b8', cursor: working ? 'not-allowed' : 'pointer' }}>
                         <Trash2 size={15} />
@@ -387,12 +430,6 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
                     </div>
                   </div>
                 ))}
-                {syncingId && (
-                  <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
-                    {syncStage === 'scraping' ? 'Scraping new LinkedIn profiles via Apify…' : syncStage === 'enriching' ? 'Enriching and saving…' : 'Reading the sheet…'}
-                    {Number(progress?.row_count) > 0 ? ` ${Number(progress?.processed_count) || 0} / ${Number(progress.row_count)}` : ''}
-                  </div>
-                )}
               </div>
             )}
           </>

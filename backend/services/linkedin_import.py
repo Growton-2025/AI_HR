@@ -14,15 +14,17 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from backend.db.connection import get_db_connection, return_db_connection
 from backend.services.apify_scrape import ApifyScrapeError, scrape_profiles
 from backend.services.candidate_pool import POOL_SOURCE_LEGACY_MASTER, POOL_SOURCE_RECRUITER_UPLOAD
 from backend.services.imported_fields import IMPORTED_EXTRA_FIELDS_KEY
 from backend.services.linkedin_normalize import normalize_linkedin
-from backend.services.profile_mapper import map_scraped_profile
+from backend.services.profile_mapper import CompanyCache, map_scraped_profile
 from backend.services.profile_persist import persist_mapped_profile
 
 logger = logging.getLogger(__name__)
@@ -136,16 +138,25 @@ def write_progress(upload_id: int, **updates: Any) -> None:
     _with_conn(run)
 
 
-def existing_candidates(normalized_li: str, owner_user_id: int) -> List[Dict[str, Any]]:
-    """Rows this owner already has for the profile. Masters (owner NULL) are not counted."""
+def existing_candidates_bulk(keys: Sequence[str], owner_user_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Rows this owner already has for each profile, in one query. Masters (owner NULL)
+    are not counted. Every key is present in the result."""
+    wanted = sorted({k for k in keys if k})
+    found: Dict[str, List[Dict[str, Any]]] = {k: [] for k in keys}
+    if not wanted:
+        return found
+
     def run(cur):
         cur.execute(
-            "SELECT id, pool_source FROM candidates WHERE normalized_linkedin = %s AND owner_user_id = %s",
-            (normalized_li, owner_user_id),
+            "SELECT normalized_linkedin, id, pool_source FROM candidates "
+            "WHERE normalized_linkedin = ANY(%s) AND owner_user_id = %s ORDER BY id",
+            (wanted, owner_user_id),
         )
-        return [{"id": r[0], "pool_source": r[1]} for r in cur.fetchall()]
+        return cur.fetchall()
 
-    return _with_conn(run)
+    for key, cid, pool_source in _with_conn(run):
+        found.setdefault(key, []).append({"id": cid, "pool_source": pool_source})
+    return found
 
 
 def delete_candidates(ids: Sequence[int]) -> int:
@@ -228,6 +239,30 @@ def _batch_size() -> int:
         return 50
 
 
+def _scrape_workers() -> int:
+    """Actor runs in flight at once, after the first one has proved Apify is answering."""
+    try:
+        return max(1, min(5, int(os.getenv("APIFY_PARALLEL_RUNS", "3") or 3)))
+    except ValueError:
+        return 3
+
+
+def _map_workers() -> int:
+    """Profiles being mapped (model and web calls) at once."""
+    try:
+        return max(1, min(16, int(os.getenv("LINKEDIN_IMPORT_MAP_WORKERS", "8") or 8)))
+    except ValueError:
+        return 8
+
+
+def _save_workers() -> int:
+    """Profiles being written to the database at once. Kept well below the DB pool size."""
+    try:
+        return max(1, min(6, int(os.getenv("LINKEDIN_IMPORT_SAVE_WORKERS", "3") or 3)))
+    except ValueError:
+        return 3
+
+
 def apply_row_extras(tables: Dict[str, Any], extras: Optional[Dict[str, Any]]) -> None:
     """Lay one source-sheet row over a scraped profile, in place.
 
@@ -265,7 +300,8 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
                         use_llm: bool = True, use_web: bool = True,
                         row_extras: Optional[Dict[str, Dict[str, Any]]] = None,
                         defer_missing: bool = False, finalize: bool = True,
-                        quiet_duplicates: bool = False) -> Dict[str, Any]:
+                        quiet_duplicates: bool = False,
+                        report: Optional[Callable[..., None]] = None) -> Dict[str, Any]:
     """Scrape, map and persist every URL; returns the final counts. Never raises for a
     single bad profile - those become ``errors`` lines and ``skipped`` counts.
 
@@ -275,140 +311,201 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
     ``deferred`` so the caller can load them from its own data instead. With
     ``finalize=False`` the upload row is left open for the caller's next phase.
     ``quiet_duplicates`` drops the per-row "already in your pool" line, for re-syncs
-    where most rows are expected to exist already.
+    where most rows are expected to exist already. ``report`` receives the progress
+    updates instead of the upload row, for a caller that merges several phases.
+
+    The run is a stream. Actor runs go out side by side; each profile is mapped (model
+    and web calls, seconds each) and saved by one worker as soon as its run returns, a
+    few saves at a time. Counts move as profiles finish; the returned ``results`` and
+    ``errors`` are in the order the URLs were given.
     """
+    started = time.monotonic()
     duplicate_policy = normalize_duplicate_policy(duplicate_policy)
     row_extras = row_extras or {}
-    inserted = replaced = skipped = assigned = processed = 0
-    errors: List[str] = []
-    touched: List[int] = []
-    results: List[Dict[str, Any]] = []
-    deferred: List[str] = []
+    report = report or (lambda **updates: write_progress(upload_id, **updates))
+    keys = [normalize_linkedin(u) for u in urls]
 
     # Apify bills per returned profile, so decide duplicates before scraping and
     # only send the URLs that will actually be loaded.
-    dupes_by_key: Dict[str, List[Dict[str, Any]]] = {}
-    to_scrape: List[str] = []
-    for url in urls:
-        key = normalize_linkedin(url)
-        dupes_by_key[key] = existing_candidates(key, owner_user_id)
-        if dupes_by_key[key] and duplicate_policy == DUPLICATE_SKIP:
-            continue
-        to_scrape.append(url)
+    dupes_by_key = existing_candidates_bulk(keys, owner_user_id)
+    skip_as_duplicate = {k for k in keys if dupes_by_key.get(k) and duplicate_policy == DUPLICATE_SKIP}
+    to_scrape = [u for u, k in zip(urls, keys) if k not in skip_as_duplicate]
+    url_of = {normalize_linkedin(u): u for u in reversed(to_scrape)}
 
-    # One actor run per chunk: the actor caps profiles per request.
-    rows: List[Dict[str, Any]] = []
-    apify_failed: List[str] = []
-    apify_requested = 0
-    not_scraped: Dict[str, str] = {}
-    size = _batch_size()
-    chunks = [to_scrape[i:i + size] for i in range(0, len(to_scrape), size)]
-    for index, chunk in enumerate(chunks):
-        try:
-            write_progress(upload_id, status="scraping")
-            scraped = scrape_profiles(chunk)
-        except ApifyScrapeError as exc:
-            if index == 0:
-                write_progress(upload_id, status="failed", completed_at=datetime.now(timezone.utc),
-                               error_message=f"apify: {exc}"[:8000])
-                return {"status": "failed", "error": str(exc), "inserted": 0, "updated": 0,
-                        "skipped": len(urls), "processed": 0, "role_assigned_count": 0,
-                        "errors": [f"apify: {exc}"], "results": [], "deferred": []}
-            # Keep what earlier chunks already returned (and were billed for); the
-            # rest is reported per row so a later sync can pick it up.
-            logger.exception("apify chunk %s of %s failed", index + 1, len(chunks))
-            for rest in chunks[index:]:
-                for url in rest:
-                    not_scraped[normalize_linkedin(url)] = str(exc)
-            break
-        rows += scraped["rows"]
-        apify_failed += scraped["failed"]
-        apify_requested += scraped["requested"]
+    # ---- shared state: every row ends up with exactly one outcome
+    lock = threading.Lock()
+    outcomes: Dict[str, Dict[str, Any]] = {}       # key -> {"result", "error", "deferred"}
+    counts = {"inserted": 0, "replaced": 0, "skipped": 0, "assigned": 0, "processed": 0}
+    touched: List[int] = []
+    timing = {"save": 0.0, "scrape": 0.0, "last_report": 0.0}
 
-    by_key = _row_index(rows)
-    write_progress(upload_id, status="enriching")
+    def error_lines() -> List[str]:
+        return [outcomes[k]["error"] for k in dict.fromkeys(keys) if k in outcomes and outcomes[k].get("error")]
 
-    for url in urls:
-        key = normalize_linkedin(url)
-        raw = by_key.get(key)
+    def settle(key: str, result: Dict[str, Any], *, error: Optional[str] = None, deferred: bool = False,
+               **bump: int) -> None:
+        """Record one row's outcome and move the counters. Deferred rows are not counted
+        here; the caller loads them another way."""
+        with lock:
+            if key in outcomes:
+                return
+            outcomes[key] = {"result": {"url": url_of.get(key) or key, **result}, "error": error, "deferred": deferred}
+            for name, amount in bump.items():
+                counts[name] += amount
+            if not deferred:
+                counts["processed"] += 1
+            now = time.monotonic()
+            due = now - timing["last_report"] >= 1.0
+            if due:
+                timing["last_report"] = now
+            snapshot = dict(counts)
+            lines = error_lines() if due else []
+        if due:      # at most one progress write a second; the final write is unconditional
+            report(processed_count=snapshot["processed"], inserted_count=snapshot["inserted"],
+                   updated_count=snapshot["replaced"], skipped_count=snapshot["skipped"],
+                   role_assigned_count=snapshot["assigned"], error_message="\n".join(lines)[:8000] or None)
+
+    # ---- one job per profile: map it, then save it
+    company_cache = CompanyCache()
+    save_gate = threading.BoundedSemaphore(_save_workers())     # the DB pool is small
+    workers = ThreadPoolExecutor(max_workers=_map_workers(), thread_name_prefix="linkedin-load")
+    jobs: Dict[str, Any] = {}
+
+    def load_profile(key: str, raw: Dict[str, Any]) -> None:
+        url = url_of[key]
         dupes = dupes_by_key.get(key, [])
-        outcome: Dict[str, Any] = {"url": url}
-        counted = True
         try:
-            if dupes and duplicate_policy == DUPLICATE_SKIP:
-                skipped += 1
-                if not quiet_duplicates:
-                    errors.append(f"{url}: already in your pool as candidate {dupes[0]['id']} (skipped, not scraped)")
-                outcome.update(status="duplicate", candidate_id=dupes[0]["id"])
-                # The person is still wanted in this role even though nothing was re-imported.
-                if assign_role(role_id, dupes[0]["id"]):
-                    assigned += 1
-                continue
-
-            if key in not_scraped:
-                skipped += 1
-                errors.append(f"{url}: not scraped, Apify failed ({not_scraped[key]})"[:500])
-                outcome["status"] = "not_scraped"
-                continue
-
-            if raw is None:
-                outcome["status"] = "not_found"
-                if defer_missing:
-                    counted = False
-                    deferred.append(url)
-                    errors.append(f"{url}: no profile returned by Apify; loaded from the sheet values instead")
-                else:
-                    skipped += 1
-                    errors.append(f"{url}: no profile returned by Apify (private, removed, or blocked)")
-                continue
-
             tables = map_scraped_profile(raw, use_llm=use_llm, use_web=use_web,
-                                         known_companies=known_companies(_company_names(raw)))
+                                         known_companies=known_companies(_company_names(raw)),
+                                         company_cache=company_cache)
             apply_row_extras(tables, row_extras.get(key))
-            if dupes:
-                delete_candidates([d["id"] for d in dupes])
-            saved = persist_mapped_profile(
-                tables, owner_user_id=owner_user_id, pool_source=POOL_SOURCE_RECRUITER_UPLOAD,
-                dry_run=False, created_by=CREATED_BY,
-                extra_candidate_fields={"source_upload_ids": [upload_id]},
-            )
-            cid = saved["candidate_id"]
-            touched.append(cid)
-            if dupes:
-                replaced += 1
-            else:
-                inserted += 1
-            if assign_role(role_id, cid):
-                assigned += 1
-            outcome.update(status="replaced" if dupes else "inserted", candidate_id=cid,
-                           counts=saved["counts"], coverage=tables.get("coverage"))
+            with save_gate:
+                save_started = time.monotonic()
+                if dupes:
+                    delete_candidates([d["id"] for d in dupes])
+                saved = persist_mapped_profile(
+                    tables, owner_user_id=owner_user_id, pool_source=POOL_SOURCE_RECRUITER_UPLOAD,
+                    dry_run=False, created_by=CREATED_BY,
+                    extra_candidate_fields={"source_upload_ids": [upload_id]},
+                )
+                cid = saved["candidate_id"]
+                joined_role = assign_role(role_id, cid)
+                with lock:
+                    timing["save"] += time.monotonic() - save_started
+                    touched.append(cid)
+            settle(key, {"status": "replaced" if dupes else "inserted", "candidate_id": cid,
+                         "counts": saved["counts"], "coverage": tables.get("coverage")},
+                   **{"replaced" if dupes else "inserted": 1, "assigned": 1 if joined_role else 0})
         except Exception as exc:  # one profile must not sink the batch
             logger.exception("linkedin import failed for %s", url)
-            outcome.update(status="error", error=str(exc))
             if defer_missing and not dupes:
-                counted = False
-                deferred.append(url)
-                errors.append(f"{url}: LinkedIn enrichment failed ({exc}); loaded from the sheet values instead"[:500])
+                settle(key, {"status": "error", "error": str(exc)}, deferred=True,
+                       error=f"{url}: LinkedIn enrichment failed ({exc}); loaded from the sheet values instead"[:500])
             else:
-                skipped += 1
-                errors.append(f"{url}: {exc}"[:500])
-        finally:
-            if counted:
-                processed += 1
-            results.append(outcome)
-            write_progress(upload_id, processed_count=processed, inserted_count=inserted,
-                           updated_count=replaced, skipped_count=skipped, role_assigned_count=assigned,
-                           error_message="\n".join(errors)[:8000] or None)
+                settle(key, {"status": "error", "error": str(exc)}, error=f"{url}: {exc}"[:500], skipped=1)
 
+    def scrape_chunk(chunk: Sequence[str]) -> Dict[str, Any]:
+        """One actor run; its profiles start loading the moment they are back."""
+        scraped = scrape_profiles(list(chunk))
+        with lock:
+            for key, row in _row_index(scraped["rows"]).items():
+                if key in url_of and key not in jobs:
+                    jobs[key] = workers.submit(load_profile, key, row)
+        return scraped
+
+    def chunk_done(chunk: Sequence[str], scraped: Optional[Dict[str, Any]], failure: Optional[str]) -> None:
+        """Give every URL of a finished run that did not come back its outcome."""
+        for url in chunk:
+            key = normalize_linkedin(url)
+            with lock:
+                loading = key in jobs
+            if loading:
+                continue
+            if failure is not None:
+                settle(key, {"status": "not_scraped"}, skipped=1,
+                       error=f"{url}: not scraped, Apify failed ({failure})"[:500])
+            elif defer_missing:
+                settle(key, {"status": "not_found"}, deferred=True,
+                       error=f"{url}: no profile returned by Apify; loaded from the sheet values instead")
+            else:
+                settle(key, {"status": "not_found"}, skipped=1,
+                       error=f"{url}: no profile returned by Apify (private, removed, or blocked)")
+
+    # ---- duplicates: nothing to scrape, but the person is still wanted in this role
+    for key in dict.fromkeys(k for k in keys if k in skip_as_duplicate):
+        existing_id = dupes_by_key[key][0]["id"]
+        url_of.setdefault(key, next(u for u, k in zip(urls, keys) if k == key))
+        settle(key, {"status": "duplicate", "candidate_id": existing_id}, skipped=1,
+               assigned=1 if assign_role(role_id, existing_id) else 0,
+               error=None if quiet_duplicates else
+               f"{url_of[key]}: already in your pool as candidate {existing_id} (skipped, not scraped)")
+
+    # ---- scraping: one actor run per chunk (the actor caps profiles per request)
+    apify_failed: List[str] = []
+    apify_requested = 0
+    size = _batch_size()
+    chunks = [to_scrape[i:i + size] for i in range(0, len(to_scrape), size)]
+    if chunks:
+        report(status="scraping")
+        # The first run goes alone: if Apify is down or out of quota the import stops
+        # here, before any other run is paid for.
+        try:
+            first = scrape_chunk(chunks[0])
+        except ApifyScrapeError as exc:
+            workers.shutdown(wait=False)
+            report(status="failed", completed_at=datetime.now(timezone.utc), error_message=f"apify: {exc}"[:8000])
+            return {"status": "failed", "error": str(exc), "inserted": 0, "updated": 0,
+                    "skipped": len(urls), "processed": 0, "role_assigned_count": 0,
+                    "errors": [f"apify: {exc}"], "results": [], "deferred": []}
+        report(status="enriching")
+        apify_failed += first["failed"]
+        apify_requested += first["requested"]
+        timing["scrape"] = time.monotonic() - started
+        chunk_done(chunks[0], first, None)
+        scraper = ThreadPoolExecutor(max_workers=_scrape_workers(), thread_name_prefix="linkedin-scrape")
+        later = [(chunk, scraper.submit(scrape_chunk, chunk)) for chunk in chunks[1:]]
+        scraper.shutdown(wait=False)
+        for index, (chunk, job) in enumerate(later, start=2):
+            # A failed run costs only its own profiles: what the other runs returned
+            # (and were billed for) is still loaded.
+            try:
+                scraped = job.result()
+            except ApifyScrapeError as exc:
+                logger.exception("apify chunk %s of %s failed", index, len(chunks))
+                chunk_done(chunk, None, str(exc))
+                continue
+            apify_failed += scraped["failed"]
+            apify_requested += scraped["requested"]
+            timing["scrape"] = time.monotonic() - started
+            chunk_done(chunk, scraped, None)
+    else:
+        report(status="enriching")
+
+    # ---- wait for every profile that is still mapping or saving
+    workers.shutdown(wait=True)
+
+    errors = error_lines()
+    ordered = list(dict.fromkeys(keys))
+    results = [outcomes[k]["result"] for k in ordered if k in outcomes]
+    deferred = [outcomes[k]["result"]["url"] for k in ordered if k in outcomes and outcomes[k]["deferred"]]
     status = "completed_with_errors" if errors else "completed"
+    final = dict(processed_count=counts["processed"], inserted_count=counts["inserted"],
+                 updated_count=counts["replaced"], skipped_count=counts["skipped"],
+                 role_assigned_count=counts["assigned"], error_message="\n".join(errors)[:8000] or None)
     if finalize:
-        write_progress(upload_id, status=status, completed_at=datetime.now(timezone.utc))
+        final.update(status=status, completed_at=datetime.now(timezone.utc))
+    report(**final)
+    cache_started = time.monotonic()
     if touched:
         refresh_caches(touched)
     logger.info("linkedin import upload_id=%s inserted=%s replaced=%s skipped=%s deferred=%s", upload_id,
-                inserted, replaced, skipped, len(deferred))
-    return {"status": status, "inserted": inserted, "updated": replaced, "skipped": skipped,
-            "processed": processed, "role_assigned_count": assigned, "errors": errors, "results": results,
+                counts["inserted"], counts["replaced"], counts["skipped"], len(deferred))
+    logger.info("linkedin import timing upload_id=%s profiles=%s total=%.1fs scrape=%.1fs save=%.1fs (summed "
+                "over %s at a time) cache=%.1fs", upload_id, len(urls), time.monotonic() - started,
+                timing["scrape"], timing["save"], _save_workers(), time.monotonic() - cache_started)
+    return {"status": status, "inserted": counts["inserted"], "updated": counts["replaced"],
+            "skipped": counts["skipped"], "processed": counts["processed"],
+            "role_assigned_count": counts["assigned"], "errors": errors, "results": results,
             "deferred": deferred, "apify_requested": apify_requested, "apify_failed": apify_failed}
 
 
