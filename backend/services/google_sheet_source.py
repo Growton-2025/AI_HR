@@ -15,6 +15,8 @@ from urllib.parse import quote
 import httpx
 import pandas as pd
 
+from backend.services import google_oauth
+
 logger = logging.getLogger(__name__)
 
 SHEETS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
@@ -64,8 +66,8 @@ def parse_sheet_url(url: str) -> Tuple[str, Optional[int]]:
 
 def _get(url: str, access_token: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
-        resp = httpx.get(url, params=params, headers={"Authorization": f"Bearer {access_token}"},
-                         timeout=HTTP_TIMEOUT_SECONDS)
+        resp = google_oauth.http().get(url, params=params, headers={"Authorization": f"Bearer {access_token}"},
+                                       timeout=HTTP_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
         raise SheetSourceError(f"Could not reach Google Sheets: {exc}")
     if resp.status_code == 200:

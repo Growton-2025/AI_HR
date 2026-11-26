@@ -70,7 +70,7 @@ def _fake_get(monkeypatch, status: int, payload: Dict[str, Any], seen: Dict[str,
             seen.update(url=url, params=params, headers=headers)
         return _Resp(status, payload)
 
-    monkeypatch.setattr(gs.httpx, "get", fake)
+    monkeypatch.setattr(gs.google_oauth, "http", lambda: type("Client", (), {"get": staticmethod(fake)}))
 
 
 def test_list_tabs_skips_hidden_and_orders_by_index(monkeypatch):

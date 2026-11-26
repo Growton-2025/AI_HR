@@ -24,7 +24,8 @@ const primaryBtn = (enabled) => ({ padding: '10px 16px', borderRadius: 10, borde
  * Import candidates from a Google Sheet: connect Google, paste the link, pick the
  * tab, confirm the column mapping (same screen as a spreadsheet upload), then
  * import. Rows with a LinkedIn profile URL are scraped and enriched through Apify.
- * Saved sheets can be re-run with "Sync now", or reopened with their saved mapping.
+ * A saved sheet stays linked: rows added to it later are imported automatically. It can
+ * also be re-read with "Sync now", or reopened with its saved mapping.
  *
  * The import itself is tracked by the app store (`trackImport`), so this window can be
  * closed while it runs; pages refresh their lists on the store's `importFinishedTick`.
@@ -314,7 +315,7 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
               <FileSpreadsheet size={18} color="#16a34a" /> Import from Google Sheet{roleName ? ` into ${roleName}` : ''}
             </div>
             <div style={{ fontSize: 13, color: '#64748b', marginTop: 4 }}>
-              Connect Google, paste the sheet link and confirm the column mapping. Rows with a LinkedIn profile URL are enriched through Apify.
+              Connect Google, paste the sheet link and confirm the column mapping. Rows with a LinkedIn profile URL are enriched through Apify. The sheet then stays linked: rows added later are imported on their own within a couple of minutes.
             </div>
           </div>
           <button type="button" onClick={onClose} disabled={working} aria-label="Close" style={{ border: 'none', background: 'transparent', cursor: working ? 'not-allowed' : 'pointer', color: '#64748b' }}>
@@ -412,9 +413,19 @@ export default function GoogleSheetImportModal({ open, roleId = null, roleName =
                         {c.sheet_title || 'Google Sheet'} / {c.tab_title}
                       </a>
                       <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
-                        {c.last_synced_at ? `Last synced ${new Date(`${c.last_synced_at}Z`).toLocaleString()}` : 'Not synced yet'}
+                        {c.auto_sync ? 'New rows import automatically · ' : ''}
+                        {c.last_synced_at ? `Last import ${new Date(`${c.last_synced_at}Z`).toLocaleString()}` : 'Nothing imported yet'}
+                        {c.auto_sync && c.last_checked_at ? ` · Sheet checked ${new Date(`${c.last_checked_at}Z`).toLocaleTimeString()}` : ''}
                         {c.enrich_linkedin ? ' · LinkedIn enrichment on' : ''}
                       </div>
+                      {c.held_count > 0 && (
+                        <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                          {c.held_count} {c.held_count === 1 ? 'row' : 'rows'} waiting for LinkedIn data · retrying automatically
+                        </div>
+                      )}
+                      {c.last_error && (
+                        <div style={{ fontSize: 11, color: '#b91c1c', marginTop: 2 }}>Not syncing: {c.last_error}</div>
+                      )}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
                       <button type="button" disabled={working} onClick={() => reviewConnection(c)} title="Open this sheet with its saved column mapping, to check or change it before importing" style={{ ...ghostBtn(working), padding: '7px 11px', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6 }}>

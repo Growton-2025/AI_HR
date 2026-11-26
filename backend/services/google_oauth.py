@@ -30,6 +30,23 @@ REQUESTED_SCOPES = f"openid email {SHEETS_SCOPE}"
 HTTP_TIMEOUT_SECONDS = 20.0
 
 _tables_ready = False
+_http_lock = threading.Lock()
+_http_client: Optional[httpx.Client] = None
+
+
+def http() -> httpx.Client:
+    """One shared client for every Google call, bound to IPv4.
+
+    Google's hosts resolve to several IPv6 addresses first; on a network where IPv6 is
+    announced but does not route, each one is tried for the full timeout before IPv4
+    is reached, so a single read took minutes. Azure's outbound traffic is IPv4 too."""
+    global _http_client
+    if _http_client is None:
+        with _http_lock:
+            if _http_client is None:
+                _http_client = httpx.Client(transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=1),
+                                            timeout=HTTP_TIMEOUT_SECONDS)
+    return _http_client
 _tables_lock = threading.Lock()
 
 
@@ -97,7 +114,10 @@ def _with_conn(fn):
         conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:      # a dropped connection cannot roll back; keep the real error
+            pass
         raise
     finally:
         return_db_connection(conn)
@@ -150,6 +170,14 @@ def ensure_tables() -> None:
                 """
             )
 
+            # Automatic sync (services/sheet_auto_sync.py): which rows were already
+            # imported, which are waiting to settle or for LinkedIn data, and when the
+            # sheet was last read.
+            for column in ("seen_row_keys JSONB", "pending_rows JSONB", "last_checked_at TIMESTAMP",
+                           "last_error TEXT", "retry_after TIMESTAMP", "content_digest VARCHAR(64)",
+                           "last_changed_at TIMESTAMP", "held_rows JSONB"):
+                cur.execute(f"ALTER TABLE sheet_connections ADD COLUMN IF NOT EXISTS {column};")
+
         _with_conn(run)
         _tables_ready = True
 
@@ -198,7 +226,7 @@ def delete_tokens(user_id: int) -> None:
 
 # ------------------------------------------------------------------------- Google
 def _post_token(data: Dict[str, str]) -> httpx.Response:
-    return httpx.post(TOKEN_URL, data=data, timeout=HTTP_TIMEOUT_SECONDS)
+    return http().post(TOKEN_URL, data=data, timeout=HTTP_TIMEOUT_SECONDS)
 
 
 def _email_from_id_token(id_token: Optional[str]) -> Optional[str]:
@@ -306,7 +334,7 @@ def disconnect(user_id: int) -> None:
     if not stored:
         return
     try:
-        httpx.post(REVOKE_URL, params={"token": decrypt_token(stored["refresh_token_enc"])},
+        http().post(REVOKE_URL, params={"token": decrypt_token(stored["refresh_token_enc"])},
                    timeout=HTTP_TIMEOUT_SECONDS)
     except Exception:
         logger.warning("google token revoke failed for user %s; removing the stored token anyway", user_id)

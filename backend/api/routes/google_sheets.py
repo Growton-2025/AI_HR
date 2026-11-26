@@ -221,6 +221,13 @@ def gsheet_connections(role_id: Optional[int] = Query(None),
         user_id=int(current_user.id), role_id=role_id, pool_only=role_id is None)}
 
 
+@router.get("/import/gsheet/sync-status")
+def gsheet_sync_status(current_user: schemas.User = Depends(deps.get_current_user)):
+    """Live state of the automatic sync for the user's linked sheets (polled by the app)."""
+    return {"auto_sync": sheet_import.auto_sync_seconds() > 0,
+            "connections": sheet_import.sync_status(user_id=int(current_user.id))}
+
+
 @router.post("/import/gsheet/connections/{connection_id}/sync")
 async def gsheet_sync(connection_id: int, current_user: schemas.User = Depends(deps.get_current_user)):
     """Re-read the saved tab and import again; people already in the pool are skipped unscraped."""

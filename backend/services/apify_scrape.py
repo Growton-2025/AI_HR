@@ -15,6 +15,11 @@ Supported actors (``APIFY_LINKEDIN_ACTOR``):
   variant with the same output shape; takes ``urls`` only.
 * ``dev_fusion/Linkedin-Profile-Scraper`` - cookie-free, takes ``profileUrls``
   and already returns the flat key shape.
+
+``APIFY_LINKEDIN_FALLBACK_ACTOR`` lists, comma-separated and in order, the actors asked
+for the profiles the main actor did not return, so one actor being out of service does
+not stop an import. Default: dev_fusion, supreme_coder, curious_coder (the main actor is
+left out; curious_coder only when a LinkedIn cookie is configured). Empty turns it off.
 """
 from __future__ import annotations
 
@@ -39,6 +44,9 @@ MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 5
 
 DEFAULT_ACTOR = "curious_coder/linkedin-profile-scraper"
+DEFAULT_FALLBACK_ACTORS = ("dev_fusion/Linkedin-Profile-Scraper,supreme_coder/linkedin-profile-scraper,"
+                           "curious_coder/linkedin-profile-scraper")
+FALLBACK_ATTEMPTS = 2
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36"
@@ -274,34 +282,37 @@ def _row_url(row: Dict[str, Any]) -> str:
     return normalize_linkedin(row.get("linkedinPublicUrl") or row.get("linkedinUrl") or "")
 
 
-def scrape_profiles(linkedin_urls: List[str]) -> Dict[str, Any]:
-    """Scrape profiles; returns ``{"rows": [...], "failed": [...], "requested": n}``.
+def _actor_key(actor: str) -> str:
+    return actor.replace("~", "/").strip().lower()
 
-    ``failed`` lists input URLs the actor returned nothing for (private, dead,
-    or blocked profiles), so callers can report them per row.
-    """
-    token, actor, cap = _config()
+
+def _has_linkedin_cookie() -> bool:
+    return bool(os.getenv("APIFY_LINKEDIN_COOKIE", "").strip() or os.getenv("APIFY_LINKEDIN_COOKIE_FILE", "").strip())
+
+
+def _fallback_actors(primary: str) -> List[str]:
+    """The actors asked, in order, when the main one returns nothing. Unsupported
+    actors, the main actor itself, and curious_coder without a LinkedIn cookie (it
+    cannot run) are left out."""
+    actors: List[str] = []
+    for actor in os.getenv("APIFY_LINKEDIN_FALLBACK_ACTOR", DEFAULT_FALLBACK_ACTORS).split(","):
+        actor, key = actor.strip(), _actor_key(actor)
+        if not actor or key == _actor_key(primary) or key not in ACTOR_ADAPTERS:
+            continue
+        if key == "curious_coder/linkedin-profile-scraper" and not _has_linkedin_cookie():
+            continue
+        if key not in {_actor_key(a) for a in actors}:
+            actors.append(actor)
+    return actors
+
+
+def _run_actor(actor: str, token: str, urls: Sequence[str], attempts: int) -> List[Dict[str, Any]]:
+    """Ask one actor for ``urls``, retrying the misses. Stops early when a run returns
+    nothing at all: that is the actor being out of service, not one flaky profile."""
     build_input, convert = _adapter(actor)
-
-    urls: List[str] = []
-    seen = set()
-    for raw in linkedin_urls:
-        key = normalize_linkedin(raw)
-        if key and key not in seen:
-            seen.add(key)
-            urls.append(raw.strip())
-    if not urls:
-        return {"rows": [], "failed": [], "requested": 0}
-    if len(urls) > cap:
-        raise ApifyScrapeError(
-            f"{len(urls)} profiles requested; APIFY_MAX_PROFILES_PER_REQUEST is {cap}"
-        )
-
-    # Actors intermittently return nothing for profiles they can fetch a moment
-    # later, and failed lookups are not billed, so retry the misses a few times.
     rows: List[Dict[str, Any]] = []
     pending = list(urls)
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         resp = requests.post(
             f"{APIFY_BASE}/acts/{actor.replace('/', '~')}/run-sync-get-dataset-items",
             params={"timeout": RUN_TIMEOUT_SECONDS},
@@ -325,11 +336,62 @@ def scrape_profiles(linkedin_urls: List[str]) -> Dict[str, Any]:
         pending = [u for u in urls if normalize_linkedin(u) not in done]
         if not pending:
             break
-        logger.info("apify attempt %s: %s of %s profiles still missing", attempt, len(pending), len(urls))
-        if attempt < MAX_ATTEMPTS:
+        logger.info("apify actor=%s attempt %s: %s of %s profiles still missing", actor, attempt, len(pending),
+                    len(urls))
+        if not batch:
+            break
+        if attempt < attempts:
             time.sleep(RETRY_DELAY_SECONDS)
+    return rows
+
+
+def scrape_profiles(linkedin_urls: List[str]) -> Dict[str, Any]:
+    """Scrape profiles; returns ``{"rows": [...], "failed": [...], "requested": n}``.
+
+    ``failed`` lists input URLs the actor returned nothing for (private, dead,
+    or blocked profiles), so callers can report them per row.
+    """
+    token, actor, cap = _config()
+    _adapter(actor)      # an unsupported actor is a configuration error, not an outage
+
+    urls: List[str] = []
+    seen = set()
+    for raw in linkedin_urls:
+        key = normalize_linkedin(raw)
+        if key and key not in seen:
+            seen.add(key)
+            urls.append(raw.strip())
+    if not urls:
+        return {"rows": [], "failed": [], "requested": 0}
+    if len(urls) > cap:
+        raise ApifyScrapeError(
+            f"{len(urls)} profiles requested; APIFY_MAX_PROFILES_PER_REQUEST is {cap}"
+        )
+
+    # Actors intermittently return nothing for profiles they can fetch a moment
+    # later, and failed lookups are not billed, so the misses are retried, then asked
+    # of the fallback actor.
+    fallbacks = _fallback_actors(actor)
+    rows: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for index, current in enumerate([actor] + fallbacks):
+        missing = [u for u in urls if normalize_linkedin(u) not in {_row_url(r) for r in rows}]
+        if not missing:
+            break
+        if index:
+            logger.info("apify: %s of %s profiles still missing; asking %s", len(missing), len(urls), current)
+        try:
+            rows += _run_actor(current, token, missing, MAX_ATTEMPTS if index == 0 else FALLBACK_ATTEMPTS)
+        except (ApifyScrapeError, requests.RequestException) as exc:
+            errors.append(f"{current}: {exc}")
+            logger.warning("apify actor=%s failed: %s", current, exc)
+    # Every actor asked failed outright: that is Apify being unreachable or out of
+    # quota, not a profile nobody could return.
+    if not rows and len(errors) == 1 + len(fallbacks):
+        raise ApifyScrapeError("; ".join(errors)[:600])
 
     got = {_row_url(r) for r in rows}
     failed = [u for u in urls if normalize_linkedin(u) not in got]
-    logger.info("apify actor=%s requested=%s returned=%s failed=%s", actor, len(urls), len(rows), len(failed))
+    logger.info("apify actor=%s fallbacks=%s requested=%s returned=%s failed=%s", actor, fallbacks, len(urls),
+                len(rows), len(failed))
     return {"rows": rows, "failed": failed, "requested": len(urls)}

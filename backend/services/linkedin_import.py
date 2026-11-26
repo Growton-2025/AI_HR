@@ -400,7 +400,7 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
             logger.exception("linkedin import failed for %s", url)
             if defer_missing and not dupes:
                 settle(key, {"status": "error", "error": str(exc)}, deferred=True,
-                       error=f"{url}: LinkedIn enrichment failed ({exc}); loaded from the sheet values instead"[:500])
+                       error=f"{url}: LinkedIn enrichment failed ({exc})"[:500])
             else:
                 settle(key, {"status": "error", "error": str(exc)}, error=f"{url}: {exc}"[:500], skipped=1)
 
@@ -426,7 +426,7 @@ def run_linkedin_import(*, upload_id: int, urls: Sequence[str], owner_user_id: i
                        error=f"{url}: not scraped, Apify failed ({failure})"[:500])
             elif defer_missing:
                 settle(key, {"status": "not_found"}, deferred=True,
-                       error=f"{url}: no profile returned by Apify; loaded from the sheet values instead")
+                       error=f"{url}: no profile returned by Apify")
             else:
                 settle(key, {"status": "not_found"}, skipped=1,
                        error=f"{url}: no profile returned by Apify (private, removed, or blocked)")

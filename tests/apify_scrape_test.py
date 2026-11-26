@@ -164,3 +164,85 @@ def test_converter_handles_real_supreme_coder_quirks():
     assert row["skills/0/title"] == "SIP Trunking"
     assert row["licenseAndCertificates/0/subtitle"] == "Udemy"
     assert row["projects/0/title"] == "Automated Text Analysis"
+
+
+# ------------------------------------------------------------------ fallback actor
+def _fake_apify(monkeypatch, answers):
+    """``answers`` maps an actor slug fragment to the items each of its runs returns."""
+    monkeypatch.setenv("APIFY_API_TOKEN", "t")
+    monkeypatch.setenv("APIFY_LINKEDIN_ACTOR", "supreme_coder/linkedin-profile-scraper")
+    monkeypatch.delenv("APIFY_LINKEDIN_COOKIE", raising=False)
+    monkeypatch.delenv("APIFY_LINKEDIN_COOKIE_FILE", raising=False)
+    monkeypatch.setattr(apify_scrape.time, "sleep", lambda seconds: None)
+    calls = []
+
+    def post(url, **kw):
+        actor = next(name for name in answers if name in url)
+        calls.append(actor)
+        answer = answers[actor]
+
+        class Resp:
+            status_code = 500 if answer == "down" else 200
+            text = "actor is down"
+
+            def json(self):
+                return answer
+
+        return Resp()
+
+    monkeypatch.setattr(apify_scrape.requests, "post", post)
+    return calls
+
+
+URL = "https://www.linkedin.com/in/ada-lovelace"
+
+
+def test_fallback_actor_is_asked_when_the_main_one_returns_nothing(monkeypatch):
+    calls = _fake_apify(monkeypatch, {"supreme_coder": [], "dev_fusion": [{"linkedinUrl": URL, "fullName": "Ada"}]})
+    out = apify_scrape.scrape_profiles([URL])
+    assert calls == ["supreme_coder", "dev_fusion"]      # an empty run is not retried on the main actor
+    assert out["failed"] == [] and out["rows"][0]["fullName"] == "Ada"
+
+
+def test_fallback_actor_is_asked_when_the_main_one_errors(monkeypatch):
+    calls = _fake_apify(monkeypatch, {"supreme_coder": "down", "dev_fusion": [{"linkedinUrl": URL}]})
+    assert apify_scrape.scrape_profiles([URL])["failed"] == [] and calls == ["supreme_coder", "dev_fusion"]
+
+
+def test_both_actors_empty_reports_the_profile_as_failed(monkeypatch):
+    calls = _fake_apify(monkeypatch, {"supreme_coder": [], "dev_fusion": []})
+    out = apify_scrape.scrape_profiles([URL])
+    assert out["rows"] == [] and out["failed"] == [URL] and calls == ["supreme_coder", "dev_fusion"]
+
+
+def test_both_actors_erroring_raises(monkeypatch):
+    _fake_apify(monkeypatch, {"supreme_coder": "down", "dev_fusion": "down"})
+    with pytest.raises(apify_scrape.ApifyScrapeError):
+        apify_scrape.scrape_profiles([URL])
+
+
+def test_fallback_can_be_turned_off_and_is_skipped_when_nothing_is_missing(monkeypatch):
+    calls = _fake_apify(monkeypatch, {"supreme_coder": [dict(CC_ITEM, publicIdentifier="ada-lovelace")],
+                                      "dev_fusion": []})
+    assert apify_scrape.scrape_profiles([URL])["failed"] == [] and calls == ["supreme_coder"]
+    monkeypatch.setenv("APIFY_LINKEDIN_FALLBACK_ACTOR", "")
+    calls2 = _fake_apify(monkeypatch, {"supreme_coder": [], "dev_fusion": [{"linkedinUrl": URL}]})
+    assert apify_scrape.scrape_profiles([URL])["failed"] == [URL] and calls2 == ["supreme_coder"]
+
+
+def test_fallbacks_are_tried_in_order_and_the_cookie_actor_only_with_a_cookie(monkeypatch):
+    answers = {"supreme_coder": [], "dev_fusion": [],
+               "curious_coder": [dict(CC_ITEM, publicIdentifier="ada-lovelace")]}
+    calls = _fake_apify(monkeypatch, answers)
+    assert apify_scrape.scrape_profiles([URL])["failed"] == [URL] and calls == ["supreme_coder", "dev_fusion"]
+    calls = _fake_apify(monkeypatch, answers)
+    monkeypatch.setenv("APIFY_LINKEDIN_COOKIE", json.dumps([{"name": "li_at", "value": "x"}]))
+    assert apify_scrape.scrape_profiles([URL])["failed"] == []
+    assert calls == ["supreme_coder", "dev_fusion", "curious_coder"]
+
+
+def test_a_different_main_actor_falls_back_to_the_other_two(monkeypatch):
+    calls = _fake_apify(monkeypatch, {"supreme_coder": [dict(CC_ITEM, publicIdentifier="ada-lovelace")],
+                                      "dev_fusion": []})
+    monkeypatch.setenv("APIFY_LINKEDIN_ACTOR", "dev_fusion/Linkedin-Profile-Scraper")
+    assert apify_scrape.scrape_profiles([URL])["failed"] == [] and calls == ["dev_fusion", "supreme_coder"]

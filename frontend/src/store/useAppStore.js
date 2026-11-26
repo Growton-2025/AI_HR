@@ -945,6 +945,31 @@ export const useAppStore = create(persist((set, get) => ({
         } catch { /* the dock is a convenience; nothing to resume is fine */ }
     },
 
+    // The automatic sheet sync starts imports nobody clicked for. Ask the server what
+    // it is doing so those imports get a progress card and the lists refresh after.
+    sheetSync: [],                // linked sheets with rows about to import or waiting for LinkedIn data
+    sheetSyncLinked: false,       // whether the user has any linked sheet (sets how often to ask)
+    refreshSheetSync: async () => {
+        if (!get().token) return
+        try {
+            const res = await axios.get(`${API_BASE}/import/gsheet/sync-status`, { timeout: 30000 })
+            const connections = res.data?.connections || []
+            for (const c of connections) {
+                if (c.running_upload_id) {
+                    get().trackImport(c.running_upload_id,
+                        { label: 'Google Sheet sync', roleId: c.role_id ?? null, roleName: c.role_name || '' },
+                        { upload_id: c.running_upload_id, status: 'processing', row_count: 0, processed_count: 0 })
+                }
+            }
+            set({
+                sheetSyncLinked: Boolean(res.data?.auto_sync) && connections.length > 0,
+                sheetSync: res.data?.auto_sync
+                    ? connections.filter(c => !c.running_upload_id && (c.new_count > 0 || c.held_count > 0))
+                    : [],
+            })
+        } catch { /* the status cards are a convenience; a missed poll is fine */ }
+    },
+
     // Sidebar State
     sidebarWidth: 260,
     isSidebarCollapsed: false,

@@ -202,6 +202,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"SMARTLEAD REPLY POLLER FAILED TO START: {e}")
 
+    # Linked Google Sheets import their new rows without anyone pressing Sync.
+    try:
+        from backend.services import sheet_auto_sync
+        sheet_auto_sync.start_poller()
+    except Exception as e:
+        print(f"SHEET AUTO-SYNC FAILED TO START: {e}")
+
     # Provider history backfill for newly added / looked-up people
     # (docs/candidate-history-linking-plan.md PR 3). Off unless
     # ENABLE_PERSON_HISTORY_BACKFILL=true; the worker checks the flag itself.
